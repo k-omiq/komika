@@ -1,0 +1,23 @@
+{
+	"version": "0.0.1",
+	"configurations": [
+		{
+			"name": "reader",
+			"runtimeExecutable": "pnpm",
+			"runtimeArgs": ["--filter", "@komika/reader", "dev"],
+			"port": 5173
+		},
+		{
+			"name": "admin",
+			"runtimeExecutable": "pnpm",
+			"runtimeArgs": ["--filter", "@komika/admin", "dev"],
+			"port": 5273
+		},
+		{
+			"name": "docs",
+			"runtimeExecutable": "python3",
+			"runtimeArgs": ["-m", "http.server", "5400"],
+			"port": 5400
+		}
+	]
+}

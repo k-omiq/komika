@@ -1,0 +1,307 @@
+<script lang="ts">
+	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
+	import { auth, logout } from '$lib/auth.svelte';
+	import Icon from './Icon.svelte';
+	import SearchOverlay from './SearchOverlay.svelte';
+
+	let {
+		searchPlaceholder = 'Search series, authors, genres…',
+		advancedSearch = true,
+	}: { searchPlaceholder?: string; advancedSearch?: boolean } = $props();
+
+	let searchOpen = $state(false);
+	let menuOpen = $state(false);
+
+	const nav = [
+		{ href: '/', label: 'Home' },
+		{ href: '/browse', label: 'Browse' },
+		{ href: '/updates', label: 'Updates' },
+		{ href: '/library', label: 'Library' },
+	];
+
+	const path = $derived(page.url.pathname);
+	function isActive(href: string): boolean {
+		return href === '/' ? path === '/' : path.startsWith(href);
+	}
+
+	// Preserve the current page so the user lands back here after signing in.
+	const loginHref = $derived(
+		path === '/login' ? '/login' : `/login?redirect=${encodeURIComponent(path)}`,
+	);
+	const initial = $derived((auth.user?.username ?? '?').charAt(0).toUpperCase());
+
+	async function signOut(): Promise<void> {
+		menuOpen = false;
+		await logout();
+		if (path === '/profile' || path === '/library') await goto('/');
+	}
+</script>
+
+<header>
+	<div class="left">
+		<a class="brand" href="/">YOMU</a>
+		<nav>
+			{#each nav as item (item.href)}
+				<a href={item.href} class="nav-link" class:active={isActive(item.href)}>{item.label}</a>
+			{/each}
+		</nav>
+	</div>
+	<div class="right">
+		<button class="icon-btn" aria-label="Search" onclick={() => (searchOpen = true)}>
+			<Icon name="search" size={21} />
+		</button>
+		<a
+			class="icon-btn donate"
+			class:on={isActive('/donate')}
+			href="/donate"
+			aria-label="Donate"
+			title="Support YOMU"
+		>
+			<Icon name="heart" size={19} fill={isActive('/donate') ? 'currentColor' : 'none'} />
+		</a>
+		<a
+			class="icon-btn"
+			class:on={isActive('/support')}
+			href="/support"
+			aria-label="Support"
+			title="Help & support"
+		>
+			<Icon name="help" size={19} />
+		</a>
+		{#if !auth.ready && !auth.user}
+			<div class="avatar skeleton" aria-hidden="true"></div>
+		{:else if auth.user}
+			<div class="account">
+				<button
+					class="avatar"
+					class:on={menuOpen || isActive('/profile')}
+					aria-label="Account menu"
+					aria-haspopup="menu"
+					aria-expanded={menuOpen}
+					onclick={() => (menuOpen = !menuOpen)}>{initial}</button
+				>
+				{#if menuOpen}
+					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
+					></button>
+					<div class="menu" role="menu">
+						<div class="menu-id">
+							<span class="menu-name">{auth.user.username}</span>
+							{#if auth.user.isAdmin}<span class="menu-badge">Admin</span>{/if}
+						</div>
+						<a class="menu-item" role="menuitem" href="/profile" onclick={() => (menuOpen = false)}
+							>Profile</a
+						>
+						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
+							>Library</a
+						>
+						<button class="menu-item danger" role="menuitem" onclick={signOut}>Sign out</button>
+					</div>
+				{/if}
+			</div>
+		{:else}
+			<a class="signin" href={loginHref}>Sign in</a>
+		{/if}
+	</div>
+</header>
+
+<SearchOverlay bind:open={searchOpen} placeholder={searchPlaceholder} advanced={advancedSearch} />
+
+<style>
+	header {
+		position: sticky;
+		top: 0;
+		z-index: 20;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		height: var(--k-header-h);
+		padding: 0 var(--k-gutter);
+		background: var(--k-glass);
+		backdrop-filter: blur(14px);
+		border-bottom: 1px solid var(--k-border);
+	}
+	.left {
+		display: flex;
+		align-items: center;
+		gap: 48px;
+	}
+	.brand {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 20px;
+		letter-spacing: -0.01em;
+		color: var(--k-text);
+		text-decoration: none;
+	}
+	nav {
+		display: flex;
+		gap: 32px;
+	}
+	.nav-link {
+		color: var(--k-text-dimmer);
+		font-size: 14px;
+		font-weight: 600;
+		text-decoration: none;
+		transition: color 0.15s;
+	}
+	.nav-link:hover,
+	.nav-link.active {
+		color: var(--k-text);
+	}
+	.right {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+	}
+	.icon-btn {
+		width: 40px;
+		height: 40px;
+		padding: 0;
+		border-radius: 50%;
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: #a7a59f;
+		cursor: pointer;
+		text-decoration: none;
+		transition: all 0.15s;
+	}
+	.icon-btn:hover {
+		border-color: rgba(255, 255, 255, 0.32);
+		color: var(--k-text);
+	}
+	.icon-btn.donate:hover,
+	.icon-btn.donate.on {
+		border-color: rgba(224, 131, 105, 0.5);
+		color: var(--k-accent);
+	}
+	.icon-btn.on {
+		border-color: rgba(255, 255, 255, 0.24);
+		color: var(--k-text);
+		background: var(--k-hover-fill);
+	}
+	.avatar {
+		width: 36px;
+		height: 36px;
+		border-radius: 50%;
+		background: var(--k-avatar);
+		border: 1px solid var(--k-border-2);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-weight: 700;
+		font-size: 13px;
+		color: var(--k-text-3);
+		text-decoration: none;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.avatar:hover,
+	.avatar.on {
+		border-color: rgba(255, 255, 255, 0.34);
+		color: var(--k-text);
+	}
+	.avatar.skeleton {
+		background: var(--k-surface-4);
+		border-color: var(--k-border);
+	}
+	.signin {
+		display: flex;
+		align-items: center;
+		height: 36px;
+		padding: 0 18px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+		font-size: 13px;
+		font-weight: 700;
+		text-decoration: none;
+		transition: background 0.15s;
+	}
+	.signin:hover {
+		background: var(--k-primary-hover);
+	}
+	.account {
+		position: relative;
+	}
+	.backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 25;
+		background: transparent;
+		border: none;
+		cursor: default;
+	}
+	.menu {
+		position: absolute;
+		top: calc(100% + 10px);
+		right: 0;
+		z-index: 26;
+		min-width: 190px;
+		padding: var(--k-space-2);
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-lg);
+		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+	}
+	.menu-id {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		padding: var(--k-space-2) var(--k-space-3) var(--k-space-3);
+		border-bottom: 1px solid var(--k-border);
+		margin-bottom: var(--k-space-2);
+	}
+	.menu-name {
+		font-size: 13px;
+		font-weight: 700;
+		color: var(--k-text-bright);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.menu-badge {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-accent-teal);
+		border: 1px solid rgba(95, 200, 207, 0.4);
+		border-radius: var(--k-radius-sm);
+		padding: 1px 5px;
+	}
+	.menu-item {
+		display: block;
+		width: 100%;
+		text-align: left;
+		padding: 9px var(--k-space-3);
+		border: none;
+		border-radius: var(--k-radius);
+		background: transparent;
+		color: var(--k-text-2);
+		font-family: var(--k-font-sans);
+		font-size: 13px;
+		font-weight: 600;
+		text-decoration: none;
+		cursor: pointer;
+		transition: background 0.12s;
+	}
+	.menu-item:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+	.menu-item.danger:hover {
+		color: var(--k-accent);
+	}
+	@media (max-width: 640px) {
+		.left {
+			gap: 20px;
+		}
+		nav {
+			gap: 18px;
+		}
+	}
+</style>

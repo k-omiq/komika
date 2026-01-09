@@ -1,0 +1,10 @@
+{
+	"name": "@komika/ui",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"exports": {
+		"./tokens.css": "./tokens.css",
+		"./reset.css": "./reset.css"
+	}
+}

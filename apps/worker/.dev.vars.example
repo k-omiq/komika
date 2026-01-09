@@ -1,0 +1,8 @@
+# Local secrets for `wrangler dev`. Copy to `.dev.vars` and fill in.
+# `.dev.vars` is gitignored and must never be committed.
+#
+# Leave these blank to run the Worker as a pure proxy (no B2). Fill them in to
+# exercise the B2 read-through / write-through path locally.
+
+B2_KEY_ID=
+B2_APP_KEY=

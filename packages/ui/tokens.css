@@ -1,0 +1,98 @@
+/*
+ * Komika / YOMU design tokens — extracted from the Claude Design project.
+ *
+ * Dark-first reader aesthetic. Bricolage Grotesque for display, Manrope for
+ * body. Every app and component consumes these variables — no hard-coded colors.
+ */
+:root {
+	/* base surfaces (darkest → lightest) */
+	--k-bg: #0c0c0d;
+	--k-surface: #0f0f10;
+	--k-surface-2: #141415;
+	--k-surface-3: #161617;
+	--k-surface-4: #1a1a1b;
+	--k-surface-5: #1f1f21;
+	--k-avatar: #1b1b1c;
+	--k-cover: #141415;
+
+	/* header / glass */
+	--k-glass: rgba(12, 12, 13, 0.78);
+	--k-glass-strong: rgba(12, 12, 13, 0.9);
+
+	/* text ramp */
+	--k-text-bright: #f7f6f3;
+	--k-text: #f2f1ee;
+	--k-text-1: #e7e5e0;
+	--k-text-2: #d4d2cc;
+	--k-text-3: #c9c7c1;
+	--k-text-muted: #b5b3ad;
+	--k-text-dim: #9c9a94;
+	--k-text-dimmer: #87857f;
+	--k-text-faint: #7d7b75;
+	--k-text-fainter: #6f6d68;
+	--k-text-ghost: #5f5d58;
+	--k-text-disabled: #57554f;
+
+	/* borders (white alpha) */
+	--k-border: rgba(255, 255, 255, 0.06);
+	--k-border-1: rgba(255, 255, 255, 0.08);
+	--k-border-2: rgba(255, 255, 255, 0.1);
+	--k-border-3: rgba(255, 255, 255, 0.12);
+	--k-border-4: rgba(255, 255, 255, 0.14);
+	--k-border-strong: rgba(255, 255, 255, 0.28);
+	--k-hover-fill: rgba(255, 255, 255, 0.04);
+
+	/* brand accents */
+	--k-accent: #e0836a; /* coral — donate / manga */
+	--k-accent-purple: #c69cf0; /* manhwa */
+	--k-accent-teal: #5fc8cf; /* manhua */
+	--k-star: #f6b73c; /* rating gold */
+
+	/* status */
+	--k-ongoing: #7fd39a;
+	--k-completed: #8fb8ff;
+	--k-hiatus: #e0b354;
+	--k-dot: #5fbf7e;
+
+	/* "inverted" primary button (light on dark) */
+	--k-primary: #f2f1ee;
+	--k-primary-hover: #ffffff;
+	--k-on-primary: #0c0c0d;
+
+	/* radius */
+	--k-radius-sm: 5px;
+	--k-radius: 8px;
+	--k-radius-md: 9px;
+	--k-radius-lg: 12px;
+	--k-radius-xl: 16px;
+	--k-radius-2xl: 22px;
+	--k-radius-pill: 999px;
+
+	/* spacing (4px base) */
+	--k-space-1: 4px;
+	--k-space-2: 8px;
+	--k-space-3: 12px;
+	--k-space-4: 16px;
+	--k-space-5: 20px;
+	--k-space-6: 24px;
+	--k-space-8: 32px;
+	--k-space-10: 40px;
+	--k-space-14: 56px;
+
+	/* typography */
+	--k-font-display: 'Bricolage Grotesque Variable', 'Bricolage Grotesque', system-ui, sans-serif;
+	--k-font-sans: 'Manrope Variable', 'Manrope', system-ui, -apple-system, sans-serif;
+	--k-font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+	/* layout */
+	--k-header-h: 64px;
+	--k-gutter: 56px;
+	--k-max-content: 1400px;
+
+	/* the placeholder "cover art" hatch used until real images load */
+	--k-hatch: repeating-linear-gradient(
+		135deg,
+		rgba(255, 255, 255, 0.03) 0 2px,
+		transparent 2px 9px
+	);
+}

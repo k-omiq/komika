@@ -1,0 +1,123 @@
+# Komika — full self-hosted public stack ("Mihon/Tachiyomi, but hosted, with a
+# public social layer and an auto-updating catalog").
+#
+# One-command bring-up:   cd deploy && ./deploy.sh
+# (or manually:           docker compose up --build -d  &&  ./bootstrap.sh )
+#
+# Services:
+#   suwayomi     — Tachidesk/Suwayomi: runs the source extensions (catalog,
+#                  chapters, page images). Bootstrapped with MangaDex + repos.
+#   flaresolverr — Cloudflare-challenge solver; Suwayomi routes protected sources
+#                  through it (enabled by bootstrap.sh). Internal-only.
+#   server       — komika-server (axum + async-graphql + SQLite): federates
+#                  suwayomi, adds accounts + social + admin, and runs the adaptive
+#                  scan scheduler that keeps the library auto-updated.
+#   reader       — static SvelteKit SPA (nginx), pointed at the server.
+#
+# Public wiring: GraphQL federation stays on the internal network
+# (SUWAYOMI_URL=http://suwayomi:4567), but page/cover image URLs are handed to the
+# browser, so the server rewrites them to SUWAYOMI_PUBLIC_URL (a host the browser
+# can reach). Set PUBLIC_HOST to your domain/IP in deploy/.env for a real deploy.
+
+name: komika
+
+services:
+  suwayomi:
+    image: ghcr.io/suwayomi/tachidesk:stable
+    restart: unless-stopped
+    environment:
+      TACHIDESK_SERVER_IP: 0.0.0.0
+      TACHIDESK_SERVER_PORT: '4567'
+    volumes:
+      - suwayomi-data:/home/suwayomi/.local/share/Tachidesk
+    ports:
+      # Must be reachable by BROWSERS for direct-mode images. In production put a
+      # reverse proxy in front that only exposes the image routes (see README).
+      - '${SUWAYOMI_PORT:-4567}:4567'
+    networks: [komika]
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:4567/ >/dev/null 2>&1 || exit 1']
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      TZ: ${TZ:-UTC}
+    # Internal-only: Suwayomi reaches it at http://flaresolverr:8191.
+    networks: [komika]
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:8191/ >/dev/null 2>&1 || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: '8080'
+      DATABASE_URL: sqlite:///data/komika.sqlite3
+      SUWAYOMI_URL: http://suwayomi:4567
+      # Public base for image URLs handed to the browser (NOT the internal host).
+      SUWAYOMI_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:${SUWAYOMI_PORT:-4567}
+      CORS_ORIGINS: http://${PUBLIC_HOST:-localhost}:${READER_PORT:-8081}
+      KOMIKA_ADMIN_USERS: ${KOMIKA_ADMIN_USERS:-admin}
+      SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
+      RUST_LOG: komika_server=info,tower_http=warn
+      # Continuous backup (Litestream → S3/B2). Blank = run without backup.
+      LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:-}
+      LITESTREAM_ENDPOINT: ${LITESTREAM_ENDPOINT:-}
+      LITESTREAM_REGION: ${LITESTREAM_REGION:-us-east-1}
+      LITESTREAM_ACCESS_KEY_ID: ${LITESTREAM_ACCESS_KEY_ID:-}
+      LITESTREAM_SECRET_ACCESS_KEY: ${LITESTREAM_SECRET_ACCESS_KEY:-}
+    volumes:
+      - server-data:/data
+    ports:
+      - '${SERVER_PORT:-8080}:8080'
+    depends_on:
+      suwayomi:
+        condition: service_healthy
+    networks: [komika]
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:8080/health || exit 1']
+      interval: 20s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  reader:
+    build:
+      context: ..
+      dockerfile: deploy/reader.Dockerfile
+      args:
+        PUBLIC_KOMIKA_BACKEND: 'on'
+        PUBLIC_KOMIKA_BACKEND_KIND: komika
+        PUBLIC_KOMIKA_API: http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}/graphql
+        PUBLIC_KOMIKA_IMG_MODE: direct
+    restart: unless-stopped
+    ports:
+      - '${READER_PORT:-8081}:80'
+    depends_on: [server]
+    networks: [komika]
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1']
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  komika:
+    driver: bridge
+
+volumes:
+  suwayomi-data:
+  server-data:

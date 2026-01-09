@@ -1,0 +1,49 @@
+name = "komika-img"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration.
+#
+# All of these are safe to commit. Secrets (B2 credentials) are NOT here —
+# see the [secrets] note at the bottom of this file.
+# ---------------------------------------------------------------------------
+[vars]
+# Comma-separated allowlist of upstream source hosts the proxy will fetch from.
+# Prevents the Worker from being used as an open proxy. Leave empty ("") to
+# allow ANY http(s) host (convenient for local dev; NOT recommended in prod).
+# Hostnames match exactly or as a suffix ("example.com" also allows
+# "cdn.example.com"). Example value:
+#   "uploads.mangadex.org,mangakakalot.com,cdn.komika.app"
+ALLOWED_SOURCE_HOSTS = ""
+
+# Comma-separated allowlist of browser Origin/Referer values permitted to
+# hotlink the proxy. Requests from a browser (i.e. that send an Origin or
+# Referer header) whose origin is not in this list are rejected with 403.
+# Requests with no Origin AND no Referer (native apps, curl, direct hits,
+# cache-fill jobs) are always allowed. Leave empty ("") to disable hotlink
+# protection entirely (dev). Example value:
+#   "https://komika.app,https://read.komika.app,http://localhost:5173"
+ALLOWED_ORIGINS = ""
+
+# --- B2 (Backblaze S3-compatible) read-through / write-through cache. -------
+# Optional. If B2_BUCKET is empty the Worker just proxies + edge-caches; B2 is
+# skipped entirely. All B2 operations fail-open: any B2 error falls back to a
+# plain upstream proxy, so a misconfigured/offline bucket never breaks reads.
+#
+# B2_ENDPOINT is the S3-compatible endpoint for your bucket's region, e.g.
+#   "https://s3.us-west-004.backblazeb2.com"
+# B2_REGION must match the region embedded in the endpoint, e.g. "us-west-004".
+B2_ENDPOINT = ""
+B2_REGION = ""
+B2_BUCKET = ""
+
+# ---------------------------------------------------------------------------
+# SECRETS — do NOT put these in [vars]. Set them with `wrangler secret put`:
+#
+#   wrangler secret put B2_KEY_ID        # Backblaze applicationKeyId
+#   wrangler secret put B2_APP_KEY       # Backblaze applicationKey
+#
+# For local `wrangler dev`, copy .dev.vars.example to .dev.vars and fill them
+# in (.dev.vars is gitignored / never committed).
+# ---------------------------------------------------------------------------

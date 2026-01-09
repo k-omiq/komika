@@ -1,0 +1,16 @@
+# Litestream continuous-backup config for the Komika SQLite DB.
+#
+# Active only when the LITESTREAM_* env vars are set (see deploy/.env); the server
+# entrypoint skips Litestream entirely otherwise. Litestream streams the WAL to an
+# S3-compatible bucket (Backblaze B2 recommended — reuse the image-cache account)
+# and restores the latest snapshot on a fresh boot. Credentials come from the
+# environment: LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY.
+dbs:
+  - path: /data/komika.sqlite3
+    replicas:
+      - type: s3
+        bucket: ${LITESTREAM_BUCKET}
+        path: komika
+        endpoint: ${LITESTREAM_ENDPOINT}
+        region: ${LITESTREAM_REGION}
+        force-path-style: true

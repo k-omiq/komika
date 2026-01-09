@@ -1,0 +1,13 @@
+# Build output & deps
+**/build
+**/dist
+**/.svelte-kit
+**/node_modules
+apps/server/target
+
+# Lockfiles / generated
+pnpm-lock.yaml
+
+# GraphQL SDL uses `//` header comments (house style); prettier's graphql
+# parser only accepts `#`, so it errors on this file. Skip it.
+packages/api/src/schema/*.graphql
