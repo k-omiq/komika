@@ -29,6 +29,12 @@ export async function saveSeriesAdmin(input: SeriesAdminInput): Promise<Series> 
 	return backend.updateSeriesAdmin(input);
 }
 
+/** Force an immediate re-scan of one series and return its refreshed state. */
+export async function triggerScan(seriesId: string): Promise<Series> {
+	if (!backend.triggerScan) throw new Error('Manual scan is unavailable on this backend.');
+	return backend.triggerScan(seriesId);
+}
+
 export const STATUS_OPTIONS: SeriesStatus[] = [
 	'ONGOING',
 	'COMPLETED',

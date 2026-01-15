@@ -212,89 +212,103 @@ async fn tick(state: &AppState) -> (usize, usize) {
         }
         overdue_seen += 1;
 
-        // Overdue: re-fetch chapters and detect new ones.
-        let chapters = match state.suwayomi.chapters(m.id).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(series_id, error = %e, "scan: chapter fetch failed; skipping");
-                continue;
-            }
-        };
-
-        let count = chapters.len() as i64;
-        let computed_avg = avg_interval_hours(&chapters).unwrap_or(prior.avg_interval_hours);
-        let new_found = count > prior.known_chapter_count;
-        let now_iso = now.to_rfc3339();
-        // Recompute the *next* effective interval from fresh data (admin still wins).
-        let next_interval = admin
-            .override_interval_hours
-            .filter(|v| *v > 0.0)
-            .unwrap_or(computed_avg);
-        // Same default when no cadence is known, and clamp so an absurd override
-        // can't overflow the Duration math below.
-        let next_interval = if next_interval > 0.0 {
-            next_interval
-        } else {
-            DEFAULT_INTERVAL_HOURS
-        }
-        .min(MAX_INTERVAL_HOURS);
-        let next_scan_at = (now
-            + chrono::Duration::milliseconds((next_interval * 3_600_000.0) as i64))
-        .to_rfc3339();
-        let last_new_chapter_at = if new_found {
-            Some(now_iso.clone())
-        } else {
-            prior.last_new_chapter_at.clone()
-        };
-
-        if new_found {
-            tracing::info!(
-                series_id,
-                title = %m.title,
-                added = count - prior.known_chapter_count,
-                total = count,
-                latest = latest_number(&chapters),
-                avg_interval_hours = computed_avg,
-                "scan: new chapters detected"
-            );
-        } else {
-            tracing::debug!(
-                series_id,
-                title = %m.title,
-                total = count,
-                avg_interval_hours = computed_avg,
-                "scan: no new chapters"
-            );
-        }
-
-        if let Err(e) = sqlx::query(
-            "INSERT INTO series_scan_state \
-               (series_id, avg_interval_hours, known_chapter_count, last_scanned_at, \
-                next_scan_at, last_new_chapter_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(series_id) DO UPDATE SET \
-               avg_interval_hours = excluded.avg_interval_hours, \
-               known_chapter_count = excluded.known_chapter_count, \
-               last_scanned_at = excluded.last_scanned_at, \
-               next_scan_at = excluded.next_scan_at, \
-               last_new_chapter_at = excluded.last_new_chapter_at, \
-               updated_at = excluded.updated_at",
-        )
-        .bind(&series_id)
-        .bind(computed_avg)
-        .bind(count)
-        .bind(&now_iso)
-        .bind(&next_scan_at)
-        .bind(&last_new_chapter_at)
-        .bind(&now_iso)
-        .execute(&state.pool)
-        .await
-        {
-            tracing::warn!(series_id, error = %e, "scan: failed to persist scan state");
+        if let Err(e) = scan_series(state, &m, now).await {
+            tracing::warn!(series_id, error = %e, "scan: series scan failed; skipping");
         }
     }
 
     (library_size, overdue_seen)
+}
+
+/// Re-fetch one series' chapters, detect new ones, and persist its scan state
+/// (rolling avg, chapter count, `last_scanned_at`, next `next_scan_at`). Returns
+/// whether new chapters were found.
+///
+/// Shared by the scheduler `tick` (which gates on pause/overdue first) and the
+/// admin `triggerScan` mutation (which forces a scan regardless of gating). It
+/// re-reads the admin override and prior state so it's self-contained for both
+/// callers.
+pub async fn scan_series(
+    state: &AppState,
+    m: &SuwayomiManga,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let series_id = m.id.to_string();
+    let admin = scan_admin(&state.pool, &series_id).await;
+    let prior = scan_state(&state.pool, &series_id)
+        .await
+        .unwrap_or_default();
+
+    let chapters = state.suwayomi.chapters(m.id).await?;
+    let count = chapters.len() as i64;
+    let computed_avg = avg_interval_hours(&chapters).unwrap_or(prior.avg_interval_hours);
+    let new_found = count > prior.known_chapter_count;
+    let now_iso = now.to_rfc3339();
+    // Recompute the *next* effective interval from fresh data (admin still wins).
+    let next_interval = admin
+        .override_interval_hours
+        .filter(|v| *v > 0.0)
+        .unwrap_or(computed_avg);
+    // Same default when no cadence is known, and clamp so an absurd override
+    // can't overflow the Duration math below.
+    let next_interval = if next_interval > 0.0 {
+        next_interval
+    } else {
+        DEFAULT_INTERVAL_HOURS
+    }
+    .min(MAX_INTERVAL_HOURS);
+    let next_scan_at =
+        (now + chrono::Duration::milliseconds((next_interval * 3_600_000.0) as i64)).to_rfc3339();
+    let last_new_chapter_at = if new_found {
+        Some(now_iso.clone())
+    } else {
+        prior.last_new_chapter_at.clone()
+    };
+
+    if new_found {
+        tracing::info!(
+            series_id,
+            title = %m.title,
+            added = count - prior.known_chapter_count,
+            total = count,
+            latest = latest_number(&chapters),
+            avg_interval_hours = computed_avg,
+            "scan: new chapters detected"
+        );
+    } else {
+        tracing::debug!(
+            series_id,
+            title = %m.title,
+            total = count,
+            avg_interval_hours = computed_avg,
+            "scan: no new chapters"
+        );
+    }
+
+    sqlx::query(
+        "INSERT INTO series_scan_state \
+           (series_id, avg_interval_hours, known_chapter_count, last_scanned_at, \
+            next_scan_at, last_new_chapter_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(series_id) DO UPDATE SET \
+           avg_interval_hours = excluded.avg_interval_hours, \
+           known_chapter_count = excluded.known_chapter_count, \
+           last_scanned_at = excluded.last_scanned_at, \
+           next_scan_at = excluded.next_scan_at, \
+           last_new_chapter_at = excluded.last_new_chapter_at, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(&series_id)
+    .bind(computed_avg)
+    .bind(count)
+    .bind(&now_iso)
+    .bind(&next_scan_at)
+    .bind(&last_new_chapter_at)
+    .bind(&now_iso)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(new_found)
 }
 
 /// Spawn the scan scheduler loop. Runs until `shutdown` resolves.

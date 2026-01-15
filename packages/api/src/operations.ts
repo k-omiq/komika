@@ -300,3 +300,27 @@ export const SCAN_STATUS = /* GraphQL */ `
 		}
 	}
 `;
+
+export const TRIGGER_SCAN = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation TriggerScan($seriesId: ID!) {
+		triggerScan(seriesId: $seriesId) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const BAN_USER = /* GraphQL */ `
+	${USER_REF}
+	mutation BanUser($userId: ID!, $banned: Boolean!) {
+		banUser(userId: $userId, banned: $banned) {
+			...UserRefFields
+		}
+	}
+`;
+
+export const DELETE_COMMENT = /* GraphQL */ `
+	mutation DeleteComment($commentId: ID!) {
+		deleteComment(commentId: $commentId)
+	}
+`;

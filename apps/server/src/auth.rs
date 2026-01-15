@@ -14,6 +14,7 @@ pub struct User {
     pub password_hash: String,
     pub avatar_url: Option<String>,
     pub is_admin: i64,
+    pub is_banned: i64,
 }
 
 /// Hash a plaintext password with Argon2id + a random salt.
@@ -43,11 +44,12 @@ pub fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Resolve the user owning a session token, if the token is valid.
+/// Resolve the user owning a session token, if the token is valid. Banned users
+/// are treated as anonymous (their existing tokens stop resolving).
 pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
     let user = sqlx::query_as::<_, User>(
-        "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin \
-         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?",
+        "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin, u.is_banned \
+         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND u.is_banned = 0",
     )
     .bind(token)
     .fetch_optional(pool)

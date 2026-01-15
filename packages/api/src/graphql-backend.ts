@@ -8,6 +8,7 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	UserRef,
 } from '@komika/types';
 import type {
 	Backend,
@@ -139,6 +140,22 @@ export class GraphQLBackend implements Backend {
 	async scanStatus(): Promise<ScanStatus> {
 		const d = await this.gql<{ scanStatus: ScanStatus }>(ops.SCAN_STATUS);
 		return d.scanStatus;
+	}
+
+	async triggerScan(seriesId: Id): Promise<Series> {
+		const d = await this.gql<{ triggerScan: Series }>(ops.TRIGGER_SCAN, { seriesId });
+		return d.triggerScan;
+	}
+
+	// --- admin moderation ---
+	async banUser(userId: Id, banned: boolean): Promise<UserRef> {
+		const d = await this.gql<{ banUser: UserRef }>(ops.BAN_USER, { userId, banned });
+		return d.banUser;
+	}
+
+	async deleteComment(commentId: Id): Promise<boolean> {
+		const d = await this.gql<{ deleteComment: boolean }>(ops.DELETE_COMMENT, { commentId });
+		return d.deleteComment;
 	}
 }
 
