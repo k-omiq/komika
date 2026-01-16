@@ -6,12 +6,17 @@
 	import '$lib/app.css';
 	import favicon from '$lib/assets/favicon.svg';
 	import { initAuth } from '$lib/auth.svelte';
+	import { initTheme } from '$lib/theme.svelte';
 
 	let { children } = $props();
 
 	// Restore + validate any persisted session once, client-side.
 	$effect(() => {
 		void initAuth();
+	});
+	// Restore the theme preference + track OS changes.
+	$effect(() => {
+		initTheme();
 	});
 </script>
 

@@ -5,6 +5,11 @@
  * body. Every app and component consumes these variables — no hard-coded colors.
  */
 :root {
+	/* Dark is the default theme; the light override lives at the bottom of this
+	   file under :root[data-theme='light']. Each app sets data-theme on <html>
+	   (see its no-FOUC head script + lib/theme.svelte.ts). */
+	color-scheme: dark;
+
 	/* base surfaces (darkest → lightest) */
 	--k-bg: #0c0c0d;
 	--k-surface: #0f0f10;
@@ -95,4 +100,60 @@
 		rgba(255, 255, 255, 0.03) 0 2px,
 		transparent 2px 9px
 	);
+}
+
+/*
+ * Light theme — overrides only the color/surface tokens (spacing, radius,
+ * typography and layout are theme-independent). Brand accents (coral/purple/
+ * teal/gold) and the deterministic avatar / flag palettes are intentionally NOT
+ * overridden: they read well on both backgrounds and are identity, not chrome.
+ */
+:root[data-theme='light'] {
+	color-scheme: light;
+
+	--k-bg: #f4f2ee;
+	--k-surface: #ffffff;
+	--k-surface-2: #faf9f6;
+	--k-surface-3: #f4f2ee;
+	--k-surface-4: #ece9e3;
+	--k-surface-5: #e4e1da;
+	--k-avatar: #e7e4dd;
+	--k-cover: #ece9e3;
+
+	--k-glass: rgba(247, 246, 243, 0.82);
+	--k-glass-strong: rgba(247, 246, 243, 0.94);
+
+	--k-text-bright: #0c0c0d;
+	--k-text: #1a1a1b;
+	--k-text-1: #26262a;
+	--k-text-2: #35353a;
+	--k-text-3: #45454b;
+	--k-text-muted: #55555c;
+	--k-text-dim: #6a6a71;
+	--k-text-dimmer: #7d7d84;
+	--k-text-faint: #8a8a91;
+	--k-text-fainter: #9a9aa0;
+	--k-text-ghost: #b0b0b5;
+	--k-text-disabled: #c2c2c7;
+
+	--k-border: rgba(0, 0, 0, 0.08);
+	--k-border-1: rgba(0, 0, 0, 0.1);
+	--k-border-2: rgba(0, 0, 0, 0.12);
+	--k-border-3: rgba(0, 0, 0, 0.14);
+	--k-border-4: rgba(0, 0, 0, 0.16);
+	--k-border-strong: rgba(0, 0, 0, 0.3);
+	--k-hover-fill: rgba(0, 0, 0, 0.04);
+
+	/* inverted primary button flips to dark-on-light */
+	--k-primary: #1a1a1b;
+	--k-primary-hover: #000000;
+	--k-on-primary: #f7f6f3;
+
+	/* status ramp darkened for contrast on a light background */
+	--k-ongoing: #2f9e5b;
+	--k-completed: #3f6fd6;
+	--k-hiatus: #b5842a;
+	--k-dot: #2f9e5b;
+
+	--k-hatch: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.05) 0 2px, transparent 2px 9px);
 }

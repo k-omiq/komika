@@ -210,11 +210,13 @@
 		line-height: 1.02;
 		letter-spacing: -0.03em;
 		margin: 0 0 14px;
-		color: var(--k-text-bright);
+		/* The hero is an always-dark cover-art scrim in both themes, so its text
+		   stays light regardless of the active theme. */
+		color: #f7f6f3;
 	}
 	.hero-sub {
 		font-size: 15px;
-		color: var(--k-text-dim);
+		color: rgba(247, 246, 243, 0.72);
 		margin-bottom: 28px;
 	}
 	.hero-cta {
@@ -222,13 +224,15 @@
 		align-items: center;
 		gap: 12px;
 	}
+	/* Hero CTAs sit on the always-dark cover scrim, so they use fixed light
+	   values (not theme tokens) and look identical in both themes. */
 	.btn-read {
 		height: 48px;
 		padding: 0 28px;
 		border: none;
 		border-radius: 8px;
-		background: var(--k-primary);
-		color: var(--k-on-primary);
+		background: #f2f1ee;
+		color: #0c0c0d;
 		font-weight: 700;
 		font-size: 15px;
 		display: inline-flex;
@@ -236,7 +240,7 @@
 		text-decoration: none;
 	}
 	.btn-read:hover {
-		background: var(--k-primary-hover);
+		background: #ffffff;
 	}
 	.btn-plus {
 		width: 48px;
@@ -244,7 +248,7 @@
 		border-radius: 8px;
 		background: transparent;
 		border: 1px solid rgba(255, 255, 255, 0.18);
-		color: var(--k-text);
+		color: #f2f1ee;
 		font-size: 18px;
 		display: inline-flex;
 		align-items: center;
@@ -277,7 +281,7 @@
 	}
 	.dot .bar.active {
 		width: 26px;
-		background: var(--k-text);
+		background: #f2f1ee;
 	}
 	.sections {
 		display: flex;
