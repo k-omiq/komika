@@ -56,3 +56,30 @@ pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<Use
     .await?;
     Ok(user)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_roundtrips_and_rejects_wrong() {
+        let h = hash_password("hunter2pw").unwrap();
+        assert_ne!(h, "hunter2pw", "stored hash must not be the plaintext");
+        assert!(verify_password("hunter2pw", &h));
+        assert!(!verify_password("wrong-password", &h));
+    }
+
+    #[test]
+    fn malformed_hash_is_rejected_not_panicked() {
+        assert!(!verify_password("anything", "not-a-valid-phc-string"));
+    }
+
+    #[test]
+    fn tokens_are_unique_256bit_hex() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_eq!(a.len(), 64, "256-bit token = 64 hex chars");
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}

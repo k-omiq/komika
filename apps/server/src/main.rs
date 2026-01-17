@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, FromRef, State},
     http::{header, HeaderMap, HeaderValue, Method},
     response::{Html, IntoResponse},
     routing::get,
@@ -20,6 +20,8 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use config::Config;
 use graphql::{build_schema, ApiSchema, AppState, ClientIp, RateLimiter, RequestAuth, ScanHealth};
@@ -55,6 +57,24 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
     peer.ip().to_string()
 }
 
+/// Combined router state: the GraphQL schema (for `/graphql`) and the DB pool
+/// (for the readiness probe). Each handler extracts just the piece it needs.
+#[derive(Clone)]
+struct RouterState {
+    schema: ApiSchema,
+    pool: sqlx::SqlitePool,
+}
+impl FromRef<RouterState> for ApiSchema {
+    fn from_ref(s: &RouterState) -> Self {
+        s.schema.clone()
+    }
+}
+impl FromRef<RouterState> for sqlx::SqlitePool {
+    fn from_ref(s: &RouterState) -> Self {
+        s.pool.clone()
+    }
+}
+
 async fn graphql_handler(
     State(schema): State<ApiSchema>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -73,8 +93,22 @@ async fn graphiql() -> impl IntoResponse {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
+/// Liveness: cheap, dependency-free — used by the container HEALTHCHECK. A blip
+/// in the DB must not flap this (that would trigger restart loops).
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Readiness: verifies the process can actually serve — i.e. the DB answers.
+/// For a load balancer / orchestrator readiness gate, not the liveness probe.
+async fn ready(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
+    match sqlx::query("SELECT 1").execute(&pool).await {
+        Ok(_) => (axum::http::StatusCode::OK, "ready"),
+        Err(e) => {
+            tracing::warn!(error = %e, "readiness check failed");
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        }
+    }
 }
 
 #[tokio::main]
@@ -83,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "komika_server=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "komika_server=info,tower_http=info".into()),
         )
         .init();
 
@@ -108,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.source_id.clone(),
     );
     let state = Arc::new(AppState {
-        pool,
+        pool: pool.clone(),
         suwayomi,
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
@@ -134,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/graphql", get(graphiql).post(graphql_handler))
         .route("/health", get(health))
+        .route("/health/ready", get(ready))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-content-type-options"),
@@ -153,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 "geolocation=(), camera=(), microphone=(), payment=(), usb=()",
             ),
         ))
-        .with_state(schema);
+        .with_state(RouterState { schema, pool });
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -175,6 +175,26 @@ pub struct ScanStatus {
     pub next_due_at: Option<String>,
 }
 
+/// A user as seen in the admin user-management console.
+#[derive(SimpleObject, Clone)]
+pub struct AdminUser {
+    pub id: ID,
+    pub username: String,
+    pub email: String,
+    pub avatar_url: Option<String>,
+    pub is_admin: bool,
+    pub is_banned: bool,
+    pub created_at: String,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct AdminUserPage {
+    pub items: Vec<AdminUser>,
+    pub page: i32,
+    pub has_next_page: bool,
+    pub total: Option<i32>,
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct SeriesPage {
     pub items: Vec<Series>,

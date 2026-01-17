@@ -334,6 +334,31 @@ impl From<CommentJoin> for ChapterComment {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct AdminUserRow {
+    id: String,
+    username: String,
+    email: String,
+    avatar_url: Option<String>,
+    is_admin: i64,
+    is_banned: i64,
+    created_at: String,
+}
+
+impl From<AdminUserRow> for AdminUser {
+    fn from(r: AdminUserRow) -> Self {
+        AdminUser {
+            id: ID(r.id),
+            username: r.username,
+            email: r.email,
+            avatar_url: r.avatar_url,
+            is_admin: r.is_admin != 0,
+            is_banned: r.is_banned != 0,
+            created_at: r.created_at,
+        }
+    }
+}
+
 fn session_user(u: &User) -> SessionUser {
     SessionUser {
         id: ID(u.id.clone()),
@@ -541,6 +566,7 @@ impl QueryRoot {
 
     /// Aggregate health of the background scan scheduler (admin console).
     async fn scan_status(&self, ctx: &Context<'_>) -> Result<ScanStatus> {
+        require_admin(ctx).await?;
         let st = state(ctx);
         let (library_size, overdue_count, last_tick_at) = {
             let h = st.scan_health.lock().unwrap();
@@ -563,6 +589,42 @@ impl QueryRoot {
             overdue_count,
             last_tick_at,
             next_due_at,
+        })
+    }
+
+    /// Admin user-management console: a paginated list of accounts, newest first.
+    async fn users(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<AdminUserPage> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        let rows: Vec<AdminUserRow> = sqlx::query_as(
+            "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
+             FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(PAGE_SIZE + 1)
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let has_next = rows.len() as i64 > PAGE_SIZE;
+        let items = rows
+            .into_iter()
+            .take(PAGE_SIZE as usize)
+            .map(AdminUser::from)
+            .collect();
+        Ok(AdminUserPage {
+            items,
+            page,
+            has_next_page: has_next,
+            total: Some(total as i32),
         })
     }
 
@@ -933,6 +995,39 @@ impl MutationRoot {
             .map_err(gql_err)?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// Admin user-management: grant or revoke a user's admin flag. An admin can't
+    /// revoke their own access (that could lock every admin out of the console).
+    async fn set_user_admin(
+        &self,
+        ctx: &Context<'_>,
+        user_id: ID,
+        is_admin: bool,
+    ) -> Result<AdminUser> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        if user_id.0 == admin.id && !is_admin {
+            return Err(Error::new("You cannot remove your own admin access."));
+        }
+        let res = sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
+            .bind(is_admin as i64)
+            .bind(&user_id.0)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        if res.rows_affected() == 0 {
+            return Err(Error::new("No such user."));
+        }
+        let row: AdminUserRow = sqlx::query_as(
+            "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
+             FROM users WHERE id = ?",
+        )
+        .bind(&user_id.0)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.into())
+    }
 }
 
 /// Create a session row and return its opaque token.
@@ -947,4 +1042,341 @@ async fn new_session(pool: &SqlitePool, user_id: &str) -> Result<String> {
         .await
         .map_err(gql_err)?;
     Ok(tok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    // ---- RateLimiter unit tests ----
+
+    #[test]
+    fn limiter_blocks_only_after_max_records() {
+        let rl = RateLimiter::new(2, 60);
+        assert!(rl.is_limited("k").is_none(), "fresh key is not limited");
+        rl.record("k");
+        assert!(rl.is_limited("k").is_none(), "1 < max still allowed");
+        rl.record("k");
+        assert!(rl.is_limited("k").is_some(), "2 >= max is limited");
+        // a different key has its own budget
+        assert!(rl.is_limited("other").is_none());
+    }
+
+    #[test]
+    fn limiter_is_read_only_until_record() {
+        let rl = RateLimiter::new(1, 60);
+        // repeated reads never trip the limit on their own
+        for _ in 0..5 {
+            assert!(rl.is_limited("k").is_none());
+        }
+        rl.record("k");
+        assert!(rl.is_limited("k").is_some());
+    }
+
+    // ---- GraphQL security integration tests (no Suwayomi needed) ----
+
+    async fn seed_user(pool: &SqlitePool, id: &str, username: &str, is_admin: i64, is_banned: i64) {
+        let hash = auth::hash_password("password123").unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, is_banned, created_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, '2020-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(format!("{username}@example.com"))
+        .bind(&hash)
+        .bind(is_admin)
+        .bind(is_banned)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn setup() -> ApiSchema {
+        setup_with_limit(100).await
+    }
+
+    async fn setup_with_limit(max: u32) -> ApiSchema {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        seed_user(&pool, "admin-id", "admin", 1, 0).await;
+        seed_user(&pool, "bob-id", "bob", 0, 0).await;
+        seed_user(&pool, "banned-id", "carol", 0, 1).await;
+        for (tok, uid) in [("admintok", "admin-id"), ("bobtok", "bob-id")] {
+            sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, '2020-01-01T00:00:00Z')")
+                .bind(tok)
+                .bind(uid)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let state = std::sync::Arc::new(AppState {
+            pool,
+            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            admin_users: vec![],
+            scan_health: Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(max, 60),
+        });
+        build_schema(state)
+    }
+
+    async fn exec(
+        schema: &ApiSchema,
+        query: &str,
+        token: Option<&str>,
+        ip: &str,
+    ) -> async_graphql::Response {
+        let req = async_graphql::Request::new(query)
+            .data(RequestAuth(token.map(|t| t.to_string())))
+            .data(ClientIp(Some(ip.to_string())));
+        schema.execute(req).await
+    }
+
+    fn first_error(resp: &async_graphql::Response) -> String {
+        resp.errors
+            .first()
+            .map(|e| e.message.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn login_succeeds_with_correct_password() {
+        let s = setup().await;
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"password123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_password() {
+        let s = setup().await;
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"nope") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Invalid username or password");
+    }
+
+    #[tokio::test]
+    async fn banned_user_cannot_login_even_with_correct_password() {
+        let s = setup().await;
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"carol", password:"password123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "This account has been suspended.");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keys_on_ip_and_ignores_successes() {
+        let s = setup_with_limit(2).await;
+        let wrong = r#"mutation { login(username:"bob", password:"nope") { token } }"#;
+        let right = r#"mutation { login(username:"bob", password:"password123") { token } }"#;
+        // two failures from the attacker IP exhaust its budget
+        for _ in 0..2 {
+            let r = exec(&s, wrong, None, "9.9.9.9").await;
+            assert_eq!(first_error(&r), "Invalid username or password");
+        }
+        // third attempt from that IP is blocked...
+        let blocked = exec(&s, right, None, "9.9.9.9").await;
+        assert!(
+            first_error(&blocked).contains("Too many login attempts"),
+            "got: {}",
+            first_error(&blocked)
+        );
+        // ...but the victim's own IP is unaffected (M1)
+        let victim = exec(&s, right, None, "8.8.8.8").await;
+        assert!(
+            victim.errors.is_empty(),
+            "cross-IP lockout: {:?}",
+            victim.errors
+        );
+        // and repeated *successful* logins never trip the limit (M2)
+        for _ in 0..5 {
+            let r = exec(&s, right, None, "7.7.7.7").await;
+            assert!(
+                r.errors.is_empty(),
+                "success counted against limit: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_only_query_is_gated() {
+        let s = setup().await;
+        let q = "{ scanStatus { librarySize } }";
+        assert_eq!(
+            first_error(&exec(&s, q, None, "1.1.1.1").await),
+            "Not authenticated"
+        );
+        assert_eq!(
+            first_error(&exec(&s, q, Some("bobtok"), "1.1.1.1").await),
+            "Admin access required"
+        );
+        let ok = exec(&s, q, Some("admintok"), "1.1.1.1").await;
+        assert!(ok.errors.is_empty(), "admin blocked: {:?}", ok.errors);
+    }
+
+    #[tokio::test]
+    async fn delete_comment_requires_admin() {
+        let s = setup().await;
+        let q = r#"mutation { deleteComment(commentId:"nope") }"#;
+        assert_eq!(
+            first_error(&exec(&s, q, Some("bobtok"), "1.1.1.1").await),
+            "Admin access required"
+        );
+        // admin: no such comment => false, no error
+        let r = exec(&s, q, Some("admintok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty());
+        assert_eq!(
+            r.data.into_json().unwrap()["deleteComment"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn ban_user_guards() {
+        let s = setup().await;
+        // non-admin rejected
+        assert_eq!(
+            first_error(
+                &exec(
+                    &s,
+                    r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+                    Some("bobtok"),
+                    "1.1.1.1"
+                )
+                .await
+            ),
+            "Admin access required"
+        );
+        // admin can't ban self
+        assert_eq!(
+            first_error(
+                &exec(
+                    &s,
+                    r#"mutation { banUser(userId:"admin-id", banned:true) { id } }"#,
+                    Some("admintok"),
+                    "1.1.1.1"
+                )
+                .await
+            ),
+            "You cannot ban your own account."
+        );
+        // admin can't ban another admin (bob promoted first would be needed; use nonexistent)
+        assert_eq!(
+            first_error(
+                &exec(
+                    &s,
+                    r#"mutation { banUser(userId:"ghost", banned:true) { id } }"#,
+                    Some("admintok"),
+                    "1.1.1.1"
+                )
+                .await
+            ),
+            "No such user."
+        );
+        // admin bans bob -> bob can no longer log in
+        let ban = exec(
+            &s,
+            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(ban.errors.is_empty(), "ban failed: {:?}", ban.errors);
+        let login = exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"password123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&login), "This account has been suspended.");
+    }
+
+    #[tokio::test]
+    async fn set_user_admin_cannot_demote_self() {
+        let s = setup().await;
+        assert_eq!(
+            first_error(
+                &exec(
+                    &s,
+                    r#"mutation { setUserAdmin(userId:"admin-id", isAdmin:false) { isAdmin } }"#,
+                    Some("admintok"),
+                    "1.1.1.1"
+                )
+                .await
+            ),
+            "You cannot remove your own admin access."
+        );
+        // promoting bob works
+        let r = exec(
+            &s,
+            r#"mutation { setUserAdmin(userId:"bob-id", isAdmin:true) { isAdmin } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "promote failed: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["setUserAdmin"]["isAdmin"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_progress_rejects_negative_page() {
+        let s = setup().await;
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId:"1", lastPageRead:-5, read:false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "lastPageRead must be non-negative");
+    }
+
+    #[tokio::test]
+    async fn update_series_admin_rejects_out_of_range() {
+        let s = setup().await;
+        assert!(first_error(
+            &exec(
+                &s,
+                r#"mutation { updateSeriesAdmin(input:{seriesId:"3", pollEveryMinutes:0}) { id } }"#,
+                Some("admintok"),
+                "1.1.1.1"
+            )
+            .await
+        )
+        .contains("pollEveryMinutes"));
+        assert!(first_error(
+            &exec(
+                &s,
+                r#"mutation { updateSeriesAdmin(input:{seriesId:"3", overrideIntervalHours:1000000000}) { id } }"#,
+                Some("admintok"),
+                "1.1.1.1"
+            )
+            .await
+        )
+        .contains("overrideIntervalHours"));
+    }
 }
