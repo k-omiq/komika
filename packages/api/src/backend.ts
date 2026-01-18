@@ -1,4 +1,5 @@
 import type {
+	AdminUser,
 	Chapter,
 	ChapterComment,
 	DiscoveryFeed,
@@ -71,6 +72,14 @@ export interface Backend {
 	/** Delete a chapter comment. Returns false if it was already gone. Optional:
 	 * only the unified Komika API implements it. */
 	deleteComment?(commentId: Id): Promise<boolean>;
+
+	// --- admin user management (requires an admin session) ---
+	/** Paginated list of user accounts. Optional: only the unified Komika API
+	 * implements it. */
+	users?(page?: number): Promise<Paginated<AdminUser>>;
+	/** Grant or revoke a user's admin flag. Optional: only the unified Komika API
+	 * implements it. */
+	setUserAdmin?(userId: Id, isAdmin: boolean): Promise<AdminUser>;
 }
 
 export interface Session {

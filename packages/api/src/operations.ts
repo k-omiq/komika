@@ -324,3 +324,38 @@ export const DELETE_COMMENT = /* GraphQL */ `
 		deleteComment(commentId: $commentId)
 	}
 `;
+
+const ADMIN_USER_FIELDS = /* GraphQL */ `
+	fragment AdminUserFields on AdminUser {
+		id
+		username
+		email
+		avatarUrl
+		isAdmin
+		isBanned
+		createdAt
+	}
+`;
+
+export const USERS = /* GraphQL */ `
+	${ADMIN_USER_FIELDS}
+	query Users($page: Int) {
+		users(page: $page) {
+			items {
+				...AdminUserFields
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
+export const SET_USER_ADMIN = /* GraphQL */ `
+	${ADMIN_USER_FIELDS}
+	mutation SetUserAdmin($userId: ID!, $isAdmin: Boolean!) {
+		setUserAdmin(userId: $userId, isAdmin: $isAdmin) {
+			...AdminUserFields
+		}
+	}
+`;
