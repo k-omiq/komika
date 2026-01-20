@@ -81,6 +81,10 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ discovery: DiscoveryFeed[] }>(ops.DISCOVERY);
 		return d.discovery;
 	}
+	async updates(page = 1): Promise<Paginated<Series>> {
+		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page });
+		return d.updates;
+	}
 	async search(query: string, page = 1): Promise<Paginated<Series>> {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, { query, page });
 		return d.search;

@@ -83,6 +83,20 @@ export const DISCOVERY = /* GraphQL */ `
 	}
 `;
 
+export const UPDATES = /* GraphQL */ `
+	${SERIES_FIELDS}
+	query Updates($page: Int) {
+		updates(page: $page) {
+			items {
+				...SeriesFields
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
 export const SEARCH = /* GraphQL */ `
 	${SERIES_FIELDS}
 	query Search($query: String!, $page: Int) {
