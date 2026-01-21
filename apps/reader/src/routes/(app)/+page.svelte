@@ -1,15 +1,21 @@
 <script lang="ts">
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Footer from '$lib/components/Footer.svelte';
+	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import { slug } from '$lib/data/mock';
+	import type { FeaturedView } from '$lib/data/source';
 
 	let { data } = $props();
 
 	let heroIndex = $state(0);
 	// Featured slides, populated once the home feeds resolve. Kept as its own
 	// state so the auto-rotate effect can depend on its length.
-	let featured = $state<{ title: string; genre: string; ch: number }[]>([]);
+	let featured = $state<FeaturedView[]>([]);
+
+	function seriesHref(f: FeaturedView): string {
+		return `/series/${f.id ?? slug(f.title)}`;
+	}
 
 	// Mirror the resolved featured list into local state (drives the hero +
 	// auto-rotate). `data.home` never rejects (mock fallback on error).
@@ -57,17 +63,19 @@
 {:then home}
 	<!-- HERO -->
 	<section class="hero">
-		<span class="cover-tag">COVER</span>
+		{#if current?.cover}
+			<div class="hero-cover"><Cover src={current.cover} alt={current.title} /></div>
+		{:else}
+			<span class="cover-tag">COVER</span>
+		{/if}
 		<div class="hero-fade"></div>
 		{#if current}
 			<div class="hero-info">
 				<h1>{current.title}</h1>
 				<div class="hero-sub">{current.genre} — Ch. {current.ch}</div>
 				<div class="hero-cta">
-					<a class="btn-read" href={`/series/${slug(current.title)}`}>Read</a>
-					<a class="btn-plus" href={`/series/${slug(current.title)}`} aria-label="Add to library"
-						>+</a
-					>
+					<a class="btn-read" href={seriesHref(current)}>Read</a>
+					<a class="btn-plus" href={seriesHref(current)} aria-label="Add to library">+</a>
 				</div>
 			</div>
 			<div class="dots">
@@ -179,6 +187,10 @@
 	}
 	.hero-loading {
 		height: 640px;
+	}
+	.hero-cover {
+		position: absolute;
+		inset: 0;
 	}
 	.head-sk {
 		width: 180px;

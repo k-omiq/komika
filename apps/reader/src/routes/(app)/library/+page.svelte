@@ -72,7 +72,7 @@
 	<h2 class="section-label">Continue Reading</h2>
 	<div class="continue-row">
 		{#each continueRow as item (item.title)}
-			<a class="continue-card" href={`/series/${slug(item.title)}`}>
+			<a class="continue-card" href={`/series/${item.id ?? slug(item.title)}`}>
 				<div class="landscape k-cover">
 					<span class="resume"><Icon name="play" size={9} fill="currentColor" />Resume</span>
 					<div class="bar"><div class="fill" style="width:{item.progress}%"></div></div>
@@ -116,7 +116,7 @@
 	{:else if items.length}
 		<div class="grid">
 			{#each items as item (item.title + item.shelf)}
-				<a class="lib-card" href={`/series/${slug(item.title)}`}>
+				<a class="lib-card" href={`/series/${item.id ?? slug(item.title)}`}>
 					<div class="cover k-cover">
 						<span
 							class="badge"

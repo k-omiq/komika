@@ -202,8 +202,6 @@
 					<span class="sep"></span>
 					<span class="fact">{totalCh} chapters</span>
 					<span class="sep"></span>
-					<span class="fact">{seriesDetail.followers} readers</span>
-					<span class="sep"></span>
 					<span class="fact">Updated {seriesDetail.updated}</span>
 				</div>
 				<div class="cta">
