@@ -1,8 +1,7 @@
-# Local secrets for `wrangler dev`. Copy to `.dev.vars` and fill in.
-# `.dev.vars` is gitignored and must never be committed.
+# The Worker needs NO secrets. It is a pure image proxy backed by the
+# Cloudflare edge cache — there is no object-storage tier and nothing to
+# authenticate against.
 #
-# Leave these blank to run the Worker as a pure proxy (no B2). Fill them in to
-# exercise the B2 read-through / write-through path locally.
-
-B2_KEY_ID=
-B2_APP_KEY=
+# All configuration lives in wrangler.toml [vars] (ALLOWED_SOURCE_HOSTS,
+# ALLOWED_ORIGINS), which are non-secret. `wrangler dev` therefore needs no
+# `.dev.vars` file at all; this example is kept only to document that.
