@@ -22,7 +22,6 @@ const SERIES_FIELDS = /* GraphQL */ `
 		sourceId
 		chapterCount
 		isMarked
-		isCached
 		rating {
 			average
 			count

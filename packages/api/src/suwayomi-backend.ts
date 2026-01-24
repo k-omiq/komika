@@ -309,7 +309,6 @@ export class SuwayomiBackend implements Backend {
 			sourceId: String(m.sourceId),
 			chapterCount: m.chapters?.totalCount ?? 0,
 			isMarked: m.inLibrary,
-			isCached: false,
 			rating: { average: 0, count: 0, distribution: [] },
 			scan: {
 				avgIntervalHours: 0,

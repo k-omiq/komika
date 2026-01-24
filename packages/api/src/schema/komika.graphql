@@ -37,7 +37,7 @@ type Query {
 }
 
 type Mutation {
-	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] pins B2 cache + scan priority)
+	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
 	postReview(input: PostReviewInput!): Review! # [komika]
 	postComment(input: PostCommentInput!): ChapterComment! # [komika]
@@ -83,7 +83,6 @@ type Series {
 	sourceId: String!
 	chapterCount: Int!
 	isMarked: Boolean! # [suwayomi] inLibrary
-	isCached: Boolean! # [komika] served from B2 rather than the Worker proxy
 	rating: RatingSummary! # [komika]
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
