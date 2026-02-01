@@ -25,6 +25,14 @@ pub struct Config {
     pub auth_rate_limit_max: u32,
     /// Sliding window (seconds) over which `auth_rate_limit_max` is counted.
     pub auth_rate_limit_window_secs: u64,
+    /// Enable the direct-MangaDex catalogue sync (CATALOGUE.md §5). Off by default —
+    /// nothing hits MangaDex unless `CATALOGUE_SYNC=on`.
+    pub catalogue_sync_enabled: bool,
+    /// Global request budget for the MangaDex crawl (fleet-wide; shared egress IP).
+    /// MangaDex's per-IP ceiling is ~5 req/s.
+    pub mangadex_rate_per_sec: f64,
+    /// User-Agent sent to MangaDex (required by their API).
+    pub mangadex_user_agent: String,
 }
 
 impl Config {
@@ -72,6 +80,21 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(300);
+        let catalogue_sync_enabled = env::var("CATALOGUE_SYNC")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "on" || v == "1" || v == "true"
+            })
+            .unwrap_or(false);
+        let mangadex_rate_per_sec = env::var("MANGADEX_RATE_PER_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &f64| v > 0.0)
+            .unwrap_or(5.0);
+        let mangadex_user_agent = env::var("MANGADEX_USER_AGENT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Komika/0.1 (+https://github.com/komika)".to_string());
         Self {
             port,
             database_url,
@@ -83,6 +106,9 @@ impl Config {
             scan_tick_seconds,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,
+            catalogue_sync_enabled,
+            mangadex_rate_per_sec,
+            mangadex_user_agent,
         }
     }
 }

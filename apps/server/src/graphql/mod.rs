@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use async_graphql::{Context, EmptySubscription, Error, Object, Result, Schema, ID};
+use async_graphql::{Context, EmptySubscription, Error, Object, Result, Schema, SimpleObject, ID};
 use chrono::Utc;
 use sqlx::SqlitePool;
 
@@ -403,6 +403,36 @@ fn session_user(u: &User) -> SessionUser {
     }
 }
 
+// ---- Catalogue / dedup (CATALOGUE.md §4, §6) -------------------------------
+
+/// Outcome of running the dedup matcher for a newly-added Tier-2 source series.
+/// `decision` is one of `auto_merge` | `review` | `new`.
+#[derive(SimpleObject)]
+pub struct MatchResult {
+    pub decision: String,
+    /// The canonical work the series was linked to (its own new work for `new`).
+    pub work_id: String,
+    /// The matched canonical work (for `auto_merge` / `review`); absent for `new`.
+    pub matched_work_id: Option<String>,
+    pub score: Option<f64>,
+    pub method: Option<String>,
+    pub source_series_id: String,
+}
+
+/// A pending mid-confidence match awaiting manual admin review.
+#[derive(SimpleObject, sqlx::FromRow)]
+pub struct MergeCandidate {
+    pub id: String,
+    pub source_series_id: String,
+    pub candidate_work_id: String,
+    pub candidate_title: Option<String>,
+    pub source_title: Option<String>,
+    pub score: f64,
+    pub method: String,
+    pub status: String,
+    pub created_at: String,
+}
+
 // ---- Query -----------------------------------------------------------------
 
 pub struct QueryRoot;
@@ -712,6 +742,28 @@ impl QueryRoot {
             has_next_page: has_next,
             total: Some(total as i32),
         })
+    }
+
+    /// Admin dedup review queue: pending mid-confidence matches, newest first, with
+    /// the candidate work's title and the source series' current title for context.
+    async fn merge_queue(&self, ctx: &Context<'_>) -> Result<Vec<MergeCandidate>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let rows = sqlx::query_as::<_, MergeCandidate>(
+            "SELECT mc.id, mc.source_series_id, mc.candidate_work_id, \
+                    cw.primary_title AS candidate_title, sw.primary_title AS source_title, \
+                    mc.score, mc.method, mc.status, mc.created_at \
+             FROM merge_candidate mc \
+             JOIN work cw ON cw.id = mc.candidate_work_id \
+             JOIN source_series ss ON ss.id = mc.source_series_id \
+             JOIN work sw ON sw.id = ss.work_id \
+             WHERE mc.status = 'pending' \
+             ORDER BY mc.created_at DESC LIMIT 200",
+        )
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows)
     }
 
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
@@ -1113,6 +1165,194 @@ impl MutationRoot {
         .await
         .map_err(gql_err)?;
         Ok(row.into())
+    }
+
+    /// Tier-2 add flow (CATALOGUE.md §6): pull a source series' detail from Suwayomi,
+    /// run the dedup matcher, and wire it into the canonical model. `auto_merge` links
+    /// straight to the matched work; `review` creates a provisional work AND enqueues a
+    /// `merge_candidate` for manual confirmation; `new` creates a first-class work.
+    async fn add_source_series(
+        &self,
+        ctx: &Context<'_>,
+        suwayomi_manga_id: ID,
+    ) -> Result<MatchResult> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let mid: i64 = suwayomi_manga_id
+            .0
+            .parse()
+            .map_err(|_| Error::new("suwayomiMangaId must be an integer id"))?;
+        let m = st.suwayomi.series(mid).await.map_err(gql_err)?;
+
+        let cand = crate::dedup::Candidate {
+            title: m.title.clone(),
+            alt_titles: Vec::new(),
+            description: m.description.clone(),
+            author: m.author.clone(),
+            year: None,
+            cover_phash: None,
+            external_ids: Vec::new(),
+        };
+        let decision = crate::dedup::resolve(&st.pool, &cand)
+            .await
+            .map_err(gql_err)?;
+
+        // The work this source series is (provisionally) linked to. For `new` and
+        // `review` we mint a first-class work from the Suwayomi metadata.
+        let make_work = || crate::catalog::WorkInput {
+            primary_title: Some(m.title.clone()),
+            description: m.description.clone(),
+            author: m.author.clone(),
+            artist: m.artist.clone(),
+            status: Some(m.status.clone()),
+            is_nsfw: false,
+            aliases: vec![crate::catalog::Alias {
+                raw: m.title.clone(),
+                lang: None,
+            }],
+            ..Default::default()
+        };
+
+        use crate::dedup::Decision;
+        let (decision_str, matched_work_id, score, method, work_id) = match &decision {
+            Decision::AutoMerge {
+                work_id,
+                score,
+                method,
+            } => (
+                "auto_merge",
+                Some(work_id.clone()),
+                Some(*score),
+                Some(method.clone()),
+                work_id.clone(),
+            ),
+            Decision::Review {
+                work_id,
+                score,
+                method,
+            } => {
+                let provisional = crate::catalog::create_work(&st.pool, &make_work())
+                    .await
+                    .map_err(gql_err)?;
+                (
+                    "review",
+                    Some(work_id.clone()),
+                    Some(*score),
+                    Some(method.clone()),
+                    provisional,
+                )
+            }
+            Decision::New => {
+                let created = crate::catalog::create_work(&st.pool, &make_work())
+                    .await
+                    .map_err(gql_err)?;
+                ("new", None, None, None, created)
+            }
+        };
+
+        let ssid = crate::catalog::upsert_source_series(
+            &st.pool,
+            &work_id,
+            "suwayomi",
+            &m.source_id,
+            &mid.to_string(),
+            None,
+            false,
+        )
+        .await
+        .map_err(gql_err)?;
+
+        if let Decision::Review {
+            work_id: cand_work,
+            score,
+            method,
+        } = &decision
+        {
+            crate::catalog::insert_merge_candidate(&st.pool, &ssid, cand_work, *score, method)
+                .await
+                .map_err(gql_err)?;
+        }
+
+        Ok(MatchResult {
+            decision: decision_str.to_string(),
+            work_id,
+            matched_work_id,
+            score,
+            method,
+            source_series_id: ssid,
+        })
+    }
+
+    /// Resolve a pending dedup review. `accept` repoints the source series onto the
+    /// candidate work and drops the now-orphaned provisional work; rejecting keeps the
+    /// provisional work as a distinct first-class entry. Either way the row is closed.
+    async fn resolve_merge_candidate(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        accept: bool,
+    ) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            source_series_id: String,
+            candidate_work_id: String,
+            status: String,
+        }
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = ?",
+        )
+        .bind(&id.0)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let Some(row) = row else {
+            return Err(Error::new("No such merge candidate."));
+        };
+        if row.status != "pending" {
+            return Err(Error::new("This merge candidate is already resolved."));
+        }
+
+        if accept {
+            let old_work: Option<String> =
+                sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+                    .bind(&row.source_series_id)
+                    .fetch_optional(&st.pool)
+                    .await
+                    .map_err(gql_err)?;
+            sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ?")
+                .bind(&row.candidate_work_id)
+                .bind(&row.source_series_id)
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
+            // Drop the provisional work if nothing else references it now.
+            if let Some(old) = old_work {
+                if old != row.candidate_work_id {
+                    sqlx::query(
+                        "DELETE FROM work WHERE id = ? \
+                         AND NOT EXISTS (SELECT 1 FROM source_series WHERE work_id = ?)",
+                    )
+                    .bind(&old)
+                    .bind(&old)
+                    .execute(&st.pool)
+                    .await
+                    .map_err(gql_err)?;
+                }
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = ? WHERE id = ?")
+            .bind(if accept { "confirmed" } else { "rejected" })
+            .bind(&now)
+            .bind(&id.0)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(true)
     }
 }
 
