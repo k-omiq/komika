@@ -33,6 +33,10 @@ pub struct Config {
     pub mangadex_rate_per_sec: f64,
     /// User-Agent sent to MangaDex (required by their API).
     pub mangadex_user_agent: String,
+    /// Compute a cover perceptual-hash per work during the catalogue sync
+    /// (CATALOGUE.md §4). Off by default — it adds one cover download per work, so
+    /// it's opt-in on top of `CATALOGUE_SYNC` via `COVER_PHASH=on`.
+    pub catalogue_cover_phash: bool,
 }
 
 impl Config {
@@ -95,6 +99,12 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Komika/0.1 (+https://github.com/komika)".to_string());
+        let catalogue_cover_phash = env::var("COVER_PHASH")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "on" || v == "1" || v == "true"
+            })
+            .unwrap_or(false);
         Self {
             port,
             database_url,
@@ -109,6 +119,7 @@ impl Config {
             catalogue_sync_enabled,
             mangadex_rate_per_sec,
             mangadex_user_agent,
+            catalogue_cover_phash,
         }
     }
 }

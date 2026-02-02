@@ -61,6 +61,28 @@ export interface AdminUser {
 	createdAt: string;
 }
 
+/**
+ * A pending mid-confidence dedup match awaiting manual admin review
+ * (CATALOGUE.md §4). The matcher couldn't confidently auto-merge the source
+ * series into `candidateWork`, so an admin confirms or rejects it.
+ */
+export interface MergeCandidate {
+	id: Id;
+	sourceSeriesId: Id;
+	candidateWorkId: Id;
+	/** Title of the canonical work the matcher proposes merging into. */
+	candidateTitle: string | null;
+	/** Current title of the source series' own (provisional) work. */
+	sourceTitle: string | null;
+	/** Confidence score in [0,1] that produced the review verdict. */
+	score: number;
+	/** Which signal produced the match (e.g. `title_corroborated`, `fuzzy`). */
+	method: string;
+	/** Lifecycle: `pending` until an admin resolves it. */
+	status: string;
+	createdAt: string;
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */

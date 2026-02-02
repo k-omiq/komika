@@ -19,6 +19,9 @@ tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "catc
 async-trait = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Cover perceptual-hash (dedup signal, CATALOGUE.md §4). Only the decoders we need
+# for MangaDex cover thumbnails — keeps the dependency surface + binary small.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"

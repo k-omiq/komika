@@ -372,3 +372,25 @@ export const SET_USER_ADMIN = /* GraphQL */ `
 		}
 	}
 `;
+
+export const MERGE_QUEUE = /* GraphQL */ `
+	query MergeQueue {
+		mergeQueue {
+			id
+			sourceSeriesId
+			candidateWorkId
+			candidateTitle
+			sourceTitle
+			score
+			method
+			status
+			createdAt
+		}
+	}
+`;
+
+export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
+	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
+		resolveMergeCandidate(id: $id, accept: $accept)
+	}
+`;

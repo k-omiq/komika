@@ -224,6 +224,25 @@ struct AdminOverrides {
     status_override: Option<String>,
 }
 
+/// Alt titles for a federated Suwayomi series from the canonical model (CATALOGUE.md
+/// §6). Once a series has been added to a canonical `work` (Tier-2 add flow, or a
+/// MangaDex spine entry it resolved to), its `work_alias` rows surface here as the
+/// series' alt titles. Empty when the series hasn't been catalogued yet — the reader
+/// then just shows no alt titles, exactly as before this wiring.
+async fn canonical_alt_titles(pool: &SqlitePool, suwayomi_id: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT wa.raw_title \
+         FROM source_series ss \
+         JOIN work_alias wa ON wa.work_id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key = ? \
+         ORDER BY wa.raw_title",
+    )
+    .bind(suwayomi_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
 async fn admin_overrides(pool: &SqlitePool, series_id: &str) -> AdminOverrides {
     sqlx::query_as::<_, AdminOverrides>(
         "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
@@ -245,6 +264,10 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
     let rating = rating_summary(&st.pool, &id).await;
     let ov = admin_overrides(&st.pool, &id).await;
     let scan = scan_state(&st.pool, &id).await;
+    // Canonical alt titles (empty until the series is catalogued); drop any that
+    // equal the primary title so the reader shows only genuine alternatives.
+    let mut alt_titles = canonical_alt_titles(&st.pool, &id).await;
+    alt_titles.retain(|t| t != &m.title);
 
     // Status: admin override wins over the source-derived status.
     let status = ov
@@ -291,7 +314,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
         author: m.author,
         artist: m.artist,
         description: m.description,
-        alt_titles: vec![],
+        alt_titles,
         title: m.title,
         id: ID(id),
     }

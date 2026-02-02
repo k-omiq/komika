@@ -170,12 +170,26 @@ impl MangaDexClient {
         }
         Ok((chapters, body.total))
     }
+
+    /// Download a work's cover thumbnail and compute its perceptual hash. Uses the
+    /// 512px thumbnail (smaller download, always JPEG). Best-effort: returns `None`
+    /// on any network/decode failure — a missing hash just means one fewer dedup
+    /// signal, never a failed sync. Rate-limited like the API calls.
+    pub async fn cover_phash(&self, manga_id: &str, file_name: &str) -> Option<String> {
+        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
+        self.limiter.acquire().await;
+        let res = self.http.get(url).send().await.ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let bytes = res.bytes().await.ok()?;
+        crate::phash::dhash(&bytes)
+    }
 }
 
 /// Proxy-ready cover URL for a MangaDex work. Callers must route this through the
-/// Worker proxy — MangaDex serves a wrong response to hotlinks. Used by the deferred
-/// cover-ingest/pHash step and canonical-model serving (CATALOGUE.md §5–6).
-#[allow(dead_code)]
+/// Worker proxy — MangaDex serves a wrong response to hotlinks. Used by cover
+/// pHash ingest and canonical-model serving (CATALOGUE.md §5–6).
 pub fn cover_url(manga_id: &str, file_name: &str) -> String {
     format!("{COVERS_BASE}/{manga_id}/{file_name}")
 }
@@ -317,7 +331,7 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             is_nsfw,
             author: rel_name(m, "author"),
             artist: rel_name(m, "artist"),
-            cover_phash: None, // computed on cover ingest in a follow-up (needs the image crate)
+            cover_phash: None, // filled by cover pHash ingest in sync_catalogue when enabled
             aliases,
             external_ids,
         },
@@ -349,8 +363,7 @@ fn rel_name(m: &MdManga, kind: &str) -> Option<String> {
 }
 
 /// MangaDex cover fileName for a manga (first cover_art relationship), if expanded.
-/// Feeds the deferred cover-ingest/pHash step (CATALOGUE.md §5).
-#[allow(dead_code)]
+/// Feeds cover pHash ingest (CATALOGUE.md §5).
 pub fn cover_file_name(m: &MdManga) -> Option<String> {
     m.relationships
         .iter()
@@ -397,6 +410,7 @@ pub async fn sync_catalogue(
     pool: &sqlx::SqlitePool,
     client: &MangaDexClient,
     initial_since: Option<String>,
+    cover_phash: bool,
 ) -> Result<u64> {
     let mut since = initial_since;
     let mut upserted: u64 = 0;
@@ -412,7 +426,15 @@ pub async fn sync_catalogue(
             }
             let page_len = mangas.len() as i64;
             for m in &mangas {
-                let (id, input) = to_work_input(m);
+                let (id, mut input) = to_work_input(m);
+                // Cover pHash ingest (opt-in): one extra cover download per work,
+                // hashed for the dedup cover signal. Best-effort — a failure leaves
+                // cover_phash None and COALESCE keeps any prior hash on re-sync.
+                if cover_phash {
+                    if let Some(fname) = cover_file_name(m) {
+                        input.cover_phash = client.cover_phash(&id, &fname).await;
+                    }
+                }
                 match catalog::upsert_work_from_mangadex(pool, &id, &input).await {
                     Ok(_) => upserted += 1,
                     Err(e) => tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed"),
@@ -527,10 +549,10 @@ pub async fn sync_chapters(
 
 /// Spawn the catalogue + chapter sync as a background task (one full sweep of each,
 /// then idle). Gated by the caller; returns immediately.
-pub fn spawn(pool: sqlx::SqlitePool, client: Arc<MangaDexClient>) {
+pub fn spawn(pool: sqlx::SqlitePool, client: Arc<MangaDexClient>, cover_phash: bool) {
     tokio::spawn(async move {
-        tracing::info!("mangadex: catalogue sync starting");
-        if let Err(e) = sync_catalogue(&pool, &client, None).await {
+        tracing::info!(cover_phash, "mangadex: catalogue sync starting");
+        if let Err(e) = sync_catalogue(&pool, &client, None, cover_phash).await {
             tracing::warn!(error = %e, "mangadex: catalogue sync ended with error");
         }
         if let Err(e) = sync_chapters(&pool, &client, None).await {

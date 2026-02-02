@@ -5,8 +5,8 @@
 //!     sites copy AniList/MAL descriptions near-verbatim, so plain shingle overlap
 //!     is the "MinHash-only" starting point the design locked in (no ML, §10).
 //!   * `phash_similarity` — normalized Hamming similarity over two hex perceptual
-//!     hashes. The comparator lives here now; the cover→hash step is added with the
-//!     `image` crate in a follow-up, so `cover_phash` is populated later.
+//!     hashes. The cover→hash step lives in `crate::phash` (dHash via the `image`
+//!     crate) and is populated during catalogue sync when `COVER_PHASH` is on.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
