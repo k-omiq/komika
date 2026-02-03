@@ -37,6 +37,9 @@ pub struct Config {
     /// (CATALOGUE.md §4). Off by default — it adds one cover download per work, so
     /// it's opt-in on top of `CATALOGUE_SYNC` via `COVER_PHASH=on`.
     pub catalogue_cover_phash: bool,
+    /// Interval between recurring incremental catalogue/chapter refresh cycles
+    /// (`updatedAtSince`). The first cycle seeds on startup; default 6h.
+    pub catalogue_sync_interval_secs: u64,
 }
 
 impl Config {
@@ -105,6 +108,11 @@ impl Config {
                 v == "on" || v == "1" || v == "true"
             })
             .unwrap_or(false);
+        let catalogue_sync_interval_secs = env::var("CATALOGUE_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(6 * 60 * 60);
         Self {
             port,
             database_url,
@@ -120,6 +128,7 @@ impl Config {
             mangadex_rate_per_sec,
             mangadex_user_agent,
             catalogue_cover_phash,
+            catalogue_sync_interval_secs,
         }
     }
 }

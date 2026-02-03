@@ -174,9 +174,16 @@ async fn main() -> anyhow::Result<()> {
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
-    // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex.
+    // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
+    // seeds on startup, then incrementally refreshes (updatedAtSince) every interval.
     if cfg.catalogue_sync_enabled {
-        mangadex::spawn(pool.clone(), mangadex.clone(), cfg.catalogue_cover_phash);
+        mangadex::spawn_recurring(
+            pool.clone(),
+            mangadex.clone(),
+            cfg.catalogue_cover_phash,
+            cfg.catalogue_sync_interval_secs,
+            shutdown_tx.subscribe(),
+        );
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
