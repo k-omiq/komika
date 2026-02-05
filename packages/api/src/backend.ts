@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	CanonicalUpdate,
 	Chapter,
 	ChapterComment,
 	DiscoveryFeed,
@@ -56,6 +57,18 @@ export interface Backend {
 	library(): Promise<Series[]>;
 	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
 
+	// --- viewer preferences ---
+	/** Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2), returning
+	 * the new value. Optional: only the unified Komika API implements it. */
+	setShowNsfw?(value: boolean): Promise<boolean>;
+
+	// --- canonical catalogue (MangaDex mirror) ---
+	/** Recently-updated mirrored MangaDex works + their latest stored chapter, newest
+	 * first, NSFW-filtered by the viewer's preference (CATALOGUE.md §6). A data feed:
+	 * these are NOT reader-openable (see {@link CanonicalUpdate}). Optional: only the
+	 * unified Komika API implements it. */
+	canonicalUpdates?(page?: number): Promise<CanonicalUpdate[]>;
+
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;
 	postReview(input: PostReviewInput): Promise<Review>;
@@ -102,7 +115,14 @@ export interface Backend {
 
 export interface Session {
 	token: string;
-	user: { id: Id; username: string; avatarUrl: string | null; isAdmin: boolean };
+	user: {
+		id: Id;
+		username: string;
+		avatarUrl: string | null;
+		isAdmin: boolean;
+		/** Whether this user opted into seeing NSFW-flagged works (CATALOGUE.md §2). */
+		showNsfw: boolean;
+	};
 }
 
 export interface RegisterInput {

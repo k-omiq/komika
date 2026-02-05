@@ -4,8 +4,28 @@
 	import { slug } from '$lib/data/mock';
 	import { getProfile, type ProfileView } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
+	import { backend } from '$lib/context';
 
 	let { data } = $props();
+
+	// NSFW visibility preference (CATALOGUE.md §2). Reflects the signed-in user's
+	// server-side setting; the toggle persists via `setShowNsfw` and updates auth.
+	const showNsfw = $derived(auth.user?.showNsfw ?? false);
+	let savingNsfw = $state(false);
+	let nsfwError = $state('');
+	async function toggleNsfw(): Promise<void> {
+		if (!auth.user || savingNsfw || !backend.setShowNsfw) return;
+		savingNsfw = true;
+		nsfwError = '';
+		try {
+			const next = await backend.setShowNsfw(!auth.user.showNsfw);
+			if (auth.user) auth.user.showNsfw = next;
+		} catch (err) {
+			nsfwError = err instanceof Error ? err.message : 'Could not update the setting.';
+		} finally {
+			savingNsfw = false;
+		}
+	}
 	// Re-fetch once auth has restored the session token onto the backend — the
 	// initial `load` can race ahead of `initAuth`, so without this the signed-in
 	// user's real profile wouldn't resolve on first paint. Falls back to the load
@@ -119,6 +139,33 @@
 	</div>
 
 	<div class="right">
+		{#if auth.user}
+			<div class="card">
+				<h3 class="card-title">Content Settings</h3>
+				<div class="setting-row">
+					<div class="setting-text">
+						<span class="setting-label">Show NSFW content</span>
+						<span class="setting-desc">
+							Include adult-rated series in browse, search, and updates.
+						</span>
+					</div>
+					<button
+						type="button"
+						class="switch"
+						class:on={showNsfw}
+						role="switch"
+						aria-checked={showNsfw}
+						aria-label="Show NSFW content"
+						disabled={savingNsfw}
+						onclick={toggleNsfw}
+					>
+						<span class="knob"></span>
+					</button>
+				</div>
+				{#if nsfwError}<p class="setting-error">{nsfwError}</p>{/if}
+			</div>
+		{/if}
+
 		<div class="card">
 			<h3 class="card-title">Favorite Genres</h3>
 			<div class="genres">
@@ -459,6 +506,66 @@
 		font-size: 15px;
 		margin: 0;
 		color: var(--k-text);
+	}
+	.setting-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+	}
+	.setting-text {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+	}
+	.setting-label {
+		font-weight: 600;
+		font-size: 14px;
+		color: var(--k-text-1);
+	}
+	.setting-desc {
+		font-size: 12.5px;
+		color: var(--k-text-faint);
+		line-height: 1.4;
+	}
+	.switch {
+		flex: 0 0 auto;
+		width: 44px;
+		height: 26px;
+		border-radius: 999px;
+		border: 1px solid var(--k-border-4);
+		background: var(--k-border-1);
+		padding: 0;
+		cursor: pointer;
+		position: relative;
+		transition: background 0.15s, border-color 0.15s;
+	}
+	.switch:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.switch.on {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+	}
+	.switch .knob {
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		background: var(--k-on-primary, #fff);
+		transition: transform 0.15s;
+	}
+	.switch.on .knob {
+		transform: translateX(18px);
+	}
+	.setting-error {
+		margin: 4px 0 0;
+		font-size: 12.5px;
+		color: var(--k-danger, #e08a8a);
 	}
 	.genres {
 		display: flex;

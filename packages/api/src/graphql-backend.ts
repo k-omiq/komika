@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	CanonicalUpdate,
 	Chapter,
 	ChapterComment,
 	DiscoveryFeed,
@@ -187,6 +188,20 @@ export class GraphQLBackend implements Backend {
 			accept,
 		});
 		return d.resolveMergeCandidate;
+	}
+
+	// --- viewer preferences ---
+	async setShowNsfw(value: boolean): Promise<boolean> {
+		const d = await this.gql<{ setShowNsfw: boolean }>(ops.SET_SHOW_NSFW, { value });
+		return d.setShowNsfw;
+	}
+
+	// --- canonical catalogue ---
+	async canonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
+		const d = await this.gql<{ canonicalUpdates: CanonicalUpdate[] }>(ops.CANONICAL_UPDATES, {
+			page,
+		});
+		return d.canonicalUpdates;
 	}
 }
 
