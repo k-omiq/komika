@@ -9,6 +9,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::auth::{self, User};
+use crate::catalog;
 use crate::scanner::{scan_series, scan_state};
 use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
 use types::*;
@@ -81,6 +82,9 @@ impl RateLimiter {
 pub struct AppState {
     pub pool: SqlitePool,
     pub suwayomi: SuwayomiClient,
+    /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
+    /// works via MangaDex@Home (CATALOGUE.md §5). Shared with the catalogue sync.
+    pub mangadex: std::sync::Arc<crate::mangadex::MangaDexClient>,
     /// Usernames granted admin (see `Config::admin_users`).
     pub admin_users: Vec<String>,
     /// Aggregate scan-scheduler health (for `scanStatus`).
@@ -377,6 +381,82 @@ async fn map_series_list(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series>
     out
 }
 
+/// Map a canonical `work` (MangaDex-mirrored) onto the shared `Series` shape so the
+/// reader reuses its existing series/reader components (CATALOGUE.md §6). The series
+/// `id` is the work id (its `w_` prefix distinguishes it from a numeric Suwayomi id,
+/// so the reader routes it down the canonical path). Cover URLs point at
+/// `uploads.mangadex.org` — the client resolves them through the Worker proxy.
+/// Fields Komika doesn't mirror for MangaDex works (genres, ratings, library/scan
+/// state) are empty/defaulted; reading is fully functional without them.
+fn map_canonical_series(work: catalog::CanonicalWork, chapter_count: i32) -> Series {
+    let cover_url = match (&work.mangadex_id, &work.cover_file_name) {
+        (Some(mid), Some(fname)) => crate::mangadex::cover_thumb_url(mid, fname),
+        _ => String::new(),
+    };
+    let title = work.primary_title.clone().unwrap_or_default();
+    let mut alt_titles = work.alt_titles;
+    alt_titles.retain(|t| t != &title);
+    let status = work
+        .status
+        .as_deref()
+        .and_then(komika_status)
+        .unwrap_or(SeriesStatus::Unknown);
+    Series {
+        id: ID(work.work_id),
+        title,
+        alt_titles,
+        author: work.author,
+        artist: work.artist,
+        description: work.description,
+        genres: Vec::new(),
+        r#type: type_from_lang(work.original_language.as_deref()),
+        status,
+        cover_url,
+        source_id: "mangadex".to_string(),
+        chapter_count,
+        is_marked: false,
+        is_nsfw: work.is_nsfw,
+        rating: RatingSummary::empty(),
+        scan: ScanPolicy {
+            avg_interval_hours: 0.0,
+            override_interval_hours: None,
+            poll_every_minutes: 30,
+            paused: false,
+            status_override: None,
+            paused_override: None,
+            last_scanned_at: None,
+            next_scan_at: None,
+        },
+        created_at: work.created_at,
+        updated_at: work.updated_at,
+    }
+}
+
+/// Map a mirrored MangaDex chapter onto the shared `Chapter` shape. The chapter `id`
+/// is the MangaDex chapter uuid (the key `canonicalPages` fetches pages with);
+/// `series_id` is the work id so navigation stays on the canonical path. Per-user
+/// reading state isn't tracked for canonical works yet (defaults to unread).
+fn map_canonical_chapter(work_id: &str, c: catalog::CanonicalChapter) -> Chapter {
+    let number = c
+        .number
+        .as_deref()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    Chapter {
+        id: ID(c.external_id),
+        series_id: ID(work_id.to_string()),
+        number,
+        title: c.title,
+        page_count: 0, // unknown until the at-home page list is fetched
+        uploaded_at: c.published_at,
+        scanlator: None,
+        read: false,
+        last_page_read: 0,
+        bookmarked: false,
+        is_downloaded: false,
+    }
+}
+
 // ---- DB row shapes for social joins ----------------------------------------
 
 #[derive(sqlx::FromRow)]
@@ -412,10 +492,23 @@ impl From<ReviewJoin> for Review {
     }
 }
 
+/// Validate a comment target type, returning the canonical `&'static str` to bind.
+/// Guards the polymorphic `comments.target_type` against arbitrary values.
+fn validate_comment_target(target_type: &str) -> Result<&'static str> {
+    match target_type {
+        "chapter" => Ok("chapter"),
+        "series" => Ok("series"),
+        other => Err(Error::new(format!(
+            "invalid comment target type: {other:?} (expected \"chapter\" or \"series\")"
+        ))),
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct CommentJoin {
     id: String,
-    chapter_id: String,
+    target_type: String,
+    target_id: String,
     body: String,
     has_spoiler: i64,
     created_at: String,
@@ -424,11 +517,12 @@ struct CommentJoin {
     author_avatar: Option<String>,
 }
 
-impl From<CommentJoin> for ChapterComment {
+impl From<CommentJoin> for Comment {
     fn from(c: CommentJoin) -> Self {
-        ChapterComment {
+        Comment {
             id: ID(c.id),
-            chapter_id: ID(c.chapter_id),
+            target_type: c.target_type,
+            target_id: ID(c.target_id),
             author: UserRef {
                 id: ID(c.author_id),
                 username: c.author_username,
@@ -670,6 +764,76 @@ impl QueryRoot {
         Ok(rows)
     }
 
+    /// Canonical reader path — a MangaDex-mirrored `work` as a `Series` (CATALOGUE.md §6).
+    /// `workId` is the `w_`-prefixed canonical id (distinct from numeric Suwayomi ids).
+    /// NSFW works are hidden unless the viewer opted in (same gate as the feeds). Reuses
+    /// the `Series` shape so the reader's existing components render it unchanged.
+    async fn canonical_series(&self, ctx: &Context<'_>, work_id: ID) -> Result<Series> {
+        let st = state(ctx);
+        let work = catalog::load_canonical_work(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?
+            .ok_or_else(|| Error::new("No such work"))?;
+        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such work"));
+        }
+        let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?;
+        Ok(map_canonical_series(work, chapters.len() as i32))
+    }
+
+    /// Chapters of a canonical work, from the stored `chapter` mirror, deduped to one
+    /// row per number (English preferred) and ordered ascending (CATALOGUE.md §6). Same
+    /// NSFW gate as `canonicalSeries`.
+    async fn canonical_chapters(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<Chapter>> {
+        let st = state(ctx);
+        let work = catalog::load_canonical_work(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?
+            .ok_or_else(|| Error::new("No such work"))?;
+        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such work"));
+        }
+        let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?;
+        Ok(chapters
+            .into_iter()
+            .map(|c| map_canonical_chapter(&work_id.0, c))
+            .collect())
+    }
+
+    /// Ordered page URLs for a mirrored MangaDex chapter, via MangaDex@Home
+    /// (CATALOGUE.md §5). `chapterId` is the MangaDex chapter uuid. The URLs are
+    /// `*.mangadex.network` hosts the client resolves through the Worker proxy (never
+    /// hotlinked). NSFW-gated by the owning work when the chapter is in the mirror.
+    async fn canonical_pages(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Vec<Page>> {
+        let st = state(ctx);
+        // Gate on the owning work's NSFW flag when we know the chapter; an unknown
+        // chapter (not in the mirror) is allowed through to the at-home fetch, which
+        // fails cleanly if the id is bogus.
+        if let Some(true) = catalog::chapter_owner_is_nsfw(&st.pool, &chapter_id.0)
+            .await
+            .map_err(gql_err)?
+        {
+            if !viewer_show_nsfw(ctx).await {
+                return Err(Error::new("No such chapter"));
+            }
+        }
+        let urls = st.mangadex.at_home(&chapter_id.0).await.map_err(gql_err)?;
+        Ok(urls
+            .into_iter()
+            .enumerate()
+            .map(|(index, source_url)| Page {
+                index: index as i32,
+                source_url,
+                width: None,
+                height: None,
+            })
+            .collect())
+    }
+
     async fn search(
         &self,
         ctx: &Context<'_>,
@@ -777,33 +941,39 @@ impl QueryRoot {
     async fn comments(
         &self,
         ctx: &Context<'_>,
-        chapter_id: ID,
+        target_type: String,
+        target_id: ID,
         #[graphql(default = 1)] page: i32,
     ) -> Result<CommentPage> {
+        let target_type = validate_comment_target(&target_type)?;
         let st = state(ctx);
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         let rows: Vec<CommentJoin> = sqlx::query_as(
-            "SELECT c.id, c.chapter_id, c.body, c.has_spoiler, c.created_at, \
+            "SELECT c.id, c.target_type, c.target_id, c.body, c.has_spoiler, c.created_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.chapter_id = ? ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
+             WHERE c.target_type = ? AND c.target_id = ? ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
         )
-        .bind(chapter_id.0.clone())
+        .bind(target_type)
+        .bind(target_id.0.clone())
         .bind(PAGE_SIZE + 1)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE chapter_id = ?")
-            .bind(chapter_id.0.clone())
-            .fetch_one(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ?",
+        )
+        .bind(target_type)
+        .bind(target_id.0.clone())
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
         let has_next = rows.len() as i64 > PAGE_SIZE;
         let items = rows
             .into_iter()
             .take(PAGE_SIZE as usize)
-            .map(ChapterComment::from)
+            .map(Comment::from)
             .collect();
         Ok(CommentPage {
             items,
@@ -997,11 +1167,8 @@ impl MutationRoot {
         Ok(row.into())
     }
 
-    async fn post_comment(
-        &self,
-        ctx: &Context<'_>,
-        input: PostCommentInput,
-    ) -> Result<ChapterComment> {
+    async fn post_comment(&self, ctx: &Context<'_>, input: PostCommentInput) -> Result<Comment> {
+        let target_type = validate_comment_target(&input.target_type)?;
         if input.body.trim().is_empty() {
             return Err(Error::new("comment body must not be empty"));
         }
@@ -1010,11 +1177,12 @@ impl MutationRoot {
         let now = Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO comments (id, chapter_id, user_id, body, has_spoiler, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO comments (id, target_type, target_id, user_id, body, has_spoiler, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
-        .bind(input.chapter_id.0.clone())
+        .bind(target_type)
+        .bind(input.target_id.0.clone())
         .bind(&user.id)
         .bind(input.body.trim())
         .bind(input.has_spoiler)
@@ -1022,9 +1190,10 @@ impl MutationRoot {
         .execute(&st.pool)
         .await
         .map_err(gql_err)?;
-        Ok(ChapterComment {
+        Ok(Comment {
             id: ID(id),
-            chapter_id: input.chapter_id,
+            target_type: target_type.to_string(),
+            target_id: input.target_id,
             author: UserRef {
                 id: ID(user.id),
                 username: user.username,
@@ -1601,6 +1770,7 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
@@ -1740,6 +1910,106 @@ mod tests {
             json.contains("Safe Work") && json.contains("Spicy Work"),
             "{json}"
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_series_and_chapters_are_readable_and_nsfw_gated() {
+        let (s, pool) = setup_full(100).await;
+        // A safe work with a cover + two chapters, and an NSFW work.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-safe",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Readable Work".into()),
+                cover_file_name: Some("cover.jpg".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-safe")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, num) in [("md-ch-2", "2"), ("md-ch-1", "1")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-safe'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // canonicalSeries maps the work; cover URL points at uploads.mangadex.org.
+        let q = format!(
+            r#"{{ canonicalSeries(workId: "{work_id}") {{ id title coverUrl sourceId chapterCount }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let json = data_json(&r);
+        assert!(json.contains("Readable Work"), "{json}");
+        assert!(
+            json.contains("uploads.mangadex.org/covers/md-safe/cover.jpg"),
+            "{json}"
+        );
+        assert!(json.contains("\"chapterCount\":2"), "{json}");
+
+        // canonicalChapters returns ordered chapters keyed by MangaDex uuid.
+        let q = format!(
+            r#"{{ canonicalChapters(workId: "{work_id}") {{ id number seriesId }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let chs = data["canonicalChapters"].as_array().unwrap();
+        assert_eq!(chs.len(), 2);
+        assert_eq!(chs[0]["id"], serde_json::json!("md-ch-1"));
+        assert_eq!(chs[0]["number"], serde_json::json!(1.0));
+        assert_eq!(chs[0]["seriesId"], serde_json::json!(work_id));
+
+        // An NSFW work is hidden from a viewer who hasn't opted in.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-nsfw",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Spicy Work".into()),
+                is_nsfw: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let nsfw_work: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-nsfw'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let q = format!(r#"{{ canonicalSeries(workId: "{nsfw_work}") {{ title }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "No such work");
+        // After opting in, it resolves.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
+        assert!(data_json(&r).contains("Spicy Work"));
     }
 
     #[tokio::test]
@@ -1968,6 +2238,7 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool,
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),

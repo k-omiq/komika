@@ -40,6 +40,9 @@ pub struct WorkInput {
     pub author: Option<String>,
     pub artist: Option<String>,
     pub cover_phash: Option<String>,
+    /// MangaDex cover fileName (e.g. `abc.jpg`); builds the cover URL for reader
+    /// browse/read of canonical works (CATALOGUE.md §5).
+    pub cover_file_name: Option<String>,
     pub aliases: Vec<Alias>,
     /// `(provider, external_id)` — e.g. `("al", "12345")`, `("mangadex", "<uuid>")`.
     pub external_ids: Vec<(String, String)>,
@@ -168,6 +171,178 @@ pub async fn load_match_data(pool: &SqlitePool, work_id: &str) -> Result<Option<
     }))
 }
 
+/// A canonical work resolved for reader browse/read (CATALOGUE.md §6). Carries the
+/// MangaDex anchor id + cover fileName so the reader can build cover URLs and reach
+/// pages via MangaDex@Home. `mangadex_id` is `None` for a first-class non-MangaDex
+/// work (not reader-openable through this path yet).
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalWork {
+    pub work_id: String,
+    pub mangadex_id: Option<String>,
+    pub primary_title: Option<String>,
+    pub description: Option<String>,
+    pub year: Option<i64>,
+    pub original_language: Option<String>,
+    pub status: Option<String>,
+    pub author: Option<String>,
+    pub artist: Option<String>,
+    pub is_nsfw: bool,
+    pub cover_file_name: Option<String>,
+    pub alt_titles: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One mirrored chapter selected for the reader (already deduped to one row per
+/// number). `external_id` is the MangaDex chapter uuid — the key used to fetch pages
+/// via MangaDex@Home.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CanonicalChapter {
+    pub external_id: String,
+    pub number: Option<String>,
+    pub volume: Option<String>,
+    pub lang: Option<String>,
+    pub title: Option<String>,
+    pub published_at: Option<String>,
+}
+
+/// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
+/// the reader's canonical series path. `None` if the work id is unknown.
+pub async fn load_canonical_work(pool: &SqlitePool, work_id: &str) -> Result<Option<CanonicalWork>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        primary_title: Option<String>,
+        description: Option<String>,
+        year: Option<i64>,
+        original_language: Option<String>,
+        status: Option<String>,
+        author: Option<String>,
+        artist: Option<String>,
+        is_nsfw: i64,
+        cover_file_name: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT primary_title, description, year, original_language, status, author, artist, \
+                is_nsfw, cover_file_name, created_at, updated_at \
+         FROM work WHERE id = ?",
+    )
+    .bind(work_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    // The MangaDex source_series (its source_key is the MangaDex manga uuid).
+    let mangadex_id = sqlx::query_scalar::<_, String>(
+        "SELECT source_key FROM source_series \
+         WHERE work_id = ? AND source_type = 'mangadex' LIMIT 1",
+    )
+    .bind(work_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let alt_titles = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = ? ORDER BY raw_title",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(Some(CanonicalWork {
+        work_id: work_id.to_string(),
+        mangadex_id,
+        primary_title: row.primary_title,
+        description: row.description,
+        year: row.year,
+        original_language: row.original_language,
+        status: row.status,
+        author: row.author,
+        artist: row.artist,
+        is_nsfw: row.is_nsfw != 0,
+        cover_file_name: row.cover_file_name,
+        alt_titles,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }))
+}
+
+/// Load the reader-facing chapter list for a canonical work: the mirrored chapters of
+/// its MangaDex source_series, deduped to one row per chapter number (preferring an
+/// English translation) and ordered ascending by number. MangaDex's firehose stores
+/// every language/scanlator, so the raw list has many rows per number — `select_reader_chapters`
+/// collapses that into a clean reading order.
+pub async fn load_canonical_chapters(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> Result<Vec<CanonicalChapter>> {
+    let rows = sqlx::query_as::<_, CanonicalChapter>(
+        "SELECT c.external_id, c.number, c.volume, c.lang, c.title, c.published_at \
+         FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+         WHERE ss.work_id = ? AND ss.source_type = 'mangadex'",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(select_reader_chapters(rows))
+}
+
+/// NSFW flag of the work owning a mirrored MangaDex chapter (by chapter uuid), for
+/// gating `canonicalPages`. `None` if the chapter isn't in the mirror.
+pub async fn chapter_owner_is_nsfw(pool: &SqlitePool, external_id: &str) -> Result<Option<bool>> {
+    let v = sqlx::query_scalar::<_, i64>(
+        "SELECT w.is_nsfw FROM chapter c \
+         JOIN source_series ss ON ss.id = c.source_series_id \
+         JOIN work w ON w.id = ss.work_id \
+         WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+    )
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(v.map(|n| n != 0))
+}
+
+/// Parse a MangaDex chapter number string ("10", "10.5", or None) into a sort key.
+/// Unparseable / missing numbers sort last.
+fn chapter_sort_key(number: &Option<String>) -> f64 {
+    number
+        .as_deref()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::INFINITY)
+}
+
+/// Collapse the raw per-language chapter rows into one row per chapter number,
+/// preferring an English translation, ordered ascending by number (number-less rows
+/// last). Pure so it's unit-testable without a DB.
+fn select_reader_chapters(rows: Vec<CanonicalChapter>) -> Vec<CanonicalChapter> {
+    use std::collections::HashMap;
+    // Key by number string ("" for number-less); keep the best row per key.
+    let mut best: HashMap<String, CanonicalChapter> = HashMap::new();
+    for row in rows {
+        let key = row.number.clone().unwrap_or_default();
+        let is_en = row.lang.as_deref() == Some("en");
+        match best.get(&key) {
+            Some(existing) => {
+                // Upgrade to an English translation when the current pick isn't one.
+                if is_en && existing.lang.as_deref() != Some("en") {
+                    best.insert(key, row);
+                }
+            }
+            None => {
+                best.insert(key, row);
+            }
+        }
+    }
+    let mut out: Vec<CanonicalChapter> = best.into_values().collect();
+    out.sort_by(|a, b| {
+        chapter_sort_key(&a.number)
+            .partial_cmp(&chapter_sort_key(&b.number))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.external_id.cmp(&b.external_id))
+    });
+    out
+}
+
 /// Insert or update a canonical work from a MangaDex manga (identified by its
 /// MangaDex id). Reuses the existing work if the MangaDex external id already maps
 /// to one; otherwise mints a new work. Aliases + external ids are added
@@ -193,8 +368,8 @@ pub async fn upsert_work_from_mangadex(
     sqlx::query(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
-            demographic, content_rating, is_nsfw, author, artist, cover_phash, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(id) DO UPDATE SET \
            primary_title = excluded.primary_title, primary_lang = excluded.primary_lang, \
            description = excluded.description, year = excluded.year, \
@@ -202,6 +377,7 @@ pub async fn upsert_work_from_mangadex(
            demographic = excluded.demographic, content_rating = excluded.content_rating, \
            is_nsfw = excluded.is_nsfw, author = excluded.author, artist = excluded.artist, \
            cover_phash = COALESCE(excluded.cover_phash, work.cover_phash), \
+           cover_file_name = COALESCE(excluded.cover_file_name, work.cover_file_name), \
            updated_at = excluded.updated_at",
     )
     .bind(&work_id)
@@ -217,6 +393,7 @@ pub async fn upsert_work_from_mangadex(
     .bind(&input.author)
     .bind(&input.artist)
     .bind(&input.cover_phash)
+    .bind(&input.cover_file_name)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -270,8 +447,8 @@ pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String>
     sqlx::query(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
-            demographic, content_rating, is_nsfw, author, artist, cover_phash, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&work_id)
     .bind(&input.primary_title)
@@ -286,6 +463,7 @@ pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String>
     .bind(&input.author)
     .bind(&input.artist)
     .bind(&input.cover_phash)
+    .bind(&input.cover_file_name)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -631,6 +809,83 @@ mod tests {
             Some("2026-07-12T00:00:00")
         );
         assert_eq!(get_sync_cursor(&pool, "chapters").await.unwrap(), None);
+    }
+
+    fn ch(external_id: &str, number: Option<&str>, lang: Option<&str>) -> CanonicalChapter {
+        CanonicalChapter {
+            external_id: external_id.into(),
+            number: number.map(Into::into),
+            volume: None,
+            lang: lang.map(Into::into),
+            title: None,
+            published_at: None,
+        }
+    }
+
+    #[test]
+    fn reader_chapters_dedupe_prefer_english_and_order() {
+        let rows = vec![
+            ch("es-2", Some("2"), Some("es")),
+            ch("en-1", Some("1"), Some("en")),
+            ch("es-1", Some("1"), Some("es")),
+            ch("en-10", Some("10"), Some("en")),
+            ch("en-2", Some("2"), Some("en")),
+            ch("oneshot", None, Some("en")),
+        ];
+        let out = select_reader_chapters(rows);
+        // One row per number, ascending numerically (10 after 2, not lexically), the
+        // number-less oneshot last.
+        let ids: Vec<&str> = out.iter().map(|c| c.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["en-1", "en-2", "en-10", "oneshot"]);
+        // Number 1 resolved to the English row even though a Spanish one was seen first.
+        assert_eq!(out[0].lang.as_deref(), Some("en"));
+    }
+
+    #[tokio::test]
+    async fn canonical_work_and_chapters_round_trip() {
+        let pool = pool().await;
+        let w = upsert_work_from_mangadex(
+            &pool,
+            "md-uuid-1",
+            &WorkInput {
+                cover_file_name: Some("cover.jpg".into()),
+                ..slime_input()
+            },
+        )
+        .await
+        .unwrap();
+        let cw = load_canonical_work(&pool, &w).await.unwrap().unwrap();
+        assert_eq!(cw.mangadex_id.as_deref(), Some("md-uuid-1"));
+        assert_eq!(cw.cover_file_name.as_deref(), Some("cover.jpg"));
+        assert!(cw.alt_titles.iter().any(|t| t.contains("Slime")));
+
+        let ssid = find_source_series_id(&pool, "mangadex", "mangadex", "md-uuid-1")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, num, lang) in [("c2", "2", "en"), ("c1", "1", "en"), ("c1es", "1", "es")] {
+            upsert_chapter(
+                &pool,
+                &ssid,
+                &ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some(lang.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let chs = load_canonical_chapters(&pool, &w).await.unwrap();
+        let ids: Vec<&str> = chs.iter().map(|c| c.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "c2"], "deduped by number, ordered");
+        // NSFW-owner lookup resolves through the chapter uuid.
+        assert_eq!(
+            chapter_owner_is_nsfw(&pool, "c1").await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(chapter_owner_is_nsfw(&pool, "nope").await.unwrap(), None);
     }
 
     #[tokio::test]

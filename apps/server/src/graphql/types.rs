@@ -140,10 +140,13 @@ pub struct Review {
     pub updated_at: String,
 }
 
+/// A comment on a polymorphic target: a chapter thread (`target_type = "chapter"`)
+/// or a series discussion (`target_type = "series"`).
 #[derive(SimpleObject, Clone)]
-pub struct ChapterComment {
+pub struct Comment {
     pub id: ID,
-    pub chapter_id: ID,
+    pub target_type: String,
+    pub target_id: ID,
     pub author: UserRef,
     pub body: String,
     pub has_spoiler: bool,
@@ -217,7 +220,7 @@ pub struct ReviewPage {
 
 #[derive(SimpleObject, Clone)]
 pub struct CommentPage {
-    pub items: Vec<ChapterComment>,
+    pub items: Vec<Comment>,
     pub page: i32,
     pub has_next_page: bool,
     pub total: Option<i32>,
@@ -233,7 +236,9 @@ pub struct PostReviewInput {
 
 #[derive(InputObject)]
 pub struct PostCommentInput {
-    pub chapter_id: ID,
+    /// `"chapter"` or `"series"`.
+    pub target_type: String,
+    pub target_id: ID,
     pub body: String,
     pub has_spoiler: bool,
 }
