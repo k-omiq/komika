@@ -588,15 +588,17 @@ pub struct MatchResult {
 
 /// One row of the canonical updates feed: a mirrored MangaDex work with its most
 /// recent stored chapter (CATALOGUE.md §6). Served from the `chapter` mirror, not a
-/// live Suwayomi round-trip. `mangadex_id` identifies the source work (covers/reading
-/// resolve through MangaDex separately — the reader's Suwayomi-keyed navigation does
-/// not yet open canonical works, so this is a data feed).
+/// live Suwayomi round-trip. `work_id` opens the work through the canonical reader
+/// path (`canonicalSeries`); `cover_url` is a proxy-ready MangaDex cover thumbnail.
 #[derive(SimpleObject, sqlx::FromRow)]
 pub struct CanonicalUpdate {
     pub work_id: String,
     pub mangadex_id: String,
     pub title: Option<String>,
     pub is_nsfw: bool,
+    /// Proxy-ready cover thumbnail URL (`uploads.mangadex.org`), or null if the cover
+    /// fileName hasn't been synced yet. The client resolves it through the Worker.
+    pub cover_url: Option<String>,
     /// Latest stored chapter number (string — chapters can be "10.5").
     pub latest_chapter: Option<String>,
     pub latest_chapter_title: Option<String>,
@@ -745,6 +747,10 @@ impl QueryRoot {
         let rows = sqlx::query_as::<_, CanonicalUpdate>(
             "SELECT ss.work_id AS work_id, ss.source_key AS mangadex_id, \
                     w.primary_title AS title, w.is_nsfw AS is_nsfw, \
+                    CASE WHEN w.cover_file_name IS NOT NULL \
+                         THEN 'https://uploads.mangadex.org/covers/' || ss.source_key || '/' \
+                              || w.cover_file_name || '.512.jpg' \
+                         ELSE NULL END AS cover_url, \
                     c.number AS latest_chapter, c.title AS latest_chapter_title, \
                     MAX(COALESCE(c.published_at, c.created_at)) AS latest_at \
              FROM chapter c \

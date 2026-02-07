@@ -25,6 +25,12 @@ type Query {
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
 	canonicalUpdates(page: Int = 1): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed)
+	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
+	# id (distinct from numeric Suwayomi ids), so the reader routes it here. Returns the
+	# shared Series/Chapter/Page shapes; NSFW-gated by the viewer's preference. CATALOGUE.md §6.
+	canonicalSeries(workId: ID!): Series! # [komika] a MangaDex-mirrored work as a Series
+	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
+	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
@@ -280,13 +286,14 @@ type MatchResult {
 }
 
 # [komika] One row of the canonical updates feed (CATALOGUE.md §6): a mirrored
-# MangaDex work + its latest stored chapter, served from the `chapter` mirror. A data
-# feed — the reader's Suwayomi-keyed navigation cannot yet OPEN a canonical work.
+# MangaDex work + its latest stored chapter, served from the `chapter` mirror. Open
+# it via canonicalSeries(workId) — `workId` is the `w_`-prefixed canonical reader id.
 type CanonicalUpdate {
 	workId: String!
 	mangadexId: String!
 	title: String
 	isNsfw: Boolean!
+	coverUrl: String # proxy-ready MangaDex cover thumbnail (null until the cover is synced)
 	latestChapter: String # latest stored chapter number (string; e.g. "10.5")
 	latestChapterTitle: String
 	latestAt: String # publish time of the latest chapter (falls back to ingest time)

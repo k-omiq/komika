@@ -13,8 +13,12 @@ compatibility_date = "2024-11-06"
 # Prevents the Worker from being used as an open proxy. Leave empty ("") to
 # allow ANY http(s) host (convenient for local dev; NOT recommended in prod).
 # Hostnames match exactly or as a suffix ("example.com" also allows
-# "cdn.example.com"). Example value:
-#   "uploads.mangadex.org,mangakakalot.com,cdn.komika.app"
+# "cdn.example.com"). MangaDex needs BOTH the cover host and the dynamic
+# MangaDex@Home page hosts: covers are served from `uploads.mangadex.org`, and
+# read-time pages from `*.mangadex.network` nodes (e.g.
+# `cmdxd98sb0x3yprd.mangadex.network`) — the `mangadex.network` suffix entry
+# covers every node. Example value:
+#   "uploads.mangadex.org,mangadex.network,mangakakalot.com,cdn.komika.app"
 ALLOWED_SOURCE_HOSTS = ""
 
 # Comma-separated allowlist of browser Origin/Referer values permitted to

@@ -203,6 +203,20 @@ export class GraphQLBackend implements Backend {
 		});
 		return d.canonicalUpdates;
 	}
+
+	// --- canonical reader path ---
+	async canonicalSeries(workId: Id): Promise<Series> {
+		const d = await this.gql<{ canonicalSeries: Series }>(ops.CANONICAL_SERIES, { workId });
+		return d.canonicalSeries;
+	}
+	async canonicalChapters(workId: Id): Promise<Chapter[]> {
+		const d = await this.gql<{ canonicalChapters: Chapter[] }>(ops.CANONICAL_CHAPTERS, { workId });
+		return d.canonicalChapters;
+	}
+	async canonicalPages(chapterId: Id): Promise<Page[]> {
+		const d = await this.gql<{ canonicalPages: Page[] }>(ops.CANONICAL_PAGES, { chapterId });
+		return d.canonicalPages;
+	}
 }
 
 export function createBackend(config: BackendConfig): Backend {

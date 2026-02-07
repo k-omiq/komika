@@ -64,10 +64,22 @@ export interface Backend {
 
 	// --- canonical catalogue (MangaDex mirror) ---
 	/** Recently-updated mirrored MangaDex works + their latest stored chapter, newest
-	 * first, NSFW-filtered by the viewer's preference (CATALOGUE.md §6). A data feed:
-	 * these are NOT reader-openable (see {@link CanonicalUpdate}). Optional: only the
+	 * first, NSFW-filtered by the viewer's preference (CATALOGUE.md §6). A data feed;
+	 * open one via {@link canonicalSeries} using its `workId`. Optional: only the
 	 * unified Komika API implements it. */
 	canonicalUpdates?(page?: number): Promise<CanonicalUpdate[]>;
+	/** A MangaDex-mirrored canonical `work` as a {@link Series}, for reader browse/read
+	 * (CATALOGUE.md §6). `workId` is the `w_`-prefixed canonical id. NSFW-gated by the
+	 * viewer's preference. Optional: only the unified Komika API implements it. */
+	canonicalSeries?(workId: Id): Promise<Series>;
+	/** Chapters of a canonical work from the stored mirror, deduped to one row per
+	 * number (English preferred) and ordered ascending. Each `Chapter.id` is the
+	 * MangaDex chapter uuid to pass to {@link canonicalPages}. Optional. */
+	canonicalChapters?(workId: Id): Promise<Chapter[]>;
+	/** Ordered page images for a mirrored MangaDex chapter via MangaDex@Home;
+	 * `chapterId` is the MangaDex chapter uuid. URLs are resolved through the Worker
+	 * proxy by the ImageProvider (never hotlinked). Optional. */
+	canonicalPages?(chapterId: Id): Promise<Page[]>;
 
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;

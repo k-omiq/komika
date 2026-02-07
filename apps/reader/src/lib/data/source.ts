@@ -7,13 +7,29 @@
  * `mock.ts`, so the app is always renderable. This is the single seam to swap as
  * the backend fills in: screens never import `mock.ts` directly.
  */
-import type { Chapter, ComicType as DomainComicType, Series, SeriesStatus } from '@komika/types';
+import type {
+	CanonicalUpdate,
+	Chapter,
+	ComicType as DomainComicType,
+	Series,
+	SeriesStatus,
+} from '@komika/types';
 import { backend, images } from '$lib/context';
 import { config } from '$lib/config';
 import * as mock from './mock';
 import type { Card, CatalogEntry, ComicType, Status } from './mock';
 
 const LIVE = config.backendEnabled;
+
+/**
+ * Whether a series id addresses a canonical (MangaDex-mirrored) `work` rather than a
+ * numeric Suwayomi series. Canonical work ids carry a `w_` prefix (CATALOGUE.md §6),
+ * so the reader routes them to the `canonical*` backend methods; Suwayomi ids are
+ * numeric and stay on the untouched Suwayomi path.
+ */
+function isCanonicalId(id: string): boolean {
+	return id.startsWith('w_');
+}
 
 /** Run a live mapping, falling back to mock on any failure. */
 async function live<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
@@ -61,6 +77,19 @@ function toCard(s: Series): Card {
 		rating: s.rating.average.toFixed(1),
 		cover: s.coverUrl,
 		id: s.id,
+	};
+}
+
+/** A canonical-updates row → home/updates Card, linking by its `w_` workId so the
+ *  card opens the MangaDex-mirrored work through the canonical reader path. */
+function toCanonicalCard(u: CanonicalUpdate): Card {
+	return {
+		title: u.title ?? 'Untitled',
+		ch: u.latestChapter ? `Ch. ${u.latestChapter}` : '',
+		time: relTime(u.latestAt),
+		rating: '',
+		cover: u.coverUrl ?? '',
+		id: u.workId,
 	};
 }
 
@@ -194,13 +223,22 @@ export function getUpdates() {
 		// chapters, newest-first). "Trending"/"Hot" reuse the discovery Trending
 		// feed. Empty (no detections yet) renders the page's empty state rather than
 		// silently substituting mock — mock is only the off/error fallback.
-		const [feeds, updates] = await Promise.all([backend.discovery(), backend.updates()]);
+		const [feeds, updates, canonical] = await Promise.all([
+			backend.discovery(),
+			backend.updates(),
+			// Canonical (MangaDex-mirrored) updates — openable via their `w_` workId
+			// through the canonical reader path. Optional method; empty on failure/off.
+			backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
+				Promise.resolve([] as CanonicalUpdate[]),
+		]);
 		const byKind = (k: string) => feeds.find((f) => f.kind === k)?.items ?? [];
 		const trending = byKind('TRENDING').map(toCard);
 		const recent = updates.items.map(toCard);
+		const canonicalCards = canonical.map(toCanonicalCard);
 		return {
 			trendingGroups: trending.length ? [{ label: 'Trending Today', items: trending }] : [],
-			newUpdates: recent,
+			// Scanner detections first, then the MangaDex mirror's freshest works.
+			newUpdates: [...recent, ...canonicalCards],
 			hotUpdates: trending,
 		};
 	}, fallback);
@@ -392,6 +430,15 @@ function mapSeriesView(s: Series, chs: Chapter[], pool: Series[]): SeriesView {
 
 export function getSeries(id: string): Promise<SeriesView> {
 	return live(async () => {
+		// Canonical (MangaDex-mirrored) works resolve through the canonical path; there
+		// is no genre-related pool for them yet, so related is empty.
+		if (isCanonicalId(id) && backend.canonicalSeries && backend.canonicalChapters) {
+			const [s, chs] = await Promise.all([
+				backend.canonicalSeries(id),
+				backend.canonicalChapters(id),
+			]);
+			return mapSeriesView(s, chs, []);
+		}
 		// Fetch a candidate pool (Popular) alongside the series to seed related-by-
 		// genre. A pool failure just yields no related — it never fails the page.
 		const [s, chs, pool] = await Promise.all([
@@ -429,6 +476,9 @@ export async function saveProgress(
 	read: boolean,
 ): Promise<void> {
 	if (!LIVE || !chapterId) return;
+	// Canonical (MangaDex-mirrored) chapters are addressed by a MangaDex uuid and have
+	// no Suwayomi-side progress store yet — skip rather than round-trip a doomed call.
+	if (!/^\d+$/.test(chapterId)) return;
 	try {
 		await backend.setProgress(chapterId, lastPageRead, read);
 	} catch (err) {
@@ -487,16 +537,24 @@ function readerFallback(seriesId: string): ReaderView {
 }
 
 export function getReaderChapter(seriesId: string, chParam?: string | null): Promise<ReaderView> {
+	const canonical =
+		isCanonicalId(seriesId) && !!backend.canonicalChapters && !!backend.canonicalPages;
 	return live(async () => {
-		const chs = await backend.chapters(seriesId);
+		const chs = canonical
+			? await backend.canonicalChapters!(seriesId)
+			: await backend.chapters(seriesId);
 		if (!chs.length) return readerFallback(seriesId);
 		const asc = [...chs].sort((a, b) => a.number - b.number);
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
 		if (!target) target = asc.find((c) => !c.read) ?? asc[0];
-		const domainPages = await backend.pages(target.id);
+		const domainPages = canonical
+			? await backend.canonicalPages!(target.id)
+			: await backend.pages(target.id);
 		const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
 		const idx = asc.findIndex((c) => c.id === target.id);
-		const series = await backend.series(seriesId).catch(() => null);
+		const series = await (
+			canonical ? backend.canonicalSeries!(seriesId) : backend.series(seriesId)
+		).catch(() => null);
 		return {
 			seriesId,
 			seriesTitle: series?.title ?? 'Reader',

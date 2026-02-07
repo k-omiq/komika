@@ -181,6 +181,8 @@ pub struct CanonicalWork {
     pub mangadex_id: Option<String>,
     pub primary_title: Option<String>,
     pub description: Option<String>,
+    /// Carried for completeness/future surfacing; not in the `Series` shape yet.
+    #[allow(dead_code)]
     pub year: Option<i64>,
     pub original_language: Option<String>,
     pub status: Option<String>,
@@ -200,6 +202,8 @@ pub struct CanonicalWork {
 pub struct CanonicalChapter {
     pub external_id: String,
     pub number: Option<String>,
+    /// Selected by the mirror query and carried for completeness; not surfaced yet.
+    #[allow(dead_code)]
     pub volume: Option<String>,
     pub lang: Option<String>,
     pub title: Option<String>,
