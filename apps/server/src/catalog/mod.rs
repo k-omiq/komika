@@ -271,11 +271,11 @@ pub async fn load_canonical_work(pool: &SqlitePool, work_id: &str) -> Result<Opt
     }))
 }
 
-/// Load the reader-facing chapter list for a canonical work: the mirrored chapters of
-/// its MangaDex source_series, deduped to one row per chapter number (preferring an
-/// English translation) and ordered ascending by number. MangaDex's firehose stores
-/// every language/scanlator, so the raw list has many rows per number — `select_reader_chapters`
-/// collapses that into a clean reading order.
+/// Load the reader-facing chapter list for a canonical work: the mirrored **English**
+/// chapters of its MangaDex source_series, deduped to one row per chapter number and
+/// ordered ascending by number. Komika serves only English chapters, so non-English
+/// rows are excluded here (belt-and-suspenders alongside the English-only sync); a
+/// number with several English scanlations is collapsed by `select_reader_chapters`.
 pub async fn load_canonical_chapters(
     pool: &SqlitePool,
     work_id: &str,
@@ -283,7 +283,7 @@ pub async fn load_canonical_chapters(
     let rows = sqlx::query_as::<_, CanonicalChapter>(
         "SELECT c.external_id, c.number, c.volume, c.lang, c.title, c.published_at \
          FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-         WHERE ss.work_id = ? AND ss.source_type = 'mangadex'",
+         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -867,7 +867,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for (ext, num, lang) in [("c2", "2", "en"), ("c1", "1", "en"), ("c1es", "1", "es")] {
+        for (ext, num, lang) in [
+            ("c2", "2", "en"),
+            ("c1", "1", "en"),
+            ("c1es", "1", "es"), // duplicate number in another language → excluded
+            ("c3es", "3", "es"), // English-absent number → excluded entirely
+        ] {
             upsert_chapter(
                 &pool,
                 &ssid,
@@ -883,7 +888,8 @@ mod tests {
         }
         let chs = load_canonical_chapters(&pool, &w).await.unwrap();
         let ids: Vec<&str> = chs.iter().map(|c| c.external_id.as_str()).collect();
-        assert_eq!(ids, vec!["c1", "c2"], "deduped by number, ordered");
+        // English-only: the Spanish rows (including the English-absent "3") are dropped.
+        assert_eq!(ids, vec!["c1", "c2"], "English-only, deduped by number, ordered");
         // NSFW-owner lookup resolves through the chapter uuid.
         assert_eq!(
             chapter_owner_is_nsfw(&pool, "c1").await.unwrap(),

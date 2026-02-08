@@ -175,6 +175,9 @@ impl MangaDexClient {
             ("offset".into(), offset.to_string()),
             (window.order_key().into(), "asc".into()),
             ("includes[]".into(), "manga".into()),
+            // English-only: Komika serves only English chapters, so filter the firehose
+            // at the source (smaller pages, no non-English rows to mirror).
+            ("translatedLanguage[]".into(), "en".into()),
         ];
         if let Some(since) = since {
             params.push((window.since_param().into(), since.to_string()));
@@ -595,6 +598,11 @@ pub async fn sync_chapters(
             for c in &chapters {
                 if let Some(ts) = chapter_window_ts(c, window) {
                     last_created = Some(ts);
+                }
+                // English-only mirror: the firehose is already filtered to `en`, but
+                // guard defensively so a stray non-English row is never stored.
+                if c.attributes.translated_language.as_deref() != Some("en") {
+                    continue;
                 }
                 let Some(manga_id) = chapter_manga_id(c) else {
                     continue;

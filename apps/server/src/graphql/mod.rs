@@ -756,7 +756,7 @@ impl QueryRoot {
              FROM chapter c \
              JOIN source_series ss ON ss.id = c.source_series_id \
              JOIN work w ON w.id = ss.work_id \
-             WHERE ss.source_type = 'mangadex' AND (? = 1 OR w.is_nsfw = 0) \
+             WHERE ss.source_type = 'mangadex' AND c.lang = 'en' AND (? = 1 OR w.is_nsfw = 0) \
              GROUP BY ss.work_id \
              ORDER BY latest_at DESC \
              LIMIT ? OFFSET ?",
@@ -1866,6 +1866,7 @@ mod tests {
             &crate::catalog::ChapterInput {
                 external_id: format!("{md_id}-{ch}"),
                 number: Some(ch.to_string()),
+                lang: Some("en".into()),
                 published_at: Some(format!("2026-07-0{ch}T00:00:00Z")),
                 ..Default::default()
             },
@@ -1938,14 +1939,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for (ext, num) in [("md-ch-2", "2"), ("md-ch-1", "1")] {
+        for (ext, num, lang) in [
+            ("md-ch-2", "2", "en"),
+            ("md-ch-1", "1", "en"),
+            ("md-ch-3-es", "3", "es"), // non-English → must never surface
+        ] {
             crate::catalog::upsert_chapter(
                 &pool,
                 &ssid,
                 &crate::catalog::ChapterInput {
                     external_id: ext.into(),
                     number: Some(num.into()),
-                    lang: Some("en".into()),
+                    lang: Some(lang.into()),
                     ..Default::default()
                 },
             )
