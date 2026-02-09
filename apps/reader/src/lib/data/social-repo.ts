@@ -18,7 +18,7 @@
  *  - Likes/replies aren't modelled server-side; in live mode they're ephemeral
  *    client-only affordances (reset on reload).
  */
-import type { ChapterComment, Review } from '@komika/types';
+import type { Comment, CommentTargetType, Review } from '@komika/types';
 import { backend } from '$lib/context';
 import { config } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
@@ -117,7 +117,7 @@ function reviewToView(r: Review): ReviewView {
 	};
 }
 
-function commentToView(c: ChapterComment): CommentView {
+function commentToView(c: Comment): CommentView {
 	const av = avatarFor(c.author.id);
 	return {
 		id: c.id,
@@ -237,16 +237,27 @@ export async function submitSeriesReview(
 	return next;
 }
 
-// ---- reader: per-chapter comments ------------------------------------------
+// ---- comments: per-chapter threads AND series-level discussion --------------
+//
+// One generalized pipeline serves both (mirrors the backend's polymorphic comment
+// target). `LocalBucket` keeps the offline fallback for the two kinds in separate
+// localStorage slots so a series discussion never collides with its reviews.
 
-export async function loadChapterComments(chapterId: string, key: string): Promise<CommentView[]> {
+type LocalBucket = 'chapter' | 'seriesThread';
+
+async function loadComments(
+	targetType: CommentTargetType,
+	targetId: string,
+	bucket: LocalBucket,
+	key: string,
+): Promise<CommentView[]> {
 	if (socialLive()) {
-		const { items } = await backend.comments(chapterId);
-		// Server returns oldest→newest; the reader shows newest first.
+		const { items } = await backend.comments(targetType, targetId);
+		// Server returns oldest→newest; the UI shows newest first.
 		return items.map(commentToView).reverse();
 	}
 	// No seeded thread — honest empty state; offline user comments persist locally.
-	const seeded = local.getComments('chapter', key, [] as ReaderComment[]);
+	const seeded = local.getComments(bucket, key, [] as ReaderComment[]);
 	return seeded.map((c) => ({
 		id: c.id,
 		authorId: '',
@@ -264,8 +275,10 @@ export async function loadChapterComments(chapterId: string, key: string): Promi
 	}));
 }
 
-export async function submitChapterComment(
-	chapterId: string,
+async function submitComment(
+	targetType: CommentTargetType,
+	targetId: string,
+	bucket: LocalBucket,
 	key: string,
 	body: string,
 	hasSpoiler: boolean,
@@ -275,7 +288,7 @@ export async function submitChapterComment(
 		// Defense-in-depth: don't post a comment unauthenticated even if the UI
 		// gate is bypassed.
 		if (!auth.user) throw new Error('You must be signed in to comment.');
-		const c = await backend.postComment({ chapterId, body, hasSpoiler });
+		const c = await backend.postComment({ targetType, targetId, body, hasSpoiler });
 		return [commentToView(c), ...currentComments];
 	}
 	const me = auth.user?.username ?? 'You';
@@ -298,7 +311,7 @@ export async function submitChapterComment(
 		...currentComments,
 	];
 	local.saveComments(
-		'chapter',
+		bucket,
 		key,
 		next.map((c) => ({
 			id: c.id,
@@ -316,6 +329,34 @@ export async function submitChapterComment(
 		})),
 	);
 	return next;
+}
+
+// Per-chapter thread (reader page).
+export function loadChapterComments(chapterId: string, key: string): Promise<CommentView[]> {
+	return loadComments('chapter', chapterId, 'chapter', key);
+}
+export function submitChapterComment(
+	chapterId: string,
+	key: string,
+	body: string,
+	hasSpoiler: boolean,
+	currentComments: CommentView[],
+): Promise<CommentView[]> {
+	return submitComment('chapter', chapterId, 'chapter', key, body, hasSpoiler, currentComments);
+}
+
+// Series-level discussion (comic detail page) — distinct from Reviews.
+export function loadSeriesComments(seriesId: string, key: string): Promise<CommentView[]> {
+	return loadComments('series', seriesId, 'seriesThread', key);
+}
+export function submitSeriesComment(
+	seriesId: string,
+	key: string,
+	body: string,
+	hasSpoiler: boolean,
+	currentComments: CommentView[],
+): Promise<CommentView[]> {
+	return submitComment('series', seriesId, 'seriesThread', key, body, hasSpoiler, currentComments);
 }
 
 // ---- admin moderation ------------------------------------------------------

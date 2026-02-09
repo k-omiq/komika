@@ -2,7 +2,8 @@ import type {
 	AdminUser,
 	CanonicalUpdate,
 	Chapter,
-	ChapterComment,
+	Comment,
+	CommentTargetType,
 	DiscoveryFeed,
 	Id,
 	MergeCandidate,
@@ -84,8 +85,9 @@ export interface Backend {
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;
 	postReview(input: PostReviewInput): Promise<Review>;
-	comments(chapterId: Id, page?: number): Promise<Paginated<ChapterComment>>;
-	postComment(input: PostCommentInput): Promise<ChapterComment>;
+	/** Comments on a chapter thread or a series-level discussion (polymorphic target). */
+	comments(targetType: CommentTargetType, targetId: Id, page?: number): Promise<Paginated<Comment>>;
+	postComment(input: PostCommentInput): Promise<Comment>;
 
 	// --- admin "manga DB" (requires an admin session) ---
 	/** Upsert per-series admin overrides (scan cadence, pause, status). Optional:
@@ -151,7 +153,8 @@ export interface PostReviewInput {
 }
 
 export interface PostCommentInput {
-	chapterId: Id;
+	targetType: CommentTargetType;
+	targetId: Id;
 	body: string;
 	hasSpoiler: boolean;
 }

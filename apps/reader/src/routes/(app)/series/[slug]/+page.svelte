@@ -6,6 +6,7 @@
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 	import Cover from '$lib/components/Cover.svelte';
+	import CommentThread from '$lib/components/CommentThread.svelte';
 	import { FLAG } from '$lib/data/mock';
 	import { setLibraryMark } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
@@ -399,9 +400,33 @@
 	</div>
 </div>
 
+<!-- discussion (series-level comments; distinct from Reviews above) -->
+<div class="discussion k-gutter">
+	<h2 class="discussion-title">Discussion</h2>
+	{#if seriesId}
+		<CommentThread
+			targetType="series"
+			targetId={seriesId}
+			storageKey={socialKey}
+			prompt="Share your thoughts on this series…"
+		/>
+	{/if}
+</div>
+
 <Footer />
 
 <style>
+	.discussion {
+		margin-top: 40px;
+		padding-bottom: 8px;
+	}
+	.discussion-title {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 22px;
+		color: var(--k-text-bright);
+		margin: 0 0 20px;
+	}
 	.backdrop {
 		position: relative;
 		height: 380px;

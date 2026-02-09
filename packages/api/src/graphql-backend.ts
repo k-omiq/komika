@@ -2,7 +2,8 @@ import type {
 	AdminUser,
 	CanonicalUpdate,
 	Chapter,
-	ChapterComment,
+	Comment,
+	CommentTargetType,
 	DiscoveryFeed,
 	Id,
 	MergeCandidate,
@@ -126,15 +127,20 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ postReview: Review }>(ops.POST_REVIEW, { input });
 		return d.postReview;
 	}
-	async comments(chapterId: Id, page = 1): Promise<Paginated<ChapterComment>> {
-		const d = await this.gql<{ comments: Paginated<ChapterComment> }>(ops.COMMENTS, {
-			chapterId,
+	async comments(
+		targetType: CommentTargetType,
+		targetId: Id,
+		page = 1,
+	): Promise<Paginated<Comment>> {
+		const d = await this.gql<{ comments: Paginated<Comment> }>(ops.COMMENTS, {
+			targetType,
+			targetId,
 			page,
 		});
 		return d.comments;
 	}
-	async postComment(input: PostCommentInput): Promise<ChapterComment> {
-		const d = await this.gql<{ postComment: ChapterComment }>(ops.POST_COMMENT, { input });
+	async postComment(input: PostCommentInput): Promise<Comment> {
+		const d = await this.gql<{ postComment: Comment }>(ops.POST_COMMENT, { input });
 		return d.postComment;
 	}
 

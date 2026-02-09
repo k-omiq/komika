@@ -211,11 +211,12 @@ export const POST_REVIEW = /* GraphQL */ `
 
 export const COMMENTS = /* GraphQL */ `
 	${USER_REF}
-	query Comments($chapterId: ID!, $page: Int) {
-		comments(chapterId: $chapterId, page: $page) {
+	query Comments($targetType: String!, $targetId: ID!, $page: Int) {
+		comments(targetType: $targetType, targetId: $targetId, page: $page) {
 			items {
 				id
-				chapterId
+				targetType
+				targetId
 				author {
 					...UserRefFields
 				}
@@ -235,7 +236,8 @@ export const POST_COMMENT = /* GraphQL */ `
 	mutation PostComment($input: PostCommentInput!) {
 		postComment(input: $input) {
 			id
-			chapterId
+			targetType
+			targetId
 			author {
 				...UserRefFields
 			}

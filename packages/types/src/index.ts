@@ -189,10 +189,18 @@ export interface Review {
 	updatedAt: string;
 }
 
-/** Per-chapter comment thread entry. */
-export interface ChapterComment {
+/** Comment target: a chapter thread or a series-level discussion. */
+export type CommentTargetType = 'chapter' | 'series';
+
+/**
+ * A comment on a polymorphic target — a per-chapter thread (`targetType: 'chapter'`)
+ * or a series-level discussion (`targetType: 'series'`). Distinct from a Review, which
+ * is a scored, one-per-user verdict.
+ */
+export interface Comment {
 	id: Id;
-	chapterId: Id;
+	targetType: CommentTargetType;
+	targetId: Id;
 	author: UserRef;
 	body: string;
 	hasSpoiler: boolean;
