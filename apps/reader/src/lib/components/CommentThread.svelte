@@ -24,12 +24,7 @@
 		/** Composer placeholder + sign-in prompt context. */
 		prompt?: string;
 	}
-	let {
-		targetType,
-		targetId,
-		storageKey,
-		prompt = 'Share your thoughts…',
-	}: Props = $props();
+	let { targetType, targetId, storageKey, prompt = 'Share your thoughts…' }: Props = $props();
 
 	let comments = $state<CommentView[]>([]);
 	let commentSort = $state<'top' | 'newest'>('newest');

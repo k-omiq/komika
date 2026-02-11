@@ -57,7 +57,9 @@
 		<div class="pager">
 			<button class="pg" disabled={loading || page === 1} onclick={() => go(-1)}>Prev</button>
 			<span class="page-num">Page {page}</span>
-			<button class="pg" disabled={loading || updates.length === 0} onclick={() => go(1)}>Next</button>
+			<button class="pg" disabled={loading || updates.length === 0} onclick={() => go(1)}
+				>Next</button
+			>
 		</div>
 	</div>
 

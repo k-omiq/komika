@@ -539,7 +539,9 @@
 		padding: 0;
 		cursor: pointer;
 		position: relative;
-		transition: background 0.15s, border-color 0.15s;
+		transition:
+			background 0.15s,
+			border-color 0.15s;
 	}
 	.switch:disabled {
 		opacity: 0.6;

@@ -123,7 +123,7 @@ pub async fn candidate_work_ids_by_token(
     if token.len() < 2 {
         return Ok(Vec::new());
     }
-    let pattern = format!("%{}%", token.replace('%', "").replace('_', ""));
+    let pattern = format!("%{}%", token.replace(['%', '_'], ""));
     let ids = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT work_id FROM work_alias WHERE normalized_title LIKE ? LIMIT ?",
     )
@@ -212,7 +212,10 @@ pub struct CanonicalChapter {
 
 /// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
 /// the reader's canonical series path. `None` if the work id is unknown.
-pub async fn load_canonical_work(pool: &SqlitePool, work_id: &str) -> Result<Option<CanonicalWork>> {
+pub async fn load_canonical_work(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> Result<Option<CanonicalWork>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         primary_title: Option<String>,
@@ -889,7 +892,11 @@ mod tests {
         let chs = load_canonical_chapters(&pool, &w).await.unwrap();
         let ids: Vec<&str> = chs.iter().map(|c| c.external_id.as_str()).collect();
         // English-only: the Spanish rows (including the English-absent "3") are dropped.
-        assert_eq!(ids, vec!["c1", "c2"], "English-only, deduped by number, ordered");
+        assert_eq!(
+            ids,
+            vec!["c1", "c2"],
+            "English-only, deduped by number, ordered"
+        );
         // NSFW-owner lookup resolves through the chapter uuid.
         assert_eq!(
             chapter_owner_is_nsfw(&pool, "c1").await.unwrap(),
