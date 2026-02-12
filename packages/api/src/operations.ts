@@ -22,7 +22,7 @@ const SERIES_FIELDS = /* GraphQL */ `
 		sourceId
 		chapterCount
 		isMarked
-		isCached
+		isNsfw
 		rating {
 			average
 			count
@@ -79,6 +79,20 @@ export const DISCOVERY = /* GraphQL */ `
 			items {
 				...SeriesFields
 			}
+		}
+	}
+`;
+
+export const UPDATES = /* GraphQL */ `
+	${SERIES_FIELDS}
+	query Updates($page: Int) {
+		updates(page: $page) {
+			items {
+				...SeriesFields
+			}
+			page
+			hasNextPage
+			total
 		}
 	}
 `;
@@ -197,11 +211,12 @@ export const POST_REVIEW = /* GraphQL */ `
 
 export const COMMENTS = /* GraphQL */ `
 	${USER_REF}
-	query Comments($chapterId: ID!, $page: Int) {
-		comments(chapterId: $chapterId, page: $page) {
+	query Comments($targetType: String!, $targetId: ID!, $page: Int) {
+		comments(targetType: $targetType, targetId: $targetId, page: $page) {
 			items {
 				id
-				chapterId
+				targetType
+				targetId
 				author {
 					...UserRefFields
 				}
@@ -221,7 +236,8 @@ export const POST_COMMENT = /* GraphQL */ `
 	mutation PostComment($input: PostCommentInput!) {
 		postComment(input: $input) {
 			id
-			chapterId
+			targetType
+			targetId
 			author {
 				...UserRefFields
 			}
@@ -242,6 +258,7 @@ const SESSION_FIELDS = /* GraphQL */ `
 			username
 			avatarUrl
 			isAdmin
+			showNsfw
 		}
 	}
 `;
@@ -356,6 +373,80 @@ export const SET_USER_ADMIN = /* GraphQL */ `
 	mutation SetUserAdmin($userId: ID!, $isAdmin: Boolean!) {
 		setUserAdmin(userId: $userId, isAdmin: $isAdmin) {
 			...AdminUserFields
+		}
+	}
+`;
+
+export const MERGE_QUEUE = /* GraphQL */ `
+	query MergeQueue {
+		mergeQueue {
+			id
+			sourceSeriesId
+			candidateWorkId
+			candidateTitle
+			sourceTitle
+			score
+			method
+			status
+			createdAt
+		}
+	}
+`;
+
+export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
+	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
+		resolveMergeCandidate(id: $id, accept: $accept)
+	}
+`;
+
+export const SET_SHOW_NSFW = /* GraphQL */ `
+	mutation SetShowNsfw($value: Boolean!) {
+		setShowNsfw(value: $value)
+	}
+`;
+
+export const CANONICAL_UPDATES = /* GraphQL */ `
+	query CanonicalUpdates($page: Int) {
+		canonicalUpdates(page: $page) {
+			workId
+			mangadexId
+			title
+			isNsfw
+			coverUrl
+			latestChapter
+			latestChapterTitle
+			latestAt
+		}
+	}
+`;
+
+// ---- canonical reader path -------------------------------------------------
+
+export const CANONICAL_SERIES = /* GraphQL */ `
+	${SERIES_FIELDS}
+	query CanonicalSeries($workId: ID!) {
+		canonicalSeries(workId: $workId) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const CANONICAL_CHAPTERS = /* GraphQL */ `
+	${CHAPTER_FIELDS}
+	query CanonicalChapters($workId: ID!) {
+		canonicalChapters(workId: $workId) {
+			...ChapterFields
+		}
+	}
+`;
+
+export const CANONICAL_PAGES = /* GraphQL */ `
+	query CanonicalPages($chapterId: ID!) {
+		canonicalPages(chapterId: $chapterId) {
+			index
+			sourceUrl
+			width
+			height
 		}
 	}
 `;

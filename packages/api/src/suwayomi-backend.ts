@@ -1,6 +1,7 @@
 import type {
 	Chapter,
-	ChapterComment,
+	Comment,
+	CommentTargetType,
 	DiscoveryFeed,
 	Id,
 	Page,
@@ -309,7 +310,7 @@ export class SuwayomiBackend implements Backend {
 			sourceId: String(m.sourceId),
 			chapterCount: m.chapters?.totalCount ?? 0,
 			isMarked: m.inLibrary,
-			isCached: false,
+			isNsfw: false, // canonical NSFW flag is a Komika service; Suwayomi has none
 			rating: { average: 0, count: 0, distribution: [] },
 			scan: {
 				avgIntervalHours: 0,
@@ -377,6 +378,13 @@ export class SuwayomiBackend implements Backend {
 			});
 		}
 		return feeds;
+	}
+
+	async updates(page = 1): Promise<Paginated<Series>> {
+		// Suwayomi has no adaptive scanner; approximate the Updates feed with the
+		// source "Latest" endpoint (newest chapters upstream).
+		const { items, hasNextPage } = await this.fetchSource('LATEST', page);
+		return { items, page, hasNextPage, total: null };
 	}
 
 	async search(query: string, page = 1): Promise<Paginated<Series>> {
@@ -456,10 +464,14 @@ export class SuwayomiBackend implements Backend {
 	async postReview(_input: PostReviewInput): Promise<Review> {
 		throw new Error('Reviews are a Komika service, not available via Suwayomi');
 	}
-	async comments(_chapterId: Id, page = 1): Promise<Paginated<ChapterComment>> {
+	async comments(
+		_targetType: CommentTargetType,
+		_targetId: Id,
+		page = 1,
+	): Promise<Paginated<Comment>> {
 		return { items: [], page, hasNextPage: false, total: 0 };
 	}
-	async postComment(_input: PostCommentInput): Promise<ChapterComment> {
+	async postComment(_input: PostCommentInput): Promise<Comment> {
 		throw new Error('Comments are a Komika service, not available via Suwayomi');
 	}
 }

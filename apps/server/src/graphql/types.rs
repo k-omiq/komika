@@ -81,7 +81,9 @@ pub struct Series {
     pub source_id: String,
     pub chapter_count: i32,
     pub is_marked: bool,
-    pub is_cached: bool,
+    /// NSFW per the canonical model (CATALOGUE.md §2); false until the series is
+    /// catalogued. Drives `show_nsfw` filtering of discovery/search/updates feeds.
+    pub is_nsfw: bool,
     pub rating: RatingSummary,
     pub scan: ScanPolicy,
     pub created_at: String,
@@ -138,10 +140,13 @@ pub struct Review {
     pub updated_at: String,
 }
 
+/// A comment on a polymorphic target: a chapter thread (`target_type = "chapter"`)
+/// or a series discussion (`target_type = "series"`).
 #[derive(SimpleObject, Clone)]
-pub struct ChapterComment {
+pub struct Comment {
     pub id: ID,
-    pub chapter_id: ID,
+    pub target_type: String,
+    pub target_id: ID,
     pub author: UserRef,
     pub body: String,
     pub has_spoiler: bool,
@@ -154,6 +159,8 @@ pub struct SessionUser {
     pub username: String,
     pub avatar_url: Option<String>,
     pub is_admin: bool,
+    /// Whether this user has opted into seeing NSFW-flagged works (CATALOGUE.md §2).
+    pub show_nsfw: bool,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -213,7 +220,7 @@ pub struct ReviewPage {
 
 #[derive(SimpleObject, Clone)]
 pub struct CommentPage {
-    pub items: Vec<ChapterComment>,
+    pub items: Vec<Comment>,
     pub page: i32,
     pub has_next_page: bool,
     pub total: Option<i32>,
@@ -229,7 +236,9 @@ pub struct PostReviewInput {
 
 #[derive(InputObject)]
 pub struct PostCommentInput {
-    pub chapter_id: ID,
+    /// `"chapter"` or `"series"`.
+    pub target_type: String,
+    pub target_id: ID,
     pub body: String,
     pub has_spoiler: bool,
 }

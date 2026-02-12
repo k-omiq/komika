@@ -7,7 +7,8 @@ Legend: `[x]` done · `[~]` in progress / partial · `[ ]` TODO.
 Deployment shape (see [`deploy/README.md`](./deploy/README.md)):
 **reader / admin** = static SPAs on an edge/CDN host · **komika-server** = one
 small always-on Rust container (SQLite on a persistent volume) · **suwayomi** =
-private container beside the server · **images** = Cloudflare Worker + B2.
+private container beside the server · **images** = Cloudflare Worker (edge-cached
+proxy; no object-storage tier).
 
 ---
 
@@ -17,7 +18,7 @@ private container beside the server · **images** = Cloudflare Worker + B2.
 - [x] Opaque session tokens via `Authorization: Bearer <token>`; server-side session→user lookup.
 - [x] Admin authorization gate (`KOMIKA_ADMIN_USERS`, `updateSeriesAdmin` admin-only mutation).
 - [~] **CORS** allow-list on the server (`CORS_ORIGINS`) — keep tight to real front-end origins in prod.
-- [~] **Security headers** — being added (nginx sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` in `deploy/nginx.conf`; CSP stubbed pending final image/API origins).
+- [x] **Security headers** — nginx sets `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and a strict **Content-Security-Policy** in `deploy/nginx.conf` (CSP origins are env-templated per deploy — `CSP_IMG_ORIGIN` / `CSP_CONNECT_ORIGIN`; verified zero violations against the built reader). Server sets the same header set + `Permissions-Policy`.
 - [ ] **TLS everywhere** — terminate at the edge (Fly/LB/Caddy); never expose server or Suwayomi over plain HTTP.
 - [ ] **WAF / rate limiting / bot mitigation** — front public origins with Cloudflare or equivalent; add login/mutation rate limits.
 - [ ] **Suwayomi not publicly exposed** — keep on the private network only (compose publishes 4567 for local debug — drop for prod).
@@ -28,18 +29,21 @@ private container beside the server · **images** = Cloudflare Worker + B2.
 ## Observability
 
 - [x] Structured logging via `tracing` + `tracing-subscriber` (env-filtered, `RUST_LOG`).
-- [x] `tower_http` request tracing enabled.
+- [x] **Optional JSON logs** for aggregators — set `LOG_FORMAT=json` (tracing-subscriber json formatter).
+- [x] `tower_http` request tracing enabled, with a **request-id** on every access-log span (`SetRequestId`/`PropagateRequestId`; echoed as `x-request-id`, honours a client-supplied one).
+- [x] **Panic resilience** — `tower_http::catch_panic` turns a panicking resolver/handler into a logged 500 instead of dropping the connection (release profile switched to `panic=unwind` so the catch actually fires).
+- [x] **Resolver-error logging** — an async-graphql extension logs every GraphQL error (which return HTTP 200) via `tracing::warn` with the request-id span, so DB/upstream failures aren't invisible.
 - [ ] Log shipping to an aggregator (platform stdout → log service).
 - [ ] Metrics endpoint (Prometheus/OTLP) — request rate, latency, error rate, Suwayomi federation health.
-- [ ] Error tracking (Sentry or similar) for server + reader.
+- [ ] Error tracking (Sentry/OpenTelemetry) — deliberately NOT a hard dependency yet (no committed DSN); wire behind an env-gated optional cargo feature when a provider is chosen. Resolver errors already log with context in the meantime.
 - [ ] Uptime/synthetic monitoring hitting `/health` and a key reader route.
 - [ ] Dashboards + alerting (SLOs on availability/latency/error rate).
 
 ## Performance
 
-- [x] Tiny server footprint — Rust release profile tuned for size (`opt-level=z`, LTO, `strip`, `panic=abort`); ~5–15 MB RSS.
+- [x] Tiny server footprint — Rust release profile tuned for size (`opt-level=z`, LTO, `strip`); ~5–15 MB RSS. (`panic=unwind` rather than `abort` so the CatchPanic layer works — a negligible size cost for real panic resilience.)
 - [x] Reader is a static SPA (`adapter-static`), CDN-cacheable; immutable-asset caching in `deploy/nginx.conf`.
-- [~] Image delivery split via Cloudflare Worker + B2 (`apps/worker`) — separate workstream.
+- [x] Image delivery via a Cloudflare Worker edge-cached proxy (`apps/worker`) — no object-storage tier; images are proxied + cached at Cloudflare's edge.
 - [ ] **Core Web Vitals budget** — Lighthouse CI job is a stub (`workflow_dispatch`); add `lighthouserc.json` + `budget.json` (LCP/CLS/INP) and enforce.
 - [ ] CDN in front of the SPA + long-cache headers verified in prod.
 - [ ] Server-side caching of hot Suwayomi federation reads (catalog/series).
@@ -50,7 +54,7 @@ private container beside the server · **images** = Cloudflare Worker + B2.
 - [x] `/health` liveness endpoint; healthchecks in `server.Dockerfile` + compose.
 - [x] DB migrations run at startup (`sqlx` migrate, `create_if_missing`).
 - [x] Container restart policy (`restart: unless-stopped`) + `depends_on: service_healthy` in compose.
-- [ ] **DB backups** — periodic snapshot of the `/data` volume (SQLite file); test restore.
+- [x] **DB backups** — continuous **Litestream** WAL replication of the `/data` SQLite DB to an S3-compatible bucket (Cloudflare R2), with restore-on-boot. Backup→wipe→restore cycle **verified** against a local MinIO stand-in (see `deploy/README.md` → "Verify backup → restore locally").
 - [ ] Deeper readiness check (verify DB + Suwayomi reachability, distinct from liveness).
 - [ ] Graceful degradation when Suwayomi is down (reader mock fallback helps the UI; server should surface a clear partial-availability state).
 
@@ -83,8 +87,9 @@ private container beside the server · **images** = Cloudflare Worker + B2.
 - [x] **Containerization** — `deploy/server.Dockerfile` (multi-stage, non-root, healthcheck), `deploy/reader.Dockerfile` (nginx SPA).
 - [x] Local stack — `deploy/docker-compose.yml` (suwayomi + server + reader, network, volumes, healthchecks).
 - [x] **DB persistence** — SQLite on a named volume (`server-data` → `/data`).
+- [x] **Native desktop app (Tauri)** — the native image path works end-to-end: the Rust `fetch_image` command is implemented + registered (`apps/reader/src-tauri/src/lib.rs`), the crate compiles, and `pnpm --filter @komika/reader tauri build` produces `Komika.app` + a signed-later `.dmg` (verified 2026-07-11 on macOS arm64). Mobile (iOS/Android) targets and code-signing/notarization remain untried.
 - [ ] Real deploy target chosen + provisioned (Fly.io / Railway / VPS) with a persistent volume at `/data`.
-- [ ] Worker + B2 image pipeline deployed (`wrangler deploy`) and wired to the reader (`PUBLIC_KOMIKA_IMG_MODE`).
+- [ ] Worker image proxy deployed (`wrangler deploy`) and wired to the reader (`PUBLIC_KOMIKA_IMG_MODE=proxy`, `PUBLIC_KOMIKA_IMG_WORKER`). The Worker needs no secrets — edge-cached proxy only.
 - [ ] IaC / reproducible provisioning (Fly `fly.toml`, Terraform, or Compose on a managed host).
 - [ ] Staging environment separate from prod.
 - [ ] Backup + disaster-recovery runbook.

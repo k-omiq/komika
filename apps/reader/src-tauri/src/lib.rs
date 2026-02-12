@@ -1,8 +1,8 @@
 /// Fetch a source image's raw bytes directly from its CDN.
 ///
 /// This is the native half of Komika's image pipeline: desktop and mobile builds
-/// scrape/fetch images themselves and never touch the Cloudflare Worker proxy or
-/// B2 (those exist for the CORS-bound web build). Returning `tauri::ipc::Response`
+/// scrape/fetch images themselves and never touch the Cloudflare Worker proxy
+/// (which exists for the CORS-bound web build). Returning `tauri::ipc::Response`
 /// sends the bytes over IPC efficiently and resolves to an `ArrayBuffer` in JS.
 #[tauri::command]
 async fn fetch_image(url: String) -> Result<tauri::ipc::Response, String> {

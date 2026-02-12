@@ -61,6 +61,48 @@ export interface AdminUser {
 	createdAt: string;
 }
 
+/**
+ * A pending mid-confidence dedup match awaiting manual admin review
+ * (CATALOGUE.md §4). The matcher couldn't confidently auto-merge the source
+ * series into `candidateWork`, so an admin confirms or rejects it.
+ */
+export interface MergeCandidate {
+	id: Id;
+	sourceSeriesId: Id;
+	candidateWorkId: Id;
+	/** Title of the canonical work the matcher proposes merging into. */
+	candidateTitle: string | null;
+	/** Current title of the source series' own (provisional) work. */
+	sourceTitle: string | null;
+	/** Confidence score in [0,1] that produced the review verdict. */
+	score: number;
+	/** Which signal produced the match (e.g. `title_corroborated`, `fuzzy`). */
+	method: string;
+	/** Lifecycle: `pending` until an admin resolves it. */
+	status: string;
+	createdAt: string;
+}
+
+/**
+ * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
+ * work with its most recent stored chapter, served from the `chapter` mirror.
+ * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through
+ * the `canonicalSeries` path.
+ */
+export interface CanonicalUpdate {
+	workId: Id;
+	mangadexId: string;
+	title: string | null;
+	isNsfw: boolean;
+	/** Proxy-ready MangaDex cover thumbnail URL; null until the cover is synced. */
+	coverUrl: string | null;
+	/** Latest stored chapter number (string — chapters can be "10.5"). */
+	latestChapter: string | null;
+	latestChapterTitle: string | null;
+	/** Publish time of the latest stored chapter (falls back to ingest time). */
+	latestAt: string | null;
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */
@@ -86,10 +128,14 @@ export interface Series {
 	sourceId: string;
 	rating: RatingSummary;
 	chapterCount: number;
-	/** True if the current user marked it (forces B2 caching + priority scanning). */
+	/** True if the current user marked it (raises scanning priority). */
 	isMarked: boolean;
-	/** True if images are served from the B2 cache rather than the Worker proxy. */
-	isCached: boolean;
+	/**
+	 * NSFW per the canonical model (CATALOGUE.md §2); false until the series is
+	 * catalogued. Discovery/search/updates already filter by the viewer's
+	 * `showNsfw` preference server-side — this lets the UI badge/flag it too.
+	 */
+	isNsfw: boolean;
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;
@@ -143,10 +189,18 @@ export interface Review {
 	updatedAt: string;
 }
 
-/** Per-chapter comment thread entry. */
-export interface ChapterComment {
+/** Comment target: a chapter thread or a series-level discussion. */
+export type CommentTargetType = 'chapter' | 'series';
+
+/**
+ * A comment on a polymorphic target — a per-chapter thread (`targetType: 'chapter'`)
+ * or a series-level discussion (`targetType: 'series'`). Distinct from a Review, which
+ * is a scored, one-per-user verdict.
+ */
+export interface Comment {
 	id: Id;
-	chapterId: Id;
+	targetType: CommentTargetType;
+	targetId: Id;
 	author: UserRef;
 	body: string;
 	hasSpoiler: boolean;

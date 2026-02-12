@@ -39,8 +39,16 @@ RUN pnpm --filter @komika/reader build
 # ---- runtime ----------------------------------------------------------------
 FROM nginx:1.27-alpine AS runtime
 
-# SPA config: history-fallback to index.html, cache immutable hashed assets.
-COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+# SPA config: history-fallback to index.html, cache immutable hashed assets, CSP.
+# Installed as a template: the stock nginx entrypoint runs envsubst on
+# /etc/nginx/templates/*.template at boot. NGINX_ENVSUBST_FILTER restricts
+# substitution to CSP_* vars so nginx runtime vars ($uri, $host, …) are left
+# alone. CSP origins default to empty (same-origin only) — override per deploy
+# (see docker-compose.yml / deploy README).
+ENV NGINX_ENVSUBST_FILTER="^CSP_" \
+    CSP_IMG_ORIGIN="" \
+    CSP_CONNECT_ORIGIN=""
+COPY deploy/nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=builder /repo/apps/reader/build /usr/share/nginx/html
 
 EXPOSE 80

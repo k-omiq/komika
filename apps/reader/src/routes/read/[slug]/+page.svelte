@@ -1,21 +1,12 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { untrack } from 'svelte';
-	import { page } from '$app/state';
 	import { getRating, setRating } from '$lib/data/social';
 	import { saveProgress } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
-	import {
-		socialLive,
-		loadChapterComments,
-		submitChapterComment,
-		canModerate,
-		deleteChapterComment,
-		banCommenter,
-		type CommentView,
-	} from '$lib/data/social-repo';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
+	import CommentThread from '$lib/components/CommentThread.svelte';
 
 	let { data } = $props();
 
@@ -38,17 +29,8 @@
 	let progressPct = $state(0);
 	let scrolledPage = $state(1);
 	let userRating = $state(0);
-	let draft = $state('');
-	let spoiler = $state(false);
-	let posting = $state(false);
-	let postError = $state<string | null>(null);
-	let commentSort = $state<'top' | 'newest'>('newest');
-	let comments = $state<CommentView[]>([]);
-	let revealed = $state<Record<string, boolean>>({});
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
-	const needsAuth = $derived(socialLive() && !auth.user);
-	const myInitial = $derived((auth.user?.username ?? 'K').charAt(0).toUpperCase());
 
 	// Per-chapter rating (1–5) stays local — the backend has no chapter-rating field.
 	$effect(() => {
@@ -62,29 +44,6 @@
 			untrack(() => chKey),
 			r,
 		);
-	});
-
-	// Per-chapter comments: live multi-user backend (or local fallback).
-	$effect(() => {
-		const id = data.chapterId;
-		const key = chKey;
-		void auth.user?.id; // reload after sign-in so "mine" resolves
-		let cancelled = false;
-		if (socialLive() && !id) {
-			comments = [];
-			return;
-		}
-		loadChapterComments(id ?? '', key)
-			.then((list) => {
-				if (!cancelled) {
-					comments = list;
-					revealed = {};
-				}
-			})
-			.catch(() => {});
-		return () => {
-			cancelled = true;
-		};
 	});
 
 	let lastY = 0;
@@ -221,59 +180,6 @@
 			current: c.id === data.chapterId,
 		})),
 	);
-
-	const sortedComments = $derived(
-		commentSort === 'top' ? [...comments].sort((a, b) => b.likes - a.likes) : comments,
-	);
-
-	function toggleLike(id: string) {
-		comments = comments.map((c) =>
-			c.id === id ? { ...c, liked: !c.liked, likes: c.likes + (c.liked ? -1 : 1) } : c,
-		);
-	}
-	function reveal(id: string) {
-		revealed = { ...revealed, [id]: true };
-	}
-	async function postComment() {
-		const body = draft.trim();
-		if (!body || posting) return;
-		posting = true;
-		postError = null;
-		try {
-			comments = await submitChapterComment(data.chapterId ?? '', chKey, body, spoiler, comments);
-			draft = '';
-			spoiler = false;
-			commentSort = 'newest';
-		} catch (err) {
-			postError = err instanceof Error ? err.message : 'Could not post your comment.';
-		} finally {
-			posting = false;
-		}
-	}
-	const canPost = $derived(draft.trim().length > 0 && !posting);
-
-	// ---- admin moderation (only shown when signed in as admin, live backend) ----
-	const canMod = $derived(canModerate());
-	let modError = $state<string | null>(null);
-	async function removeComment(id: string) {
-		modError = null;
-		try {
-			comments = await deleteChapterComment(id, comments);
-		} catch (err) {
-			modError = err instanceof Error ? err.message : 'Could not delete the comment.';
-		}
-	}
-	async function banAuthor(c: CommentView) {
-		modError = null;
-		if (!confirm(`Ban ${c.name}? They won't be able to sign in.`)) return;
-		try {
-			await banCommenter(c.authorId);
-			// Drop their comments from view; they persist server-side until deleted.
-			comments = comments.filter((x) => x.authorId !== c.authorId);
-		} catch (err) {
-			modError = err instanceof Error ? err.message : 'Could not ban the user.';
-		}
-	}
 
 	function stageClick() {
 		if (!lockChrome) chromeVisible = !chromeVisible;
@@ -552,91 +458,14 @@
 		</div>
 	{/if}
 
-	<!-- comments -->
+	<!-- comments (shared thread component; series discussion uses the same one) -->
 	<section class="comments">
-		<div class="c-head">
-			<h3><Icon name="comment" size={20} stroke="#87857f" />{comments.length} comments</h3>
-			<div class="sort-tabs">
-				<button class="stab" class:on={commentSort === 'top'} onclick={() => (commentSort = 'top')}
-					>Top</button
-				>
-				<button
-					class="stab"
-					class:on={commentSort === 'newest'}
-					onclick={() => (commentSort = 'newest')}>Newest</button
-				>
-			</div>
-		</div>
-
-		{#if needsAuth}
-			<div class="signin-prompt">
-				<span>Sign in to join the discussion on this chapter.</span>
-				<a
-					class="signin-link"
-					href={`/login?redirect=${encodeURIComponent(page.url.pathname + page.url.search)}`}
-					>Sign in</a
-				>
-			</div>
-		{:else}
-			<div class="composer">
-				<div class="avatar me">{myInitial}</div>
-				<div class="composer-body">
-					<textarea bind:value={draft} placeholder="Share your thoughts on this chapter…" rows="3"
-					></textarea>
-					{#if postError}<p class="post-error">{postError}</p>{/if}
-					<div class="composer-foot">
-						<label class="spoiler-toggle">
-							<input type="checkbox" bind:checked={spoiler} />
-							<span>Contains spoilers</span>
-						</label>
-						<button class="post" class:enabled={canPost} onclick={postComment} disabled={!canPost}>
-							{posting ? 'Posting…' : 'Post comment'}
-						</button>
-					</div>
-				</div>
-			</div>
-		{/if}
-
-		{#if modError}<p class="post-error">{modError}</p>{/if}
-
-		<div class="c-list">
-			{#each sortedComments as c (c.id)}
-				<div class="comment">
-					<div class="avatar" style="background:{c.bg};color:{c.fg}">{c.initial}</div>
-					<div class="c-body">
-						<div class="c-meta">
-							<span class="c-name">{c.name}</span>
-							{#if c.isOp}<span class="op">TRANSLATOR</span>{/if}
-							{#if c.mine}<span class="mine">You</span>{/if}
-							<span class="c-time">{c.time}</span>
-						</div>
-						{#if c.hasSpoiler && !revealed[c.id]}
-							<button class="spoiler-veil" onclick={() => reveal(c.id)}>
-								<Icon name="alert" size={14} />Spoiler — tap to reveal
-							</button>
-						{:else}
-							<p class="c-text">{c.body}</p>
-						{/if}
-						<div class="c-actions">
-							<button class="like" class:on={c.liked} onclick={() => toggleLike(c.id)}>
-								<Icon name="heart" size={15} fill={c.liked ? 'currentColor' : 'none'} />{c.likes}
-							</button>
-							<button class="reply"><Icon name="reply" size={15} />Reply</button>
-							{#if canMod}
-								<button class="mod" onclick={() => removeComment(c.id)}>
-									<Icon name="x" size={14} />Delete
-								</button>
-								{#if !c.mine && c.authorId}
-									<button class="mod danger" onclick={() => banAuthor(c)}>
-										<Icon name="alert" size={14} />Ban
-									</button>
-								{/if}
-							{/if}
-						</div>
-					</div>
-				</div>
-			{/each}
-		</div>
+		<CommentThread
+			targetType="chapter"
+			targetId={data.chapterId ?? ''}
+			storageKey={chKey}
+			prompt="Share your thoughts on this chapter…"
+		/>
 	</section>
 </main>
 
@@ -1316,268 +1145,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 22px;
-	}
-	.c-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		flex-wrap: wrap;
-	}
-	.c-head h3 {
-		display: inline-flex;
-		align-items: center;
-		gap: 10px;
-		font-size: 21px;
-		letter-spacing: -0.01em;
-		margin: 0;
-		color: var(--k-text-bright);
-	}
-	.sort-tabs {
-		display: flex;
-		gap: 6px;
-	}
-	.stab {
-		font-size: 12.5px;
-		font-weight: 700;
-		padding: 7px 14px;
-		border-radius: var(--k-radius-pill);
-		cursor: pointer;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-dimmer);
-		transition: all 0.15s;
-	}
-	.stab.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
-	}
-	.composer {
-		display: flex;
-		gap: 14px;
-		align-items: flex-start;
-	}
-	.avatar {
-		flex: 0 0 auto;
-		width: 40px;
-		height: 40px;
-		border-radius: 50%;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-weight: 700;
-		font-size: 15px;
-	}
-	.avatar.me {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-	}
-	.composer-body {
-		flex: 1;
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-	}
-	textarea {
-		width: 100%;
-		resize: vertical;
-		box-sizing: border-box;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-3);
-		border-radius: 12px;
-		padding: 14px 16px;
-		color: var(--k-text);
-		font-family: var(--k-font-sans);
-		font-size: 14px;
-		line-height: 1.5;
-		outline: none;
-		transition: border-color 0.15s;
-	}
-	textarea:focus {
-		border-color: var(--k-border-strong);
-	}
-	.composer-foot {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		flex-wrap: wrap;
-	}
-	.spoiler-toggle {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 12px;
-		font-weight: 600;
-		color: var(--k-text-fainter);
-		cursor: pointer;
-		user-select: none;
-	}
-	.spoiler-toggle input {
-		width: 15px;
-		height: 15px;
-		accent-color: var(--k-accent);
-		cursor: pointer;
-	}
-	.post-error {
-		margin: 0;
-		font-size: 12.5px;
-		color: var(--k-accent);
-	}
-	.post {
-		height: 42px;
-		padding: 0 22px;
-		border: none;
-		border-radius: 9px;
-		background: var(--k-surface-4);
-		color: var(--k-text-disabled);
-		font-weight: 700;
-		font-size: 13.5px;
-		cursor: not-allowed;
-		transition: all 0.15s;
-	}
-	.post.enabled {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		cursor: pointer;
-	}
-	.signin-prompt {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		flex-wrap: wrap;
-		padding: 18px 22px;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-2);
-		border-radius: 12px;
-		font-size: 14px;
-		color: var(--k-text-dim);
-	}
-	.signin-link {
-		flex: 0 0 auto;
-		height: 38px;
-		padding: 0 20px;
-		display: inline-flex;
-		align-items: center;
-		border-radius: var(--k-radius-pill);
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-size: 13px;
-		font-weight: 700;
-		text-decoration: none;
-	}
-	.signin-link:hover {
-		background: var(--k-primary-hover);
-	}
-	.mine {
-		font-size: 9.5px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		color: var(--k-on-primary);
-		background: var(--k-primary);
-		padding: 2px 6px;
-		border-radius: 5px;
-	}
-	.spoiler-veil {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		padding: 10px 14px;
-		background: var(--k-surface-3);
-		border: 1px dashed var(--k-border-3);
-		border-radius: 8px;
-		color: var(--k-text-dim);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.spoiler-veil:hover {
-		color: var(--k-text);
-		border-color: var(--k-border-strong);
-	}
-	.c-list {
-		display: flex;
-		flex-direction: column;
-	}
-	.comment {
-		display: flex;
-		gap: 14px;
-		align-items: flex-start;
-		padding: 20px 0;
-		border-top: 1px solid var(--k-border);
-	}
-	.c-body {
-		flex: 1;
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.c-meta {
-		display: flex;
-		align-items: center;
-		gap: 9px;
-		flex-wrap: wrap;
-	}
-	.c-name {
-		font-weight: 700;
-		font-size: 14px;
-		color: var(--k-text-1);
-	}
-	.op {
-		font-size: 9.5px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		color: var(--k-on-primary);
-		background: #e0b354;
-		padding: 2px 6px;
-		border-radius: 5px;
-	}
-	.c-time {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-	}
-	.c-text {
-		margin: 0;
-		font-size: 14px;
-		line-height: 1.6;
-		color: #c4c2bc;
-	}
-	.c-actions {
-		display: flex;
-		align-items: center;
-		gap: 20px;
-		margin-top: 2px;
-	}
-	.like,
-	.reply,
-	.mod {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		background: none;
-		border: none;
-		cursor: pointer;
-		padding: 0;
-		font-size: 12.5px;
-		font-weight: 700;
-		color: var(--k-text-dimmer);
-		transition: color 0.15s;
-	}
-	.like:hover,
-	.reply:hover,
-	.mod:hover {
-		color: var(--k-text);
-	}
-	.mod.danger:hover {
-		color: #f0808a;
-	}
-	.like.on {
-		color: var(--k-accent);
 	}
 	@media (max-width: 640px) {
 		.chapter-header h1 {

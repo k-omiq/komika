@@ -19,35 +19,47 @@ schema {
 type Query {
 	# catalog
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
+	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, newest-first
 	search(query: String!, page: Int = 1): SeriesPage! # [suwayomi] source/library search
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
+	canonicalUpdates(page: Int = 1): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed)
+	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
+	# id (distinct from numeric Suwayomi ids), so the reader routes it here. Returns the
+	# shared Series/Chapter/Page shapes; NSFW-gated by the viewer's preference. CATALOGUE.md §6.
+	canonicalSeries(workId: ID!): Series! # [komika] a MangaDex-mirrored work as a Series
+	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
+	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
-	comments(chapterId: ID!, page: Int = 1): CommentPage! # [komika]
+	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null
 	# ops / admin (all require isAdmin)
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
+	mergeQueue: [MergeCandidate!]! # [komika] dedup review queue — pending mid-confidence matches (requires isAdmin)
 }
 
 type Mutation {
-	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] pins B2 cache + scan priority)
+	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
 	postReview(input: PostReviewInput!): Review! # [komika]
-	postComment(input: PostCommentInput!): ChapterComment! # [komika]
+	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
 	login(username: String!, password: String!): Session! # [komika]
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
+	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
 	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
 	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
 	banUser(userId: ID!, banned: Boolean!): UserRef! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
+	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
+	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 }
 
 enum ComicType {
@@ -82,7 +94,7 @@ type Series {
 	sourceId: String!
 	chapterCount: Int!
 	isMarked: Boolean! # [suwayomi] inLibrary
-	isCached: Boolean! # [komika] served from B2 rather than the Worker proxy
+	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
 	rating: RatingSummary! # [komika]
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
@@ -164,9 +176,12 @@ type Review {
 	updatedAt: String!
 }
 
-type ChapterComment {
+# A comment on a polymorphic target: a chapter thread (targetType="chapter") or a
+# series-level discussion (targetType="series"). Distinct from Review (scored, one/user).
+type Comment {
 	id: ID!
-	chapterId: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
 	author: UserRef!
 	body: String!
 	hasSpoiler: Boolean!
@@ -183,6 +198,7 @@ type SessionUser {
 	username: String!
 	avatarUrl: String
 	isAdmin: Boolean!
+	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
 }
 
 type SeriesPage {
@@ -200,7 +216,7 @@ type ReviewPage {
 }
 
 type CommentPage {
-	items: [ChapterComment!]!
+	items: [Comment!]!
 	page: Int!
 	hasNextPage: Boolean!
 	total: Int
@@ -214,7 +230,8 @@ input PostReviewInput {
 }
 
 input PostCommentInput {
-	chapterId: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
 	body: String!
 	hasSpoiler: Boolean!
 }
@@ -259,4 +276,42 @@ type AdminUserPage {
 	page: Int!
 	hasNextPage: Boolean!
 	total: Int
+}
+
+# [komika] Outcome of the Tier-2 dedup matcher (CATALOGUE.md §4).
+# `decision` is one of `auto_merge` | `review` | `new`.
+type MatchResult {
+	decision: String!
+	workId: String!
+	matchedWorkId: String
+	score: Float
+	method: String
+	sourceSeriesId: String!
+}
+
+# [komika] One row of the canonical updates feed (CATALOGUE.md §6): a mirrored
+# MangaDex work + its latest stored chapter, served from the `chapter` mirror. Open
+# it via canonicalSeries(workId) — `workId` is the `w_`-prefixed canonical reader id.
+type CanonicalUpdate {
+	workId: String!
+	mangadexId: String!
+	title: String
+	isNsfw: Boolean!
+	coverUrl: String # proxy-ready MangaDex cover thumbnail (null until the cover is synced)
+	latestChapter: String # latest stored chapter number (string; e.g. "10.5")
+	latestChapterTitle: String
+	latestAt: String # publish time of the latest chapter (falls back to ingest time)
+}
+
+# [komika] A pending mid-confidence match awaiting manual admin review.
+type MergeCandidate {
+	id: String!
+	sourceSeriesId: String!
+	candidateWorkId: String!
+	candidateTitle: String
+	sourceTitle: String
+	score: Float!
+	method: String!
+	status: String!
+	createdAt: String!
 }

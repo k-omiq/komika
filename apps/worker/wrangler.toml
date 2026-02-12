@@ -5,16 +5,20 @@ compatibility_date = "2024-11-06"
 # ---------------------------------------------------------------------------
 # Non-secret configuration.
 #
-# All of these are safe to commit. Secrets (B2 credentials) are NOT here —
-# see the [secrets] note at the bottom of this file.
+# All of these are safe to commit. The Worker is a pure proxy backed by the
+# Cloudflare edge cache — it needs no secrets and no object storage.
 # ---------------------------------------------------------------------------
 [vars]
 # Comma-separated allowlist of upstream source hosts the proxy will fetch from.
 # Prevents the Worker from being used as an open proxy. Leave empty ("") to
 # allow ANY http(s) host (convenient for local dev; NOT recommended in prod).
 # Hostnames match exactly or as a suffix ("example.com" also allows
-# "cdn.example.com"). Example value:
-#   "uploads.mangadex.org,mangakakalot.com,cdn.komika.app"
+# "cdn.example.com"). MangaDex needs BOTH the cover host and the dynamic
+# MangaDex@Home page hosts: covers are served from `uploads.mangadex.org`, and
+# read-time pages from `*.mangadex.network` nodes (e.g.
+# `cmdxd98sb0x3yprd.mangadex.network`) — the `mangadex.network` suffix entry
+# covers every node. Example value:
+#   "uploads.mangadex.org,mangadex.network,mangakakalot.com,cdn.komika.app"
 ALLOWED_SOURCE_HOSTS = ""
 
 # Comma-separated allowlist of browser Origin/Referer values permitted to
@@ -26,24 +30,7 @@ ALLOWED_SOURCE_HOSTS = ""
 #   "https://komika.app,https://read.komika.app,http://localhost:5173"
 ALLOWED_ORIGINS = ""
 
-# --- B2 (Backblaze S3-compatible) read-through / write-through cache. -------
-# Optional. If B2_BUCKET is empty the Worker just proxies + edge-caches; B2 is
-# skipped entirely. All B2 operations fail-open: any B2 error falls back to a
-# plain upstream proxy, so a misconfigured/offline bucket never breaks reads.
-#
-# B2_ENDPOINT is the S3-compatible endpoint for your bucket's region, e.g.
-#   "https://s3.us-west-004.backblazeb2.com"
-# B2_REGION must match the region embedded in the endpoint, e.g. "us-west-004".
-B2_ENDPOINT = ""
-B2_REGION = ""
-B2_BUCKET = ""
-
 # ---------------------------------------------------------------------------
-# SECRETS — do NOT put these in [vars]. Set them with `wrangler secret put`:
-#
-#   wrangler secret put B2_KEY_ID        # Backblaze applicationKeyId
-#   wrangler secret put B2_APP_KEY       # Backblaze applicationKey
-#
-# For local `wrangler dev`, copy .dev.vars.example to .dev.vars and fill them
-# in (.dev.vars is gitignored / never committed).
+# The Worker needs no secrets: it proxies + edge-caches only. There is no
+# object-storage tier, so `wrangler secret put` / .dev.vars are not required.
 # ---------------------------------------------------------------------------

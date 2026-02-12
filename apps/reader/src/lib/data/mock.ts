@@ -489,6 +489,8 @@ export function chapterTitle(n: number): string {
 	return CHAPTER_TITLES[(n * 7) % CHAPTER_TITLES.length];
 }
 
+// Shape of a locally-persisted series review in the offline/backend-off fallback.
+// No seeded data — the fallback starts empty (see CATALOGUE.md §7).
 export interface SeriesComment {
 	id: number;
 	name: string;
@@ -499,49 +501,6 @@ export interface SeriesComment {
 	likes: number;
 	liked: boolean;
 }
-
-export const seriesComments: SeriesComment[] = [
-	{
-		id: 1,
-		name: 'Mika R.',
-		initial: 'M',
-		chapter: 'Ch. 143',
-		time: '2h ago',
-		body: 'The pacing this arc is unreal. Ren finally facing the collector head-on had me holding my breath the whole chapter.',
-		likes: 48,
-		liked: false,
-	},
-	{
-		id: 2,
-		name: 'devon_k',
-		initial: 'D',
-		chapter: 'Ch. 142',
-		time: '6h ago',
-		body: 'Called it — the borrowed-hours mechanic was always going to cost him someone close. Still hurts to actually read it though.',
-		likes: 31,
-		liked: false,
-	},
-	{
-		id: 3,
-		name: 'yuuki',
-		initial: 'Y',
-		chapter: 'Ch. 140',
-		time: '1d ago',
-		body: 'The art in the last few pages is some of the best in the whole series. That double spread is going straight to my wallpaper.',
-		likes: 22,
-		liked: false,
-	},
-	{
-		id: 4,
-		name: 'A. Lin',
-		initial: 'A',
-		chapter: 'Ch. 143',
-		time: '1d ago',
-		body: 'New readers: push past chapter 20. The payoff is worth every borrowed minute, I promise.',
-		likes: 15,
-		liked: false,
-	},
-];
 
 export const relatedSeries = [
 	{ title: 'Ashfall Doctrine', genre: 'Action', ch: 133, rating: '9.4' },
@@ -576,6 +535,8 @@ export function readerPages(): ReaderPage[] {
 	return arr;
 }
 
+// Shape of a locally-persisted chapter comment in the offline/backend-off fallback.
+// No seeded data — the fallback starts empty (see CATALOGUE.md §7).
 export interface ReaderComment {
 	id: string;
 	name: string;
@@ -590,79 +551,6 @@ export interface ReaderComment {
 	replies: number;
 	body: string;
 }
-
-export const readerComments: ReaderComment[] = [
-	{
-		id: 'c1',
-		name: 'Aria_reads',
-		initial: 'A',
-		bg: '#3a2f4a',
-		fg: '#d9c7f0',
-		ts: 100,
-		time: '2h ago',
-		isOp: false,
-		likes: 214,
-		liked: false,
-		replies: 12,
-		body: 'That final page genuinely made me put my phone down for a minute. The framing of the empty chair says more than any line of dialogue could.',
-	},
-	{
-		id: 'c2',
-		name: 'yomu_scans',
-		initial: 'Y',
-		bg: '#e0b354',
-		fg: '#0c0c0d',
-		ts: 96,
-		time: '3h ago',
-		isOp: true,
-		likes: 176,
-		liked: false,
-		replies: 5,
-		body: 'Thanks for reading! This was a tricky chapter to letter — lots of overlapping panels. Next one drops Friday.',
-	},
-	{
-		id: 'c3',
-		name: 'Devon',
-		initial: 'D',
-		bg: '#2f4a3a',
-		fg: '#a7e0c0',
-		ts: 88,
-		time: '5h ago',
-		isOp: false,
-		likes: 98,
-		liked: false,
-		replies: 3,
-		body: 'Called the ledger twist three chapters ago and I have never felt more vindicated in my life.',
-	},
-	{
-		id: 'c4',
-		name: 'mika.png',
-		initial: 'M',
-		bg: '#4a2f33',
-		fg: '#f0b7bd',
-		ts: 80,
-		time: '1d ago',
-		isOp: false,
-		likes: 143,
-		liked: false,
-		replies: 8,
-		body: 'The double-spread art is unreal. You can feel the weight of the rain. Whoever the artist is deserves a raise.',
-	},
-	{
-		id: 'c5',
-		name: 'solstice',
-		initial: 'S',
-		bg: '#2f3a4a',
-		fg: '#a7c8f0',
-		ts: 72,
-		time: '2d ago',
-		isOp: false,
-		likes: 21,
-		liked: false,
-		replies: 0,
-		body: 'New to this series after a friend recommended it — completely hooked. Bingeing from chapter one was the right call.',
-	},
-];
 
 // ---- Library ---------------------------------------------------------------
 

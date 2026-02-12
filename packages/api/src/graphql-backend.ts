@@ -1,9 +1,12 @@
 import type {
 	AdminUser,
+	CanonicalUpdate,
 	Chapter,
-	ChapterComment,
+	Comment,
+	CommentTargetType,
 	DiscoveryFeed,
 	Id,
+	MergeCandidate,
 	Page,
 	Paginated,
 	Review,
@@ -81,6 +84,10 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ discovery: DiscoveryFeed[] }>(ops.DISCOVERY);
 		return d.discovery;
 	}
+	async updates(page = 1): Promise<Paginated<Series>> {
+		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page });
+		return d.updates;
+	}
 	async search(query: string, page = 1): Promise<Paginated<Series>> {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, { query, page });
 		return d.search;
@@ -120,15 +127,20 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ postReview: Review }>(ops.POST_REVIEW, { input });
 		return d.postReview;
 	}
-	async comments(chapterId: Id, page = 1): Promise<Paginated<ChapterComment>> {
-		const d = await this.gql<{ comments: Paginated<ChapterComment> }>(ops.COMMENTS, {
-			chapterId,
+	async comments(
+		targetType: CommentTargetType,
+		targetId: Id,
+		page = 1,
+	): Promise<Paginated<Comment>> {
+		const d = await this.gql<{ comments: Paginated<Comment> }>(ops.COMMENTS, {
+			targetType,
+			targetId,
 			page,
 		});
 		return d.comments;
 	}
-	async postComment(input: PostCommentInput): Promise<ChapterComment> {
-		const d = await this.gql<{ postComment: ChapterComment }>(ops.POST_COMMENT, { input });
+	async postComment(input: PostCommentInput): Promise<Comment> {
+		const d = await this.gql<{ postComment: Comment }>(ops.POST_COMMENT, { input });
 		return d.postComment;
 	}
 
@@ -168,6 +180,48 @@ export class GraphQLBackend implements Backend {
 	async setUserAdmin(userId: Id, isAdmin: boolean): Promise<AdminUser> {
 		const d = await this.gql<{ setUserAdmin: AdminUser }>(ops.SET_USER_ADMIN, { userId, isAdmin });
 		return d.setUserAdmin;
+	}
+
+	// --- admin dedup review ---
+	async mergeQueue(): Promise<MergeCandidate[]> {
+		const d = await this.gql<{ mergeQueue: MergeCandidate[] }>(ops.MERGE_QUEUE);
+		return d.mergeQueue;
+	}
+
+	async resolveMergeCandidate(id: Id, accept: boolean): Promise<boolean> {
+		const d = await this.gql<{ resolveMergeCandidate: boolean }>(ops.RESOLVE_MERGE_CANDIDATE, {
+			id,
+			accept,
+		});
+		return d.resolveMergeCandidate;
+	}
+
+	// --- viewer preferences ---
+	async setShowNsfw(value: boolean): Promise<boolean> {
+		const d = await this.gql<{ setShowNsfw: boolean }>(ops.SET_SHOW_NSFW, { value });
+		return d.setShowNsfw;
+	}
+
+	// --- canonical catalogue ---
+	async canonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
+		const d = await this.gql<{ canonicalUpdates: CanonicalUpdate[] }>(ops.CANONICAL_UPDATES, {
+			page,
+		});
+		return d.canonicalUpdates;
+	}
+
+	// --- canonical reader path ---
+	async canonicalSeries(workId: Id): Promise<Series> {
+		const d = await this.gql<{ canonicalSeries: Series }>(ops.CANONICAL_SERIES, { workId });
+		return d.canonicalSeries;
+	}
+	async canonicalChapters(workId: Id): Promise<Chapter[]> {
+		const d = await this.gql<{ canonicalChapters: Chapter[] }>(ops.CANONICAL_CHAPTERS, { workId });
+		return d.canonicalChapters;
+	}
+	async canonicalPages(chapterId: Id): Promise<Page[]> {
+		const d = await this.gql<{ canonicalPages: Page[] }>(ops.CANONICAL_PAGES, { chapterId });
+		return d.canonicalPages;
 	}
 }
 

@@ -2,7 +2,14 @@
  * Admin data layer — catalog listing + override writes, straight through the
  * unified backend (no mock fallback: the console requires the real API).
  */
-import type { AdminUser, Paginated, Series, SeriesStatus } from '@komika/types';
+import type {
+	AdminUser,
+	CanonicalUpdate,
+	MergeCandidate,
+	Paginated,
+	Series,
+	SeriesStatus,
+} from '@komika/types';
 import type { SeriesAdminInput } from '@komika/api';
 import { backend } from './context';
 
@@ -51,6 +58,34 @@ export async function setUserBanned(userId: string, banned: boolean): Promise<vo
 export async function setUserAdmin(userId: string, isAdmin: boolean): Promise<AdminUser> {
 	if (!backend.setUserAdmin) throw new Error('User management is unavailable on this backend.');
 	return backend.setUserAdmin(userId, isAdmin);
+}
+
+/** Pending dedup matches awaiting manual review (CATALOGUE.md §4). */
+export async function loadMergeQueue(): Promise<MergeCandidate[]> {
+	if (!backend.mergeQueue) throw new Error('Dedup review is unavailable on this backend.');
+	return backend.mergeQueue();
+}
+
+/**
+ * Resolve a dedup review. `accept` merges the source series into the candidate
+ * work; rejecting keeps it as a distinct first-class work. Returns true when the
+ * row was closed.
+ */
+export async function resolveMergeCandidate(id: string, accept: boolean): Promise<boolean> {
+	if (!backend.resolveMergeCandidate)
+		throw new Error('Dedup review is unavailable on this backend.');
+	return backend.resolveMergeCandidate(id, accept);
+}
+
+/**
+ * Recently-updated mirrored MangaDex works + their latest stored chapter, from the
+ * canonical `chapter` mirror (CATALOGUE.md §6). A monitoring feed for the mirror —
+ * these works are not reader-openable yet.
+ */
+export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
+	if (!backend.canonicalUpdates)
+		throw new Error('Catalogue updates are unavailable on this backend.');
+	return backend.canonicalUpdates(page);
 }
 
 export const STATUS_OPTIONS: SeriesStatus[] = [
