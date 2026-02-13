@@ -31,7 +31,8 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required to run the bootst
 # ---- config -------------------------------------------------------------------
 if [ ! -f .env ]; then
   cp .env.example .env
-  printf "${yl}! created deploy/.env from the template — review it (esp. KOMIKA_ADMIN_PASSWORD and PUBLIC_HOST).${z}\n"
+  printf "${yl}! created deploy/.env from the template.${z}\n"
+  die "review deploy/.env before deploying — set a real KOMIKA_ADMIN_PASSWORD (the template ships a public placeholder) and PUBLIC_HOST, then re-run ./deploy.sh."
 fi
 set -a; . ./.env 2>/dev/null || true; set +a
 PUBLIC_HOST="${PUBLIC_HOST:-localhost}"

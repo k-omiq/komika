@@ -39,7 +39,8 @@ ENV = load_env()
 SUWA_PORT = ENV.get("SUWAYOMI_PORT", "4567")
 SRV_PORT = ENV.get("SERVER_PORT", "8080")
 ADMIN_USER = ENV.get("KOMIKA_ADMIN_USERS", "admin").split(",")[0].strip() or "admin"
-ADMIN_PW = ENV.get("KOMIKA_ADMIN_PASSWORD", "change-this-admin-pw")
+DEFAULT_ADMIN_PW = "change-this-admin-pw"
+ADMIN_PW = ENV.get("KOMIKA_ADMIN_PASSWORD", DEFAULT_ADMIN_PW)
 ADMIN_EMAIL = ENV.get("KOMIKA_ADMIN_EMAIL", "admin@example.com")
 SEED = [s.strip() for s in ENV.get("SEED_SERIES", "").split(",") if s.strip()]
 
@@ -192,6 +193,14 @@ def seed_library():
 
 
 def main():
+    if ADMIN_PW == DEFAULT_ADMIN_PW:
+        print(
+            f"{C['rd']}✗ KOMIKA_ADMIN_PASSWORD is still the committed placeholder "
+            f"('{DEFAULT_ADMIN_PW}'). Set a real password in deploy/.env before "
+            f"bootstrapping.{C['z']}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if not wait_for(f"http://localhost:{SUWA_PORT}/", "Suwayomi"):
         sys.exit(1)
     if not wait_for(f"http://localhost:{SRV_PORT}/health", "Komika server"):
