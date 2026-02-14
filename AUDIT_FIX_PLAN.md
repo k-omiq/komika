@@ -35,7 +35,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 
 **Phase 1 — Security must-fix before any public exposure**
 - [x] 1.1 🔴 D1 — deploy.sh must halt on default admin password — deploy.sh now `die`s after creating `.env` (no fall-through to up+bootstrap); bootstrap.py `main()` exits 1 if `KOMIKA_ADMIN_PASSWORD` == `change-this-admin-pw`. Verified both exit codes.
-- [ ] 1.2 🔴 A2 — stop trusting client `X-Forwarded-For`
+- [x] 1.2 🔴 A2 — stop trusting client `X-Forwarded-For` — hand-rolled `Cidr` (v4/v6 prefix match, no new crate); `resolve_client_ip` now honors XFF/X-Real-IP only when the socket peer is in `TRUSTED_PROXY_CIDRS` (new Config field, default empty → uses socket peer). v4-mapped-v6 canonicalized. 9 unit tests added. Documented the knob in docker-compose.yml.
 - [ ] 1.3 🔴 A1 — session expiry + rotation
 - [ ] 1.4 🟡 D2 — restrict/loopback-bind unauthenticated Suwayomi (or default to Worker image path)
 - [ ] 1.5 🟡 D4 — disable public GraphiQL + introspection in prod

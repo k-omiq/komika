@@ -15,6 +15,11 @@ pub struct Config {
     pub source_id: Option<String>,
     /// Origins allowed by CORS (the reader dev/preview servers by default).
     pub cors_origins: Vec<String>,
+    /// CIDR blocks of trusted reverse proxies. `X-Forwarded-For`/`X-Real-IP` are
+    /// honored for the rate-limit key ONLY when the direct socket peer is inside
+    /// one of these; empty (default) means always use the socket peer, matching
+    /// the shipped compose that publishes the server port directly.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Usernames that are granted admin (for the "manga DB" console). Promoted at
     /// startup and on registration.
     pub admin_users: Vec<String>,
@@ -62,6 +67,12 @@ impl Config {
             .unwrap_or_else(|_| {
                 "http://localhost:5173,http://localhost:4173,http://tauri.localhost".to_string()
             })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let trusted_proxy_cidrs = env::var("TRUSTED_PROXY_CIDRS")
+            .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -120,6 +131,7 @@ impl Config {
             suwayomi_public_url,
             source_id,
             cors_origins,
+            trusted_proxy_cidrs,
             admin_users,
             scan_tick_seconds,
             auth_rate_limit_max,

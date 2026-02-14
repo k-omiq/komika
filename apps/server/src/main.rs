@@ -11,7 +11,7 @@ mod suwayomi;
 
 use std::sync::Arc;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
@@ -43,25 +43,96 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Resolve the client IP for rate-limiting. Behind nginx (see deploy/nginx.conf)
-/// the real client is in `X-Forwarded-For` (first hop) or `X-Real-IP`; direct
-/// dev connections fall back to the socket peer address.
-fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let ip = first.trim();
+/// A CIDR block (IPv4 or IPv6) used to recognize trusted reverse proxies.
+#[derive(Clone, Copy, Debug)]
+struct Cidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    /// Parse `a.b.c.d/nn`, `a:b::/nn`, or a bare IP (treated as a /32 or /128
+    /// host route). Returns `None` for malformed input or an out-of-range prefix.
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p.trim().parse::<u8>().ok()?)),
+            None => (s, None),
+        };
+        let network: IpAddr = addr.trim().parse().ok()?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+            return None;
+        }
+        Some(Cidr { network, prefix })
+    }
+
+    /// Whether `ip` falls inside this block. A v4 block never matches a v6
+    /// address (and vice versa); callers should canonicalize v4-mapped v6 first.
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
+                u32::from(net) & mask == u32::from(addr) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                let mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix)
+                };
+                u128::from(net) & mask == u128::from(addr) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse a list of CIDR strings, logging (and dropping) any that don't parse.
+fn parse_trusted_proxies(raw: &[String]) -> Vec<Cidr> {
+    raw.iter()
+        .filter_map(|s| match Cidr::parse(s) {
+            Some(c) => Some(c),
+            None => {
+                tracing::warn!(cidr = %s, "ignoring malformed TRUSTED_PROXY_CIDRS entry");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Resolve the client IP for rate-limiting. Client-supplied forwarding headers
+/// (`X-Forwarded-For` leftmost hop, then `X-Real-IP`) are honored ONLY when the
+/// direct socket peer is a configured trusted proxy (`TRUSTED_PROXY_CIDRS`);
+/// otherwise the value is trivially spoofable, so we key on the socket peer. The
+/// default (empty allowlist) always uses the peer, matching the shipped compose
+/// that publishes `8080` directly with no proxy in front.
+fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) -> String {
+    // Canonicalize v4-mapped v6 (e.g. `::ffff:127.0.0.1`) so a v4 CIDR matches a
+    // dual-stack socket peer.
+    let peer_ip = peer.ip().to_canonical();
+    if trusted.iter().any(|c| c.contains(peer_ip)) {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                let ip = first.trim();
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
+            }
+        }
+        if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            let ip = rip.trim();
             if !ip.is_empty() {
                 return ip.to_string();
             }
         }
     }
-    if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = rip.trim();
-        if !ip.is_empty() {
-            return ip.to_string();
-        }
-    }
-    peer.ip().to_string()
+    peer_ip.to_string()
 }
 
 /// Combined router state: the GraphQL schema (for `/graphql`) and the DB pool
@@ -70,6 +141,7 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
 struct RouterState {
     schema: ApiSchema,
     pool: sqlx::SqlitePool,
+    trusted_proxies: Arc<Vec<Cidr>>,
 }
 impl FromRef<RouterState> for ApiSchema {
     fn from_ref(s: &RouterState) -> Self {
@@ -81,15 +153,21 @@ impl FromRef<RouterState> for sqlx::SqlitePool {
         s.pool.clone()
     }
 }
+impl FromRef<RouterState> for Arc<Vec<Cidr>> {
+    fn from_ref(s: &RouterState) -> Self {
+        s.trusted_proxies.clone()
+    }
+}
 
 async fn graphql_handler(
     State(schema): State<ApiSchema>,
+    State(trusted): State<Arc<Vec<Cidr>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer)));
+    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
     schema
         .execute(req.into_inner().data(auth).data(ip))
         .await
@@ -252,7 +330,11 @@ async fn main() -> anyhow::Result<()> {
         // Outermost: a panicking resolver/handler becomes a 500 (logged) instead
         // of dropping the connection or killing the worker task.
         .layer(CatchPanicLayer::custom(handle_panic))
-        .with_state(RouterState { schema, pool });
+        .with_state(RouterState {
+            schema,
+            pool,
+            trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
+        });
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -289,4 +371,98 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
     let _ = shutdown_tx.send(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn peer(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+
+    #[test]
+    fn cidr_ipv4_contains() {
+        let c = Cidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains("10.1.2.3".parse().unwrap()));
+        assert!(c.contains("10.255.255.255".parse().unwrap()));
+        assert!(!c.contains("11.0.0.1".parse().unwrap()));
+        assert!(!c.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_bare_ip_is_host_route() {
+        let c = Cidr::parse("127.0.0.1").unwrap();
+        assert!(c.contains("127.0.0.1".parse().unwrap()));
+        assert!(!c.contains("127.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_ipv6_and_cross_family() {
+        let c = Cidr::parse("2001:db8::/32").unwrap();
+        assert!(c.contains("2001:db8::1".parse().unwrap()));
+        assert!(!c.contains("2001:db9::1".parse().unwrap()));
+        // a v4 block never matches a v6 address
+        let v4 = Cidr::parse("10.0.0.0/8").unwrap();
+        assert!(!v4.contains("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_rejects_malformed() {
+        assert!(Cidr::parse("not-an-ip").is_none());
+        assert!(Cidr::parse("10.0.0.0/33").is_none());
+        assert!(Cidr::parse("::1/129").is_none());
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_forwarded_headers() {
+        // No trusted proxies configured (the default): the socket peer wins and a
+        // spoofed X-Forwarded-For cannot move the rate-limit key.
+        let h = hdrs(&[("x-forwarded-for", "1.2.3.4"), ("x-real-ip", "5.6.7.8")]);
+        let ip = resolve_client_ip(&h, peer("203.0.113.9"), &[]);
+        assert_eq!(ip, "203.0.113.9");
+    }
+
+    #[test]
+    fn trusted_peer_honors_xff_leftmost() {
+        let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        let h = hdrs(&[("x-forwarded-for", "1.2.3.4, 10.0.0.5")]);
+        let ip = resolve_client_ip(&h, peer("10.0.0.5"), &trusted);
+        assert_eq!(ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn trusted_peer_falls_back_to_x_real_ip() {
+        let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        let h = hdrs(&[("x-real-ip", "9.9.9.9")]);
+        let ip = resolve_client_ip(&h, peer("10.0.0.5"), &trusted);
+        assert_eq!(ip, "9.9.9.9");
+    }
+
+    #[test]
+    fn trusted_peer_without_headers_uses_peer() {
+        let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        let ip = resolve_client_ip(&HeaderMap::new(), peer("10.0.0.5"), &trusted);
+        assert_eq!(ip, "10.0.0.5");
+    }
+
+    #[test]
+    fn v4_mapped_v6_peer_matches_v4_cidr() {
+        let trusted = vec![Cidr::parse("127.0.0.0/8").unwrap()];
+        let h = hdrs(&[("x-forwarded-for", "1.2.3.4")]);
+        // A dual-stack socket may present a v4 peer as `::ffff:127.0.0.1`.
+        let ip = resolve_client_ip(&h, peer("::ffff:127.0.0.1"), &trusted);
+        assert_eq!(ip, "1.2.3.4");
+    }
 }

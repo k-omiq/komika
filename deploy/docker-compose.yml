@@ -69,6 +69,11 @@ services:
       # Public base for image URLs handed to the browser (NOT the internal host).
       SUWAYOMI_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:${SUWAYOMI_PORT:-4567}
       CORS_ORIGINS: http://${PUBLIC_HOST:-localhost}:${READER_PORT:-8081}
+      # CIDRs of trusted reverse proxies. Leave blank when publishing 8080
+      # directly (the default) so the auth rate-limiter keys on the real socket
+      # peer. Set it (e.g. 10.0.0.0/8) ONLY if a proxy you control fronts the
+      # server and sets X-Forwarded-For / X-Real-IP.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       KOMIKA_ADMIN_USERS: ${KOMIKA_ADMIN_USERS:-admin}
       SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
       RUST_LOG: komika_server=info,tower_http=warn
