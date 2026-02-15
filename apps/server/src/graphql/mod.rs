@@ -91,6 +91,8 @@ pub struct AppState {
     pub scan_health: Mutex<ScanHealth>,
     /// Per-key sliding-window limiter for `login` / `register`.
     pub auth_limiter: RateLimiter,
+    /// Absolute session lifetime in seconds (see `Config::session_ttl_secs`).
+    pub session_ttl_secs: i64,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -1247,7 +1249,7 @@ impl MutationRoot {
         if user.is_banned != 0 {
             return Err(Error::new("This account has been suspended."));
         }
-        let tok = new_session(&st.pool, &user.id).await?;
+        let tok = new_session(&st.pool, &user.id, st.session_ttl_secs).await?;
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         Ok(Session {
             token: tok,
@@ -1304,7 +1306,7 @@ impl MutationRoot {
                 gql_err(e)
             }
         })?;
-        let tok = new_session(&st.pool, &id).await?;
+        let tok = new_session(&st.pool, &id, st.session_ttl_secs).await?;
         Ok(Session {
             token: tok,
             user: SessionUser {
@@ -1683,16 +1685,27 @@ impl MutationRoot {
 }
 
 /// Create a session row and return its opaque token.
-async fn new_session(pool: &SqlitePool, user_id: &str) -> Result<String> {
+async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<String> {
     let tok = auth::generate_token();
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)")
-        .bind(&tok)
-        .bind(user_id)
-        .bind(&now)
+    let now = Utc::now();
+    let created = now.to_rfc3339();
+    let expires = auth::format_ts(now + chrono::Duration::seconds(ttl_secs));
+    sqlx::query(
+        "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&tok)
+    .bind(user_id)
+    .bind(&created)
+    .bind(&expires)
+    .execute(pool)
+    .await
+    .map_err(gql_err)?;
+    // Opportunistic GC: drop rows that have already expired so the table (and its
+    // index) don't accumulate dead sessions between event-driven deletes.
+    let _ = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+        .bind(auth::format_ts(now))
         .execute(pool)
-        .await
-        .map_err(gql_err)?;
+        .await;
     Ok(tok)
 }
 
@@ -1766,13 +1779,24 @@ mod tests {
         seed_user(&pool, "bob-id", "bob", 0, 0).await;
         seed_user(&pool, "banned-id", "carol", 0, 1).await;
         for (tok, uid) in [("admintok", "admin-id"), ("bobtok", "bob-id")] {
-            sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, '2020-01-01T00:00:00Z')")
-                .bind(tok)
-                .bind(uid)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at) \
+                 VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+            )
+            .bind(tok)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
+        // An already-expired session — its token must not resolve (A1).
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) \
+             VALUES ('expiredtok', 'bob-id', '2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
@@ -1780,6 +1804,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
+            session_ttl_secs: 30 * 24 * 60 * 60,
         });
         (build_schema(state), pool)
     }
@@ -1841,6 +1866,39 @@ mod tests {
             &s,
             r#"mutation { setShowNsfw(value: true) }"#,
             None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn expired_session_token_does_not_resolve() {
+        let s = setup().await;
+        // A live session resolves.
+        let r = exec(
+            &s,
+            r#"{ session { user { username } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(data_json(&r).contains("\"username\":\"bob\""));
+        // The seeded expired token (expires_at 2020-02-01) must resolve to null.
+        let r = exec(
+            &s,
+            r#"{ session { user { username } } }"#,
+            Some("expiredtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert_eq!(data_json(&r), "{\"session\":null}");
+        // An expired token is also treated as anonymous for auth-gated mutations.
+        let r = exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("expiredtok"),
             "1.1.1.1",
         )
         .await;
@@ -2251,6 +2309,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 30 * 24 * 60 * 60,
         });
         let s = build_schema(state);
         let r = exec(

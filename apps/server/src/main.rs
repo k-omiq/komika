@@ -246,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),
+        session_ttl_secs: cfg.session_ttl_secs,
     });
 
     // Background adaptive scan scheduler, sharing the same AppState.

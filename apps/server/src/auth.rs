@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use chrono::{DateTime, Utc};
 use rand_core::{OsRng, RngCore};
 use sqlx::SqlitePool;
 
@@ -44,14 +45,27 @@ pub fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Resolve the user owning a session token, if the token is valid. Banned users
-/// are treated as anonymous (their existing tokens stop resolving).
+/// Format a UTC instant as a fixed-width, lexically-sortable timestamp
+/// (`YYYY-MM-DDTHH:MM:SSZ`). Session `expires_at` values and the comparison
+/// bound both use this, so a plain string comparison agrees with chronological
+/// order — unlike `to_rfc3339()`, whose optional `+00:00` offset and variable
+/// fractional-second width make lexical comparison unsafe.
+pub fn format_ts(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Resolve the user owning a session token, if the token is valid and unexpired.
+/// Banned users are treated as anonymous (their existing tokens stop resolving),
+/// as are sessions whose `expires_at` is in the past or NULL.
 pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
+    let now = format_ts(Utc::now());
     let user = sqlx::query_as::<_, User>(
         "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin, u.is_banned \
-         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND u.is_banned = 0",
+         FROM sessions s JOIN users u ON u.id = s.user_id \
+         WHERE s.token = ? AND u.is_banned = 0 AND s.expires_at > ?",
     )
     .bind(token)
+    .bind(&now)
     .fetch_optional(pool)
     .await?;
     Ok(user)

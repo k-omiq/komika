@@ -30,6 +30,9 @@ pub struct Config {
     pub auth_rate_limit_max: u32,
     /// Sliding window (seconds) over which `auth_rate_limit_max` is counted.
     pub auth_rate_limit_window_secs: u64,
+    /// Absolute lifetime of a session token (seconds). After this, the token
+    /// stops resolving and the user must sign in again. Default 30 days.
+    pub session_ttl_secs: i64,
     /// Enable the direct-MangaDex catalogue sync (CATALOGUE.md §5). Off by default —
     /// nothing hits MangaDex unless `CATALOGUE_SYNC=on`.
     pub catalogue_sync_enabled: bool,
@@ -98,6 +101,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(300);
+        let session_ttl_secs = env::var("SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &i64| v > 0)
+            .unwrap_or(30 * 24 * 60 * 60);
         let catalogue_sync_enabled = env::var("CATALOGUE_SYNC")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
@@ -136,6 +144,7 @@ impl Config {
             scan_tick_seconds,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,
+            session_ttl_secs,
             catalogue_sync_enabled,
             mangadex_rate_per_sec,
             mangadex_user_agent,

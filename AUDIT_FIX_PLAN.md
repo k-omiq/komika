@@ -36,7 +36,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 **Phase 1 — Security must-fix before any public exposure**
 - [x] 1.1 🔴 D1 — deploy.sh must halt on default admin password — deploy.sh now `die`s after creating `.env` (no fall-through to up+bootstrap); bootstrap.py `main()` exits 1 if `KOMIKA_ADMIN_PASSWORD` == `change-this-admin-pw`. Verified both exit codes.
 - [x] 1.2 🔴 A2 — stop trusting client `X-Forwarded-For` — hand-rolled `Cidr` (v4/v6 prefix match, no new crate); `resolve_client_ip` now honors XFF/X-Real-IP only when the socket peer is in `TRUSTED_PROXY_CIDRS` (new Config field, default empty → uses socket peer). v4-mapped-v6 canonicalized. 9 unit tests added. Documented the knob in docker-compose.yml.
-- [ ] 1.3 🔴 A1 — session expiry + rotation
+- [x] 1.3 🔴 A1 — session expiry + rotation — migration `0010` adds `sessions.expires_at` (+ index, backfill via strftime to canonical `YYYY-MM-DDTHH:MM:SSZ`). `new_session` sets `expires_at = now + SESSION_TTL_SECS` (new Config field, default 30d) using a fixed-width lexically-sortable format (`auth::format_ts`), + opportunistic GC of expired rows. `user_for_token` enforces `AND s.expires_at > ?`. Test seeds an expired token → `session` returns null. Note: rotation-on-use not added (absolute TTL only); localStorage token (A6) still applies.
 - [ ] 1.4 🟡 D2 — restrict/loopback-bind unauthenticated Suwayomi (or default to Worker image path)
 - [ ] 1.5 🟡 D4 — disable public GraphiQL + introspection in prod
 - [ ] 1.6 🟡 A5 — reserve `KOMIKA_ADMIN_USERS` names from open registration
