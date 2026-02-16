@@ -15,9 +15,10 @@
 #   reader       — static SvelteKit SPA (nginx), pointed at the server.
 #
 # Public wiring: GraphQL federation stays on the internal network
-# (SUWAYOMI_URL=http://suwayomi:4567), but page/cover image URLs are handed to the
-# browser, so the server rewrites them to SUWAYOMI_PUBLIC_URL (a host the browser
-# can reach). Set PUBLIC_HOST to your domain/IP in deploy/.env for a real deploy.
+# (SUWAYOMI_URL=http://suwayomi:4567). Suwayomi's port is bound to loopback only
+# (its admin API is unauthenticated), so browser images route through the
+# Cloudflare image Worker (reader IMG_MODE=proxy; set KOMIKA_IMG_WORKER_URL).
+# Set PUBLIC_HOST to your domain/IP in deploy/.env for a real deploy.
 
 name: komika
 
@@ -31,9 +32,15 @@ services:
     volumes:
       - suwayomi-data:/home/suwayomi/.local/share/Tachidesk
     ports:
-      # Must be reachable by BROWSERS for direct-mode images. In production put a
-      # reverse proxy in front that only exposes the image routes (see README).
-      - '${SUWAYOMI_PORT:-4567}:4567'
+      # Bound to LOOPBACK only: Suwayomi's GraphQL admin API is unauthenticated
+      # (add/remove sources, trigger downloads, enumerate library), so it must not
+      # be internet-reachable. The server federates it over the internal network
+      # (SUWAYOMI_URL=http://suwayomi:4567), which is unaffected. Browser images go
+      # through the Cloudflare image Worker (reader IMG_MODE=proxy below), not this
+      # port. Caveat: because the Worker also can't reach a loopback-bound
+      # Suwayomi, images for *Suwayomi-source* (non-canonical) series won't proxy;
+      # the canonical MangaDex path (uploads.mangadex.org / mangadex.network) does.
+      - '127.0.0.1:${SUWAYOMI_PORT:-4567}:4567'
     networks: [komika]
     healthcheck:
       test: ['CMD-SHELL', 'wget -qO- http://localhost:4567/ >/dev/null 2>&1 || exit 1']
@@ -107,14 +114,16 @@ services:
         PUBLIC_KOMIKA_BACKEND: 'on'
         PUBLIC_KOMIKA_BACKEND_KIND: komika
         PUBLIC_KOMIKA_API: http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}/graphql
-        PUBLIC_KOMIKA_IMG_MODE: direct
+        # Images route through the Cloudflare image Worker (not the now
+        # loopback-only Suwayomi port). Set KOMIKA_IMG_WORKER_URL in deploy/.env
+        # to your deployed Worker's base URL; images stay broken until it is set.
+        PUBLIC_KOMIKA_IMG_MODE: proxy
+        PUBLIC_KOMIKA_IMG_WORKER: ${KOMIKA_IMG_WORKER_URL:-}
     restart: unless-stopped
     environment:
-      # CSP origins (nginx templates them at boot). Default image mode is
-      # `direct`, so images load from the public Suwayomi host; connect-src is the
-      # GraphQL API origin. Switch CSP_IMG_ORIGIN to the Worker base URL if you
-      # move to PUBLIC_KOMIKA_IMG_MODE=proxy.
-      CSP_IMG_ORIGIN: http://${PUBLIC_HOST:-localhost}:${SUWAYOMI_PORT:-4567}
+      # CSP origins (nginx templates them at boot). Image mode is `proxy`, so
+      # images load from the image Worker; connect-src is the GraphQL API origin.
+      CSP_IMG_ORIGIN: ${KOMIKA_IMG_WORKER_URL:-}
       CSP_CONNECT_ORIGIN: http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}
     ports:
       - '${READER_PORT:-8081}:80'
