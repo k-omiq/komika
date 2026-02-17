@@ -19,7 +19,7 @@ use axum::{
     extract::{ConnectInfo, FromRef, State},
     http::{header, HeaderMap, HeaderValue, Method},
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use tower::ServiceBuilder;
@@ -268,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
 
-    let schema = build_schema(state);
+    let schema = build_schema(state, !cfg.graphiql_enabled);
 
     let origins: Vec<_> = cfg
         .cors_origins
@@ -280,8 +280,17 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
+    // GraphiQL (GET /graphql) is served only when explicitly enabled; otherwise a
+    // GET is a 405 and only the POST endpoint exists. Introspection is disabled in
+    // the same off state (see build_schema above).
+    let graphql_route = if cfg.graphiql_enabled {
+        get(graphiql).post(graphql_handler)
+    } else {
+        post(graphql_handler)
+    };
+
     let app = Router::new()
-        .route("/graphql", get(graphiql).post(graphql_handler))
+        .route("/graphql", graphql_route)
         .route("/health", get(health))
         .route("/health/ready", get(ready))
         // Request-id + access-log span. SetRequestId runs first (generates an

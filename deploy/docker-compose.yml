@@ -82,6 +82,9 @@ services:
       # server and sets X-Forwarded-For / X-Real-IP.
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       KOMIKA_ADMIN_USERS: ${KOMIKA_ADMIN_USERS:-admin}
+      # GraphiQL IDE + schema introspection. Off by default so the public API
+      # exposes neither; set GRAPHIQL_ENABLED=on in deploy/.env only for dev.
+      GRAPHIQL_ENABLED: ${GRAPHIQL_ENABLED:-off}
       SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
       RUST_LOG: komika_server=info,tower_http=warn
       # Continuous backup (Litestream → S3-compatible; Cloudflare R2 reference).

@@ -33,6 +33,9 @@ pub struct Config {
     /// Absolute lifetime of a session token (seconds). After this, the token
     /// stops resolving and the user must sign in again. Default 30 days.
     pub session_ttl_secs: i64,
+    /// Serve the GraphiQL IDE on `GET /graphql` and allow schema introspection.
+    /// Off by default so a public deployment exposes neither; enable only in dev.
+    pub graphiql_enabled: bool,
     /// Enable the direct-MangaDex catalogue sync (CATALOGUE.md §5). Off by default —
     /// nothing hits MangaDex unless `CATALOGUE_SYNC=on`.
     pub catalogue_sync_enabled: bool,
@@ -106,6 +109,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &i64| v > 0)
             .unwrap_or(30 * 24 * 60 * 60);
+        let graphiql_enabled = env::var("GRAPHIQL_ENABLED")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "on" || v == "1" || v == "true"
+            })
+            .unwrap_or(false);
         let catalogue_sync_enabled = env::var("CATALOGUE_SYNC")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
@@ -145,6 +154,7 @@ impl Config {
             auth_rate_limit_max,
             auth_rate_limit_window_secs,
             session_ttl_secs,
+            graphiql_enabled,
             catalogue_sync_enabled,
             mangadex_rate_per_sec,
             mangadex_user_agent,

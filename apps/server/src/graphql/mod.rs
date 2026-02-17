@@ -108,12 +108,17 @@ pub struct ClientIp(pub Option<String>);
 pub type ApiSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
 /// Build the schema over a shared `AppState`. The same `Arc` is handed to the scan
-/// scheduler so resolvers and the background task see one set of state.
-pub fn build_schema(state: std::sync::Arc<AppState>) -> ApiSchema {
-    Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+/// scheduler so resolvers and the background task see one set of state. When
+/// `disable_introspection` is set (production default), schema introspection is
+/// turned off so the API surface isn't publicly enumerable.
+pub fn build_schema(state: std::sync::Arc<AppState>, disable_introspection: bool) -> ApiSchema {
+    let mut builder = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .extension(ErrorLogger)
-        .data(state)
-        .finish()
+        .data(state);
+    if disable_introspection {
+        builder = builder.disable_introspection();
+    }
+    builder.finish()
 }
 
 /// async-graphql extension that logs every resolver error server-side. GraphQL
@@ -1806,7 +1811,7 @@ mod tests {
             auth_limiter: RateLimiter::new(max, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         });
-        (build_schema(state), pool)
+        (build_schema(state, false), pool)
     }
 
     async fn exec(
@@ -1870,6 +1875,51 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn introspection_toggles_with_flag() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let mk_state = || {
+            std::sync::Arc::new(AppState {
+                pool: pool.clone(),
+                suwayomi: crate::suwayomi::SuwayomiClient::new(
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    None,
+                ),
+                mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+                admin_users: vec![],
+                scan_health: Mutex::new(ScanHealth::default()),
+                auth_limiter: RateLimiter::new(100, 60),
+                session_ttl_secs: 30 * 24 * 60 * 60,
+            })
+        };
+        const Q: &str = "{ __schema { queryType { name } } }";
+        // Disabled (production default): `__schema` resolves to null, so the API
+        // surface is not enumerable.
+        let disabled = build_schema(mk_state(), true);
+        let r = disabled.execute(Q).await;
+        assert_eq!(
+            serde_json::to_string(&r.data).unwrap(),
+            "{\"__schema\":null}",
+            "disabled introspection must not leak the schema (errors: {:?})",
+            r.errors
+        );
+        // Enabled (dev): introspection returns the real schema.
+        let enabled = build_schema(mk_state(), false);
+        let r = enabled.execute(Q).await;
+        let json = serde_json::to_string(&r.data).unwrap();
+        assert!(
+            r.errors.is_empty() && json.contains("queryType") && json != "{\"__schema\":null}",
+            "introspection should work when enabled: {json} (errors: {:?})",
+            r.errors
+        );
     }
 
     #[tokio::test]
@@ -2311,7 +2361,7 @@ mod tests {
             auth_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         });
-        let s = build_schema(state);
+        let s = build_schema(state, false);
         let r = exec(
             &s,
             r#"{ updates { total hasNextPage items { id } } }"#,
