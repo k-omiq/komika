@@ -1,5 +1,20 @@
 use std::env;
 
+/// A secret string that never prints its value in `Debug` output (Config is
+/// logged wholesale at startup via `?cfg`).
+#[derive(Clone, Default)]
+pub struct Secret(pub Option<String>);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Some(<redacted>)"
+        } else {
+            "None"
+        })
+    }
+}
+
 /// Runtime configuration, sourced from env vars (see `.env.example`).
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -20,9 +35,16 @@ pub struct Config {
     /// one of these; empty (default) means always use the socket peer, matching
     /// the shipped compose that publishes the server port directly.
     pub trusted_proxy_cidrs: Vec<String>,
-    /// Usernames that are granted admin (for the "manga DB" console). Promoted at
-    /// startup and on registration.
+    /// Usernames that are granted admin (for the "manga DB" console). These names
+    /// are reserved from open registration and provisioned/promoted at startup.
     pub admin_users: Vec<String>,
+    /// Password used to CREATE a configured admin account at startup when it does
+    /// not yet exist (existing accounts are only promoted, never re-passworded).
+    /// None disables account creation — admins must already exist to be promoted.
+    pub admin_password: Secret,
+    /// Email for the primary provisioned admin account. Others get a synthesized
+    /// `<username>@admin.local`. Only used when creating a missing admin account.
+    pub admin_email: Option<String>,
     /// How often the background scan scheduler wakes to re-evaluate the library.
     pub scan_tick_seconds: u64,
     /// Max failed login/register attempts per key within the rate-limit window
@@ -89,6 +111,14 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let admin_password = Secret(
+            env::var("KOMIKA_ADMIN_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        );
+        let admin_email = env::var("KOMIKA_ADMIN_EMAIL")
+            .ok()
+            .filter(|s| !s.is_empty());
         let scan_tick_seconds = env::var("SCAN_TICK_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -150,6 +180,8 @@ impl Config {
             cors_origins,
             trusted_proxy_cidrs,
             admin_users,
+            admin_password,
+            admin_email,
             scan_tick_seconds,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,

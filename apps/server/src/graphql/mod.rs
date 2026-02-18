@@ -1285,13 +1285,21 @@ impl MutationRoot {
         if input.password.len() < 8 {
             return Err(Error::new("password must be at least 8 characters"));
         }
+        // Admin usernames are reserved: open registration must never grant admin
+        // (A5). Admin accounts are provisioned/promoted at startup from
+        // KOMIKA_ADMIN_USERS + KOMIKA_ADMIN_PASSWORD (see provision_admins), so a
+        // stranger cannot squat a configured admin name to self-elevate.
+        if st
+            .admin_users
+            .iter()
+            .any(|u| u.eq_ignore_ascii_case(username))
+        {
+            return Err(Error::new("This username is reserved."));
+        }
         let hash = auth::hash_password(&input.password).map_err(gql_err)?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let is_admin = st
-            .admin_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(username));
+        let is_admin = false;
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
              VALUES (?, ?, ?, ?, NULL, ?, ?)",
@@ -1714,6 +1722,68 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
     Ok(tok)
 }
 
+/// Ensure every configured admin username exists and is an admin. An existing
+/// account is promoted (never re-passworded); a missing one is CREATED from
+/// `admin_password` (with `is_admin = 1`). When no password is configured, a
+/// missing admin can only be logged — it cannot self-register, since admin names
+/// are reserved from open registration (A5). This is the sole path to admin
+/// status: `register` never grants it.
+pub async fn provision_admins(
+    pool: &SqlitePool,
+    admin_users: &[String],
+    admin_password: Option<&str>,
+    admin_email: Option<&str>,
+) -> anyhow::Result<()> {
+    for (idx, username) in admin_users.iter().enumerate() {
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
+                .bind(username)
+                .fetch_optional(pool)
+                .await?;
+        if let Some((id,)) = existing {
+            sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+                .bind(&id)
+                .execute(pool)
+                .await?;
+            tracing::info!(username, "ensured admin (promoted existing account)");
+            continue;
+        }
+        let Some(pw) = admin_password else {
+            tracing::warn!(
+                username,
+                "configured admin user is missing and KOMIKA_ADMIN_PASSWORD is unset — \
+                 cannot provision it, and the reserved name cannot self-register"
+            );
+            continue;
+        };
+        let hash = auth::hash_password(pw)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        // The primary admin gets the configured email; any others get a
+        // collision-free synthetic address (email is UNIQUE).
+        let email = match (idx, admin_email) {
+            (0, Some(e)) => e.to_string(),
+            _ => format!("{username}@admin.local"),
+        };
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
+             VALUES (?, ?, ?, ?, NULL, 1, ?)",
+        )
+        .bind(&id)
+        .bind(username)
+        .bind(&email)
+        .bind(&hash)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+        tracing::info!(
+            username,
+            "provisioned admin account from KOMIKA_ADMIN_PASSWORD"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,6 +1990,107 @@ mod tests {
             "introspection should work when enabled: {json} (errors: {:?})",
             r.errors
         );
+    }
+
+    #[tokio::test]
+    async fn provision_admins_creates_promotes_and_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // Missing admin + password → created as admin with the configured email.
+        provision_admins(&pool, &["admin".into()], Some("s3cret-pw"), Some("a@b.com"))
+            .await
+            .unwrap();
+        let (is_admin, email, hash): (i64, String, String) = sqlx::query_as(
+            "SELECT is_admin, email, password_hash FROM users WHERE username='admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(is_admin, 1);
+        assert_eq!(email, "a@b.com");
+        assert!(auth::verify_password("s3cret-pw", &hash), "password usable");
+
+        // Idempotent re-run with a different password: no duplicate, existing
+        // password preserved (never re-passworded).
+        provision_admins(
+            &pool,
+            &["admin".into()],
+            Some("different-pw"),
+            Some("a@b.com"),
+        )
+        .await
+        .unwrap();
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE username='admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate admin row");
+        let (hash2,): (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE username='admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            auth::verify_password("s3cret-pw", &hash2),
+            "existing password preserved, not reset"
+        );
+
+        // Existing non-admin gets promoted; no password required.
+        seed_user(&pool, "bob-id", "bob", 0, 0).await;
+        provision_admins(&pool, &["bob".into()], None, None)
+            .await
+            .unwrap();
+        let (bob_admin,): (i64,) =
+            sqlx::query_as("SELECT is_admin FROM users WHERE username='bob'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bob_admin, 1, "existing account promoted");
+    }
+
+    #[tokio::test]
+    async fn register_rejects_reserved_admin_username() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = std::sync::Arc::new(AppState {
+            pool: pool.clone(),
+            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+            admin_users: vec!["admin".into()],
+            scan_health: Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 30 * 24 * 60 * 60,
+        });
+        let s = build_schema(state, false);
+        // A configured admin name is reserved (case-insensitive) — open
+        // registration cannot squat it or self-elevate.
+        let r = exec(
+            &s,
+            r#"mutation { register(input:{username:"Admin", email:"x@y.com", password:"password123"}) { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "This username is reserved.");
+        // A normal name registers fine and is NOT admin.
+        let r = exec(
+            &s,
+            r#"mutation { register(input:{username:"alice", email:"a@y.com", password:"password123"}) { user { isAdmin } } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"isAdmin\":false"));
     }
 
     #[tokio::test]

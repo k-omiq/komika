@@ -220,15 +220,15 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init(&cfg.database_url).await?;
 
-    // Promote configured admin usernames (idempotent, case-insensitive to match
-    // the register-time admin check).
-    for username in &cfg.admin_users {
-        sqlx::query("UPDATE users SET is_admin = 1 WHERE username = ? COLLATE NOCASE")
-            .bind(username)
-            .execute(&pool)
-            .await?;
-        tracing::info!(username, "ensured admin");
-    }
+    // Provision/promote configured admin accounts (idempotent). This is the only
+    // path to admin: `register` reserves these names and never grants admin.
+    graphql::provision_admins(
+        &pool,
+        &cfg.admin_users,
+        cfg.admin_password.0.as_deref(),
+        cfg.admin_email.as_deref(),
+    )
+    .await?;
 
     let suwayomi = SuwayomiClient::new(
         cfg.suwayomi_url.clone(),

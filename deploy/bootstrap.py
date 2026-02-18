@@ -130,19 +130,12 @@ def enable_flaresolverr():
 # ---- 3. Komika admin account --------------------------------------------------
 
 def create_admin():
-    log(f"creating admin account '{ADMIN_USER}'")
-    q = ("mutation($u:String!,$e:String!,$p:String!){ "
-         "register(input:{username:$u,email:$e,password:$p}){ user { username isAdmin } } }")
-    try:
-        d = gql(SRV, q, {"u": ADMIN_USER, "e": ADMIN_EMAIL, "p": ADMIN_PW})
-        u = d["register"]["user"]
-        ok(f"admin '{u['username']}' created (isAdmin={u['isAdmin']})")
-    except Exception as e:
-        msg = str(e)
-        if "taken" in msg:
-            ok(f"admin '{ADMIN_USER}' already exists (promoted via KOMIKA_ADMIN_USERS)")
-        else:
-            warn(f"create admin: {msg}")
+    # The server provisions the admin account itself at startup, from
+    # KOMIKA_ADMIN_USERS + KOMIKA_ADMIN_PASSWORD (the names are reserved from open
+    # registration, so this cannot be done via the register mutation). By the time
+    # bootstrap runs, the account already exists — nothing to do here.
+    log(f"admin account '{ADMIN_USER}' is provisioned by the server at startup")
+    ok("admin provisioning is server-side (KOMIKA_ADMIN_PASSWORD)")
 
 
 # ---- 4. Seed the library ------------------------------------------------------
