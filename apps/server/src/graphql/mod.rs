@@ -48,8 +48,14 @@ impl RateLimiter {
     pub fn is_limited(&self, key: &str) -> Option<u64> {
         let now = Instant::now();
         let mut map = self.hits.lock().unwrap();
-        let entry = map.entry(key.to_string()).or_default();
+        // Only inspect an existing entry — never insert on a read, or every
+        // distinct client IP would leave a permanent key (unbounded RSS growth).
+        let entry = map.get_mut(key)?;
         entry.retain(|t| now.duration_since(*t) < self.window);
+        if entry.is_empty() {
+            map.remove(key);
+            return None;
+        }
         if entry.len() as u32 >= self.max {
             let oldest = entry.first().copied().unwrap_or(now);
             let retry = self.window.saturating_sub(now.duration_since(oldest));
@@ -63,6 +69,15 @@ impl RateLimiter {
     pub fn record(&self, key: &str) {
         let now = Instant::now();
         let mut map = self.hits.lock().unwrap();
+        // Opportunistic sweep: when the map is large, drop keys whose window has
+        // fully elapsed so a churn of distinct client IPs can't grow it without
+        // bound (there is no background reaper).
+        if map.len() >= 4096 {
+            map.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < self.window);
+                !v.is_empty()
+            });
+        }
         let entry = map.entry(key.to_string()).or_default();
         entry.retain(|t| now.duration_since(*t) < self.window);
         entry.push(now);
@@ -104,6 +119,18 @@ pub struct RequestAuth(pub Option<String>);
 /// cannot exhaust another account's budget.
 #[derive(Clone, Default)]
 pub struct ClientIp(pub Option<String>);
+
+/// Upper bound on password length accepted by `login`/`register`, enforced
+/// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
+const MAX_PASSWORD_LEN: usize = 1024;
+
+/// A fixed dummy Argon2 hash (of a random password nobody knows), used to run a
+/// constant-work verify on the login missing-user path so response time doesn't
+/// reveal whether a username exists (A3). Built once with the default params so
+/// it costs the same as a real verify.
+static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    auth::hash_password("komika-constant-time-dummy-abc123").expect("dummy hash")
+});
 
 pub type ApiSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
@@ -1234,17 +1261,33 @@ impl MutationRoot {
                 "Too many login attempts — try again in {retry}s"
             )));
         }
-        let user = sqlx::query_as::<_, User>(
+        // Reject over-long passwords before any Argon2 work (A7). Such a password
+        // can never be valid (registration caps at the same length), so this is
+        // just the wrong-credentials path.
+        if password.len() > MAX_PASSWORD_LEN {
+            st.auth_limiter.record(&key);
+            return Err(Error::new("Invalid username or password"));
+        }
+        let row = sqlx::query_as::<_, User>(
             "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned FROM users WHERE username = ?",
         )
         .bind(&username)
         .fetch_optional(&st.pool)
         .await
-        .map_err(gql_err)?
-        .filter(|u| auth::verify_password(&password, &u.password_hash));
-        let user = match user {
-            Some(u) => u,
+        .map_err(gql_err)?;
+        // Always run an Argon2 verify — against the real hash if the user exists,
+        // else a fixed dummy hash — so login time doesn't reveal whether the
+        // username exists (A3).
+        let password_ok = match &row {
+            Some(u) => auth::verify_password(&password, &u.password_hash),
             None => {
+                auth::verify_password(&password, &DUMMY_PASSWORD_HASH);
+                false
+            }
+        };
+        let user = match row {
+            Some(u) if password_ok => u,
+            _ => {
                 st.auth_limiter.record(&key); // count only failed attempts
                 return Err(Error::new("Invalid username or password"));
             }
@@ -1284,6 +1327,9 @@ impl MutationRoot {
         }
         if input.password.len() < 8 {
             return Err(Error::new("password must be at least 8 characters"));
+        }
+        if input.password.len() > MAX_PASSWORD_LEN {
+            return Err(Error::new("password must be at most 1024 characters"));
         }
         // Admin usernames are reserved: open registration must never grant admin
         // (A5). Admin accounts are provisioned/promoted at startup from
@@ -1814,6 +1860,32 @@ mod tests {
         assert!(rl.is_limited("k").is_some());
     }
 
+    #[test]
+    fn limiter_does_not_leak_keys() {
+        // A read on an unknown key must not insert a map entry (A4) — otherwise
+        // every distinct client IP would grow the map without bound.
+        let rl = RateLimiter::new(3, 60);
+        for i in 0..100 {
+            assert!(rl.is_limited(&format!("k{i}")).is_none());
+        }
+        assert_eq!(
+            rl.hits.lock().unwrap().len(),
+            0,
+            "reads must not insert keys"
+        );
+
+        // A key whose window has fully elapsed is evicted on the next read.
+        let rl0 = RateLimiter::new(3, 0); // zero-length window → immediately stale
+        rl0.record("k");
+        assert_eq!(rl0.hits.lock().unwrap().len(), 1);
+        assert!(rl0.is_limited("k").is_none());
+        assert_eq!(
+            rl0.hits.lock().unwrap().len(),
+            0,
+            "a fully-stale key is evicted on read"
+        );
+    }
+
     // ---- GraphQL security integration tests (no Suwayomi needed) ----
 
     async fn seed_user(pool: &SqlitePool, id: &str, username: &str, is_admin: i64, is_banned: i64) {
@@ -2323,6 +2395,37 @@ mod tests {
             "1.1.1.1",
         )
         .await;
+        assert_eq!(first_error(&r), "Invalid username or password");
+    }
+
+    #[tokio::test]
+    async fn login_with_unknown_username_is_rejected_uniformly() {
+        let s = setup().await;
+        // A3: an unknown username returns the same error as a wrong password
+        // (and, in prod, after the same constant-work Argon2 verify).
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"nobody-here", password:"password123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Invalid username or password");
+    }
+
+    #[tokio::test]
+    async fn overlong_passwords_are_rejected() {
+        let s = setup().await;
+        let long = "x".repeat(MAX_PASSWORD_LEN + 1);
+        // A7: register rejects an over-long password.
+        let q = format!(
+            r#"mutation {{ register(input:{{username:"newbie", email:"n@e.com", password:"{long}"}}) {{ token }} }}"#
+        );
+        let r = exec(&s, &q, None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "password must be at most 1024 characters");
+        // A7: login rejects an over-long password without hashing it.
+        let q = format!(r#"mutation {{ login(username:"bob", password:"{long}") {{ token }} }}"#);
+        let r = exec(&s, &q, None, "1.1.1.1").await;
         assert_eq!(first_error(&r), "Invalid username or password");
     }
 
