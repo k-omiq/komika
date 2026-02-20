@@ -64,6 +64,9 @@ pub struct Config {
     /// Global request budget for the MangaDex crawl (fleet-wide; shared egress IP).
     /// MangaDex's per-IP ceiling is ~5 req/s.
     pub mangadex_rate_per_sec: f64,
+    /// Dedicated budget for MangaDex `/at-home` calls (per minute). This endpoint
+    /// has its own ~40/min limit, far tighter than the global one. Default 40.
+    pub mangadex_athome_per_min: f64,
     /// User-Agent sent to MangaDex (required by their API).
     pub mangadex_user_agent: String,
     /// Compute a cover perceptual-hash per work during the catalogue sync
@@ -156,6 +159,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &f64| v > 0.0)
             .unwrap_or(5.0);
+        let mangadex_athome_per_min = env::var("MANGADEX_ATHOME_PER_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &f64| v > 0.0)
+            .unwrap_or(40.0);
         let mangadex_user_agent = env::var("MANGADEX_USER_AGENT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -189,6 +197,7 @@ impl Config {
             graphiql_enabled,
             catalogue_sync_enabled,
             mangadex_rate_per_sec,
+            mangadex_athome_per_min,
             mangadex_user_agent,
             catalogue_cover_phash,
             catalogue_sync_interval_secs,

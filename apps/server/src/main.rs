@@ -238,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
     let mangadex = Arc::new(mangadex::MangaDexClient::new(
         &cfg.mangadex_user_agent,
         cfg.mangadex_rate_per_sec,
+        cfg.mangadex_athome_per_min,
     ));
     let state = Arc::new(AppState {
         pool: pool.clone(),

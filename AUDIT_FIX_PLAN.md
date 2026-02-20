@@ -43,7 +43,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 - [x] 1.7 🟡 A3 / A4 / ⚪ A7 — auth hardening bundle — **A3:** login always runs an Argon2 verify (real hash or fixed `DUMMY_PASSWORD_HASH`) so timing doesn't reveal username existence. **A4:** `is_limited` no longer inserts on read (`get_mut`+`?`), evicts fully-stale keys, and `record` sweeps the map when it exceeds 4096 keys. **A7:** `MAX_PASSWORD_LEN=1024` enforced before hashing in both login (→ invalid creds) and register (→ "at most 1024"). 3 tests added. Note: the distinct "This account has been suspended." message (A3 second half) left as-is — intended UX, only reachable with a correct password (not a username-enumeration vector).
 
 **Phase 2 — MangaDex proxy-compliance (avoid 429/IP ban)**
-- [ ] 2.1 🔴 M1 / CR1 — dedicated ≤40/min limiter for `/at-home` (+ optional per-chapter cache)
+- [x] 2.1 🔴 M1 / CR1 — dedicated ≤40/min limiter for `/at-home` — `MangaDexClient` gains an `athome_limiter: TokenBucket` (rate `MANGADEX_ATHOME_PER_MIN/60`, Config default 40); `at_home` now acquires it in addition to the global bucket. **Caught + fixed a latent bug:** `TokenBucket` capacity was `= rate`, so a sub-1/s rate (0.67/s) could never reach the 1-token threshold and would block forever — floored capacity at 1.0 (no-op for rate≥1). `MangaDexClient::new` gained an arg → updated main.rs + 4 test sites. Fixed the inverted comment. 3 tests added. **Deferred (optional, noted):** per-chapter at_home TTL cache — not required for the 40/min cap; skipped to keep scope tight.
 - [ ] 2.2 🟠 M2 — 429/5xx backoff + Retry-After; target ~4 req/s
 - [ ] 2.3 🟡 M5 — HTTP request timeout on the MangaDex client
 - [ ] 2.4 🟡 M3 / M6 — resumable seed + gate chapters on catalogue completion

@@ -1947,7 +1947,9 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
-            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                "test-ua", 5.0, 40.0,
+            )),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
@@ -2035,7 +2037,9 @@ mod tests {
                     None,
                     None,
                 ),
-                mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+                mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                    "test-ua", 5.0, 40.0,
+                )),
                 admin_users: vec![],
                 scan_health: Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
@@ -2136,7 +2140,9 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
-            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                "test-ua", 5.0, 40.0,
+            )),
             admin_users: vec!["admin".into()],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
@@ -2629,7 +2635,9 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool,
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
-            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0)),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                "test-ua", 5.0, 40.0,
+            )),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),

@@ -66,12 +66,17 @@ struct BucketState {
 impl TokenBucket {
     fn new(rate_per_sec: f64) -> Self {
         let rate = rate_per_sec.max(0.1);
+        // Capacity must be at least one token: `acquire` needs a whole token, and
+        // refill is capped at `capacity`, so a sub-1/s rate (e.g. the 40/min =
+        // 0.67/s at-home bucket) with capacity < 1 could never accumulate a token
+        // and would block forever. Flooring at 1 is a no-op for rates >= 1/s.
+        let capacity = rate.max(1.0);
         Self {
             inner: Mutex::new(BucketState {
-                tokens: rate,
+                tokens: capacity,
                 last: Instant::now(),
             }),
-            capacity: rate,
+            capacity,
             refill_per_sec: rate,
         }
     }
@@ -99,11 +104,15 @@ impl TokenBucket {
 /// The direct MangaDex API client. Cheap to clone-share via `Arc`.
 pub struct MangaDexClient {
     http: reqwest::Client,
+    /// Global budget shared by every MangaDex call (~5 req/s per-IP ceiling).
     limiter: TokenBucket,
+    /// Dedicated budget for `/at-home`, whose own limit (~40/min) is far tighter
+    /// than the global one. Acquired *in addition to* `limiter` in `at_home`.
+    athome_limiter: TokenBucket,
 }
 
 impl MangaDexClient {
-    pub fn new(user_agent: &str, rate_per_sec: f64) -> Self {
+    pub fn new(user_agent: &str, rate_per_sec: f64, athome_per_min: f64) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(user_agent.to_string())
             .build()
@@ -111,6 +120,7 @@ impl MangaDexClient {
         Self {
             http,
             limiter: TokenBucket::new(rate_per_sec),
+            athome_limiter: TokenBucket::new(athome_per_min / 60.0),
         }
     }
 
@@ -221,9 +231,11 @@ impl MangaDexClient {
     /// (`GET /at-home/server/{chapterId}` → `{ baseUrl, chapter: { hash, data[] } }`).
     /// Each page URL is `{baseUrl}/data/{hash}/{filename}`. These are dynamic
     /// `*.mangadex.network` hosts and MUST be proxied by the Worker (hotlinks get a
-    /// wrong response). Rate-limited (this endpoint is capped at 40/min; the global
-    /// ~5 req/s bucket keeps us well under). CATALOGUE.md §5, §9.
+    /// wrong response). This endpoint is capped at ~40/min — far below the global
+    /// ~5 req/s (300/min) budget — so it takes a dedicated `athome_limiter` in
+    /// addition to the global one. CATALOGUE.md §5, §9.
     pub async fn at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
+        self.athome_limiter.acquire().await;
         self.limiter.acquire().await;
         let res = self
             .http
@@ -825,5 +837,33 @@ mod tests {
             Some("2018-10-04T22:16:00")
         );
         assert_eq!(to_since("garbage"), None);
+    }
+
+    #[test]
+    fn token_bucket_floors_capacity_at_one() {
+        // Normal rates are unchanged...
+        assert_eq!(TokenBucket::new(5.0).capacity, 5.0);
+        // ...but a sub-1/s rate is floored so `acquire` can accumulate a whole
+        // token (otherwise refill caps below 1.0 and it blocks forever).
+        assert_eq!(TokenBucket::new(40.0 / 60.0).capacity, 1.0);
+        assert_eq!(TokenBucket::new(0.05).capacity, 1.0);
+    }
+
+    #[tokio::test]
+    async fn sub_one_per_sec_bucket_does_not_hang() {
+        // 40/min = 0.67/s. Before the capacity floor this bucket could never reach
+        // the 1-token threshold and the very first acquire would block forever.
+        let b = TokenBucket::new(40.0 / 60.0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), b.acquire())
+            .await
+            .expect("first acquire must not hang");
+    }
+
+    #[test]
+    fn at_home_limiter_is_built_from_per_minute_rate() {
+        let c = MangaDexClient::new("ua", 5.0, 40.0);
+        assert_eq!(c.limiter.refill_per_sec, 5.0);
+        assert!((c.athome_limiter.refill_per_sec - 40.0 / 60.0).abs() < 1e-9);
+        assert_eq!(c.athome_limiter.capacity, 1.0);
     }
 }
