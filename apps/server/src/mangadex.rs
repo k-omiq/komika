@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -101,6 +101,24 @@ impl TokenBucket {
     }
 }
 
+/// Parse a `Retry-After` header (integer seconds form, which MangaDex uses),
+/// clamped to a sane ceiling so a hostile/broken value can't stall the crawl.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(60)))
+}
+
+/// Exponential backoff for retry attempt `n` (0-based): 0.5s, 1s, 2s, 4s, …
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis(500u64 << attempt.min(6))
+}
+
 /// The direct MangaDex API client. Cheap to clone-share via `Arc`.
 pub struct MangaDexClient {
     http: reqwest::Client,
@@ -121,6 +139,49 @@ impl MangaDexClient {
             http,
             limiter: TokenBucket::new(rate_per_sec),
             athome_limiter: TokenBucket::new(athome_per_min / 60.0),
+        }
+    }
+
+    /// Send a rate-limited GET with bounded retries on 429 / 5xx, honoring an
+    /// upstream `Retry-After` header when present, else exponential backoff. This
+    /// keeps a single transient rate-limit/blip from aborting a whole sweep or a
+    /// page-load. The rate-limit token(s) are acquired fresh on every attempt, so
+    /// a retry still counts against the budget. `athome` also acquires the tighter
+    /// at-home bucket. `label` is only for error/log messages.
+    async fn get_with_retry(
+        &self,
+        url: &str,
+        params: &[(String, String)],
+        athome: bool,
+        label: &str,
+    ) -> Result<reqwest::Response> {
+        const MAX_RETRIES: u32 = 4;
+        let mut attempt: u32 = 0;
+        loop {
+            if athome {
+                self.athome_limiter.acquire().await;
+            }
+            self.limiter.acquire().await;
+            let res = self.http.get(url).query(params).send().await?;
+            let status = res.status();
+            if status.is_success() {
+                return Ok(res);
+            }
+            // 429 (rate limited) and 5xx (transient upstream) are worth retrying;
+            // 4xx (other) are not — they won't fix themselves.
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            if !retryable || attempt >= MAX_RETRIES {
+                return Err(anyhow!("MangaDex {label} error {status}"));
+            }
+            let wait = retry_after(res.headers()).unwrap_or_else(|| backoff(attempt));
+            attempt += 1;
+            tracing::warn!(
+                status = %status,
+                attempt,
+                wait_ms = wait.as_millis() as u64,
+                "mangadex {label}: retrying after error",
+            );
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -148,16 +209,9 @@ impl MangaDexClient {
         if let Some(since) = since {
             params.push((window.since_param().into(), since.to_string()));
         }
-        self.limiter.acquire().await;
         let res = self
-            .http
-            .get(format!("{API_BASE}/manga"))
-            .query(&params)
-            .send()
+            .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga")
             .await?;
-        if !res.status().is_success() {
-            return Err(anyhow!("MangaDex /manga error {}", res.status()));
-        }
         let body: RawList = res.json().await?;
         let mut mangas = Vec::with_capacity(body.data.len());
         let mut skipped = 0usize;
@@ -192,16 +246,9 @@ impl MangaDexClient {
         if let Some(since) = since {
             params.push((window.since_param().into(), since.to_string()));
         }
-        self.limiter.acquire().await;
         let res = self
-            .http
-            .get(format!("{API_BASE}/chapter"))
-            .query(&params)
-            .send()
+            .get_with_retry(&format!("{API_BASE}/chapter"), &params, false, "/chapter")
             .await?;
-        if !res.status().is_success() {
-            return Err(anyhow!("MangaDex /chapter error {}", res.status()));
-        }
         let body: RawChapterList = res.json().await?;
         let mut chapters = Vec::with_capacity(body.data.len());
         for raw in body.data {
@@ -235,16 +282,14 @@ impl MangaDexClient {
     /// ~5 req/s (300/min) budget — so it takes a dedicated `athome_limiter` in
     /// addition to the global one. CATALOGUE.md §5, §9.
     pub async fn at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
-        self.athome_limiter.acquire().await;
-        self.limiter.acquire().await;
         let res = self
-            .http
-            .get(format!("{API_BASE}/at-home/server/{chapter_id}"))
-            .send()
+            .get_with_retry(
+                &format!("{API_BASE}/at-home/server/{chapter_id}"),
+                &[],
+                true,
+                "/at-home",
+            )
             .await?;
-        if !res.status().is_success() {
-            return Err(anyhow!("MangaDex /at-home error {}", res.status()));
-        }
         let body: AtHome = res.json().await?;
         let base = body.base_url.trim_end_matches('/');
         let hash = &body.chapter.hash;
@@ -865,5 +910,32 @@ mod tests {
         assert_eq!(c.limiter.refill_per_sec, 5.0);
         assert!((c.athome_limiter.refill_per_sec - 40.0 / 60.0).abs() < 1e-9);
         assert_eq!(c.athome_limiter.capacity, 1.0);
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(backoff(0), Duration::from_millis(500));
+        assert_eq!(backoff(1), Duration::from_millis(1000));
+        assert_eq!(backoff(3), Duration::from_millis(4000));
+        // Shift is capped so a large attempt index can't overflow / explode.
+        assert_eq!(backoff(10), Duration::from_millis(500 << 6));
+    }
+
+    #[test]
+    fn retry_after_parses_and_clamps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(5)));
+        // Absurd values are clamped to 60s.
+        h.insert(RETRY_AFTER, HeaderValue::from_static("100000"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(60)));
+        // HTTP-date form (non-integer) and missing header → None (fall back to backoff).
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&h), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
     }
 }

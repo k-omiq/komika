@@ -158,7 +158,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v: &f64| v > 0.0)
-            .unwrap_or(5.0);
+            // ~4 req/s leaves headroom under MangaDex's 5 req/s ceiling so a burst
+            // (or reader at-home traffic sharing the budget) doesn't sit on the
+            // ban threshold (M2).
+            .unwrap_or(4.0);
         let mangadex_athome_per_min = env::var("MANGADEX_ATHOME_PER_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
