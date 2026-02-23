@@ -133,6 +133,13 @@ impl MangaDexClient {
     pub fn new(user_agent: &str, rate_per_sec: f64, athome_per_min: f64) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(user_agent.to_string())
+            // Bound every request so a hung/slow MangaDex connection can't stall a
+            // sweep or a reader page-load indefinitely (M5). A timeout surfaces as
+            // a request error (it aborts the current page rather than being
+            // retried like a 429/5xx status); an incremental cycle self-heals next
+            // pass since the cursor only advances on success.
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builds");
         Self {
