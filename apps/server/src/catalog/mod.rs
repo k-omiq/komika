@@ -662,16 +662,65 @@ pub async fn insert_merge_candidate(
     Ok(id)
 }
 
-/// Read the sync cursor for a job (`catalogue` | `chapters`). `None` means the job
-/// has never completed a cycle → the caller should do a full `createdAt` seed.
-pub async fn get_sync_cursor(pool: &SqlitePool, job: &str) -> Result<Option<String>> {
-    let v = sqlx::query_scalar::<_, String>(
-        "SELECT last_synced_at FROM catalogue_sync_state WHERE job = ?",
+/// A sync job's persisted state.
+#[derive(Debug, Clone)]
+pub struct SyncState {
+    /// While `seed_done` is false this is a provisional `createdAt` resume point;
+    /// afterwards it's the incremental `updatedAtSince` cursor.
+    pub cursor: String,
+    /// Whether the initial full `createdAt` seed has completed at least once.
+    pub seed_done: bool,
+}
+
+/// Read a job's full sync state (cursor + whether its initial seed has finished).
+/// `None` means the job has never run → do a fresh full `createdAt` seed.
+pub async fn get_sync_state(pool: &SqlitePool, job: &str) -> Result<Option<SyncState>> {
+    let row = sqlx::query_as::<_, (String, i64)>(
+        "SELECT last_synced_at, seed_done FROM catalogue_sync_state WHERE job = ?",
     )
     .bind(job)
     .fetch_optional(pool)
     .await?;
-    Ok(v)
+    Ok(row.map(|(cursor, seed_done)| SyncState {
+        cursor,
+        seed_done: seed_done != 0,
+    }))
+}
+
+/// Persist provisional seed progress (leaving `seed_done = 0`) so an interrupted
+/// full seed resumes from `since` instead of restarting at `createdAt`=0 (M6).
+pub async fn set_seed_progress(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
+         VALUES (?, ?, ?, 0) \
+         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(job)
+    .bind(since)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark a job's initial full seed complete and set its incremental cursor to
+/// `since` (the wall-clock at the completed cycle's start).
+pub async fn mark_seed_done(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
+         VALUES (?, ?, ?, 1) \
+         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
+           updated_at = excluded.updated_at, seed_done = 1",
+    )
+    .bind(job)
+    .bind(since)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Persist the sync cursor for a job. `since` is the MangaDex `since` timestamp to use
@@ -791,31 +840,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_cursor_round_trips() {
+    async fn sync_state_seed_progress_and_completion() {
         let pool = pool().await;
-        assert_eq!(get_sync_cursor(&pool, "catalogue").await.unwrap(), None);
-        set_sync_cursor(&pool, "catalogue", "2026-07-11T00:00:00")
+        // Never run → no state → a fresh createdAt seed.
+        assert!(get_sync_state(&pool, "catalogue").await.unwrap().is_none());
+
+        // A provisional seed checkpoint keeps seed_done = false so the next cycle
+        // resumes the createdAt seed from this cursor (M6).
+        set_seed_progress(&pool, "catalogue", "2026-07-11T00:00:00")
             .await
             .unwrap();
-        assert_eq!(
-            get_sync_cursor(&pool, "catalogue")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("2026-07-11T00:00:00")
-        );
-        // Upsert overwrites, and jobs are independent.
-        set_sync_cursor(&pool, "catalogue", "2026-07-12T00:00:00")
+        let s = get_sync_state(&pool, "catalogue")
+            .await
+            .unwrap()
+            .expect("state present");
+        assert_eq!(s.cursor, "2026-07-11T00:00:00");
+        assert!(!s.seed_done, "still seeding after a provisional checkpoint");
+
+        // A later checkpoint advances the cursor, still seeding.
+        set_seed_progress(&pool, "catalogue", "2026-07-11T06:00:00")
             .await
             .unwrap();
-        assert_eq!(
-            get_sync_cursor(&pool, "catalogue")
+        assert!(
+            !get_sync_state(&pool, "catalogue")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("2026-07-12T00:00:00")
+                .unwrap()
+                .seed_done
         );
-        assert_eq!(get_sync_cursor(&pool, "chapters").await.unwrap(), None);
+
+        // Completing the seed flips seed_done and sets the incremental cursor.
+        mark_seed_done(&pool, "catalogue", "2026-07-12T00:00:00")
+            .await
+            .unwrap();
+        let s = get_sync_state(&pool, "catalogue").await.unwrap().unwrap();
+        assert_eq!(s.cursor, "2026-07-12T00:00:00");
+        assert!(s.seed_done);
+
+        // Incremental cursor advances without clearing seed_done.
+        set_sync_cursor(&pool, "catalogue", "2026-07-13T00:00:00")
+            .await
+            .unwrap();
+        let s = get_sync_state(&pool, "catalogue").await.unwrap().unwrap();
+        assert_eq!(s.cursor, "2026-07-13T00:00:00");
+        assert!(s.seed_done, "incremental cursor keeps seed_done");
+
+        // Jobs are independent.
+        assert!(get_sync_state(&pool, "chapters").await.unwrap().is_none());
     }
 
     fn ch(external_id: &str, number: Option<&str>, lang: Option<&str>) -> CanonicalChapter {

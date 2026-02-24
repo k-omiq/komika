@@ -576,6 +576,7 @@ pub async fn sync_catalogue(
     window: SyncWindow,
     initial_since: Option<String>,
     cover_phash: bool,
+    job: &str,
 ) -> Result<u64> {
     let mut since = initial_since;
     let mut upserted: u64 = 0;
@@ -629,6 +630,16 @@ pub async fn sync_catalogue(
             break;
         }
         since = next_since;
+        // Checkpoint the seed's progress so an abort resumes from this window
+        // rather than restarting at createdAt=0 (M6). Only during the createdAt
+        // seed; incremental cursors are written once, at cycle end.
+        if window == SyncWindow::Created {
+            if let Some(ref s) = since {
+                if let Err(e) = catalog::set_seed_progress(pool, job, s).await {
+                    tracing::warn!(error = %e, "mangadex: failed to checkpoint catalogue seed");
+                }
+            }
+        }
     }
     tracing::info!(upserted, "mangadex: catalogue sweep complete");
     Ok(upserted)
@@ -643,6 +654,7 @@ pub async fn sync_chapters(
     client: &MangaDexClient,
     window: SyncWindow,
     initial_since: Option<String>,
+    job: &str,
 ) -> Result<u64> {
     let mut since = initial_since;
     let mut stored: u64 = 0;
@@ -715,6 +727,14 @@ pub async fn sync_chapters(
             break;
         }
         since = next_since;
+        // Checkpoint the chapter seed's progress so an abort resumes here (M6).
+        if window == SyncWindow::Created {
+            if let Some(ref s) = since {
+                if let Err(e) = catalog::set_seed_progress(pool, job, s).await {
+                    tracing::warn!(error = %e, "mangadex: failed to checkpoint chapter seed");
+                }
+            }
+        }
     }
     tracing::info!(stored, "mangadex: chapter sweep complete");
     Ok(stored)
@@ -730,54 +750,97 @@ async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phas
     // cycle is >= this, so it's caught by the next cycle rather than missed.
     let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    match catalog::get_sync_cursor(pool, "catalogue").await {
-        Ok(cur) => {
-            let (window, since) = match &cur {
-                Some(ts) => (SyncWindow::Updated, Some(ts.clone())),
-                None => (SyncWindow::Created, None),
+    // --- Catalogue -----------------------------------------------------------
+    // seed_done == false → (re)run/resume the full createdAt seed from the
+    // provisional cursor; true → incremental updatedAtSince refresh.
+    let catalogue_state = match catalog::get_sync_state(pool, "catalogue").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "mangadex: catalogue state read failed; skipping cycle");
+            return;
+        }
+    };
+    let catalogue_seeded = catalogue_state
+        .as_ref()
+        .map(|s| s.seed_done)
+        .unwrap_or(false);
+    let (window, since) = match &catalogue_state {
+        Some(s) if s.seed_done => (SyncWindow::Updated, Some(s.cursor.clone())),
+        Some(s) => (SyncWindow::Created, Some(s.cursor.clone())), // resume seed
+        None => (SyncWindow::Created, None),                      // fresh seed
+    };
+    match sync_catalogue(pool, client, window, since, cover_phash, "catalogue").await {
+        Ok(n) => {
+            tracing::info!(
+                upserted = n,
+                incremental = catalogue_seeded,
+                "mangadex: catalogue cycle done"
+            );
+            // Completing a fresh/resumed seed flips seed_done and sets the
+            // incremental cursor; an already-seeded run just advances the cursor.
+            let res = if catalogue_seeded {
+                catalog::set_sync_cursor(pool, "catalogue", &run_start).await
+            } else {
+                catalog::mark_seed_done(pool, "catalogue", &run_start).await
             };
-            match sync_catalogue(pool, client, window, since, cover_phash).await {
-                Ok(n) => {
-                    tracing::info!(
-                        upserted = n,
-                        incremental = cur.is_some(),
-                        "mangadex: catalogue cycle done"
-                    );
-                    if let Err(e) = catalog::set_sync_cursor(pool, "catalogue", &run_start).await {
-                        tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "mangadex: catalogue cycle failed (cursor unchanged)")
-                }
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
             }
         }
-        Err(e) => tracing::warn!(error = %e, "mangadex: catalogue cursor read failed; skipping"),
+        Err(e) => {
+            tracing::warn!(error = %e, "mangadex: catalogue cycle failed (cursor unchanged)");
+        }
     }
 
-    match catalog::get_sync_cursor(pool, "chapters").await {
-        Ok(cur) => {
-            let (window, since) = match &cur {
-                Some(ts) => (SyncWindow::Updated, Some(ts.clone())),
-                None => (SyncWindow::Created, None),
+    // --- Chapters ------------------------------------------------------------
+    // Gate the chapter seed on the catalogue seed having completed (M3): until
+    // every work is catalogued, a chapter whose work is missing is skipped, and
+    // the chapters cursor would advance past it (updatedAtSince never revisits an
+    // old createdAt), permanently losing it. Re-read state so a seed that just
+    // completed above is observed this same cycle.
+    let catalogue_done = catalog::get_sync_state(pool, "catalogue")
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.seed_done)
+        .unwrap_or(false);
+    if !catalogue_done {
+        tracing::info!("mangadex: skipping chapter sync until the catalogue seed completes");
+        return;
+    }
+
+    let chapter_state = match catalog::get_sync_state(pool, "chapters").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "mangadex: chapter state read failed; skipping");
+            return;
+        }
+    };
+    let chapters_seeded = chapter_state.as_ref().map(|s| s.seed_done).unwrap_or(false);
+    let (window, since) = match &chapter_state {
+        Some(s) if s.seed_done => (SyncWindow::Updated, Some(s.cursor.clone())),
+        Some(s) => (SyncWindow::Created, Some(s.cursor.clone())),
+        None => (SyncWindow::Created, None),
+    };
+    match sync_chapters(pool, client, window, since, "chapters").await {
+        Ok(n) => {
+            tracing::info!(
+                stored = n,
+                incremental = chapters_seeded,
+                "mangadex: chapter cycle done"
+            );
+            let res = if chapters_seeded {
+                catalog::set_sync_cursor(pool, "chapters", &run_start).await
+            } else {
+                catalog::mark_seed_done(pool, "chapters", &run_start).await
             };
-            match sync_chapters(pool, client, window, since).await {
-                Ok(n) => {
-                    tracing::info!(
-                        stored = n,
-                        incremental = cur.is_some(),
-                        "mangadex: chapter cycle done"
-                    );
-                    if let Err(e) = catalog::set_sync_cursor(pool, "chapters", &run_start).await {
-                        tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "mangadex: chapter cycle failed (cursor unchanged)")
-                }
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
             }
         }
-        Err(e) => tracing::warn!(error = %e, "mangadex: chapter cursor read failed; skipping"),
+        Err(e) => {
+            tracing::warn!(error = %e, "mangadex: chapter cycle failed (cursor unchanged)");
+        }
     }
 }
 
