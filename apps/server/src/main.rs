@@ -257,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
     // seeds on startup, then incrementally refreshes (updatedAtSince) every interval.
+    //
+    // FLEET CONSTRAINT (M4, CATALOGUE.md §9): the MangaDex rate limiter is
+    // in-process, so it only bounds THIS process. Enable CATALOGUE_SYNC on exactly
+    // one replica — N replicas syncing = N× the shared-IP budget → 429/ban. Moving
+    // to a shared (DB/Redis) limiter is the prerequisite for multi-replica sync.
     if cfg.catalogue_sync_enabled {
         mangadex::spawn_recurring(
             pool.clone(),

@@ -299,6 +299,15 @@ canonical works (MangaDex tags aren't mirrored yet).
 5 req/s ceiling is a **fleet** budget, not per-user. The catalogue crawl must run behind
 a **global token-bucket limiter**; coalesce/queue rather than fan out.
 
+**Single-replica constraint (M4).** The limiter (`MangaDexClient`'s `TokenBucket`, plus
+the dedicated `/at-home` bucket) is **in-process** — it bounds one server process, not the
+fleet. Running N server replicas with `CATALOGUE_SYNC=on` (or serving reader `at_home`
+page-loads) multiplies the effective rate to N×, which breaches the shared-IP ceiling and
+risks a 429/403 ban. Until the budget is moved to a shared limiter (DB/Redis keyed by
+egress IP), **exactly one replica may have `CATALOGUE_SYNC=on`**, and if reader page-load
+`at_home` traffic is also significant, keep the API tier to a single replica or front it
+with a shared limiter. The shipped single-container compose satisfies this by default.
+
 ## 10. Decisions (locked 2026-07-11)
 
 1. **Description similarity depth** — **MinHash-only** to start (no ML dependency).
