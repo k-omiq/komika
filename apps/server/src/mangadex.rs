@@ -567,8 +567,10 @@ pub fn to_since(ts: &str) -> Option<String> {
 // ---- Sync loops ------------------------------------------------------------
 
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
-/// the `createdAtSince` window past the 10k offset cap, upserting each work. Best
-/// effort: a failed page/record is logged and does not abort the sweep. Pass
+/// the `createdAtSince` window past the 10k offset cap, upserting each work. A
+/// failed *record* upsert is logged and skipped, but a page that still errors
+/// after the retry layer (`get_with_retry`) aborts the sweep with `Err`; the cursor
+/// is left unchanged, so the next cycle retries the same window. Pass
 /// `initial_since` to resume/incrementally refresh from a known timestamp.
 pub async fn sync_catalogue(
     pool: &sqlx::SqlitePool,
@@ -626,7 +628,16 @@ pub async fn sync_catalogue(
         // boundary second), stop rather than loop forever.
         let next_since = last_created.as_deref().and_then(to_since);
         if next_since.is_none() || next_since == since {
-            tracing::warn!("mangadex: window could not advance; stopping sweep");
+            // The window can't advance because >9,900 records share this boundary
+            // second (createdAt has 1s resolution). We stop to avoid an infinite
+            // loop, which silently drops everything past offset 9,900 in that
+            // second. Recovering would need a secondary tiebreaker (e.g. paging by
+            // id within the tied second); log at error so it's visible if it trips.
+            tracing::error!(
+                since = since.as_deref().unwrap_or("<none>"),
+                "mangadex: catalogue window stuck on a boundary second (>9900 records \
+                 share it) — records past offset 9900 in this second are dropped"
+            );
             break;
         }
         since = next_since;
@@ -723,7 +734,14 @@ pub async fn sync_chapters(
         }
         let next_since = last_created.as_deref().and_then(to_since);
         if next_since.is_none() || next_since == since {
-            tracing::warn!("mangadex: chapter window could not advance; stopping");
+            // As in the catalogue sweep: >9,900 chapters sharing one boundary
+            // second stalls the window; stopping drops the overflow. More likely on
+            // the high-volume /chapter firehose. Log at error (see M7).
+            tracing::error!(
+                since = since.as_deref().unwrap_or("<none>"),
+                "mangadex: chapter window stuck on a boundary second (>9900 records \
+                 share it) — records past offset 9900 in this second are dropped"
+            );
             break;
         }
         since = next_since;
