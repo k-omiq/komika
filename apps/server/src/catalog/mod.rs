@@ -604,6 +604,27 @@ pub async fn find_source_series_id(
     Ok(id)
 }
 
+/// Resolve the `(id, work_id)` of an existing source_series by its natural key —
+/// for the idempotency pre-check in the Tier-2 add flow, which needs the linked
+/// work to report back without re-running the matcher (DD2).
+pub async fn find_source_series(
+    pool: &SqlitePool,
+    source_type: &str,
+    source_id: &str,
+    source_key: &str,
+) -> Result<Option<(String, String)>> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, work_id FROM source_series \
+         WHERE source_type = ? AND source_id = ? AND source_key = ?",
+    )
+    .bind(source_type)
+    .bind(source_id)
+    .bind(source_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert one mirrored chapter under a source_series (idempotent on external id).
 pub async fn upsert_chapter(
     pool: &SqlitePool,

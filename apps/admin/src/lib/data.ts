@@ -5,6 +5,7 @@
 import type {
 	AdminUser,
 	CanonicalUpdate,
+	MatchResult,
 	MergeCandidate,
 	Paginated,
 	Series,
@@ -75,6 +76,17 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
 	if (!backend.resolveMergeCandidate)
 		throw new Error('Dedup review is unavailable on this backend.');
 	return backend.resolveMergeCandidate(id, accept);
+}
+
+/**
+ * Run the Tier-2 dedup add flow for a Suwayomi manga id: link it to a canonical
+ * work (auto-merge / queue for review / create new), idempotently. Returns the
+ * matcher's decision.
+ */
+export async function addSourceSeries(suwayomiMangaId: string): Promise<MatchResult> {
+	if (!backend.addSourceSeries)
+		throw new Error('Add source series is unavailable on this backend.');
+	return backend.addSourceSeries(suwayomiMangaId);
 }
 
 /**

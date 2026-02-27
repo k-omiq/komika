@@ -133,6 +133,28 @@ impl SuwayomiClient {
         }
     }
 
+    /// Fetch a cover thumbnail's raw bytes for server-side pHash (dedup signal,
+    /// DD1). Uses the INTERNAL `base_url` (this runs server-side, not in the
+    /// browser, so the public image host may be unreachable). Best-effort: returns
+    /// `None` on any missing URL / network / non-success — a missing hash just
+    /// means one fewer dedup signal, never a failure.
+    pub async fn cover_bytes(&self, thumbnail_url: Option<&str>) -> Option<Vec<u8>> {
+        let raw = thumbnail_url?;
+        if raw.is_empty() {
+            return None;
+        }
+        let url = if raw.starts_with("http") {
+            raw.to_string()
+        } else {
+            format!("{}{}", self.base_url, raw)
+        };
+        let res = self.http.get(url).send().await.ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        Some(res.bytes().await.ok()?.to_vec())
+    }
+
     async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
         let res = self
             .http

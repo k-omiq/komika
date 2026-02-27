@@ -6,6 +6,7 @@ import type {
 	CommentTargetType,
 	DiscoveryFeed,
 	Id,
+	MatchResult,
 	MergeCandidate,
 	Page,
 	Paginated,
@@ -125,6 +126,10 @@ export interface Backend {
 	 * true when the row was closed. Optional: only the unified Komika API
 	 * implements it. */
 	resolveMergeCandidate?(id: Id, accept: boolean): Promise<boolean>;
+	/** Run the Tier-2 dedup add flow for a Suwayomi manga: link it to a canonical
+	 * work (auto-merge / queue for review / create new), idempotently. Optional:
+	 * only the unified Komika API implements it. */
+	addSourceSeries?(suwayomiMangaId: Id): Promise<MatchResult>;
 }
 
 export interface Session {

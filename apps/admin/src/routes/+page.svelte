@@ -1,8 +1,14 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import type { Series, SeriesStatus } from '@komika/types';
+	import type { MatchResult, Series, SeriesStatus } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
-	import { loadCatalog, saveSeriesAdmin, triggerScan, STATUS_OPTIONS } from '$lib/data';
+	import {
+		loadCatalog,
+		saveSeriesAdmin,
+		triggerScan,
+		addSourceSeries,
+		STATUS_OPTIONS,
+	} from '$lib/data';
 
 	let query = $state('');
 	let series = $state<Series[]>([]);
@@ -36,6 +42,37 @@
 	function onSearch(e: SubmitEvent): void {
 		e.preventDefault();
 		void refresh(query);
+	}
+
+	// ---- add to canonical catalogue (Tier-2 dedup add flow) ----
+	let addMsg = $state<Record<string, string>>({});
+	let addingId = $state<string | null>(null);
+
+	function decisionLabel(r: MatchResult): string {
+		switch (r.decision) {
+			case 'auto_merge':
+				return `auto-merged into ${r.workId}`;
+			case 'review':
+				return 'queued for review';
+			case 'new':
+				return 'added as new';
+			case 'existing':
+				return 'already added';
+			default:
+				return r.decision;
+		}
+	}
+
+	async function onAdd(s: Series): Promise<void> {
+		addingId = s.id;
+		try {
+			const r = await addSourceSeries(s.id);
+			addMsg = { ...addMsg, [s.id]: decisionLabel(r) };
+		} catch (err) {
+			addMsg = { ...addMsg, [s.id]: err instanceof Error ? err.message : 'Add failed.' };
+		} finally {
+			addingId = null;
+		}
 	}
 
 	// ---- editor ----
@@ -195,6 +232,10 @@
 					</span>
 					<span class="col-actions">
 						<button class="edit" onclick={() => openEditor(s)}>Edit</button>
+						<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
+							{addingId === s.id ? 'Adding…' : 'Add'}
+						</button>
+						{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
 					</span>
 				</div>
 			{/each}
@@ -473,8 +514,14 @@
 	}
 	.col-actions {
 		text-align: right;
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 8px;
+		flex-wrap: wrap;
 	}
-	.edit {
+	.edit,
+	.add {
 		height: 32px;
 		padding: 0 14px;
 		border-radius: var(--k-radius);
@@ -487,8 +534,17 @@
 		cursor: pointer;
 		transition: all 0.15s;
 	}
-	.edit:hover {
+	.edit:hover,
+	.add:hover {
 		border-color: var(--k-border-strong);
+	}
+	.add:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.add-msg {
+		font-size: 12px;
+		color: var(--k-text-faint);
 	}
 	.empty {
 		padding: 40px 20px;

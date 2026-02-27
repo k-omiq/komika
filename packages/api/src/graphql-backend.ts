@@ -6,6 +6,7 @@ import type {
 	CommentTargetType,
 	DiscoveryFeed,
 	Id,
+	MatchResult,
 	MergeCandidate,
 	Page,
 	Paginated,
@@ -194,6 +195,13 @@ export class GraphQLBackend implements Backend {
 			accept,
 		});
 		return d.resolveMergeCandidate;
+	}
+
+	async addSourceSeries(suwayomiMangaId: Id): Promise<MatchResult> {
+		const d = await this.gql<{ addSourceSeries: MatchResult }>(ops.ADD_SOURCE_SERIES, {
+			suwayomiMangaId,
+		});
+		return d.addSourceSeries;
 	}
 
 	// --- viewer preferences ---

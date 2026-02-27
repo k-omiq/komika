@@ -84,6 +84,25 @@ export interface MergeCandidate {
 }
 
 /**
+ * The result of the Tier-2 `addSourceSeries` dedup add flow: what the matcher
+ * decided for the added source series and which canonical work it resolved to.
+ */
+export interface MatchResult {
+	/** `auto_merge` | `review` | `new` | `existing` (already linked). */
+	decision: string;
+	/** The canonical work the source series is now linked to. */
+	workId: Id;
+	/** The pre-existing work the matcher proposed (for `auto_merge`/`review`). */
+	matchedWorkId: string | null;
+	/** Confidence score in [0,1] that produced the decision, if any. */
+	score: number | null;
+	/** Which signal produced the match, if any. */
+	method: string | null;
+	/** The source_series row created/linked. */
+	sourceSeriesId: string;
+}
+
+/**
  * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
  * work with its most recent stored chapter, served from the `chapter` mirror.
  * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through

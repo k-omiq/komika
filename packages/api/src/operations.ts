@@ -399,6 +399,19 @@ export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	}
 `;
 
+export const ADD_SOURCE_SERIES = /* GraphQL */ `
+	mutation AddSourceSeries($suwayomiMangaId: ID!) {
+		addSourceSeries(suwayomiMangaId: $suwayomiMangaId) {
+			decision
+			workId
+			matchedWorkId
+			score
+			method
+			sourceSeriesId
+		}
+	}
+`;
+
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)

@@ -1571,103 +1571,17 @@ impl MutationRoot {
             .map_err(|_| Error::new("suwayomiMangaId must be an integer id"))?;
         let m = st.suwayomi.series(mid).await.map_err(gql_err)?;
 
-        let cand = crate::dedup::Candidate {
-            title: m.title.clone(),
-            alt_titles: Vec::new(),
-            description: m.description.clone(),
-            author: m.author.clone(),
-            year: None,
-            cover_phash: None,
-            external_ids: Vec::new(),
+        // DD1: compute the cover pHash server-side (strongest cheap dedup signal).
+        // Best-effort — `None` on any fetch/decode failure just drops the signal.
+        // Done here (the only async/network step) so the core is unit-testable
+        // without a live Suwayomi.
+        let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+            Some(bytes) => crate::phash::dhash(&bytes),
+            None => None,
         };
-        let decision = crate::dedup::resolve(&st.pool, &cand)
+        add_source_series_core(&st.pool, &m, cover_phash)
             .await
-            .map_err(gql_err)?;
-
-        // The work this source series is (provisionally) linked to. For `new` and
-        // `review` we mint a first-class work from the Suwayomi metadata.
-        let make_work = || crate::catalog::WorkInput {
-            primary_title: Some(m.title.clone()),
-            description: m.description.clone(),
-            author: m.author.clone(),
-            artist: m.artist.clone(),
-            status: Some(m.status.clone()),
-            is_nsfw: false,
-            aliases: vec![crate::catalog::Alias {
-                raw: m.title.clone(),
-                lang: None,
-            }],
-            ..Default::default()
-        };
-
-        use crate::dedup::Decision;
-        let (decision_str, matched_work_id, score, method, work_id) = match &decision {
-            Decision::AutoMerge {
-                work_id,
-                score,
-                method,
-            } => (
-                "auto_merge",
-                Some(work_id.clone()),
-                Some(*score),
-                Some(method.clone()),
-                work_id.clone(),
-            ),
-            Decision::Review {
-                work_id,
-                score,
-                method,
-            } => {
-                let provisional = crate::catalog::create_work(&st.pool, &make_work())
-                    .await
-                    .map_err(gql_err)?;
-                (
-                    "review",
-                    Some(work_id.clone()),
-                    Some(*score),
-                    Some(method.clone()),
-                    provisional,
-                )
-            }
-            Decision::New => {
-                let created = crate::catalog::create_work(&st.pool, &make_work())
-                    .await
-                    .map_err(gql_err)?;
-                ("new", None, None, None, created)
-            }
-        };
-
-        let ssid = crate::catalog::upsert_source_series(
-            &st.pool,
-            &work_id,
-            "suwayomi",
-            &m.source_id,
-            &mid.to_string(),
-            None,
-            false,
-        )
-        .await
-        .map_err(gql_err)?;
-
-        if let Decision::Review {
-            work_id: cand_work,
-            score,
-            method,
-        } = &decision
-        {
-            crate::catalog::insert_merge_candidate(&st.pool, &ssid, cand_work, *score, method)
-                .await
-                .map_err(gql_err)?;
-        }
-
-        Ok(MatchResult {
-            decision: decision_str.to_string(),
-            work_id,
-            matched_work_id,
-            score,
-            method,
-            source_series_id: ssid,
-        })
+            .map_err(gql_err)
     }
 
     /// Resolve a pending dedup review. `accept` repoints the source series onto the
@@ -1766,6 +1680,139 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
         .execute(pool)
         .await;
     Ok(tok)
+}
+
+/// Core of the Tier-2 "add source series" flow (DD2/DD1/N1). Separated from the
+/// resolver's Suwayomi fetch so it's unit-testable without a live Suwayomi:
+/// idempotency pre-check, dedup, provisional work creation, source-series link,
+/// and review-queue insert. `cover_phash` is the already-computed cover hash
+/// (None when unavailable).
+async fn add_source_series_core(
+    pool: &SqlitePool,
+    m: &crate::suwayomi::SuwayomiManga,
+    cover_phash: Option<String>,
+) -> anyhow::Result<MatchResult> {
+    let source_key = m.id.to_string();
+
+    // DD2 idempotency: if this source series is already linked to a work, return
+    // that linkage untouched instead of re-running the matcher (which would mint an
+    // orphan work and, for a review, a duplicate merge_candidate row).
+    if let Some((ssid, existing_work_id)) =
+        crate::catalog::find_source_series(pool, "suwayomi", &m.source_id, &source_key).await?
+    {
+        return Ok(MatchResult {
+            decision: "existing".into(),
+            work_id: existing_work_id,
+            matched_work_id: None,
+            score: None,
+            method: None,
+            source_series_id: ssid,
+        });
+    }
+
+    // N1/N5: source-level NSFW. Suwayomi's schema exposes no confirmed
+    // source/manga nsfw boolean (no live instance was available to probe, and
+    // requesting an unconfirmed `source.isNsfw` would break every manga query if
+    // absent), so derive it from the genres already fetched. CATALOGUE.md §2:
+    // NSFW = source flag OR contentRating; this is the source-flag half.
+    let source_nsfw = m.genre.iter().any(|g| {
+        let g = g.to_ascii_lowercase();
+        ["hentai", "erotica", "smut", "pornographic", "adult"]
+            .iter()
+            .any(|k| g.contains(k))
+    });
+
+    // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
+    // `external_ids` stays empty — the external-ID dedup rung is a no-op here.
+    let cand = crate::dedup::Candidate {
+        title: m.title.clone(),
+        alt_titles: Vec::new(),
+        description: m.description.clone(),
+        author: m.author.clone(),
+        year: None,
+        cover_phash: cover_phash.clone(),
+        external_ids: Vec::new(),
+    };
+    let decision = crate::dedup::resolve(pool, &cand).await?;
+
+    // The work this source series is (provisionally) linked to. For `new` and
+    // `review` we mint a first-class work from the Suwayomi metadata.
+    let make_work = || crate::catalog::WorkInput {
+        primary_title: Some(m.title.clone()),
+        description: m.description.clone(),
+        author: m.author.clone(),
+        artist: m.artist.clone(),
+        status: Some(m.status.clone()),
+        is_nsfw: source_nsfw,
+        cover_phash: cover_phash.clone(),
+        aliases: vec![crate::catalog::Alias {
+            raw: m.title.clone(),
+            lang: None,
+        }],
+        ..Default::default()
+    };
+
+    use crate::dedup::Decision;
+    let (decision_str, matched_work_id, score, method, work_id) = match &decision {
+        Decision::AutoMerge {
+            work_id,
+            score,
+            method,
+        } => (
+            "auto_merge",
+            Some(work_id.clone()),
+            Some(*score),
+            Some(method.clone()),
+            work_id.clone(),
+        ),
+        Decision::Review {
+            work_id,
+            score,
+            method,
+        } => {
+            let provisional = crate::catalog::create_work(pool, &make_work()).await?;
+            (
+                "review",
+                Some(work_id.clone()),
+                Some(*score),
+                Some(method.clone()),
+                provisional,
+            )
+        }
+        Decision::New => {
+            let created = crate::catalog::create_work(pool, &make_work()).await?;
+            ("new", None, None, None, created)
+        }
+    };
+
+    let ssid = crate::catalog::upsert_source_series(
+        pool,
+        &work_id,
+        "suwayomi",
+        &m.source_id,
+        &source_key,
+        None,
+        source_nsfw,
+    )
+    .await?;
+
+    if let Decision::Review {
+        work_id: cand_work,
+        score,
+        method,
+    } = &decision
+    {
+        crate::catalog::insert_merge_candidate(pool, &ssid, cand_work, *score, method).await?;
+    }
+
+    Ok(MatchResult {
+        decision: decision_str.to_string(),
+        work_id,
+        matched_work_id,
+        score,
+        method,
+        source_series_id: ssid,
+    })
 }
 
 /// Ensure every configured admin username exists and is an admin. An existing
@@ -1884,6 +1931,141 @@ mod tests {
             0,
             "a fully-stale key is evicted on read"
         );
+    }
+
+    // ---- Tier-2 add-source-series core (DD2/DD1/N1) -----------------------
+
+    fn suwayomi_manga(
+        id: i64,
+        title: &str,
+        genre: &[&str],
+        source_id: &str,
+    ) -> crate::suwayomi::SuwayomiManga {
+        crate::suwayomi::SuwayomiManga {
+            id,
+            title: title.into(),
+            thumbnail_url: None,
+            author: None,
+            artist: None,
+            description: None,
+            genre: genre.iter().map(|g| g.to_string()).collect(),
+            status: "ONGOING".into(),
+            in_library: false,
+            in_library_at: None,
+            last_fetched_at: None,
+            source_id: source_id.into(),
+            source: None,
+            chapters: None,
+        }
+    }
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn add_source_series_new_sets_nsfw_and_is_idempotent() {
+        let pool = migrated_pool().await;
+        // A unique-title, NSFW-genre series → decision "new", work.is_nsfw = 1 (N1).
+        let m = suwayomi_manga(42, "A Very Spicy One-Off", &["Action", "Hentai"], "src1");
+        let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r1.decision, "new");
+        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+            .bind(&r1.work_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(nsfw, 1, "N1: an NSFW genre sets work.is_nsfw");
+
+        let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // DD2: re-adding the same source id returns the existing linkage and mints
+        // nothing new.
+        let r2 = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r2.decision, "existing");
+        assert_eq!(r2.work_id, r1.work_id);
+        assert_eq!(r2.source_series_id, r1.source_series_id);
+        let works_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(works_after, works_before, "DD2: no orphan work on re-add");
+    }
+
+    #[tokio::test]
+    async fn add_source_series_review_does_not_duplicate_on_re_add() {
+        let pool = migrated_pool().await;
+        // Pre-seed a work with a title so a same-titled add lands in Review (title
+        // match, no corroboration → mid score).
+        let existing = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Twin Star Exorcists".into()),
+                aliases: vec![crate::catalog::Alias {
+                    raw: "Twin Star Exorcists".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src1");
+        let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r1.decision, "review", "title match with no corroboration");
+        assert_eq!(r1.matched_work_id.as_deref(), Some(existing.as_str()));
+
+        let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mc_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mc_before, 1, "one pending review row after the first add");
+
+        // DD2: re-add → existing; neither the orphan work nor a duplicate
+        // merge_candidate is created.
+        let r2 = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r2.decision, "existing");
+        let works_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mc_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(works_after, works_before, "DD2: no orphan work on re-add");
+        assert_eq!(mc_after, mc_before, "DD2: no duplicate merge_candidate");
+    }
+
+    #[tokio::test]
+    async fn add_source_series_safe_genre_is_not_nsfw() {
+        let pool = migrated_pool().await;
+        let m = suwayomi_manga(
+            99,
+            "Wholesome Slice of Life",
+            &["Comedy", "Slice of Life"],
+            "src1",
+        );
+        let r = add_source_series_core(&pool, &m, None).await.unwrap();
+        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+            .bind(&r.work_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(nsfw, 0, "safe genres → work.is_nsfw stays 0");
     }
 
     // ---- GraphQL security integration tests (no Suwayomi needed) ----
