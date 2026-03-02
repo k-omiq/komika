@@ -11,7 +11,8 @@
  *
  *   GET /img?src=<url-encoded upstream image URL>
  *
- *   - src : absolute http(s) URL of the upstream image (required).
+ *   - src : absolute http(s) URL of the upstream image (required). The host must
+ *           be in ALLOWED_SOURCE_HOSTS; an empty allowlist denies all (fail closed).
  *
  * Caching layers, in order:
  *   1. Cloudflare edge cache (caches.default) — always on.
@@ -151,10 +152,13 @@ function parseList(raw: string | undefined): string[] {
 		.filter(Boolean);
 }
 
-/** Empty allowlist => allow all. Otherwise match host exactly or as a suffix. */
+/**
+ * Empty allowlist => deny all (fail closed) — an unconfigured proxy must never be
+ * an open proxy (I1/CR5). Otherwise match host exactly or as a suffix.
+ */
 function hostAllowed(hostname: string, raw: string | undefined): boolean {
 	const list = parseList(raw);
-	if (list.length === 0) return true;
+	if (list.length === 0) return false;
 	const host = hostname.toLowerCase();
 	return list.some((allowed) => {
 		const a = allowed.toLowerCase();

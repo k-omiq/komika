@@ -58,7 +58,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 - [ ] 3.5 ⚪ DD5 / DD6 / DD7 — dedup labels/determinism cleanup
 
 **Phase 4 — Image pipeline**
-- [ ] 4.1 🟡 I1 / CR5 — non-empty prod allowlist default (or fail-closed in prod)
+- [x] 4.1 🟡 I1 / CR5 — `hostAllowed` now **fails closed** on an empty allowlist (`return false`, was `return true`), so an unconfigured Worker is never an open proxy; shipped `ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network"` as the committed default (the canonical web path) and updated the wrangler.toml + top-of-file comments (empty now denies all; add hosts for dev instead of clearing). Chose the always-fail-closed route over an `[env.production]`/`--env` restructure to avoid renaming the deployed worker. `tsc --noEmit` clean. **Note:** `originAllowed` (hotlink) intentionally left empty=disabled — it's not the SSRF control (I5); the host allowlist carries abuse prevention.
 - [ ] 4.2 🟡 I2 — validate/timeout/size-cap native `fetch_image`
 - [ ] 4.3 🟡 I3 — Worker Content-Type validation
 - [ ] 4.4 ⚪ I4 / I6 — native UA/Referer; guard `direct` mode
