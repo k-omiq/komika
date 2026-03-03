@@ -26,3 +26,8 @@ tauri-plugin-log = "2"
 # Native direct-fetch of source images (bypasses the web-only Worker proxy).
 # rustls avoids a system OpenSSL dependency, keeping mobile/desktop builds lean.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Async DNS resolution for the pre-fetch host guard (client-side SSRF defense).
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "macros", "rt"] }
