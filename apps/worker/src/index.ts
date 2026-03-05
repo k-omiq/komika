@@ -106,7 +106,15 @@ export default {
 			return errorResponse(502, `Upstream ${originResp.status}`);
 		}
 
-		const contentType = originResp.headers.get('Content-Type') ?? 'application/octet-stream';
+		// Only ever re-serve actual images. Without this, an upstream `text/html`
+		// (or any non-image) body would be laundered under our trusted origin with
+		// permissive CORS + a 7-day immutable cache (content laundering / cache
+		// poisoning) — see I3. Reject anything that isn't `image/*`.
+		const contentType = originResp.headers.get('Content-Type') ?? '';
+		if (!isImageContentType(contentType)) {
+			console.error(`img proxy: non-image Content-Type "${contentType}" for ${upstream.toString()}`);
+			return errorResponse(502, 'Upstream is not an image');
+		}
 
 		const res = finalizeImage(originResp, contentType);
 		ctx.waitUntil(edge.put(cacheKey, res.clone()));
@@ -141,6 +149,11 @@ function errorResponse(status: number, message: string): Response {
 		status,
 		headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS_HEADERS },
 	});
+}
+
+/** True when the (possibly parameterized) Content-Type is an `image/*` type. */
+function isImageContentType(contentType: string): boolean {
+	return /^image\//i.test(contentType.split(';', 1)[0].trim());
 }
 
 /** Parse a comma-separated allowlist var into a trimmed, non-empty list. */
