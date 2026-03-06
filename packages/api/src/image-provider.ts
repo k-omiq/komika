@@ -31,15 +31,41 @@ export interface WebImageProviderConfig {
 	direct?: boolean;
 }
 
+/** Hosts that must go through the Worker proxy (CORS + hotlink); `direct` breaks them. */
+const PROXY_REQUIRED_HOSTS = [/(^|\.)mangadex\.org$/i, /(^|\.)mangadex\.network$/i];
+
 /** Web provider: rewrite source URLs to Worker-proxied URLs (or pass through in direct mode). */
 export class WebImageProvider implements ImageProvider {
 	constructor(private readonly config: WebImageProviderConfig) {}
 
+	/** Warn once if `direct` is paired with a host that needs proxying (I6). */
+	private directGuardWarned = false;
+
 	private resolve(sourceUrl: string): string {
 		if (!sourceUrl) return '';
-		if (this.config.direct) return sourceUrl;
+		if (this.config.direct) {
+			this.warnIfProxyRequired(sourceUrl);
+			return sourceUrl;
+		}
 		const base = this.config.workerBaseUrl.replace(/\/$/, '');
 		return `${base}/img?src=${encodeURIComponent(sourceUrl)}`;
+	}
+
+	private warnIfProxyRequired(sourceUrl: string): void {
+		if (this.directGuardWarned) return;
+		let host: string;
+		try {
+			host = new URL(sourceUrl).hostname;
+		} catch {
+			return;
+		}
+		if (PROXY_REQUIRED_HOSTS.some((re) => re.test(host))) {
+			this.directGuardWarned = true;
+			console.warn(
+				`[komika] PUBLIC_KOMIKA_IMG_MODE=direct with a host that needs the Worker proxy (${host}). ` +
+					'MangaDex covers/pages will fail via CORS/hotlink — use proxy mode for MangaDex-backed reading.',
+			);
+		}
 	}
 
 	async resolvePage(page: Page): Promise<string> {

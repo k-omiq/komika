@@ -18,9 +18,23 @@ fn image_client() -> &'static reqwest::Client {
     reqwest::Client::builder()
       .timeout(FETCH_TIMEOUT)
       .redirect(reqwest::redirect::Policy::none())
+      // Some CDNs (MangaDex among them) gate on a UA/Referer and 403 requests
+      // without them; the Worker sets both, so the native path must match to avoid
+      // a web/native divergence on exactly those hosts (I4).
+      .user_agent("Komika/0.1 (+https://komika.app)")
       .build()
       .expect("build image http client")
   })
+}
+
+/// Same-origin Referer for the target (mirrors the Worker's `scheme://host[:port]/`).
+fn referer_for(url: &reqwest::Url) -> String {
+  let mut r = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+  if let Some(port) = url.port() {
+    r.push_str(&format!(":{port}"));
+  }
+  r.push('/');
+  r
 }
 
 /// Fetch a source image's raw bytes directly from its CDN.
@@ -42,6 +56,7 @@ async fn fetch_image(url: String) -> Result<tauri::ipc::Response, String> {
     let target = validate_image_url(&next).await?;
     let resp = client
       .get(target.clone())
+      .header(reqwest::header::REFERER, referer_for(&target))
       .send()
       .await
       .map_err(|e| e.to_string())?;
@@ -196,6 +211,14 @@ mod tests {
   #[test]
   fn allows_public_ipv6() {
     assert!(!is_blocked_ip(&"2606:4700:4700::1111".parse().unwrap()));
+  }
+
+  #[test]
+  fn referer_is_origin_with_trailing_slash() {
+    let u = reqwest::Url::parse("https://uploads.mangadex.org/covers/x/y.jpg").unwrap();
+    assert_eq!(referer_for(&u), "https://uploads.mangadex.org/");
+    let p = reqwest::Url::parse("http://example.com:8080/a/b").unwrap();
+    assert_eq!(referer_for(&p), "http://example.com:8080/");
   }
 
   #[tokio::test]
