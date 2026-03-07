@@ -14,7 +14,7 @@ ratings, and per-chapter comments** on top of a full Mihon-parity reader.
 
 | Client             | Build target                      | Image source                 |
 | ------------------ | --------------------------------- | ---------------------------- |
-| Web / PWA          | Svelte static SPA                 | Cloudflare Worker proxy + B2 |
+| Web / PWA          | Svelte static SPA                 | Cloudflare Worker proxy      |
 | Desktop            | Tauri v2 (wraps the same SPA)     | Direct fetch via Rust core   |
 | iOS / Android      | Tauri v2 mobile (same SPA + Rust) | Direct fetch via Rust core   |
 | Admin ("manga DB") | Svelte static SPA (web-only)      | n/a                          |
@@ -22,8 +22,8 @@ ratings, and per-chapter comments** on top of a full Mihon-parity reader.
 > **Direction (updated): native-first.** The product targets **Desktop + iOS/Android
 > (Tauri)**; the public **web app is deprioritized** (kept as an optional build). Two
 > consequences: (1) native apps fetch image bytes **directly from the source via the Rust
-> `fetch_image` core**, so the Cloudflare Worker/B2 **image proxy is off the critical path**
-> (B2's first job is now Litestream backup); (2) **SEO / edge-SSR is moot** — apps are
+> `fetch_image` core**, so the Cloudflare Worker **image proxy is off the critical path**
+> (there is no B2 image tier — B2/R2's only job now is Litestream backup); (2) **SEO / edge-SSR is moot** — apps are
 > store/direct-distributed, not crawled — which removes the biggest earlier "gate". Mobile
 > still needs `tauri ios/android init` + Android SDK/NDK. The hosted backend
 > (server + Suwayomi + FlareSolverr + scanner + social) stays central; clients are thin.
@@ -104,7 +104,8 @@ time-between-chapters** (`avgIntervalHours`), **admin-overridable**
 (`overrideIntervalHours`) in the admin console. Once a series is "overdue" it is
 re-polled every `pollEveryMinutes` (e.g. 30) until the new chapter appears. The
 scanner **pauses** automatically for `COMPLETED` / `HIATUS` / `CANCELLED`. This
-drives both the B2 cache-fill and new-chapter notifications.
+drives new-chapter notifications (there is no image cache-fill job — images are
+edge-cached on demand only).
 
 ## Social layer
 
@@ -348,12 +349,12 @@ then integrated + verified together:
   `{librarySize,overdueCount,lastTickAt,nextDueAt}`, headers present. `cargo build` +
   `fmt` + `clippy -D warnings` + `--release` all clean.
 - **Image pipeline** (`apps/worker` + `packages/api/src/image-provider.ts`). A
-  Cloudflare Worker: `GET /img?src=<url>[&cache=1]` — validates + host-allowlists,
-  hotlink protection, edge cache (Cache API), optional **B2** read-through +
-  write-through (on `cache=1`) via S3 SigV4 (`aws4fetch`), fails open to plain proxy,
-  streamed bodies, immutable cache headers. Client `WebImageProvider` proxy mode now
-  builds the Worker URL. `tsc` clean. **Code-complete; needs a Cloudflare account + B2
-  bucket to run live.**
+  Cloudflare Worker: `GET /img?src=<url>` — validates + host-allowlists (empty list
+  fails **closed**), hotlink protection, `image/*` Content-Type enforcement, edge
+  cache (Cache API) only (no object-storage tier — B2 removed in `6d06784`), streamed
+  bodies, immutable cache headers. Client `WebImageProvider` proxy mode builds the
+  Worker URL; native builds fetch directly in Rust (host-guarded against SSRF, UA +
+  Referer set). `tsc` clean. **Code-complete; needs a Cloudflare account to run live.**
 - **Reader polish / a11y / virtualization** (`apps/reader/src`). Long-strip
   **virtualization** (IntersectionObserver windowing — verified ~4 `<img>` mounted of
   38 cells, window moves on scroll, offscreen torn down, aspect-ratio reserves layout);
@@ -432,7 +433,7 @@ komika-server` when `LITESTREAM_*` env is set — streaming the WAL to S3/B2 (po
 - [x] Series page wired to backend — real detail, genres, chapters, poster cover
 - [x] Reader wired to backend — real chapters, pages, page images, chapter nav
 - [x] Build the Komika unified server + real multi-user social (server done; reader UI swap pending)
-- [ ] Cloudflare Worker image proxy + B2 cache-fill
+- [ ] Cloudflare Worker image proxy (edge-cache only; no B2 tier)
 - [ ] Android SDK/NDK setup for mobile builds
 
 ```
