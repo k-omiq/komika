@@ -353,6 +353,30 @@ impl SuwayomiClient {
             .collect())
     }
 
+    /// Resolve the owning manga id for a Suwayomi chapter, for NSFW-gating `pages`.
+    /// Suwayomi chapter ids are sequential integers, so a viewer who hasn't opted in
+    /// could otherwise hand-craft one to read an NSFW series' page images — the gate
+    /// needs the owning series, which isn't mirrored locally for Suwayomi sources.
+    /// `None` if the chapter is unknown to the source server.
+    pub async fn chapter_manga_id(&self, chapter_id: i64) -> Result<Option<i64>> {
+        let doc = "query CM($id: Int!) { chapters(condition: { id: $id }) { nodes { mangaId } } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            manga_id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            chapters: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({ "id": chapter_id })).await?;
+        Ok(d.chapters.nodes.first().map(|n| n.manga_id))
+    }
+
     pub async fn library(&self) -> Result<Vec<SuwayomiManga>> {
         let doc = format!(
             "{MANGA_FIELDS}\nquery L {{ mangas(condition: {{ inLibrary: true }}) {{ nodes {{ ...MangaFields }} }} }}"

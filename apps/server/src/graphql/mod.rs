@@ -906,6 +906,11 @@ impl QueryRoot {
     async fn series(&self, ctx: &Context<'_>, id: ID) -> Result<Series> {
         let st = state(ctx);
         let n = id.0.parse::<i64>().map_err(gql_err)?;
+        // Suwayomi ids are sequential integers, so gate before the source round-trip:
+        // an opted-out viewer must not read the detail of an NSFW series by id (N2).
+        if canonical_is_nsfw(&st.pool, &id.0).await && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such series"));
+        }
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         Ok(map_series(st, m).await)
     }
@@ -913,6 +918,10 @@ impl QueryRoot {
     async fn chapters(&self, ctx: &Context<'_>, series_id: ID) -> Result<Vec<Chapter>> {
         let st = state(ctx);
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        // Gate the chapter list on the owning series' NSFW flag (same as `series`, N2).
+        if canonical_is_nsfw(&st.pool, &series_id.0).await && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such series"));
+        }
         let list = st.suwayomi.chapters(n).await.map_err(gql_err)?;
         Ok(list.into_iter().map(map_chapter).collect())
     }
@@ -920,6 +929,17 @@ impl QueryRoot {
     async fn pages(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Vec<Page>> {
         let st = state(ctx);
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
+        // The NSFW flag lives on the owning series/work, not the chapter, and Suwayomi
+        // chapters aren't mirrored locally — so resolve the manga id from the source and
+        // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
+        // is allowed through to the (cleanly-failing) page fetch, mirroring canonicalPages.
+        if let Some(manga_id) = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)? {
+            if canonical_is_nsfw(&st.pool, &manga_id.to_string()).await
+                && !viewer_show_nsfw(ctx).await
+            {
+                return Err(Error::new("No such chapter"));
+            }
+        }
         let urls = st.suwayomi.pages(n).await.map_err(gql_err)?;
         Ok(urls
             .into_iter()
@@ -936,7 +956,11 @@ impl QueryRoot {
     async fn library(&self, ctx: &Context<'_>) -> Result<Vec<Series>> {
         let st = state(ctx);
         let list = st.suwayomi.library().await.map_err(gql_err)?;
-        Ok(map_series_list(st, list).await)
+        // Hide NSFW series from the library too, unless the viewer opted in (N2).
+        Ok(filter_nsfw(
+            viewer_show_nsfw(ctx).await,
+            map_series_list(st, list).await,
+        ))
     }
 
     async fn reviews(
@@ -2558,6 +2582,84 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn suwayomi_detail_and_reader_paths_gate_nsfw() {
+        let (s, pool) = setup_full(100).await;
+        // A federated Suwayomi series (id 4242) linked to an NSFW work — the state left
+        // by the Tier-2 add flow once it flags a source series as NSFW (3.1). The
+        // Suwayomi ids are sequential, so an opted-out viewer could otherwise hand-craft
+        // this id to read full detail / chapter list / page images (N2).
+        let work_id = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Spicy Suwa".into()),
+                is_nsfw: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "suwayomi", "4242", None, true,
+        )
+        .await
+        .unwrap();
+
+        // Opted-out viewer: detail + chapter list are hidden *before* any source
+        // round-trip, so the gate resolves without the (unreachable) Suwayomi server.
+        let r = exec(
+            &s,
+            r#"{ series(id: "4242") { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "No such series");
+        let r = exec(
+            &s,
+            r#"{ chapters(seriesId: "4242") { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "No such series");
+
+        // Opting in passes the gate: the query then fails only because the test
+        // Suwayomi server is unreachable, NOT with the NSFW not-found.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let r = exec(
+            &s,
+            r#"{ series(id: "4242") { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_ne!(
+            first_error(&r),
+            "No such series",
+            "opted-in viewer must pass the gate: {:?}",
+            r.errors
+        );
+
+        // A safe/uncatalogued series is never over-blocked: even for an opted-out
+        // viewer (admin defaults to hidden) the gate passes and the resolver proceeds to
+        // the (unreachable) source, so the error is not the NSFW not-found.
+        let r = exec(
+            &s,
+            r#"{ series(id: "999999") { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_ne!(first_error(&r), "No such series");
     }
 
     #[tokio::test]
