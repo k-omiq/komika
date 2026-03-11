@@ -586,6 +586,19 @@ pub async fn upsert_source_series(
     Ok(id)
 }
 
+/// Escalate a work to NSFW. Only ever sets the flag — never clears it: "unknown =
+/// safe", but once any source signals NSFW the work stays NSFW. Idempotent. The
+/// gating reads consult `work.is_nsfw` exclusively (never `source_series.is_nsfw`),
+/// so a source-level signal must be OR'd in here to have any effect (N4).
+pub async fn mark_work_nsfw(pool: &SqlitePool, work_id: &str) -> Result<()> {
+    sqlx::query("UPDATE work SET is_nsfw = 1, updated_at = ? WHERE id = ? AND is_nsfw = 0")
+        .bind(Utc::now().to_rfc3339())
+        .bind(work_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Resolve the id of an existing source_series by its natural key.
 pub async fn find_source_series_id(
     pool: &SqlitePool,

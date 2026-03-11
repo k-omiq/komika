@@ -722,29 +722,42 @@ impl QueryRoot {
         #[graphql(default = 1)] page: i32,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // NSFW is filtered in SQL (like canonical_updates) rather than after the page
+        // slice, so `total`/`has_next` count only the rows the viewer can see — no skew
+        // where a page under-fills yet reports another page (N3). A series is NSFW when
+        // its Suwayomi source_series links to a work flagged NSFW.
+        const NSFW_FILTER: &str = "(? = 1 OR NOT EXISTS ( \
+             SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'suwayomi' AND ss.source_key = sss.series_id \
+               AND w.is_nsfw = 1))";
         // Series ids with a detected new-chapter timestamp, newest-first. Fetch one
         // extra to compute has_next without a second round-trip.
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT series_id FROM series_scan_state \
-             WHERE last_new_chapter_at IS NOT NULL \
-             ORDER BY last_new_chapter_at DESC, series_id ASC LIMIT ? OFFSET ?",
-        )
+        let ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT series_id FROM series_scan_state sss \
+             WHERE last_new_chapter_at IS NOT NULL AND {NSFW_FILTER} \
+             ORDER BY last_new_chapter_at DESC, series_id ASC LIMIT ? OFFSET ?"
+        ))
+        .bind(show_nsfw as i64)
         .bind(PAGE_SIZE + 1)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM series_scan_state WHERE last_new_chapter_at IS NOT NULL",
-        )
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM series_scan_state sss \
+             WHERE last_new_chapter_at IS NOT NULL AND {NSFW_FILTER}"
+        ))
+        .bind(show_nsfw as i64)
         .fetch_one(&st.pool)
         .await
         .map_err(gql_err)?;
         let has_next = ids.len() as i64 > PAGE_SIZE;
 
         // Hydrate each id from Suwayomi. A series that has since been removed from
-        // the source is skipped rather than failing the whole feed.
+        // the source is skipped rather than failing the whole feed. NSFW is already
+        // filtered in SQL above, so no post-slice filter is needed here.
         let mut items = Vec::new();
         for id in ids.into_iter().take(PAGE_SIZE as usize) {
             let Ok(n) = id.parse::<i64>() else { continue };
@@ -755,7 +768,6 @@ impl QueryRoot {
                 }
             }
         }
-        let items = filter_nsfw(viewer_show_nsfw(ctx).await, items);
         Ok(SeriesPage {
             items,
             page,
@@ -1820,6 +1832,13 @@ async fn add_source_series_core(
     )
     .await?;
 
+    // N4: the source-level NSFW signal must reach `work.is_nsfw` — the only column the
+    // gating reads consult. `new`/`review` already mint the work with it via make_work;
+    // an `auto_merge` reuses an existing (possibly SFW) work, so OR the flag in there.
+    if source_nsfw {
+        crate::catalog::mark_work_nsfw(pool, &work_id).await?;
+    }
+
     if let Decision::Review {
         work_id: cand_work,
         score,
@@ -2582,6 +2601,113 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn updates_total_excludes_nsfw_for_opted_out_viewer() {
+        // N3: `total`/`has_next` must count only rows the viewer can see, filtered in
+        // SQL rather than after the page slice. Seed two series with a new-chapter
+        // timestamp — one linked to an NSFW work, one to a SFW work.
+        let (s, pool) = setup_full(100).await;
+        for (sid, title, nsfw) in [("100", "Safe Feed", false), ("200", "Spicy Feed", true)] {
+            let wid = crate::catalog::create_work(
+                &pool,
+                &crate::catalog::WorkInput {
+                    primary_title: Some(title.into()),
+                    is_nsfw: nsfw,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            crate::catalog::upsert_source_series(
+                &pool, &wid, "suwayomi", "suwayomi", sid, None, nsfw,
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO series_scan_state (series_id, last_new_chapter_at, updated_at) \
+                 VALUES (?, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z')",
+            )
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Opted-out (default): total counts only the SFW series (no skew).
+        let r = exec(
+            &s,
+            r#"{ updates { total hasNextPage } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        assert_eq!(
+            data["updates"]["total"],
+            serde_json::json!(1),
+            "N3: nsfw row must not inflate total"
+        );
+        assert_eq!(data["updates"]["hasNextPage"], serde_json::json!(false));
+
+        // Opted in: both rows count.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let r = exec(&s, r#"{ updates { total } }"#, Some("bobtok"), "1.1.1.1").await;
+        let data = r.data.into_json().unwrap();
+        assert_eq!(data["updates"]["total"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn auto_merge_ors_source_nsfw_into_existing_work() {
+        // N4: an auto-merge onto an existing SFW work must escalate that work to NSFW
+        // when the source signals it — every gating read consults `work.is_nsfw`, never
+        // `source_series.is_nsfw`, so setting only the latter would leak.
+        let pool = migrated_pool().await;
+        // A SFW existing work with a title + cover so an exact-title + matching-cover
+        // add auto-merges (DD3 requires cover corroboration for auto-merge).
+        let existing = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Border Town Tales".into()),
+                cover_phash: Some("aabbccddeeff0011".into()),
+                is_nsfw: false,
+                aliases: vec![crate::catalog::Alias {
+                    raw: "Border Town Tales".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Same title, an NSFW genre (source_nsfw = true), identical cover hash.
+        let m = suwayomi_manga(55, "Border Town Tales", &["Action", "Hentai"], "src1");
+        let r = add_source_series_core(&pool, &m, Some("aabbccddeeff0011".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.decision, "auto_merge",
+            "expected auto-merge, got {}",
+            r.decision
+        );
+        assert_eq!(r.work_id, existing);
+        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+            .bind(&existing)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            nsfw, 1,
+            "N4: source nsfw signal must OR into the merged work"
+        );
     }
 
     #[tokio::test]
