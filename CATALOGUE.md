@@ -150,9 +150,10 @@ Natural home: `apps/server/src/dedup/`.
 3. **Fuzzy title** — trigram / token similarity → a **candidate shortlist** (not a
    decision).
 4. **Corroborate candidates** → confidence score:
-   - **Description similarity** — cheap **MinHash / shingle overlap** (decided:
-     MinHash-only to start; aggregators copy AniList/MAL descriptions verbatim, so
-     this catches most). Semantic embeddings deferred until precision demands them.
+   - **Description similarity** — cheap **exact shingle-Jaccard** (decided: plain
+     shingle overlap to start, computed exactly — not MinHash signatures; aggregators
+     copy AniList/MAL descriptions verbatim, so this catches most). Semantic embeddings
+     deferred until precision demands them.
    - **Cover perceptual-hash** — pHash + Hamming distance. Strongest cheap signal;
      the same series reuses the same art.
    - Author/artist, year proximity, tags/demographic, original language.
@@ -310,8 +311,10 @@ with a shared limiter. The shipped single-container compose satisfies this by de
 
 ## 10. Decisions (locked 2026-07-11)
 
-1. **Description similarity depth** — **MinHash-only** to start (no ML dependency).
-   Semantic embeddings deferred; revisit only if match precision proves insufficient.
+1. **Description similarity depth** — **exact shingle-Jaccard** to start (no ML
+   dependency; computed exactly over the full shingle sets, not MinHash signatures —
+   MinHash would only be an approximation for scale we don't have). Semantic embeddings
+   deferred; revisit only if match precision proves insufficient.
 2. **pHash placement** — **server-side**, computed on cover ingest during MangaDex
    sync. ✅ Realized as a hand-rolled 64-bit dHash over the `image` crate's decoders
    (`src/phash.rs`) — no extra image-hash dependency. Keeps hashing next to the data.

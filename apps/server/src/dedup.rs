@@ -119,18 +119,21 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
     }
 
     // 4. Score every candidate; keep the best (carrying whether the cover pHash
-    //    corroborated it, needed for the DD3 auto-merge guard).
+    //    corroborated it, needed for the DD3 auto-merge guard). `candidate_ids` is a
+    //    HashSet with nondeterministic iteration, so ties are broken by the lowest
+    //    work_id — otherwise the surfaced Review candidate would be arbitrary across
+    //    runs when several equal-scoring works share the exact title (DD7).
     let mut best: Option<(Scored, String)> = None;
     for wid in &candidate_ids {
         let Some(md) = catalog::load_match_data(pool, wid).await? else {
             continue;
         };
         let scored = score_candidate(cand, &norm_titles, &md);
-        if best
-            .as_ref()
-            .map(|(s, _)| scored.score > s.score)
-            .unwrap_or(true)
-        {
+        let replace = match best.as_ref() {
+            None => true,
+            Some((s, w)) => scored.score > s.score || (scored.score == s.score && wid < w),
+        };
+        if replace {
             best = Some((scored, wid.clone()));
         }
     }
@@ -142,11 +145,11 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
     // 5. Decide. A title-driven match (the only kind that reaches here — external-ID
     //    hits returned above) auto-merges only when a corroborating cover backs it, so
     //    a shared common title plus description overlap alone routes to Review (DD3).
-    let method = if exact_hit {
-        "title_corroborated"
-    } else {
-        "fuzzy"
-    };
+    // `method` labels align to the documented `merge_candidate.method` enum
+    // (migration 0005): external_id / title_exact / fuzzy / description / cover. The
+    // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
+    // finer description/cover distinction isn't surfaced separately (DD6).
+    let method = if exact_hit { "title_exact" } else { "fuzzy" };
     let cover_corroborated = scored
         .phash_sim
         .map(|p| p >= PHASH_CORROBORATION)
@@ -390,6 +393,44 @@ mod tests {
             Decision::New => panic!("DD4: multi-token block should have found the work"),
             Decision::Review { work_id, .. } | Decision::AutoMerge { work_id, .. } => {
                 assert_eq!(work_id, existing)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tied_review_candidate_is_deterministic() {
+        // DD7: two distinct works share the exact normalized title with no
+        // corroboration → equal score → Review. The candidate set is a HashSet
+        // (nondeterministic order), so the surfaced work_id must be pinned by the
+        // lowest-work_id tiebreak and stable across repeated resolves.
+        let pool = pool().await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(
+                catalog::create_work(
+                    &pool,
+                    &WorkInput {
+                        primary_title: Some("Ambiguous Title".into()),
+                        aliases: vec![Alias {
+                            raw: "Ambiguous Title".into(),
+                            lang: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let expected = ids.iter().min().unwrap().clone();
+        let cand = Candidate {
+            title: "Ambiguous Title".into(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            match resolve(&pool, &cand).await.unwrap() {
+                Decision::Review { work_id, .. } => assert_eq!(work_id, expected),
+                other => panic!("expected review, got {other:?}"),
             }
         }
     }
