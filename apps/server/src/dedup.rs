@@ -57,6 +57,14 @@ pub enum Decision {
 pub const HIGH: f64 = 0.85;
 pub const MID: f64 = 0.6;
 const FUZZY_BLOCK_LIMIT: i64 = 50;
+/// How many of the longest title tokens the fuzzy block keys on (DD4). Keying on
+/// only the single longest token missed a merge whenever the discriminating token
+/// wasn't the longest; unioning the top-N candidate sets closes that recall gap.
+const FUZZY_BLOCK_TOKENS: usize = 3;
+/// Minimum cover-pHash similarity that counts as corroboration for a title-driven
+/// auto-merge (DD3). A shared normalized title plus mere description overlap must
+/// not auto-merge on its own — without a corroborating cover it lands in Review.
+const PHASH_CORROBORATION: f64 = 0.8;
 
 /// Resolve `cand` against the canonical works in `pool`.
 pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
@@ -97,9 +105,11 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
         candidate_ids.extend(ids);
     }
 
-    // 3. Fuzzy blocking when no exact hit: block on the longest title token.
+    // 3. Fuzzy blocking when no exact hit: block on the top-N longest title tokens
+    //    (union), so the discriminating token being shorter than a generic one
+    //    doesn't drop the real match (DD4).
     if candidate_ids.is_empty() {
-        if let Some(token) = longest_token(&norm_titles) {
+        for token in top_tokens(&norm_titles, FUZZY_BLOCK_TOKENS) {
             let ids = catalog::candidate_work_ids_by_token(pool, &token, FUZZY_BLOCK_LIMIT).await?;
             candidate_ids.extend(ids);
         }
@@ -108,28 +118,43 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
         return Ok(Decision::New);
     }
 
-    // 4. Score every candidate; keep the best.
-    let mut best: Option<(f64, String)> = None;
+    // 4. Score every candidate; keep the best (carrying whether the cover pHash
+    //    corroborated it, needed for the DD3 auto-merge guard). `candidate_ids` is a
+    //    HashSet with nondeterministic iteration, so ties are broken by the lowest
+    //    work_id — otherwise the surfaced Review candidate would be arbitrary across
+    //    runs when several equal-scoring works share the exact title (DD7).
+    let mut best: Option<(Scored, String)> = None;
     for wid in &candidate_ids {
         let Some(md) = catalog::load_match_data(pool, wid).await? else {
             continue;
         };
-        let score = score_candidate(cand, &norm_titles, &md);
-        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-            best = Some((score, wid.clone()));
+        let scored = score_candidate(cand, &norm_titles, &md);
+        let replace = match best.as_ref() {
+            None => true,
+            Some((s, w)) => scored.score > s.score || (scored.score == s.score && wid < w),
+        };
+        if replace {
+            best = Some((scored, wid.clone()));
         }
     }
-    let Some((score, work_id)) = best else {
+    let Some((scored, work_id)) = best else {
         return Ok(Decision::New);
     };
+    let score = scored.score;
 
-    // 5. Decide.
-    let method = if exact_hit {
-        "title_corroborated"
-    } else {
-        "fuzzy"
-    };
-    Ok(if score >= HIGH {
+    // 5. Decide. A title-driven match (the only kind that reaches here — external-ID
+    //    hits returned above) auto-merges only when a corroborating cover backs it, so
+    //    a shared common title plus description overlap alone routes to Review (DD3).
+    // `method` labels align to the documented `merge_candidate.method` enum
+    // (migration 0005): external_id / title_exact / fuzzy / description / cover. The
+    // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
+    // finer description/cover distinction isn't surfaced separately (DD6).
+    let method = if exact_hit { "title_exact" } else { "fuzzy" };
+    let cover_corroborated = scored
+        .phash_sim
+        .map(|p| p >= PHASH_CORROBORATION)
+        .unwrap_or(false);
+    Ok(if score >= HIGH && cover_corroborated {
         Decision::AutoMerge {
             work_id,
             score,
@@ -146,10 +171,18 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
     })
 }
 
+/// A candidate's confidence plus the cover-pHash signal that fed it (kept separate so
+/// the decision can require cover corroboration for a title-driven auto-merge — DD3).
+struct Scored {
+    score: f64,
+    /// Cover-pHash similarity vs the candidate work, if both had a hash.
+    phash_sim: Option<f64>,
+}
+
 /// Confidence in [0,1]: `0.6*title + 0.4*corroboration`, plus small author/year
 /// boosters. Title alone (no description/cover overlap) tops out at ~0.6 → Review,
 /// so auto-merge needs corroboration on top of the title.
-fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData) -> f64 {
+fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData) -> Scored {
     let title_sim = norm_titles
         .iter()
         .flat_map(|nt| {
@@ -163,7 +196,8 @@ fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData)
     if let (Some(a), Some(b)) = (&cand.description, &md.description) {
         corrob = corrob.max(description_similarity(a, b));
     }
-    if let Some(p) = phash_similarity(cand.cover_phash.as_deref(), md.cover_phash.as_deref()) {
+    let phash_sim = phash_similarity(cand.cover_phash.as_deref(), md.cover_phash.as_deref());
+    if let Some(p) = phash_sim {
         corrob = corrob.max(p);
     }
 
@@ -174,7 +208,10 @@ fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData)
     if year_close(cand.year, md.year) {
         score += 0.03;
     }
-    score.min(1.0)
+    Scored {
+        score: score.min(1.0),
+        phash_sim,
+    }
 }
 
 fn author_matches(a: &Option<String>, b: &Option<String>) -> bool {
@@ -192,13 +229,20 @@ fn year_close(a: Option<i64>, b: Option<i64>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if (a - b).abs() <= 1)
 }
 
-fn longest_token(norm_titles: &[String]) -> Option<String> {
-    norm_titles
+/// The `n` longest distinct title tokens (≥3 chars), longest first — the fuzzy block
+/// keys on these (DD4). Ties broken lexically so the selection is deterministic.
+fn top_tokens(norm_titles: &[String], n: usize) -> Vec<String> {
+    let mut toks: Vec<String> = norm_titles
         .iter()
         .flat_map(|t| t.split_whitespace())
         .filter(|w| w.chars().count() >= 3)
-        .max_by_key(|w| w.chars().count())
         .map(|w| w.to_string())
+        .collect();
+    // Longest first, then lexical — so equal-length duplicates sit adjacent for dedup.
+    toks.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
+    toks.dedup();
+    toks.truncate(n);
+    toks
 }
 
 #[cfg(test)]
@@ -279,7 +323,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn title_plus_copied_description_auto_merges() {
+    async fn exact_title_with_description_only_goes_to_review() {
+        // DD3: an exact alt-title match whose only corroboration is an overlapping
+        // description (no cover pHash) must NOT auto-merge — a same-titled but distinct
+        // work with a copied blurb would otherwise merge unseen. It lands in Review.
         let pool = pool().await;
         let w = seed_slime(&pool).await;
         let cand = Candidate {
@@ -291,8 +338,100 @@ mod tests {
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
+            Decision::Review { work_id, .. } => assert_eq!(work_id, w),
+            other => panic!("expected review (DD3: no cover corroboration), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_title_with_cover_phash_auto_merges() {
+        // DD3: the same exact-title match auto-merges once a corroborating cover backs
+        // it — here an identical pHash to the seeded work's `ffff0000ffff0000`.
+        let pool = pool().await;
+        let w = seed_slime(&pool).await;
+        let cand = Candidate {
+            title: "Tensei Shitara Slime Datta Ken".into(),
+            cover_phash: Some("ffff0000ffff0000".into()),
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
             Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, w),
-            other => panic!("expected auto-merge, got {other:?}"),
+            other => panic!("expected auto-merge (cover corroborated), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzzy_block_finds_work_when_discriminating_token_is_not_longest() {
+        // DD4: the fuzzy block used to key on only the single longest token. The
+        // existing work's alias is "phantom dungeon"; the candidate adds a strictly
+        // longer, non-shared word ("extraordinary", 13 > 7) so the single-longest block
+        // keys on a token absent from every alias → returned nothing → Decision::New (a
+        // silent duplicate). The top-N union still keys on the shared "dungeon"/"phantom"
+        // tokens and finds it. A copied description lifts it into the Review band.
+        let pool = pool().await;
+        let blurb = "A lone delver descends the phantom dungeon beneath the ruined capital.";
+        let existing = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Phantom Dungeon".into()),
+                description: Some(blurb.into()),
+                aliases: vec![Alias {
+                    raw: "Phantom Dungeon".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cand = Candidate {
+            title: "Extraordinary Phantom Dungeon".into(),
+            description: Some(blurb.into()),
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
+            Decision::New => panic!("DD4: multi-token block should have found the work"),
+            Decision::Review { work_id, .. } | Decision::AutoMerge { work_id, .. } => {
+                assert_eq!(work_id, existing)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tied_review_candidate_is_deterministic() {
+        // DD7: two distinct works share the exact normalized title with no
+        // corroboration → equal score → Review. The candidate set is a HashSet
+        // (nondeterministic order), so the surfaced work_id must be pinned by the
+        // lowest-work_id tiebreak and stable across repeated resolves.
+        let pool = pool().await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(
+                catalog::create_work(
+                    &pool,
+                    &WorkInput {
+                        primary_title: Some("Ambiguous Title".into()),
+                        aliases: vec![Alias {
+                            raw: "Ambiguous Title".into(),
+                            lang: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let expected = ids.iter().min().unwrap().clone();
+        let cand = Candidate {
+            title: "Ambiguous Title".into(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            match resolve(&pool, &cand).await.unwrap() {
+                Decision::Review { work_id, .. } => assert_eq!(work_id, expected),
+                other => panic!("expected review, got {other:?}"),
+            }
         }
     }
 

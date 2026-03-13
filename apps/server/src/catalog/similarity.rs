@@ -1,9 +1,11 @@
 //! Cheap similarity signals for the dedup matcher (CATALOGUE.md §4, step 4).
 //!
 //! Two dependency-free comparators:
-//!   * `description_similarity` — Jaccard over word/char shingle sets. Aggregator
-//!     sites copy AniList/MAL descriptions near-verbatim, so plain shingle overlap
-//!     is the "MinHash-only" starting point the design locked in (no ML, §10).
+//!   * `description_similarity` — exact Jaccard over word/char shingle sets (NOT
+//!     MinHash signatures — the full sets are intersected directly). Aggregator sites
+//!     copy AniList/MAL descriptions near-verbatim, so plain shingle overlap is the
+//!     cheap-no-ML starting point the design locked in (§10). MinHash would only be
+//!     needed to approximate this Jaccard at scale; we compute it exactly.
 //!   * `phash_similarity` — normalized Hamming similarity over two hex perceptual
 //!     hashes. The cover→hash step lives in `crate::phash` (dHash via the `image`
 //!     crate) and is populated during catalogue sync when `COVER_PHASH` is on.
