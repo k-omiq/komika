@@ -226,8 +226,8 @@ async fn tick(state: &AppState) -> (usize, usize) {
 ///
 /// Shared by the scheduler `tick` (which gates on pause/overdue first) and the
 /// admin `triggerScan` mutation (which forces a scan regardless of gating). It
-/// re-reads the admin override and prior state so it's self-contained for both
-/// callers.
+/// re-reads the admin override so it's self-contained for both callers; the
+/// fetch + detection + persist is delegated to `record_scan`.
 pub async fn scan_series(
     state: &AppState,
     m: &SuwayomiManga,
@@ -235,14 +235,35 @@ pub async fn scan_series(
 ) -> anyhow::Result<bool> {
     let series_id = m.id.to_string();
     let admin = scan_admin(&state.pool, &series_id).await;
-    let prior = scan_state(&state.pool, &series_id)
-        .await
-        .unwrap_or_default();
-
     let chapters = state.suwayomi.chapters(m.id).await?;
+    record_scan(&state.pool, &series_id, &m.title, &admin, &chapters, now).await
+}
+
+/// Detect new chapters from a freshly-fetched chapter list and persist the
+/// series' scan state. Split out of `scan_series` so the bookkeeping is testable
+/// without a live Suwayomi (it reads its own `prior` row, so the read-modify-write
+/// is self-contained).
+///
+/// First observation (no prior row) records the baseline chapter count *without*
+/// stamping `last_new_chapter_at` — otherwise a fresh deploy's first tick flags the
+/// entire seeded back catalogue as just-updated and floods the `updates` feed [SC3].
+async fn record_scan(
+    pool: &SqlitePool,
+    series_id: &str,
+    title: &str,
+    admin: &ScanAdmin,
+    chapters: &[SuwayomiChapter],
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let prior_opt = scan_state(pool, series_id).await;
+    let first_observation = prior_opt.is_none();
+    let prior = prior_opt.unwrap_or_default();
+
     let count = chapters.len() as i64;
-    let computed_avg = avg_interval_hours(&chapters).unwrap_or(prior.avg_interval_hours);
-    let new_found = count > prior.known_chapter_count;
+    let computed_avg = avg_interval_hours(chapters).unwrap_or(prior.avg_interval_hours);
+    // On first observation we only record the baseline; a series is never "new"
+    // the first time we see it (SC3).
+    let new_found = !first_observation && count > prior.known_chapter_count;
     let now_iso = now.to_rfc3339();
     // Recompute the *next* effective interval from fresh data (admin still wins).
     let next_interval = admin
@@ -268,19 +289,20 @@ pub async fn scan_series(
     if new_found {
         tracing::info!(
             series_id,
-            title = %m.title,
+            title,
             added = count - prior.known_chapter_count,
             total = count,
-            latest = latest_number(&chapters),
+            latest = latest_number(chapters),
             avg_interval_hours = computed_avg,
             "scan: new chapters detected"
         );
     } else {
         tracing::debug!(
             series_id,
-            title = %m.title,
+            title,
             total = count,
             avg_interval_hours = computed_avg,
+            first_observation,
             "scan: no new chapters"
         );
     }
@@ -298,14 +320,14 @@ pub async fn scan_series(
            last_new_chapter_at = excluded.last_new_chapter_at, \
            updated_at = excluded.updated_at",
     )
-    .bind(&series_id)
+    .bind(series_id)
     .bind(computed_avg)
     .bind(count)
     .bind(&now_iso)
     .bind(&next_scan_at)
     .bind(&last_new_chapter_at)
     .bind(&now_iso)
-    .execute(&state.pool)
+    .execute(pool)
     .await?;
 
     Ok(new_found)
@@ -348,6 +370,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     fn at(iso: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(iso)
@@ -356,11 +379,15 @@ mod tests {
     }
 
     fn chap(upload_date: Option<&str>) -> SuwayomiChapter {
+        chap_n(1, 1.0, upload_date)
+    }
+
+    fn chap_n(id: i64, number: f64, upload_date: Option<&str>) -> SuwayomiChapter {
         SuwayomiChapter {
-            id: 1,
+            id,
             manga_id: 1,
             name: "c".into(),
-            chapter_number: 1.0,
+            chapter_number: number,
             scanlator: None,
             upload_date: upload_date.map(|s| s.to_string()),
             is_read: false,
@@ -369,6 +396,21 @@ mod tests {
             last_page_read: 0,
             page_count: 0,
         }
+    }
+
+    /// N chapters numbered 1..=N, undated (count-only fixtures).
+    fn chaps(n: i64) -> Vec<SuwayomiChapter> {
+        (1..=n).map(|i| chap_n(i, i as f64, None)).collect()
+    }
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
     }
 
     #[test]
@@ -416,5 +458,66 @@ mod tests {
         let now = at("2026-01-01T00:00:00Z");
         let future = now + chrono::Duration::milliseconds(ms);
         assert!(future > now);
+    }
+
+    // ---- record_scan bookkeeping (DB-backed) ----
+
+    async fn persisted(pool: &SqlitePool, series_id: &str) -> ScanState {
+        scan_state(pool, series_id)
+            .await
+            .expect("scan state row should exist")
+    }
+
+    #[tokio::test]
+    async fn first_observation_records_baseline_without_flagging_new() {
+        // SC3: a fresh series with a full back catalogue must NOT be flagged as
+        // "new" on first sight — record the baseline count, leave last_new NULL.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        let now = at("2026-01-01T00:00:00Z");
+
+        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(12), now)
+            .await
+            .unwrap();
+        assert!(!new_found, "first observation must not report new chapters");
+
+        let row = persisted(&pool, "1").await;
+        assert_eq!(row.known_chapter_count, 12);
+        assert!(
+            row.last_new_chapter_at.is_none(),
+            "first observation must not stamp last_new_chapter_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn subsequent_scan_flags_new_chapter() {
+        // Steady state after a baseline: an added chapter IS reported and stamps
+        // last_new_chapter_at.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let then = at("2026-01-08T00:00:00Z");
+        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(13), then)
+            .await
+            .unwrap();
+        assert!(new_found, "an added chapter must be reported");
+
+        let row = persisted(&pool, "1").await;
+        assert_eq!(row.known_chapter_count, 13);
+        assert_eq!(
+            row.last_new_chapter_at.as_deref(),
+            Some(then.to_rfc3339()).as_deref()
+        );
     }
 }

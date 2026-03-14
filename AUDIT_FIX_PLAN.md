@@ -66,7 +66,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 
 **Phase 5 — Scanner correctness**
 - [ ] 5.1 🟡 SC1 — implement overdue re-poll cadence (`poll_every_minutes`)
-- [ ] 5.2 🟡 SC3 — don't flag the back catalogue as "new" on first observation
+- [x] 5.2 🟡 SC3 — extracted `record_scan` from `scan_series` (fetch stays in `scan_series`; the read-prior→detect→upsert is now a testable pool-only helper). First observation (`scan_state` returns `None`) records the baseline `known_chapter_count` with `last_new_chapter_at` left NULL and `new_found=false`, so a fresh deploy's first tick no longer floods `updates`; steady-state behaviour unchanged. 2 DB tests (baseline no-flag; subsequent add flags).
 - [ ] 5.3 🟡 SC4 — detect add+remove churn (persist/compare max chapter number or key-set)
 - [ ] 5.4 🟡 SC5 — minimum interval clamp
 - [ ] 5.5 ⚪ SC6 / SC7 — scan-state transaction + `next_scan_at` consistency
