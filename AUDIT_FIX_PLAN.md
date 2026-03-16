@@ -67,7 +67,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 **Phase 5 — Scanner correctness**
 - [ ] 5.1 🟡 SC1 — implement overdue re-poll cadence (`poll_every_minutes`)
 - [x] 5.2 🟡 SC3 — extracted `record_scan` from `scan_series` (fetch stays in `scan_series`; the read-prior→detect→upsert is now a testable pool-only helper). First observation (`scan_state` returns `None`) records the baseline `known_chapter_count` with `last_new_chapter_at` left NULL and `new_found=false`, so a fresh deploy's first tick no longer floods `updates`; steady-state behaviour unchanged. 2 DB tests (baseline no-flag; subsequent add flags).
-- [ ] 5.3 🟡 SC4 — detect add+remove churn (persist/compare max chapter number or key-set)
+- [x] 5.3 🟡 SC4 — took the max-chapter-number route (not the key-set). Migration `0012` adds a **nullable** `known_max_chapter REAL` (NULL = not yet observed, so pre-`0012`/first-observation rows seed a baseline instead of firing on the jump from 0). `latest_number` now returns `Option<f64>`; `new_found = count > prior OR latest > prior_max + 1e-6`. The stored max is a **high-water mark** (never regresses on a top-chapter removal, so a re-add doesn't re-flag), and a count regression is now logged instead of silently overwritten. **Limitation (noted):** same-or-lower-numbered replacements (e.g. remove #3, add #2.5) still aren't caught — that needs the key-set route, deferred as heavier. 2 DB tests (count-stable higher number is new; high-water mark holds on shrink).
 - [ ] 5.4 🟡 SC5 — minimum interval clamp
 - [ ] 5.5 ⚪ SC6 / SC7 — scan-state transaction + `next_scan_at` consistency
 

@@ -40,6 +40,10 @@ const MAX_INTERVAL_HOURS: f64 = 100.0 * 365.0 * 24.0; // ~100 years
 pub struct ScanState {
     pub avg_interval_hours: f64,
     pub known_chapter_count: i64,
+    /// Highest chapter number seen at the last scan. `None` = not yet observed
+    /// (pre-`0012` rows), which suppresses number-based new-chapter detection
+    /// until a baseline is recorded (SC4).
+    pub known_max_chapter: Option<f64>,
     pub last_scanned_at: Option<String>,
     pub next_scan_at: Option<String>,
     pub last_new_chapter_at: Option<String>,
@@ -48,8 +52,8 @@ pub struct ScanState {
 /// Read the persisted scan state for a series, if any.
 pub async fn scan_state(pool: &SqlitePool, series_id: &str) -> Option<ScanState> {
     sqlx::query_as::<_, ScanState>(
-        "SELECT avg_interval_hours, known_chapter_count, last_scanned_at, next_scan_at, \
-         last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
+        "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, last_scanned_at, \
+         next_scan_at, last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
     )
     .bind(series_id)
     .fetch_optional(pool)
@@ -119,13 +123,18 @@ pub fn avg_interval_hours(chapters: &[SuwayomiChapter]) -> Option<f64> {
     Some(avg_ms / 3_600_000.0)
 }
 
-/// The latest (highest) chapter number seen, for logging new-chapter detection.
-fn latest_number(chapters: &[SuwayomiChapter]) -> f64 {
+/// The latest (highest) chapter number seen, or `None` for an empty list.
+/// Used both for new-chapter detection (SC4) and log output.
+fn latest_number(chapters: &[SuwayomiChapter]) -> Option<f64> {
     chapters
         .iter()
         .map(|c| c.chapter_number)
-        .fold(f64::MIN, f64::max)
+        .fold(None, |acc, n| Some(acc.map_or(n, |a: f64| a.max(n))))
 }
+
+/// Two chapter numbers within this tolerance are treated as equal, so float
+/// round-trips through SQLite don't spuriously read as "a higher chapter."
+const CHAPTER_NUMBER_EPS: f64 = 1e-6;
 
 fn parse_iso(v: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(v?)
@@ -261,9 +270,36 @@ async fn record_scan(
 
     let count = chapters.len() as i64;
     let computed_avg = avg_interval_hours(chapters).unwrap_or(prior.avg_interval_hours);
+    let latest = latest_number(chapters);
+    // A higher chapter number than we've seen means a new chapter even when the
+    // *count* is unchanged — upstream can drop one chapter and add another within
+    // an interval, leaving count flat but the max number advanced (SC4). Only
+    // compares when a prior max exists, so pre-`0012`/first-observation rows just
+    // seed a baseline rather than firing on the jump from "unknown".
+    let advanced_number = match (latest, prior.known_max_chapter) {
+        (Some(l), Some(prev)) => l > prev + CHAPTER_NUMBER_EPS,
+        _ => false,
+    };
     // On first observation we only record the baseline; a series is never "new"
     // the first time we see it (SC3).
-    let new_found = !first_observation && count > prior.known_chapter_count;
+    let new_found = !first_observation && (count > prior.known_chapter_count || advanced_number);
+    // Highest number seen is a high-water mark: never regress it just because
+    // upstream removed the top chapter, so a later re-add doesn't re-flag.
+    let known_max = match latest {
+        Some(l) => Some(prior.known_max_chapter.map_or(l, |p| p.max(l))),
+        None => prior.known_max_chapter,
+    };
+    // A shrinking count means upstream removed chapters; surface it (the count is
+    // still overwritten downward, but it's no longer silent) (SC4).
+    if !first_observation && count < prior.known_chapter_count {
+        tracing::info!(
+            series_id,
+            title,
+            prior = prior.known_chapter_count,
+            total = count,
+            "scan: chapter count regressed (upstream removed chapters)"
+        );
+    }
     let now_iso = now.to_rfc3339();
     // Recompute the *next* effective interval from fresh data (admin still wins).
     let next_interval = admin
@@ -292,7 +328,7 @@ async fn record_scan(
             title,
             added = count - prior.known_chapter_count,
             total = count,
-            latest = latest_number(chapters),
+            latest = latest.unwrap_or(f64::NAN),
             avg_interval_hours = computed_avg,
             "scan: new chapters detected"
         );
@@ -309,12 +345,13 @@ async fn record_scan(
 
     sqlx::query(
         "INSERT INTO series_scan_state \
-           (series_id, avg_interval_hours, known_chapter_count, last_scanned_at, \
-            next_scan_at, last_new_chapter_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+           (series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
+            last_scanned_at, next_scan_at, last_new_chapter_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(series_id) DO UPDATE SET \
            avg_interval_hours = excluded.avg_interval_hours, \
            known_chapter_count = excluded.known_chapter_count, \
+           known_max_chapter = excluded.known_max_chapter, \
            last_scanned_at = excluded.last_scanned_at, \
            next_scan_at = excluded.next_scan_at, \
            last_new_chapter_at = excluded.last_new_chapter_at, \
@@ -323,6 +360,7 @@ async fn record_scan(
     .bind(series_id)
     .bind(computed_avg)
     .bind(count)
+    .bind(known_max)
     .bind(&now_iso)
     .bind(&next_scan_at)
     .bind(&last_new_chapter_at)
@@ -518,6 +556,81 @@ mod tests {
         assert_eq!(
             row.last_new_chapter_at.as_deref(),
             Some(then.to_rfc3339()).as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn count_stable_but_higher_number_is_new() {
+        // SC4: upstream drops one chapter and adds a higher-numbered one within an
+        // interval — count is unchanged (3 -> 3) but the max number advanced.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        let base = vec![
+            chap_n(1, 1.0, None),
+            chap_n(2, 2.0, None),
+            chap_n(3, 3.0, None),
+        ];
+        let churned = vec![
+            chap_n(1, 1.0, None),
+            chap_n(2, 2.0, None),
+            chap_n(4, 4.0, None),
+        ];
+
+        record_scan(&pool, "1", "S", &admin, &base, at("2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(persisted(&pool, "1").await.known_max_chapter, Some(3.0));
+
+        let new_found = record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &churned,
+            at("2026-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(new_found, "a higher chapter number must count as new");
+        assert_eq!(persisted(&pool, "1").await.known_max_chapter, Some(4.0));
+    }
+
+    #[tokio::test]
+    async fn max_chapter_is_a_high_water_mark() {
+        // Removing the top chapter must not regress the stored max (else a later
+        // re-add would spuriously re-flag), and no new chapter is reported.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        let full = vec![
+            chap_n(1, 1.0, None),
+            chap_n(2, 2.0, None),
+            chap_n(3, 3.0, None),
+        ];
+        let trimmed = vec![chap_n(1, 1.0, None), chap_n(2, 2.0, None)];
+
+        record_scan(&pool, "1", "S", &admin, &full, at("2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let new_found = record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &trimmed,
+            at("2026-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(!new_found, "a shrink must not report a new chapter");
+        let row = persisted(&pool, "1").await;
+        assert_eq!(
+            row.known_chapter_count, 2,
+            "count follows upstream downward"
+        );
+        assert_eq!(
+            row.known_max_chapter,
+            Some(3.0),
+            "max stays at the high-water mark"
         );
     }
 }
