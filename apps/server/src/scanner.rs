@@ -35,6 +35,38 @@ const DEFAULT_INTERVAL_HOURS: f64 = 24.0;
 /// overflow the `chrono::Duration` math when computing `next_scan_at`.
 const MAX_INTERVAL_HOURS: f64 = 100.0 * 365.0 * 24.0; // ~100 years
 
+/// Floor on an *inferred* (rolling-avg) interval. A same-day upload burst yields
+/// sub-hour gaps, which would make the series overdue on essentially every 300s
+/// tick and refetched every tick — needless source/FlareSolverr load. Real series
+/// rarely sustain more than a few updates a day, so 6h is a safe floor for the
+/// steady cadence (the accelerated overdue poll is a separate knob, see SC1).
+const MIN_INTERVAL_HOURS: f64 = 6.0;
+
+/// Hard floor applied to an explicit admin `override_interval_hours`. A deliberate
+/// human override is allowed below `MIN_INTERVAL_HOURS` (that's the point of an
+/// override), but never below this — it still protects upstreams from a 0.01h
+/// hammer typo'd into the console.
+const HARD_MIN_INTERVAL_HOURS: f64 = 1.0;
+
+/// Resolve the steady effective interval (hours) from an optional admin override
+/// and the inferred rolling average, clamping into a sane range (SC5):
+///   - an explicit override wins and is clamped to `[HARD_MIN, MAX]`;
+///   - otherwise the inferred avg (or the default when none) is clamped to
+///     `[MIN, MAX]`, so a burst series isn't refetched every tick.
+fn resolve_interval(override_interval_hours: Option<f64>, inferred_avg: f64) -> f64 {
+    match override_interval_hours.filter(|v| *v > 0.0) {
+        Some(o) => o.clamp(HARD_MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS),
+        None => {
+            let base = if inferred_avg > 0.0 {
+                inferred_avg
+            } else {
+                DEFAULT_INTERVAL_HOURS
+            };
+            base.clamp(MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS)
+        }
+    }
+}
+
 /// Persisted scan state row (mirrors `series_scan_state`).
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct ScanState {
@@ -202,19 +234,11 @@ async fn tick(state: &AppState) -> (usize, usize) {
             .unwrap_or_default();
 
         // Effective interval: admin override wins; else the last-computed rolling
-        // avg; else a sane default. A brand-new series (no last_scanned_at) is
-        // always overdue and scanned promptly; the default only matters once it
-        // has been scanned but still yields no inferable cadence, so it isn't
-        // re-fetched every tick.
-        let effective_interval = admin
-            .override_interval_hours
-            .filter(|v| *v > 0.0)
-            .unwrap_or(prior.avg_interval_hours);
-        let effective_interval = if effective_interval > 0.0 {
-            effective_interval
-        } else {
-            DEFAULT_INTERVAL_HOURS
-        };
+        // avg; else a sane default — clamped into a sane range so a burst series
+        // (sub-hour avg) isn't refetched every tick. A brand-new series (no
+        // last_scanned_at) is always overdue and scanned promptly.
+        let effective_interval =
+            resolve_interval(admin.override_interval_hours, prior.avg_interval_hours);
 
         if !is_overdue(prior.last_scanned_at.as_deref(), effective_interval, now) {
             continue;
@@ -301,19 +325,9 @@ async fn record_scan(
         );
     }
     let now_iso = now.to_rfc3339();
-    // Recompute the *next* effective interval from fresh data (admin still wins).
-    let next_interval = admin
-        .override_interval_hours
-        .filter(|v| *v > 0.0)
-        .unwrap_or(computed_avg);
-    // Same default when no cadence is known, and clamp so an absurd override
-    // can't overflow the Duration math below.
-    let next_interval = if next_interval > 0.0 {
-        next_interval
-    } else {
-        DEFAULT_INTERVAL_HOURS
-    }
-    .min(MAX_INTERVAL_HOURS);
+    // Recompute the *next* effective interval from fresh data (admin still wins),
+    // clamped into `[MIN|HARD_MIN, MAX]` — same resolution as the tick gate (SC5).
+    let next_interval = resolve_interval(admin.override_interval_hours, computed_avg);
     let next_scan_at =
         (now + chrono::Duration::milliseconds((next_interval * 3_600_000.0) as i64)).to_rfc3339();
     let last_new_chapter_at = if new_found {
@@ -496,6 +510,26 @@ mod tests {
         let now = at("2026-01-01T00:00:00Z");
         let future = now + chrono::Duration::milliseconds(ms);
         assert!(future > now);
+    }
+
+    #[test]
+    fn inferred_interval_clamps_up_to_min() {
+        // A same-day burst (avg 0.2h) must be floored to MIN, not left sub-hour.
+        assert_eq!(resolve_interval(None, 0.2), MIN_INTERVAL_HOURS);
+        // A normal weekly avg passes straight through.
+        assert_eq!(resolve_interval(None, 168.0), 168.0);
+        // No inferable cadence -> default (which is itself >= MIN).
+        assert_eq!(resolve_interval(None, 0.0), DEFAULT_INTERVAL_HOURS);
+    }
+
+    #[test]
+    fn override_bypasses_min_but_not_hard_floor() {
+        // A deliberate override may go below MIN...
+        assert_eq!(resolve_interval(Some(2.0), 168.0), 2.0);
+        // ...but never below the hard floor that protects upstreams.
+        assert_eq!(resolve_interval(Some(0.01), 168.0), HARD_MIN_INTERVAL_HOURS);
+        // Upper clamp still holds.
+        assert_eq!(resolve_interval(Some(1e9), 0.0), MAX_INTERVAL_HOURS);
     }
 
     // ---- record_scan bookkeeping (DB-backed) ----
