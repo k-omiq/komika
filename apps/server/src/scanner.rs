@@ -1,16 +1,23 @@
 //! Adaptive scan scheduler.
 //!
 //! A background tokio task that keeps the federated library catalog fresh. Every
-//! `SCAN_TICK_SECONDS` it walks the Suwayomi library and, for each series, decides
-//! whether the series is *overdue* for a re-scan based on its adaptive cadence:
+//! `SCAN_TICK_SECONDS` it walks the Suwayomi library and re-scans each series that
+//! has reached its persisted `next_scan_at`. That schedule is adaptive:
 //!
-//!   effective_interval = admin override_interval_hours  (if set)
-//!                        else rolling avg gap between chapter uploads
+//!   steady_interval = admin override_interval_hours  (if set)
+//!                     else rolling avg gap between chapter uploads
+//!                     (clamped into a sane `[MIN, MAX]` range)
 //!
-//! Overdue series get their chapters re-fetched; new chapters (detected by chapter
-//! count / latest number vs. the last known count) are logged. All derived state is
-//! persisted in `series_scan_state`, which `graphql::map_series` folds back into
-//! `Series.scan` for the client and admin console.
+//! After a scan finds a new chapter (or on first observation) the next scan is
+//! scheduled a full `steady_interval` out. But once a series comes due and finds
+//! *no* new chapter — the expected chapter is late — it enters an "awaiting" state
+//! and is re-polled at the (clamped) admin `poll_every_minutes` cadence until the
+//! chapter lands, then reverts to steady.
+//!
+//! Due series get their chapters re-fetched; new chapters (detected by chapter
+//! count OR max chapter number vs. the last known values) are logged. All derived
+//! state is persisted in `series_scan_state`, which `graphql::map_series` folds
+//! back into `Series.scan` for the client and admin console.
 //!
 //! Resilience: a per-series error is logged and skipped — it never aborts the tick
 //! or the loop. The loop exits cleanly when the provided shutdown signal fires.
@@ -27,8 +34,8 @@ use crate::graphql::AppState;
 use crate::suwayomi::{SuwayomiChapter, SuwayomiManga};
 
 /// Fallback cadence when no interval can be inferred yet (e.g. a series with
-/// fewer than two dated chapters). Without this, `effective_interval` stays 0.0
-/// and `is_overdue` is always true, re-fetching the series on every single tick.
+/// fewer than two dated chapters). Without this, the steady interval would be 0.0
+/// and the series would be re-scheduled for immediate re-fetch on every tick.
 const DEFAULT_INTERVAL_HOURS: f64 = 24.0;
 
 /// Upper bound on any effective interval, so an absurd admin override can't
@@ -67,6 +74,31 @@ fn resolve_interval(override_interval_hours: Option<f64>, inferred_avg: f64) -> 
     }
 }
 
+/// Default accelerated re-poll cadence (minutes) when the admin hasn't set
+/// `poll_every_minutes`. Mirrors the API default surfaced in `map_series`.
+const DEFAULT_POLL_MINUTES: f64 = 30.0;
+
+/// Floor on the accelerated re-poll cadence. The scan loop itself ticks every
+/// `SCAN_TICK_SECONDS` (300s default), so a `poll_every_minutes` below the tick
+/// cadence can't actually poll faster than the tick anyway; 15min is a gentle
+/// floor that keeps overdue re-checks frequent without hammering upstreams.
+const MIN_POLL_MINUTES: f64 = 15.0;
+
+/// Resolve the accelerated re-poll cadence (minutes) for an *awaiting* series —
+/// one that's overdue for a new chapter that hasn't landed yet (SC1). Clamped to
+/// at least `MIN_POLL_MINUTES` and never above the steady interval (a poll slower
+/// than the steady cadence would be no acceleration at all).
+fn resolve_poll_minutes(poll_every_minutes: Option<i64>, steady_interval_hours: f64) -> f64 {
+    let requested = poll_every_minutes
+        .filter(|v| *v > 0)
+        .map(|v| v as f64)
+        .unwrap_or(DEFAULT_POLL_MINUTES);
+    let steady_minutes = steady_interval_hours * 60.0;
+    // `max` then `min` (not `clamp`) so a degenerate steady_minutes < MIN can't
+    // panic; it just collapses the poll cadence onto the steady one.
+    requested.max(MIN_POLL_MINUTES).min(steady_minutes)
+}
+
 /// Persisted scan state row (mirrors `series_scan_state`).
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct ScanState {
@@ -94,17 +126,21 @@ pub async fn scan_state(pool: &SqlitePool, series_id: &str) -> Option<ScanState>
     .flatten()
 }
 
-/// Admin overrides the scanner cares about (interval + pause), read from `series_admin`.
+/// Admin overrides the scanner cares about (interval + poll cadence + pause),
+/// read from `series_admin`.
 #[derive(Default, sqlx::FromRow)]
 struct ScanAdmin {
     override_interval_hours: Option<f64>,
+    /// Accelerated re-poll cadence (minutes) used once a series is overdue for a
+    /// new chapter that hasn't landed yet (SC1). `None` -> `DEFAULT_POLL_MINUTES`.
+    poll_every_minutes: Option<i64>,
     paused_override: Option<i64>,
     status_override: Option<String>,
 }
 
 async fn scan_admin(pool: &SqlitePool, series_id: &str) -> ScanAdmin {
     sqlx::query_as::<_, ScanAdmin>(
-        "SELECT override_interval_hours, paused_override, status_override \
+        "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
          FROM series_admin WHERE series_id = ?",
     )
     .bind(series_id)
@@ -174,19 +210,14 @@ fn parse_iso(v: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Decide whether `now - last_scanned_at >= effective_interval`. A series that has
-/// never been scanned (no `last_scanned_at`) is always due.
-fn is_overdue(
-    last_scanned_at: Option<&str>,
-    effective_interval_hours: f64,
-    now: DateTime<Utc>,
-) -> bool {
-    match parse_iso(last_scanned_at) {
+/// Decide whether a series is due for a scan by gating on its persisted
+/// `next_scan_at` (SC1/SC7). A series with no scheduled scan (never scanned, or a
+/// pre-existing row without one) is always due. Gating and the admin console's
+/// "next due" now read the same stored value, so they can't disagree.
+fn is_due(next_scan_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    match parse_iso(next_scan_at) {
         None => true,
-        Some(last) => {
-            let elapsed_hours = (now - last).num_seconds() as f64 / 3600.0;
-            elapsed_hours >= effective_interval_hours
-        }
+        Some(next) => now >= next,
     }
 }
 
@@ -233,14 +264,12 @@ async fn tick(state: &AppState) -> (usize, usize) {
             .await
             .unwrap_or_default();
 
-        // Effective interval: admin override wins; else the last-computed rolling
-        // avg; else a sane default — clamped into a sane range so a burst series
-        // (sub-hour avg) isn't refetched every tick. A brand-new series (no
-        // last_scanned_at) is always overdue and scanned promptly.
-        let effective_interval =
-            resolve_interval(admin.override_interval_hours, prior.avg_interval_hours);
-
-        if !is_overdue(prior.last_scanned_at.as_deref(), effective_interval, now) {
+        // Gate on the persisted `next_scan_at`, which `scan_series` schedules from
+        // the steady cadence normally and from the accelerated poll cadence while a
+        // series is awaiting an overdue chapter (SC1). Gating and the admin
+        // console's "next due" now read the same stored value, so they agree (SC7).
+        // A brand-new series has no `next_scan_at` and is scanned promptly.
+        if !is_due(prior.next_scan_at.as_deref(), now) {
             continue;
         }
         overdue_seen += 1;
@@ -325,11 +354,22 @@ async fn record_scan(
         );
     }
     let now_iso = now.to_rfc3339();
-    // Recompute the *next* effective interval from fresh data (admin still wins),
-    // clamped into `[MIN|HARD_MIN, MAX]` — same resolution as the tick gate (SC5).
-    let next_interval = resolve_interval(admin.override_interval_hours, computed_avg);
-    let next_scan_at =
-        (now + chrono::Duration::milliseconds((next_interval * 3_600_000.0) as i64)).to_rfc3339();
+    // Steady cadence from fresh data (admin override wins), clamped into
+    // `[MIN|HARD_MIN, MAX]` (SC5).
+    let steady_interval = resolve_interval(admin.override_interval_hours, computed_avg);
+    // "Awaiting" = we scanned an already-due series and found no new chapter, so
+    // the expected next chapter is late. Re-poll at the accelerated (clamped) poll
+    // cadence until it lands, instead of waiting a full steady interval (SC1).
+    // First observation just recorded a baseline — not awaiting.
+    let awaiting = !new_found && !first_observation;
+    let next_interval_hours = if awaiting {
+        resolve_poll_minutes(admin.poll_every_minutes, steady_interval) / 60.0
+    } else {
+        steady_interval
+    };
+    let next_scan_at = (now
+        + chrono::Duration::milliseconds((next_interval_hours * 3_600_000.0) as i64))
+    .to_rfc3339();
     let last_new_chapter_at = if new_found {
         Some(now_iso.clone())
     } else {
@@ -466,28 +506,36 @@ mod tests {
     }
 
     #[test]
-    fn never_scanned_series_is_overdue() {
-        assert!(is_overdue(None, 24.0, at("2026-01-01T00:00:00Z")));
+    fn unscheduled_series_is_due() {
+        // No next_scan_at (never scanned) -> always due.
+        assert!(is_due(None, at("2026-01-01T00:00:00Z")));
     }
 
     #[test]
-    fn recent_scan_within_interval_is_not_overdue() {
-        // last scan 1h ago, interval 24h
-        assert!(!is_overdue(
-            Some("2025-12-31T23:00:00Z"),
-            24.0,
+    fn future_next_scan_is_not_due() {
+        assert!(!is_due(
+            Some("2026-01-02T00:00:00Z"),
             at("2026-01-01T00:00:00Z")
         ));
     }
 
     #[test]
-    fn stale_scan_past_interval_is_overdue() {
-        // last scan 7d ago, interval 24h
-        assert!(is_overdue(
-            Some("2025-12-25T00:00:00Z"),
-            24.0,
+    fn past_next_scan_is_due() {
+        assert!(is_due(
+            Some("2025-12-31T00:00:00Z"),
             at("2026-01-01T00:00:00Z")
         ));
+    }
+
+    #[test]
+    fn poll_cadence_is_clamped() {
+        // Default poll (30m) passes through under a weekly steady interval.
+        assert_eq!(resolve_poll_minutes(None, 168.0), DEFAULT_POLL_MINUTES);
+        // A 1-minute poll floors to MIN_POLL_MINUTES (can't out-run the tick).
+        assert_eq!(resolve_poll_minutes(Some(1), 168.0), MIN_POLL_MINUTES);
+        // A poll slower than the steady interval collapses onto it (no negative
+        // "acceleration"): steady 1h = 60m caps a 120m poll.
+        assert_eq!(resolve_poll_minutes(Some(120), 1.0), 60.0);
     }
 
     #[test]
@@ -665,6 +713,63 @@ mod tests {
             row.known_max_chapter,
             Some(3.0),
             "max stays at the high-water mark"
+        );
+    }
+
+    /// Hours between `now` and a series' persisted `next_scan_at`.
+    async fn hours_until_next_scan(pool: &SqlitePool, series_id: &str, now: DateTime<Utc>) -> f64 {
+        let next = persisted(pool, series_id)
+            .await
+            .next_scan_at
+            .expect("next_scan_at should be scheduled");
+        let next = DateTime::parse_from_rfc3339(&next)
+            .unwrap()
+            .with_timezone(&Utc);
+        (next - now).num_milliseconds() as f64 / 3_600_000.0
+    }
+
+    #[tokio::test]
+    async fn awaiting_series_repolls_at_poll_cadence_then_reverts() {
+        // SC1: a weekly series (override 168h) that comes due and finds no new
+        // chapter re-polls at poll_every_minutes (30m), not a full week; once a
+        // chapter lands it reverts to the steady 168h cadence.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            override_interval_hours: Some(168.0),
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+
+        // Baseline (first observation): steady cadence, not awaiting.
+        let t0 = at("2026-01-01T00:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "1", t0).await - 168.0).abs() < 0.01,
+            "first observation schedules the steady interval"
+        );
+
+        // Came due, no new chapter -> awaiting -> accelerated 30m poll.
+        let t1 = at("2026-01-08T00:00:00Z");
+        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(5), t1)
+            .await
+            .unwrap();
+        assert!(!new_found);
+        assert!(
+            (hours_until_next_scan(&pool, "1", t1).await - 0.5).abs() < 0.01,
+            "awaiting series re-polls at the 30-minute poll cadence"
+        );
+
+        // Chapter finally lands -> revert to the steady interval.
+        let t2 = at("2026-01-08T00:30:00Z");
+        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(6), t2)
+            .await
+            .unwrap();
+        assert!(new_found);
+        assert!(
+            (hours_until_next_scan(&pool, "1", t2).await - 168.0).abs() < 0.01,
+            "a landed chapter reverts to the steady cadence"
         );
     }
 }
