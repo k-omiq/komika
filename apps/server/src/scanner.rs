@@ -309,6 +309,14 @@ pub async fn scan_series(
 /// First observation (no prior row) records the baseline chapter count *without*
 /// stamping `last_new_chapter_at` — otherwise a fresh deploy's first tick flags the
 /// entire seeded back catalogue as just-updated and floods the `updates` feed [SC3].
+///
+/// The prior read and the upsert run in one transaction [SC6]: an admin
+/// `triggerScan` overlapping a scheduler tick can no longer interleave their
+/// read-modify-write and double-count or clobber `known_chapter_count`. The slow
+/// chapter fetch already happened in `scan_series`, so the tx spans only the two
+/// DB ops; under WAL a losing concurrent writer gets `SQLITE_BUSY_SNAPSHOT` and
+/// this scan errors out (logged + skipped by the tick, retried next interval)
+/// rather than committing a stale write.
 async fn record_scan(
     pool: &SqlitePool,
     series_id: &str,
@@ -317,7 +325,14 @@ async fn record_scan(
     chapters: &[SuwayomiChapter],
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let prior_opt = scan_state(pool, series_id).await;
+    let mut tx = pool.begin().await?;
+    let prior_opt = sqlx::query_as::<_, ScanState>(
+        "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, last_scanned_at, \
+         next_scan_at, last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
+    )
+    .bind(series_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let first_observation = prior_opt.is_none();
     let prior = prior_opt.unwrap_or_default();
 
@@ -419,9 +434,10 @@ async fn record_scan(
     .bind(&next_scan_at)
     .bind(&last_new_chapter_at)
     .bind(&now_iso)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(new_found)
 }
 
@@ -770,6 +786,52 @@ mod tests {
         assert!(
             (hours_until_next_scan(&pool, "1", t2).await - 168.0).abs() < 0.01,
             "a landed chapter reverts to the steady cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_scan_does_not_double_count() {
+        // SC6: the read-prior + upsert is a single transaction and `count` is set
+        // from the fresh list (not incremented), so a triggerScan repeating a tick
+        // over the same chapters can't double-count or re-flag.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &chaps(7),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let after_first = persisted(&pool, "1").await;
+
+        let new_found = record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &chaps(7),
+            at("2026-01-01T00:05:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(!new_found, "an identical re-scan reports no new chapters");
+        let after_second = persisted(&pool, "1").await;
+        assert_eq!(
+            after_second.known_chapter_count, 7,
+            "count is not double-counted"
+        );
+        assert_eq!(
+            after_first.known_chapter_count,
+            after_second.known_chapter_count
+        );
+        assert!(
+            after_second.last_new_chapter_at.is_none(),
+            "an identical re-scan does not stamp last_new_chapter_at"
         );
     }
 }
