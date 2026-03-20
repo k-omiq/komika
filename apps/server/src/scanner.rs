@@ -113,17 +113,22 @@ pub struct ScanState {
     pub last_new_chapter_at: Option<String>,
 }
 
+/// The column list for a `ScanState` row, shared by `scan_state` (pooled read)
+/// and `record_scan`'s in-transaction read so the two can't drift out of sync
+/// with the struct.
+const SCAN_STATE_SELECT: &str =
+    "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, \
+     last_scanned_at, next_scan_at, last_new_chapter_at \
+     FROM series_scan_state WHERE series_id = ?";
+
 /// Read the persisted scan state for a series, if any.
 pub async fn scan_state(pool: &SqlitePool, series_id: &str) -> Option<ScanState> {
-    sqlx::query_as::<_, ScanState>(
-        "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, last_scanned_at, \
-         next_scan_at, last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
-    )
-    .bind(series_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
+    sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
+        .bind(series_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Admin overrides the scanner cares about (interval + poll cadence + pause),
@@ -326,13 +331,10 @@ async fn record_scan(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
-    let prior_opt = sqlx::query_as::<_, ScanState>(
-        "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, last_scanned_at, \
-         next_scan_at, last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
-    )
-    .bind(series_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let prior_opt = sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
+        .bind(series_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let first_observation = prior_opt.is_none();
     let prior = prior_opt.unwrap_or_default();
 
