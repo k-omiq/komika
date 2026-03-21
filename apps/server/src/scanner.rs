@@ -12,7 +12,9 @@
 //! scheduled a full `steady_interval` out. But once a series comes due and finds
 //! *no* new chapter — the expected chapter is late — it enters an "awaiting" state
 //! and is re-polled at the (clamped) admin `poll_every_minutes` cadence until the
-//! chapter lands, then reverts to steady.
+//! chapter lands, then reverts to steady. The accelerated poll is bounded to a
+//! window past the due time (`min(steady_interval, AWAITING_MAX_HOURS)`), so a
+//! stalled series doesn't poll forever.
 //!
 //! Due series get their chapters re-fetched; new chapters (detected by chapter
 //! count OR max chapter number vs. the last known values) are logged. All derived
@@ -84,6 +86,16 @@ const DEFAULT_POLL_MINUTES: f64 = 30.0;
 /// floor that keeps overdue re-checks frequent without hammering upstreams.
 const MIN_POLL_MINUTES: f64 = 15.0;
 
+/// Absolute ceiling on how long a series stays in the accelerated poll cadence
+/// past its due time before falling back to the steady cadence (SC1). Without a
+/// bound, a stalled-but-ONGOING series (never auto-paused) — or one whose inferred
+/// interval underestimates its true cadence — would poll every `poll_every_minutes`
+/// indefinitely. A chapter that's actually coming almost always lands within a
+/// couple of days of its cadence; past that the series is treated as steady again.
+/// The effective window is `min(steady_interval, this)`, so short-cadence series
+/// don't poll aggressively for many multiples of their own interval.
+const AWAITING_MAX_HOURS: f64 = 48.0;
+
 /// Resolve the accelerated re-poll cadence (minutes) for an *awaiting* series —
 /// one that's overdue for a new chapter that hasn't landed yet (SC1). Clamped to
 /// at least `MIN_POLL_MINUTES` and never above the steady interval (a poll slower
@@ -111,6 +123,9 @@ pub struct ScanState {
     pub last_scanned_at: Option<String>,
     pub next_scan_at: Option<String>,
     pub last_new_chapter_at: Option<String>,
+    /// When the current overdue-awaiting streak began (SC1). `None` = not awaiting
+    /// (a chapter is on schedule). Bounds how long the accelerated poll runs.
+    pub awaiting_since: Option<String>,
 }
 
 /// The column list for a `ScanState` row, shared by `scan_state` (pooled read)
@@ -118,7 +133,7 @@ pub struct ScanState {
 /// with the struct.
 const SCAN_STATE_SELECT: &str =
     "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, \
-     last_scanned_at, next_scan_at, last_new_chapter_at \
+     last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since \
      FROM series_scan_state WHERE series_id = ?";
 
 /// Read the persisted scan state for a series, if any.
@@ -374,12 +389,31 @@ async fn record_scan(
     // Steady cadence from fresh data (admin override wins), clamped into
     // `[MIN|HARD_MIN, MAX]` (SC5).
     let steady_interval = resolve_interval(admin.override_interval_hours, computed_avg);
-    // "Awaiting" = we scanned an already-due series and found no new chapter, so
-    // the expected next chapter is late. Re-poll at the accelerated (clamped) poll
-    // cadence until it lands, instead of waiting a full steady interval (SC1).
-    // First observation just recorded a baseline — not awaiting.
-    let awaiting = !new_found && !first_observation;
-    let next_interval_hours = if awaiting {
+    // "Awaiting" = the series was *genuinely due* (past its persisted `next_scan_at`)
+    // and found no new chapter, so the expected chapter is late (SC1). We gate on
+    // due-ness — not merely "a scan found nothing" — so an admin `triggerScan` that
+    // force-scans a series *before* its cadence doesn't wrongly flip it into the
+    // accelerated poll. First observation just recorded a baseline — not awaiting.
+    let due_now = is_due(prior.next_scan_at.as_deref(), now);
+    let awaiting = due_now && !new_found && !first_observation;
+    // Stamp when the awaiting streak began (preserve the original start across
+    // repeated polls); clear it as soon as a chapter lands or we're not awaiting.
+    let awaiting_since = if awaiting {
+        prior
+            .awaiting_since
+            .clone()
+            .or_else(|| Some(now_iso.clone()))
+    } else {
+        None
+    };
+    // Re-poll fast only within a bounded window past the due time; beyond it the
+    // series is treated as steady again so a stalled/underestimated series doesn't
+    // poll forever (SC1). The window scales with the cadence but is capped.
+    let awaiting_window_hours = steady_interval.min(AWAITING_MAX_HOURS);
+    let awaited_hours = parse_iso(awaiting_since.as_deref())
+        .map(|start| (now - start).num_seconds() as f64 / 3600.0)
+        .unwrap_or(0.0);
+    let next_interval_hours = if awaiting && awaited_hours < awaiting_window_hours {
         resolve_poll_minutes(admin.poll_every_minutes, steady_interval) / 60.0
     } else {
         steady_interval
@@ -417,8 +451,8 @@ async fn record_scan(
     sqlx::query(
         "INSERT INTO series_scan_state \
            (series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
-            last_scanned_at, next_scan_at, last_new_chapter_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+            last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(series_id) DO UPDATE SET \
            avg_interval_hours = excluded.avg_interval_hours, \
            known_chapter_count = excluded.known_chapter_count, \
@@ -426,6 +460,7 @@ async fn record_scan(
            last_scanned_at = excluded.last_scanned_at, \
            next_scan_at = excluded.next_scan_at, \
            last_new_chapter_at = excluded.last_new_chapter_at, \
+           awaiting_since = excluded.awaiting_since, \
            updated_at = excluded.updated_at",
     )
     .bind(series_id)
@@ -435,6 +470,7 @@ async fn record_scan(
     .bind(&now_iso)
     .bind(&next_scan_at)
     .bind(&last_new_chapter_at)
+    .bind(&awaiting_since)
     .bind(&now_iso)
     .execute(&mut *tx)
     .await?;
@@ -788,6 +824,88 @@ mod tests {
         assert!(
             (hours_until_next_scan(&pool, "1", t2).await - 168.0).abs() < 0.01,
             "a landed chapter reverts to the steady cadence"
+        );
+        assert!(
+            persisted(&pool, "1").await.awaiting_since.is_none(),
+            "awaiting_since is cleared once a chapter lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_manual_scan_does_not_enter_awaiting() {
+        // SC1/item-2: an admin triggerScan that force-scans a series BEFORE its
+        // cadence (not yet due) and finds nothing must NOT flip it into the
+        // accelerated poll — that would be a false "overdue".
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            override_interval_hours: Some(168.0),
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+
+        let t0 = at("2026-01-01T00:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
+            .await
+            .unwrap();
+
+        // Force-scan just 1h later — long before the 168h cadence.
+        let early = at("2026-01-01T01:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), early)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "1", early).await - 168.0).abs() < 0.01,
+            "a not-yet-due scan keeps the steady cadence"
+        );
+        assert!(
+            persisted(&pool, "1").await.awaiting_since.is_none(),
+            "a not-yet-due scan does not enter awaiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn awaiting_backs_off_to_steady_after_window() {
+        // SC1: a series that stays overdue past the awaiting window stops polling
+        // aggressively and falls back to the steady cadence, so it can't poll
+        // forever. Window = min(steady 168h, AWAITING_MAX_HOURS 48h) = 48h.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            override_interval_hours: Some(168.0),
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+
+        let t0 = at("2026-01-01T00:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
+            .await
+            .unwrap();
+
+        // First due-empty scan -> awaiting starts, accelerated poll.
+        let t1 = at("2026-01-08T00:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), t1)
+            .await
+            .unwrap();
+        let awaiting_since = persisted(&pool, "1").await.awaiting_since;
+        assert_eq!(
+            awaiting_since.as_deref(),
+            Some(t1.to_rfc3339()).as_deref(),
+            "awaiting streak starts at the first due-empty scan"
+        );
+
+        // Still empty 50h later (> 48h window) -> back off to steady, but the
+        // awaiting streak start is preserved (not reset).
+        let t2 = at("2026-01-10T02:00:00Z");
+        record_scan(&pool, "1", "S", &admin, &chaps(5), t2)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "1", t2).await - 168.0).abs() < 0.01,
+            "past the awaiting window the series reverts to the steady cadence"
+        );
+        assert_eq!(
+            persisted(&pool, "1").await.awaiting_since.as_deref(),
+            Some(t1.to_rfc3339()).as_deref(),
+            "awaiting_since is preserved across the back-off"
         );
     }
 
