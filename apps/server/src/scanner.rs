@@ -954,4 +954,111 @@ mod tests {
             "an identical re-scan does not stamp last_new_chapter_at"
         );
     }
+
+    /// End-to-end smoke test against a *live* Suwayomi. Ignored by default (needs a
+    /// running Suwayomi with a seeded library); run with:
+    ///   KOMIKA_LIVE_SUWAYOMI=http://localhost:4567 \
+    ///     cargo test --bin komika-server -- --ignored live_suwayomi_end_to_end --nocapture
+    /// It validates the real GraphQL queries/deserialization (which the synthetic
+    /// unit tests can't) and drives `record_scan` off real chapter data.
+    #[tokio::test]
+    #[ignore = "requires a live Suwayomi with a seeded library (KOMIKA_LIVE_SUWAYOMI)"]
+    async fn live_suwayomi_end_to_end() {
+        let Ok(base) = std::env::var("KOMIKA_LIVE_SUWAYOMI") else {
+            eprintln!("skipped: set KOMIKA_LIVE_SUWAYOMI=http://localhost:4567");
+            return;
+        };
+        let client = crate::suwayomi::SuwayomiClient::new(base, None, None);
+
+        // (1) Real Suwayomi schema: library()/series()/chapters() deserialize.
+        let lib = client.library().await.expect("library()");
+        assert!(
+            !lib.is_empty(),
+            "seed a series into the Suwayomi library first"
+        );
+        let m = lib.into_iter().next().unwrap();
+        let detail = client.series(m.id).await.expect("series()");
+        assert_eq!(detail.id, m.id, "series() resolves the same manga");
+        let chapters = client.chapters(m.id).await.expect("chapters()");
+        assert!(!chapters.is_empty(), "expected the series to have chapters");
+
+        // (2) Real millisecond uploadDate strings yield a positive finite cadence.
+        let avg = avg_interval_hours(&chapters);
+        if let Some(a) = avg {
+            assert!(a > 0.0 && a.is_finite(), "avg_interval_hours = {a}");
+        }
+
+        let count = chapters.len() as i64;
+        let real_max = latest_number(&chapters).expect("a max chapter number");
+        eprintln!(
+            "live '{}' (#{}) — {} chapters, max #{}, avg_interval_hours={:?}",
+            m.title, m.id, count, real_max, avg
+        );
+
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        let sid = m.id.to_string();
+        let now = at("2026-07-15T00:00:00Z");
+
+        // (3) First observation over REAL data: baseline recorded, nothing flagged
+        // as new (SC3), and known_max_chapter captured even though it exceeds the
+        // count (SC4 — here 166.5 > 102 for Oshi no Ko).
+        let new_found = record_scan(&pool, &sid, &m.title, &admin, &chapters, now)
+            .await
+            .unwrap();
+        assert!(
+            !new_found,
+            "first observation must not flag the back catalogue"
+        );
+        let row = persisted(&pool, &sid).await;
+        assert_eq!(row.known_chapter_count, count);
+        assert_eq!(row.known_max_chapter, Some(real_max));
+        assert!(row.last_new_chapter_at.is_none());
+
+        // (4) Identical re-scan a minute later: not due, no double-count (SC6).
+        let again = record_scan(
+            &pool,
+            &sid,
+            &m.title,
+            &admin,
+            &chapters,
+            now + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        assert!(!again, "an identical re-scan reports no new chapters");
+        assert_eq!(persisted(&pool, &sid).await.known_chapter_count, count);
+
+        // (5) Splice a higher-numbered chapter onto the real list and mark the
+        // series due: SC4 detects the number advance; a landed chapter clears
+        // awaiting and reverts to steady cadence (SC1).
+        let mut plus = chapters.clone();
+        let mut top = plus[0].clone();
+        top.id = i64::MAX;
+        top.chapter_number = real_max + 1.0;
+        plus.push(top);
+        sqlx::query("UPDATE series_scan_state SET next_scan_at = NULL WHERE series_id = ?")
+            .bind(&sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let landed = record_scan(
+            &pool,
+            &sid,
+            &m.title,
+            &admin,
+            &plus,
+            now + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+        assert!(landed, "a higher chapter number must be detected as new");
+        let row = persisted(&pool, &sid).await;
+        assert_eq!(row.known_max_chapter, Some(real_max + 1.0));
+        assert!(row.last_new_chapter_at.is_some());
+        assert!(
+            row.awaiting_since.is_none(),
+            "a landed chapter is not awaiting"
+        );
+    }
 }
