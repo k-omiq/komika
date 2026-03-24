@@ -72,7 +72,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 - [ ] 5.5 ⚪ SC6 / SC7 — scan-state transaction + `next_scan_at` consistency
 
 **Phase 6 — Canonical reader path**
-- [ ] 6.1 🟡 CR2 — deterministic English-scanlation selection
+- [x] 6.1 🟡 CR2 — deterministic English-scanlation selection — `ORDER BY c.published_at DESC, c.external_id ASC` in `load_canonical_chapters` + explicit `prefer_reader_chapter` tiebreak (English > latest published_at > lowest external_id) so a duplicated English number keeps a stable `external_id`; unit test `reader_chapters_english_tiebreak_deterministic` asserts stability across shuffled input.
 - [ ] 6.2 🟡 CR3 — reject/handle backfilled `w_<numeric>` ids
 - [ ] 6.3 ⚪ CR4 — number-less chapter ordering (server/reader agreement)
 - [ ] 6.4 🟡 CR6 — per-user progress/library/rating for canonical works (larger; tracked follow-up)
