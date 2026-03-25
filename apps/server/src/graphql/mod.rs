@@ -826,6 +826,12 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?
             .ok_or_else(|| Error::new("No such work"))?;
+        // The canonical path is MangaDex-anchored by contract: a backfilled
+        // `w_<numeric>` work has no mangadex source (mangadex_id = None) → empty cover
+        // and zero chapters. Reject it as not-found rather than serving a shell (CR3).
+        if work.mangadex_id.is_none() {
+            return Err(Error::new("No such work"));
+        }
         if work.is_nsfw && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such work"));
         }
@@ -844,6 +850,10 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?
             .ok_or_else(|| Error::new("No such work"))?;
+        // MangaDex-anchored by contract; reject a non-anchored backfilled work (CR3).
+        if work.mangadex_id.is_none() {
+            return Err(Error::new("No such work"));
+        }
         if work.is_nsfw && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such work"));
         }
@@ -2601,6 +2611,57 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn canonical_resolvers_reject_non_mangadex_anchored_work() {
+        // A backfilled `w_<numeric>` work has no mangadex source (mangadex_id = None):
+        // `isCanonicalId` would still route it here, and the resolver must return
+        // "No such work" rather than a titleless/coverless/chapterless shell (CR3).
+        let (s, pool) = setup_full(100).await;
+        sqlx::query("INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_42', 'Backfilled Shell', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A non-mangadex (suwayomi) source_series — no mangadex anchor exists.
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES ('ss_42', 'w_42', 'suwayomi', '', '42', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let q = r#"{ canonicalSeries(workId: "w_42") { title } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "No such work");
+
+        let q = r#"{ canonicalChapters(workId: "w_42") { id } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "No such work");
+
+        // A normal mangadex-anchored canonical work still resolves.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-anchored",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Anchored Work".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let anchored: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-anchored'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let q = format!(r#"{{ canonicalSeries(workId: "{anchored}") {{ title }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(
+            r.errors.is_empty(),
+            "anchored work should resolve: {:?}",
+            r.errors
+        );
+        assert!(data_json(&r).contains("Anchored Work"));
     }
 
     #[tokio::test]

@@ -73,7 +73,7 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 
 **Phase 6 — Canonical reader path**
 - [x] 6.1 🟡 CR2 — deterministic English-scanlation selection — `ORDER BY c.published_at DESC, c.external_id ASC` in `load_canonical_chapters` + explicit `prefer_reader_chapter` tiebreak (English > latest published_at > lowest external_id) so a duplicated English number keeps a stable `external_id`; unit test `reader_chapters_english_tiebreak_deterministic` asserts stability across shuffled input.
-- [ ] 6.2 🟡 CR3 — reject/handle backfilled `w_<numeric>` ids
+- [x] 6.2 🟡 CR3 — reject/handle backfilled `w_<numeric>` ids — server guard: `canonicalSeries`/`canonicalChapters` now return "No such work" when `work.mangadex_id.is_none()`, making the canonical path MangaDex-anchored by contract (a shell → clean error). Test `canonical_resolvers_reject_non_mangadex_anchored_work` seeds a `w_42` + suwayomi source and asserts both resolvers error while a mangadex-anchored work still resolves. Reader-side `isCanonicalId` left as-is (server guard closes it).
 - [ ] 6.3 ⚪ CR4 — number-less chapter ordering (server/reader agreement)
 - [ ] 6.4 🟡 CR6 — per-user progress/library/rating for canonical works (larger; tracked follow-up)
 
