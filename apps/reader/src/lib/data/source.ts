@@ -392,9 +392,17 @@ function relatedFor(s: Series, pool: Series[]): RelatedView[] {
 	return picks.map(toRelated);
 }
 
-function mapSeriesView(s: Series, chs: Chapter[], pool: Series[]): SeriesView {
+function mapSeriesView(
+	s: Series,
+	chs: Chapter[],
+	pool: Series[],
+	preserveOrder = false,
+): SeriesView {
 	const type = toViewType(s.type);
-	const asc = [...chs].sort((a, b) => a.number - b.number);
+	// Canonical chapters are already server-ordered ascending (number-less last); sorting
+	// by number would float a oneshot (wire value 0) ahead of ch. 1 (CR4). The Suwayomi
+	// path keeps its explicit ascending sort.
+	const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
 	const firstUnread = asc.find((c) => !c.read) ?? asc[0];
 	return {
 		detail: {
@@ -437,7 +445,7 @@ export function getSeries(id: string): Promise<SeriesView> {
 				backend.canonicalSeries(id),
 				backend.canonicalChapters(id),
 			]);
-			return mapSeriesView(s, chs, []);
+			return mapSeriesView(s, chs, [], true);
 		}
 		// Fetch a candidate pool (Popular) alongside the series to seed related-by-
 		// genre. A pool failure just yields no related — it never fails the page.
@@ -544,7 +552,11 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 			? await backend.canonicalChapters!(seriesId)
 			: await backend.chapters(seriesId);
 		if (!chs.length) return readerFallback(seriesId);
-		const asc = [...chs].sort((a, b) => a.number - b.number);
+		// Canonical chapters already arrive server-ordered ascending with number-less/
+		// oneshot rows last; re-sorting by number here would float a oneshot (wire value
+		// 0) to the front, contradicting that order (CR4). Only the Suwayomi path — whose
+		// backend order isn't guaranteed ascending — is sorted.
+		const asc = canonical ? chs : [...chs].sort((a, b) => a.number - b.number);
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
 		if (!target) target = asc.find((c) => !c.read) ?? asc[0];
 		const domainPages = canonical

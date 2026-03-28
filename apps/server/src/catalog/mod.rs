@@ -286,7 +286,8 @@ pub async fn load_canonical_chapters(
     let rows = sqlx::query_as::<_, CanonicalChapter>(
         "SELECT c.external_id, c.number, c.volume, c.lang, c.title, c.published_at \
          FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
+         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+         ORDER BY c.published_at DESC, c.external_id ASC",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -318,20 +319,41 @@ fn chapter_sort_key(number: &Option<String>) -> f64 {
         .unwrap_or(f64::INFINITY)
 }
 
+/// True when `candidate` is a better reader representative than `existing` for the
+/// same chapter number. Deterministic so a duplicated number always resolves to the
+/// same `external_id` regardless of DB row order (CR2): English wins over non-English,
+/// then latest `published_at`, then lowest `external_id`. Without this, two English
+/// scanlations of one number would keep the arbitrary first-seen row and
+/// `canonicalPages` could serve a different group's pages on reload.
+fn prefer_reader_chapter(candidate: &CanonicalChapter, existing: &CanonicalChapter) -> bool {
+    use std::cmp::Ordering;
+    let cand_en = candidate.lang.as_deref() == Some("en");
+    let exist_en = existing.lang.as_deref() == Some("en");
+    if cand_en != exist_en {
+        return cand_en;
+    }
+    // Same English-ness: prefer the latest publish (a present date beats `None`),
+    // then the lowest `external_id` as a stable final tiebreak.
+    match candidate.published_at.cmp(&existing.published_at) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => candidate.external_id < existing.external_id,
+    }
+}
+
 /// Collapse the raw per-language chapter rows into one row per chapter number,
 /// preferring an English translation, ordered ascending by number (number-less rows
 /// last). Pure so it's unit-testable without a DB.
 fn select_reader_chapters(rows: Vec<CanonicalChapter>) -> Vec<CanonicalChapter> {
     use std::collections::HashMap;
-    // Key by number string ("" for number-less); keep the best row per key.
+    // Key by number string ("" for number-less); keep the best row per key via a
+    // deterministic tiebreak (see `prefer_reader_chapter`).
     let mut best: HashMap<String, CanonicalChapter> = HashMap::new();
     for row in rows {
         let key = row.number.clone().unwrap_or_default();
-        let is_en = row.lang.as_deref() == Some("en");
         match best.get(&key) {
             Some(existing) => {
-                // Upgrade to an English translation when the current pick isn't one.
-                if is_en && existing.lang.as_deref() != Some("en") {
+                if prefer_reader_chapter(&row, existing) {
                     best.insert(key, row);
                 }
             }
@@ -931,6 +953,47 @@ mod tests {
             lang: lang.map(Into::into),
             title: None,
             published_at: None,
+        }
+    }
+
+    fn ch_pub(
+        external_id: &str,
+        number: Option<&str>,
+        lang: Option<&str>,
+        published_at: Option<&str>,
+    ) -> CanonicalChapter {
+        CanonicalChapter {
+            published_at: published_at.map(Into::into),
+            ..ch(external_id, number, lang)
+        }
+    }
+
+    #[test]
+    fn reader_chapters_english_tiebreak_deterministic() {
+        // Two English scanlations of the same number (CR2). The kept representative
+        // must be the same regardless of input order: latest `published_at` wins.
+        let older = ch_pub("md-a", Some("5"), Some("en"), Some("2020-01-01T00:00:00Z"));
+        let newer = ch_pub("md-z", Some("5"), Some("en"), Some("2023-01-01T00:00:00Z"));
+
+        for rows in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            let out = select_reader_chapters(rows);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0].external_id, "md-z",
+                "latest published_at kept regardless of input order"
+            );
+        }
+
+        // Equal `published_at` → lowest `external_id` breaks the tie, both orders.
+        let a = ch_pub("md-a", Some("5"), Some("en"), Some("2021-01-01T00:00:00Z"));
+        let b = ch_pub("md-b", Some("5"), Some("en"), Some("2021-01-01T00:00:00Z"));
+        for rows in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+            let out = select_reader_chapters(rows);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].external_id, "md-a");
         }
     }
 
