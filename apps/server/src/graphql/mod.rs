@@ -422,7 +422,12 @@ async fn map_series_list(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series>
 /// `uploads.mangadex.org` — the client resolves them through the Worker proxy.
 /// Fields Komika doesn't mirror for MangaDex works (genres, ratings, library/scan
 /// state) are empty/defaulted; reading is fully functional without them.
-fn map_canonical_series(work: catalog::CanonicalWork, chapter_count: i32) -> Series {
+async fn map_canonical_series(
+    pool: &SqlitePool,
+    user_id: Option<&str>,
+    work: catalog::CanonicalWork,
+    chapter_count: i32,
+) -> Series {
     let cover_url = match (&work.mangadex_id, &work.cover_file_name) {
         (Some(mid), Some(fname)) => crate::mangadex::cover_thumb_url(mid, fname),
         _ => String::new(),
@@ -435,6 +440,22 @@ fn map_canonical_series(work: catalog::CanonicalWork, chapter_count: i32) -> Ser
         .as_deref()
         .and_then(komika_status)
         .unwrap_or(SeriesStatus::Unknown);
+    // Rating reuses the string-keyed `reviews` aggregate (a `w_` id round-trips with
+    // no schema change); library membership is per-user (CR6).
+    let rating = rating_summary(pool, &work.work_id).await;
+    let is_marked =
+        match user_id {
+            Some(uid) => sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM canonical_library WHERE user_id = ? AND work_id = ?)",
+            )
+            .bind(uid)
+            .bind(&work.work_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+                != 0,
+            None => false,
+        };
     Series {
         id: ID(work.work_id),
         title,
@@ -448,9 +469,9 @@ fn map_canonical_series(work: catalog::CanonicalWork, chapter_count: i32) -> Ser
         cover_url,
         source_id: "mangadex".to_string(),
         chapter_count,
-        is_marked: false,
+        is_marked,
         is_nsfw: work.is_nsfw,
-        rating: RatingSummary::empty(),
+        rating,
         scan: ScanPolicy {
             avg_interval_hours: 0.0,
             override_interval_hours: None,
@@ -469,13 +490,19 @@ fn map_canonical_series(work: catalog::CanonicalWork, chapter_count: i32) -> Ser
 /// Map a mirrored MangaDex chapter onto the shared `Chapter` shape. The chapter `id`
 /// is the MangaDex chapter uuid (the key `canonicalPages` fetches pages with);
 /// `series_id` is the work id so navigation stays on the canonical path. Per-user
-/// reading state isn't tracked for canonical works yet (defaults to unread).
-fn map_canonical_chapter(work_id: &str, c: catalog::CanonicalChapter) -> Chapter {
+/// reading state (`progress`, keyed by the chapter uuid) drives resume-at-last-chapter;
+/// anonymous / never-read chapters default to unread (CR6).
+fn map_canonical_chapter(
+    work_id: &str,
+    c: catalog::CanonicalChapter,
+    progress: Option<(i32, bool)>,
+) -> Chapter {
     let number = c
         .number
         .as_deref()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .unwrap_or(0.0);
+    let (last_page_read, read) = progress.unwrap_or((0, false));
     Chapter {
         id: ID(c.external_id),
         series_id: ID(work_id.to_string()),
@@ -484,11 +511,36 @@ fn map_canonical_chapter(work_id: &str, c: catalog::CanonicalChapter) -> Chapter
         page_count: 0, // unknown until the at-home page list is fetched
         uploaded_at: c.published_at,
         scanlator: None,
-        read: false,
-        last_page_read: 0,
+        read,
+        last_page_read,
         bookmarked: false,
         is_downloaded: false,
     }
+}
+
+/// Per-user read state for every chapter of one canonical work, keyed by the MangaDex
+/// chapter uuid. One query per series (not per chapter), matching the cost `map_series`
+/// already pays. Anonymous viewers get an empty map (all chapters read as unread).
+async fn canonical_progress_map(
+    pool: &SqlitePool,
+    user_id: Option<&str>,
+    work_id: &str,
+) -> HashMap<String, (i32, bool)> {
+    let Some(uid) = user_id else {
+        return HashMap::new();
+    };
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT chapter_id, last_page_read, read FROM canonical_progress \
+         WHERE user_id = ? AND work_id = ?",
+    )
+    .bind(uid)
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|(cid, lpr, rd)| (cid, (lpr as i32, rd != 0)))
+        .collect()
 }
 
 // ---- DB row shapes for social joins ----------------------------------------
@@ -838,7 +890,14 @@ impl QueryRoot {
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
-        Ok(map_canonical_series(work, chapters.len() as i32))
+        let user = current_user(ctx).await;
+        Ok(map_canonical_series(
+            &st.pool,
+            user.as_ref().map(|u| u.id.as_str()),
+            work,
+            chapters.len() as i32,
+        )
+        .await)
     }
 
     /// Chapters of a canonical work, from the stored `chapter` mirror, deduped to one
@@ -860,9 +919,16 @@ impl QueryRoot {
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
+        let user = current_user(ctx).await;
+        let progress =
+            canonical_progress_map(&st.pool, user.as_ref().map(|u| u.id.as_str()), &work_id.0)
+                .await;
         Ok(chapters
             .into_iter()
-            .map(|c| map_canonical_chapter(&work_id.0, c))
+            .map(|c| {
+                let p = progress.get(&c.external_id).copied();
+                map_canonical_chapter(&work_id.0, c, p)
+            })
             .collect())
     }
 
@@ -1180,6 +1246,45 @@ pub struct MutationRoot;
 impl MutationRoot {
     async fn mark(&self, ctx: &Context<'_>, series_id: ID, marked: bool) -> Result<Series> {
         let st = state(ctx);
+        // Canonical (MangaDex-mirrored) works keep per-user library membership in
+        // `canonical_library`; numeric Suwayomi ids fall through unchanged (CR6).
+        if series_id.0.starts_with("w_") {
+            let user = require_user(ctx).await?;
+            if marked {
+                let now = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES (?, ?, ?) \
+                     ON CONFLICT(user_id, work_id) DO NOTHING",
+                )
+                .bind(&user.id)
+                .bind(&series_id.0)
+                .bind(&now)
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
+            } else {
+                sqlx::query("DELETE FROM canonical_library WHERE user_id = ? AND work_id = ?")
+                    .bind(&user.id)
+                    .bind(&series_id.0)
+                    .execute(&st.pool)
+                    .await
+                    .map_err(gql_err)?;
+            }
+            let work = catalog::load_canonical_work(&st.pool, &series_id.0)
+                .await
+                .map_err(gql_err)?
+                .ok_or_else(|| Error::new("No such work"))?;
+            let chapters = catalog::load_canonical_chapters(&st.pool, &series_id.0)
+                .await
+                .map_err(gql_err)?;
+            return Ok(map_canonical_series(
+                &st.pool,
+                Some(user.id.as_str()),
+                work,
+                chapters.len() as i32,
+            )
+            .await);
+        }
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
         st.suwayomi
             .set_in_library(n, marked)
@@ -1200,6 +1305,43 @@ impl MutationRoot {
             return Err(Error::new("lastPageRead must be non-negative"));
         }
         let st = state(ctx);
+        // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
+        // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
+        let is_numeric =
+            !chapter_id.0.is_empty() && chapter_id.0.bytes().all(|b| b.is_ascii_digit());
+        if !is_numeric {
+            let user = require_user(ctx).await?;
+            // The owning work, for per-series aggregation. If the chapter isn't in the
+            // mirror, store with work_id = '' rather than erroring — it's per-user private.
+            let work_id: String = sqlx::query_scalar(
+                "SELECT ss.work_id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+            )
+            .bind(&chapter_id.0)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?
+            .unwrap_or_default();
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO canonical_progress \
+                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                   last_page_read = excluded.last_page_read, read = excluded.read, \
+                   work_id = excluded.work_id, updated_at = excluded.updated_at",
+            )
+            .bind(&user.id)
+            .bind(&chapter_id.0)
+            .bind(&work_id)
+            .bind(last_page_read as i64)
+            .bind(read)
+            .bind(&now)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+            return Ok(true);
+        }
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
         st.suwayomi
             .set_progress(n, last_page_read as i64, read)
@@ -2662,6 +2804,168 @@ mod tests {
             r.errors
         );
         assert!(data_json(&r).contains("Anchored Work"));
+    }
+
+    #[tokio::test]
+    async fn canonical_progress_library_and_rating_round_trip() {
+        // CR6: a canonical (w_) work gets per-user library + progress state and a
+        // reused (reviews-backed) rating aggregate — all keyed on the opaque w_/uuid.
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-cr6",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Stateful Work".into()),
+                cover_file_name: Some("cover.jpg".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-cr6")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, num) in [("uuid-a", "1"), ("uuid-b", "2")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-cr6'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // ---- Library: mark persists + reflects, unmark removes ----
+        let mark_q = |m: bool| {
+            format!(r#"mutation {{ mark(seriesId: "{work_id}", marked: {m}) {{ isMarked }} }}"#)
+        };
+        // Anonymous cannot persist.
+        let r = exec(&s, &mark_q(true), None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Not authenticated");
+
+        let r = exec(&s, &mark_q(true), Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "mark failed: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"isMarked\":true"));
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM canonical_library WHERE user_id = 'bob-id' AND work_id = ?",
+        )
+        .bind(&work_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
+        // canonicalSeries reflects the mark for bob but not for an anonymous viewer.
+        let series_q = format!(r#"{{ canonicalSeries(workId: "{work_id}") {{ isMarked }} }}"#);
+        let r = exec(&s, &series_q, Some("bobtok"), "1.1.1.1").await;
+        assert!(data_json(&r).contains("\"isMarked\":true"));
+        let r = exec(&s, &series_q, None, "1.1.1.1").await;
+        assert!(data_json(&r).contains("\"isMarked\":false"));
+        // Unmark removes.
+        let r = exec(&s, &mark_q(false), Some("bobtok"), "1.1.1.1").await;
+        assert!(data_json(&r).contains("\"isMarked\":false"));
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_library WHERE user_id = 'bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "unmark deletes the row");
+
+        // ---- Progress: setProgress on a uuid persists + drives resume ----
+        let prog_q =
+            r#"mutation { setProgress(chapterId: "uuid-a", lastPageRead: 12, read: true) }"#;
+        // Anonymous cannot persist.
+        let r = exec(&s, prog_q, None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Not authenticated");
+
+        let r = exec(&s, prog_q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "setProgress failed: {:?}", r.errors);
+        // canonicalChapters surfaces the per-user read state (and only for that user).
+        let chapters_q =
+            format!(r#"{{ canonicalChapters(workId: "{work_id}") {{ id read lastPageRead }} }}"#);
+        let r = exec(&s, &chapters_q, Some("bobtok"), "1.1.1.1").await;
+        let data = r.data.into_json().unwrap();
+        let chs = data["canonicalChapters"].as_array().unwrap();
+        let a = chs.iter().find(|c| c["id"] == "uuid-a").unwrap();
+        assert_eq!(a["read"], serde_json::json!(true));
+        assert_eq!(a["lastPageRead"], serde_json::json!(12));
+        // The owning work_id was resolved from the chapter uuid.
+        let stored_work: String = sqlx::query_scalar(
+            "SELECT work_id FROM canonical_progress WHERE user_id = 'bob-id' AND chapter_id = 'uuid-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_work, work_id);
+        // A second call updates in place — no duplicate row.
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId: "uuid-a", lastPageRead: 30, read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let (cnt, lpr, rd): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(last_page_read), MAX(read) FROM canonical_progress \
+             WHERE user_id = 'bob-id' AND chapter_id = 'uuid-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((cnt, lpr, rd), (1, 30, 0), "upsert in place");
+        // An anonymous viewer sees the chapter as unread.
+        let r = exec(&s, &chapters_q, None, "1.1.1.1").await;
+        let data = r.data.into_json().unwrap();
+        let a = data["canonicalChapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "uuid-a")
+            .unwrap()
+            .clone();
+        assert_eq!(a["read"], serde_json::json!(false));
+        assert_eq!(a["lastPageRead"], serde_json::json!(0));
+
+        // ---- Rating: postReview on the w_ id aggregates via reused reviews ----
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ postReview(input: {{ seriesId: "{work_id}", score: 9, body: "", hasSpoiler: false }}) {{ score }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "postReview failed: {:?}", r.errors);
+        let r = exec(
+            &s,
+            &format!(
+                r#"{{ canonicalSeries(workId: "{work_id}") {{ rating {{ average count }} }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let data = r.data.into_json().unwrap();
+        assert_eq!(
+            data["canonicalSeries"]["rating"]["average"],
+            serde_json::json!(9.0)
+        );
+        assert_eq!(
+            data["canonicalSeries"]["rating"]["count"],
+            serde_json::json!(1)
+        );
     }
 
     #[tokio::test]
