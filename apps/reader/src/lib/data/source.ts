@@ -484,9 +484,9 @@ export async function saveProgress(
 	read: boolean,
 ): Promise<void> {
 	if (!LIVE || !chapterId) return;
-	// Canonical (MangaDex-mirrored) chapters are addressed by a MangaDex uuid and have
-	// no Suwayomi-side progress store yet — skip rather than round-trip a doomed call.
-	if (!/^\d+$/.test(chapterId)) return;
+	// Both numeric Suwayomi chapter ids and MangaDex-uuid canonical ids persist:
+	// the server routes on id shape (canonical → `canonical_progress`) (CR6). The
+	// non-empty guard above is the only shape check the client needs.
 	try {
 		await backend.setProgress(chapterId, lastPageRead, read);
 	} catch (err) {
