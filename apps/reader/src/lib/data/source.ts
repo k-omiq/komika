@@ -468,6 +468,11 @@ export function getSeries(id: string): Promise<SeriesView> {
  */
 export async function setLibraryMark(seriesId: string, marked: boolean): Promise<boolean> {
 	if (!LIVE) return marked;
+	// Both numeric Suwayomi ids and `w_` canonical ids persist: the server `mark`
+	// resolver routes on id shape (canonical → `canonical_library`) (CR6), so no
+	// client-side id-shape guard is needed here — do NOT early-return the optimistic
+	// value for `w_` ids, that would short-circuit canonical library persistence.
+	// The try/catch below is only the defensive fallback for offline/mock.
 	try {
 		const s = await backend.mark(seriesId, marked);
 		return s.isMarked;
