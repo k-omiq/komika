@@ -384,7 +384,19 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response:
 }
 
 async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutting down");
     let _ = shutdown_tx.send(true);
 }
