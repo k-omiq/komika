@@ -72,3 +72,19 @@ printf "  ${bd}Suwayomi${z}    http://%s:%s   (source management / images)\n" "$
 printf "  admin login: ${bd}%s${z} / (KOMIKA_ADMIN_PASSWORD in deploy/.env)\n" "${KOMIKA_ADMIN_USERS%%,*}"
 printf "\n  Manage:  ./deploy.sh logs   ·   ./deploy.sh down   ·   ./deploy.sh destroy\n"
 printf "  The adaptive scanner auto-updates the seeded library — no manual refresh needed.\n"
+
+# ---- backup status ------------------------------------------------------------
+# Continuous backup is opt-in: server-entrypoint.sh only runs the DB under
+# Litestream when ALL of LITESTREAM_BUCKET / LITESTREAM_ACCESS_KEY_ID /
+# LITESTREAM_SECRET_ACCESS_KEY are set (mirror that exact gate here). If backup
+# is off, the single data volume holds accounts, argon2 hashes, session tokens,
+# reviews, comments and scan-state with NO copy — warn loudly so it isn't a
+# silent data-loss surprise.
+if [ -n "${LITESTREAM_BUCKET:-}" ] && [ -n "${LITESTREAM_ACCESS_KEY_ID:-}" ] && [ -n "${LITESTREAM_SECRET_ACCESS_KEY:-}" ]; then
+  printf "\n${gn}✓ Continuous backup ENABLED${z} — DB replicated to %s via Litestream.\n" "${LITESTREAM_BUCKET}"
+else
+  printf "\n${rd}${bd}⚠ NO BACKUP CONFIGURED${z}${rd} — the database has NO continuous backup.${z}\n"
+  printf "${rd}  A volume loss or ${bd}./deploy.sh destroy${z}${rd} is UNRECOVERABLE: accounts, password\n"
+  printf "  hashes, session tokens, reviews, comments and scan-state would be gone.${z}\n"
+  printf "${rd}  Enable it by setting the ${bd}LITESTREAM_*${z}${rd} vars in ${bd}deploy/.env${z}${rd} (see deploy/.env.example).${z}\n"
+fi
