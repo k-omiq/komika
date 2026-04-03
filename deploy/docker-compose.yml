@@ -91,6 +91,16 @@ services:
       # exposes neither; set GRAPHIQL_ENABLED=on in deploy/.env only for dev.
       GRAPHIQL_ENABLED: ${GRAPHIQL_ENABLED:-off}
       SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
+      # Canonical catalogue sync (direct MangaDex; CATALOGUE.md). Off by default —
+      # nothing hits MangaDex unless CATALOGUE_SYNC=on. It is opt-in and, because
+      # the rate limiter is in-process, only ONE replica may enable it (see
+      # CATALOGUE.md "Single-replica constraint (M4)"). Set a descriptive
+      # MANGADEX_USER_AGENT when enabling, per MangaDex API etiquette. COVER_PHASH
+      # adds cover perceptual-hashing for dedup on top of the sync.
+      CATALOGUE_SYNC: ${CATALOGUE_SYNC:-off}
+      MANGADEX_USER_AGENT: ${MANGADEX_USER_AGENT:-Komika/0.1 (+https://github.com/komika)}
+      CATALOGUE_SYNC_INTERVAL_SECS: ${CATALOGUE_SYNC_INTERVAL_SECS:-21600}
+      COVER_PHASH: ${COVER_PHASH:-off}
       RUST_LOG: komika_server=info,tower_http=warn
       # Continuous backup (Litestream → S3-compatible; Cloudflare R2 reference).
       # Blank = run without backup. For R2 set LITESTREAM_REGION=auto.
