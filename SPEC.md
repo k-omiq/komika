@@ -105,7 +105,9 @@ time-between-chapters** (`avgIntervalHours`), **admin-overridable**
 re-polled every `pollEveryMinutes` (e.g. 30) until the new chapter appears. The
 scanner **pauses** automatically for `COMPLETED` / `HIATUS` / `CANCELLED`. This
 drives new-chapter notifications (there is no image cache-fill job — images are
-edge-cached on demand only).
+edge-cached on demand only). This adaptive per-series scanning applies to Suwayomi-library
+series only, by design; MangaDex-mirrored canonical works are refreshed on a global interval
+by the catalogue sync and surface their updates via `canonicalUpdates` (see CATALOGUE.md §5–6).
 
 ## Social layer
 
