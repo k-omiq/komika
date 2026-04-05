@@ -110,7 +110,11 @@
 		if (!confirm(`Ban ${c.name}? They won't be able to sign in.`)) return;
 		try {
 			await banCommenter(c.authorId);
-			comments = comments.filter((x) => x.authorId !== c.authorId);
+			// Re-fetch from the server so the banned author's comments disappear via
+			// the authoritative response (the server now hides banned users' content).
+			// A local filter looked immediate but lied — the comments returned on reload.
+			comments = await load(targetId ?? '', storageKey);
+			revealed = {};
 		} catch (err) {
 			modError = err instanceof Error ? err.message : 'Could not ban the user.';
 		}

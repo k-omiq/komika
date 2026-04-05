@@ -1063,7 +1063,7 @@ impl QueryRoot {
             "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id = ? ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
+             WHERE r.series_id = ? AND u.is_banned = 0 ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(series_id.0.clone())
         .bind(PAGE_SIZE + 1)
@@ -1071,7 +1071,10 @@ impl QueryRoot {
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE series_id = ?")
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id \
+             WHERE r.series_id = ? AND u.is_banned = 0",
+        )
             .bind(series_id.0.clone())
             .fetch_one(&st.pool)
             .await
@@ -1104,7 +1107,7 @@ impl QueryRoot {
             "SELECT c.id, c.target_type, c.target_id, c.body, c.has_spoiler, c.created_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = ? AND c.target_id = ? ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
+             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0 ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
@@ -1114,7 +1117,8 @@ impl QueryRoot {
         .await
         .map_err(gql_err)?;
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ?",
+            "SELECT COUNT(*) FROM comments c JOIN users u ON u.id = c.user_id \
+             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
@@ -3350,6 +3354,77 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&login), "This account has been suspended.");
+    }
+
+    #[tokio::test]
+    async fn ban_hides_comments_and_reviews() {
+        let s = setup().await;
+        // Bob posts a comment on a series thread and a review on that series.
+        let posted_comment = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"great read", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted_comment.errors.is_empty(),
+            "post comment failed: {:?}",
+            posted_comment.errors
+        );
+        let posted_review = exec(
+            &s,
+            r#"mutation { postReview(input:{ seriesId:"s1", score:9, body:"loved it", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted_review.errors.is_empty(),
+            "post review failed: {:?}",
+            posted_review.errors
+        );
+
+        // Before the ban both surface, with total == 1.
+        let before = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total }
+                reviews(seriesId:"s1") { items { id } total } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let b = before.data.into_json().unwrap();
+        assert_eq!(b["comments"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(b["comments"]["total"], serde_json::json!(1));
+        assert_eq!(b["reviews"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(b["reviews"]["total"], serde_json::json!(1));
+
+        // Admin bans bob.
+        let ban = exec(
+            &s,
+            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(ban.errors.is_empty(), "ban failed: {:?}", ban.errors);
+
+        // After the ban bob's comment and review are hidden server-side and the
+        // totals decrement, so the admin's "removed" feedback is truthful on reload.
+        let after = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total }
+                reviews(seriesId:"s1") { items { id } total } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let a = after.data.into_json().unwrap();
+        assert!(a["comments"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(a["comments"]["total"], serde_json::json!(0));
+        assert!(a["reviews"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(a["reviews"]["total"], serde_json::json!(0));
     }
 
     #[tokio::test]
