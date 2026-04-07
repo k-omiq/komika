@@ -54,11 +54,16 @@ $DC up --build -d
 
 say "waiting for services to report healthy…"
 # Give the stack up to ~5 min to go healthy (Suwayomi's first boot is slow).
+# Track whether we broke out because everything went healthy vs. timed out, so a
+# persistently-unhealthy stack fails loudly instead of bootstrapping half-up.
+healthy=""
 for _ in $(seq 1 100); do
   unhealthy=$($DC ps --format '{{.Service}} {{.Health}}' 2>/dev/null | awk '$2!="" && $2!="healthy"{print $1}' | tr '\n' ' ')
-  [ -z "${unhealthy// }" ] && break
+  if [ -z "${unhealthy// }" ]; then healthy=1; break; fi
   sleep 3
 done
+# Timed out with services still not healthy → don't bootstrap a partial stack.
+[ -n "$healthy" ] || die "services did not become healthy: ${unhealthy% }"
 
 # ---- bootstrap ----------------------------------------------------------------
 say "bootstrapping (extensions, Cloudflare bypass, admin, library seed)…"

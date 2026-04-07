@@ -138,6 +138,28 @@ jobs:
         run: cargo build --release
 
   # ---------------------------------------------------------------------------
+  # Deploy stack: build both Docker images and validate the compose file so a
+  # broken Dockerfile/compose can't pass CI green. Runs on the same push/PR
+  # triggers as the always-on jobs (image builds are slow but that's the point).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (docker build + compose config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build both images from the repo root (compose uses context: ..).
+      - name: Build server image
+        run: docker build -f deploy/server.Dockerfile -t komika-server:ci .
+
+      - name: Build reader image
+        run: docker build -f deploy/reader.Dockerfile -t komika-reader:ci .
+
+      # Validate the compose file parses (interpolates env, resolves merges).
+      - name: Validate compose config
+        run: docker compose -f deploy/docker-compose.yml config >/dev/null
+
+  # ---------------------------------------------------------------------------
   # E2E smoke tests (manual). Standing up the full federated stack (Suwayomi +
   # server) is heavy, and the reader ships a mock fallback so content is always
   # present — so the smoke run only needs the static reader preview. Gated to
