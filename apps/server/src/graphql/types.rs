@@ -61,6 +61,10 @@ pub struct ScanPolicy {
     /// override (scanner auto-decides).
     pub status_override: Option<SeriesStatus>,
     pub paused_override: Option<bool>,
+    /// Raw admin poll-interval override (minutes). `null` = no override, so the
+    /// effective `poll_every_minutes` above is the folded default. The admin
+    /// console decodes its field from this so an unset poll stays unset.
+    pub poll_every_minutes_override: Option<i32>,
     pub last_scanned_at: Option<String>,
     pub next_scan_at: Option<String>,
 }

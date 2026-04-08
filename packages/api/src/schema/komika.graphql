@@ -116,6 +116,9 @@ type ScanPolicy {
 	# the status default even when they coincide. null => no override.
 	statusOverride: SeriesStatus
 	pausedOverride: Boolean
+	# Raw admin poll-interval override (minutes). null => no override, so the
+	# effective pollEveryMinutes above is the folded default.
+	pollEveryMinutesOverride: Int
 	lastScannedAt: String
 	nextScanAt: String
 }

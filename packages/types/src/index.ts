@@ -38,6 +38,8 @@ export interface ScanPolicy {
 	 */
 	statusOverride: SeriesStatus | null;
 	pausedOverride: boolean | null;
+	/** Raw admin poll-interval override (minutes); `null` = no override. */
+	pollEveryMinutesOverride: number | null;
 	lastScannedAt: string | null;
 	nextScanAt: string | null;
 }

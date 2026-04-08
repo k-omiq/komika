@@ -379,6 +379,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
             paused,
             status_override: ov.status_override.as_deref().and_then(komika_status),
             paused_override: ov.paused_override.map(|v| v != 0),
+            poll_every_minutes_override: ov.poll_every_minutes.map(|v| v as i32),
             last_scanned_at: scan
                 .as_ref()
                 .and_then(|s| s.last_scanned_at.clone())
@@ -479,6 +480,7 @@ async fn map_canonical_series(
             paused: false,
             status_override: None,
             paused_override: None,
+            poll_every_minutes_override: None,
             last_scanned_at: None,
             next_scan_at: None,
         },
@@ -3546,5 +3548,110 @@ mod tests {
             .await
         )
         .contains("overrideIntervalHours"));
+    }
+
+    /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
+    /// dead port; `map_series` never dials it, so read-shape tests stay offline).
+    fn state_with_pool(pool: SqlitePool) -> std::sync::Arc<AppState> {
+        std::sync::Arc::new(AppState {
+            pool,
+            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                "test-ua", 5.0, 40.0,
+            )),
+            admin_users: vec![],
+            scan_health: Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 30 * 24 * 60 * 60,
+        })
+    }
+
+    /// AD1: the raw poll override is exposed nullable, distinct from the folded
+    /// effective value. With no admin row `pollEveryMinutesOverride` is null while
+    /// `pollEveryMinutes` still reports the folded default (30); once an override
+    /// is set the raw field echoes it. A row whose poll column is NULL (only a
+    /// sibling override set) must keep the raw poll override null.
+    #[tokio::test]
+    async fn scan_policy_exposes_raw_poll_override_nullable() {
+        let pool = migrated_pool().await;
+        let st = state_with_pool(pool.clone());
+        let m = suwayomi_manga(3, "AD1 Fixture", &["Action"], "src1");
+
+        // No admin row: override is null, effective folds to the default.
+        let scan = map_series(&st, m.clone()).await.scan;
+        assert_eq!(scan.poll_every_minutes, 30, "effective folds to default");
+        assert_eq!(
+            scan.poll_every_minutes_override, None,
+            "no admin row => raw poll override is null"
+        );
+
+        // A sibling-only override (poll column left NULL) must NOT pin poll.
+        sqlx::query(
+            "INSERT INTO series_admin \
+               (series_id, override_interval_hours, poll_every_minutes, paused_override, status_override, updated_at) \
+             VALUES ('3', 12.0, NULL, NULL, NULL, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let scan = map_series(&st, m.clone()).await.scan;
+        assert_eq!(scan.poll_every_minutes, 30, "NULL poll still folds to default");
+        assert_eq!(
+            scan.poll_every_minutes_override, None,
+            "a NULL poll column stays an unset raw override"
+        );
+
+        // An explicit poll override echoes the raw value on both fields.
+        sqlx::query("UPDATE series_admin SET poll_every_minutes = 45 WHERE series_id = '3'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scan = map_series(&st, m).await.scan;
+        assert_eq!(scan.poll_every_minutes, 45, "effective reflects the override");
+        assert_eq!(
+            scan.poll_every_minutes_override,
+            Some(45),
+            "raw poll override echoes the explicit value"
+        );
+    }
+
+    /// AD1: saving the whole admin state with no poll override must not create or
+    /// pin a `poll_every_minutes` row — a null clears the column rather than
+    /// writing the folded default. (Suwayomi hydration of the returned Series is
+    /// unreachable in tests, so the mutation surfaces an error, but the upsert has
+    /// already committed and is what we assert on.)
+    #[tokio::test]
+    async fn update_series_admin_null_poll_does_not_pin_override() {
+        let (s, pool) = setup_full(100).await;
+
+        // Save with only a sibling override; poll omitted => null.
+        let _ = exec(
+            &s,
+            r#"mutation { updateSeriesAdmin(input:{seriesId:"3", overrideIntervalHours:12}) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let poll: Option<i64> =
+            sqlx::query_scalar("SELECT poll_every_minutes FROM series_admin WHERE series_id = '3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(poll, None, "a null poll override leaves the column NULL, not 30");
+
+        // An explicit poll override persists the raw value.
+        let _ = exec(
+            &s,
+            r#"mutation { updateSeriesAdmin(input:{seriesId:"3", pollEveryMinutes:45}) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let poll: Option<i64> =
+            sqlx::query_scalar("SELECT poll_every_minutes FROM series_admin WHERE series_id = '3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(poll, Some(45), "explicit override persists the raw value");
     }
 }

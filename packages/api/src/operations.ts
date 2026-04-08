@@ -35,6 +35,7 @@ const SERIES_FIELDS = /* GraphQL */ `
 			paused
 			statusOverride
 			pausedOverride
+			pollEveryMinutesOverride
 			lastScannedAt
 			nextScanAt
 		}
