@@ -1806,7 +1806,29 @@ impl MutationRoot {
         let Some(row) = row else {
             return Err(Error::new("No such merge candidate."));
         };
+        // Fast-path only — the correctness guard is the atomic claim below.
         if row.status != "pending" {
+            return Err(Error::new("This merge candidate is already resolved."));
+        }
+
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+
+        // Atomically claim the candidate: only the admin whose UPDATE flips a
+        // still-`pending` row proceeds. A concurrent resolver that already claimed
+        // it leaves `rows_affected() == 0` here, so the loser never repoints.
+        let now = Utc::now().to_rfc3339();
+        let claim = sqlx::query(
+            "UPDATE merge_candidate SET status = ?, resolved_at = ? \
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(if accept { "confirmed" } else { "rejected" })
+        .bind(&now)
+        .bind(&id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if claim.rows_affected() == 0 {
+            tx.rollback().await.map_err(gql_err)?;
             return Err(Error::new("This merge candidate is already resolved."));
         }
 
@@ -1814,13 +1836,13 @@ impl MutationRoot {
             let old_work: Option<String> =
                 sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
                     .bind(&row.source_series_id)
-                    .fetch_optional(&st.pool)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(gql_err)?;
             sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ?")
                 .bind(&row.candidate_work_id)
                 .bind(&row.source_series_id)
-                .execute(&st.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(gql_err)?;
             // Drop the provisional work if nothing else references it now.
@@ -1832,21 +1854,14 @@ impl MutationRoot {
                     )
                     .bind(&old)
                     .bind(&old)
-                    .execute(&st.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(gql_err)?;
                 }
             }
         }
 
-        let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = ? WHERE id = ?")
-            .bind(if accept { "confirmed" } else { "rejected" })
-            .bind(&now)
-            .bind(&id.0)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
         Ok(true)
     }
 }
@@ -3653,5 +3668,111 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(poll, Some(45), "explicit override persists the raw value");
+    }
+
+    /// AD2: resolving a merge candidate must be an atomic claim, not a
+    /// check-then-write TOCTOU. Once a candidate is accepted, a second resolve of
+    /// the same id must fail with the already-resolved error and must NOT re-run
+    /// the source_series repoint or the provisional-work delete — the guarded
+    /// `WHERE ... AND status='pending'` UPDATE turns the second attempt into a
+    /// no-op, so `resolved_at` stays exactly as the first (winning) call left it.
+    #[tokio::test]
+    async fn resolve_merge_candidate_is_an_atomic_claim() {
+        let (s, pool) = setup_full(100).await;
+
+        // Two works: the provisional one the source currently points at, and the
+        // canonical target the candidate proposes merging onto.
+        for wid in ["w_prov", "w_canon"] {
+            sqlx::query(
+                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
+                 VALUES (?, 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            )
+            .bind(wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss1', 'w_prov', 'suwayomi', 'k1', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO merge_candidate \
+             (id, source_series_id, candidate_work_id, score, method, status, created_at) \
+             VALUES ('mc1', 'ss1', 'w_canon', 0.8, 'title_exact', 'pending', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // First resolve (accept): repoints ss1 onto w_canon and drops the now-orphan
+        // provisional work.
+        let r = exec(
+            &s,
+            r#"mutation { resolveMergeCandidate(id: "mc1", accept: true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "first resolve failed: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"resolveMergeCandidate\":true"));
+
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_id, "w_canon", "accept repoints the source onto the canonical work");
+        let prov_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(prov_count, 0, "the orphaned provisional work is deleted");
+        let (status, resolved_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, resolved_at FROM merge_candidate WHERE id = 'mc1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "confirmed");
+        let resolved_at = resolved_at.expect("resolved_at set on first resolve");
+
+        // Second resolve of the SAME id: the guarded UPDATE matches zero pending
+        // rows, so this is rejected and mutates nothing further.
+        let r2 = exec(
+            &s,
+            r#"mutation { resolveMergeCandidate(id: "mc1", accept: true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r2),
+            "This merge candidate is already resolved.",
+            "the second resolve is refused"
+        );
+
+        // The claim made the second attempt a no-op: work_id unchanged, provisional
+        // work still gone, and resolved_at identical to the winning call (a blind
+        // re-UPDATE would have stamped a fresh timestamp here).
+        let work_id2: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_id2, "w_canon", "second resolve does not re-repoint the source");
+        let resolved_at2: Option<String> =
+            sqlx::query_scalar("SELECT resolved_at FROM merge_candidate WHERE id = 'mc1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            resolved_at2.as_deref(),
+            Some(resolved_at.as_str()),
+            "resolved_at is untouched — the guarded UPDATE claimed nothing the second time"
+        );
     }
 }
