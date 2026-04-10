@@ -13,7 +13,6 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
-	UserRef,
 } from '@komika/types';
 import type {
 	Backend,
@@ -162,8 +161,8 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- admin moderation ---
-	async banUser(userId: Id, banned: boolean): Promise<UserRef> {
-		const d = await this.gql<{ banUser: UserRef }>(ops.BAN_USER, { userId, banned });
+	async banUser(userId: Id, banned: boolean): Promise<AdminUser> {
+		const d = await this.gql<{ banUser: AdminUser }>(ops.BAN_USER, { userId, banned });
 		return d.banUser;
 	}
 

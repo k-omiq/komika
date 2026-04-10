@@ -14,7 +14,6 @@ import type {
 	ScanStatus,
 	Series,
 	SeriesStatus,
-	UserRef,
 } from '@komika/types';
 
 /**
@@ -104,7 +103,7 @@ export interface Backend {
 	// --- admin moderation (requires an admin session) ---
 	/** Suspend (`banned: true`) or restore a user account. Optional: only the
 	 * unified Komika API implements it. */
-	banUser?(userId: Id, banned: boolean): Promise<UserRef>;
+	banUser?(userId: Id, banned: boolean): Promise<AdminUser>;
 	/** Delete a chapter comment. Returns false if it was already gone. Optional:
 	 * only the unified Komika API implements it. */
 	deleteComment?(commentId: Id): Promise<boolean>;

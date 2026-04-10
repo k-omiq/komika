@@ -328,21 +328,6 @@ export const TRIGGER_SCAN = /* GraphQL */ `
 	}
 `;
 
-export const BAN_USER = /* GraphQL */ `
-	${USER_REF}
-	mutation BanUser($userId: ID!, $banned: Boolean!) {
-		banUser(userId: $userId, banned: $banned) {
-			...UserRefFields
-		}
-	}
-`;
-
-export const DELETE_COMMENT = /* GraphQL */ `
-	mutation DeleteComment($commentId: ID!) {
-		deleteComment(commentId: $commentId)
-	}
-`;
-
 const ADMIN_USER_FIELDS = /* GraphQL */ `
 	fragment AdminUserFields on AdminUser {
 		id
@@ -352,6 +337,21 @@ const ADMIN_USER_FIELDS = /* GraphQL */ `
 		isAdmin
 		isBanned
 		createdAt
+	}
+`;
+
+export const BAN_USER = /* GraphQL */ `
+	${ADMIN_USER_FIELDS}
+	mutation BanUser($userId: ID!, $banned: Boolean!) {
+		banUser(userId: $userId, banned: $banned) {
+			...AdminUserFields
+		}
+	}
+`;
+
+export const DELETE_COMMENT = /* GraphQL */ `
+	mutation DeleteComment($commentId: ID!) {
+		deleteComment(commentId: $commentId)
 	}
 `;
 

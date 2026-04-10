@@ -1663,19 +1663,20 @@ impl MutationRoot {
     /// Admin moderation: suspend or restore a user account. A banned user can't
     /// sign in and their active sessions are revoked immediately. Admins can't
     /// ban themselves or another admin.
-    async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<UserRef> {
+    async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<AdminUser> {
         let admin = require_admin(ctx).await?;
         let st = state(ctx);
         if user_id.0 == admin.id {
             return Err(Error::new("You cannot ban your own account."));
         }
-        let target: Option<(String, String, Option<String>, i64)> =
-            sqlx::query_as("SELECT id, username, avatar_url, is_admin FROM users WHERE id = ?")
-                .bind(&user_id.0)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        let Some((id, username, avatar_url, is_admin)) = target else {
+        let target: Option<(String, String, String, Option<String>, i64, String)> = sqlx::query_as(
+            "SELECT id, username, email, avatar_url, is_admin, created_at FROM users WHERE id = ?",
+        )
+        .bind(&user_id.0)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let Some((id, username, email, avatar_url, is_admin, created_at)) = target else {
             return Err(Error::new("No such user."));
         };
         if is_admin != 0 {
@@ -1695,10 +1696,14 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?;
         }
-        Ok(UserRef {
+        Ok(AdminUser {
             id: ID(id),
             username,
+            email,
             avatar_url,
+            is_admin: is_admin != 0,
+            is_banned: banned,
+            created_at,
         })
     }
 
@@ -3354,15 +3359,19 @@ mod tests {
             ),
             "No such user."
         );
-        // admin bans bob -> bob can no longer log in
+        // admin bans bob -> bob can no longer log in. The mutation now returns
+        // the full AdminUser, so `isBanned` is selectable and reflects the write.
         let ban = exec(
             &s,
-            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            r#"mutation { banUser(userId:"bob-id", banned:true) { isBanned username } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
         .await;
         assert!(ban.errors.is_empty(), "ban failed: {:?}", ban.errors);
+        let ban_data = ban.data.into_json().unwrap();
+        assert_eq!(ban_data["banUser"]["isBanned"], serde_json::json!(true));
+        assert_eq!(ban_data["banUser"]["username"], serde_json::json!("bob"));
         let login = exec(
             &s,
             r#"mutation { login(username:"bob", password:"password123") { token } }"#,
