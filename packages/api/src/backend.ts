@@ -84,6 +84,9 @@ export interface Backend {
 
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;
+	/** The signed-in viewer's own review for a series, regardless of pagination
+	 * (null if none / signed out). Optional: only the unified Komika API implements it. */
+	myReview?(seriesId: Id): Promise<Review | null>;
 	postReview(input: PostReviewInput): Promise<Review>;
 	/** Comments on a chapter thread or a series-level discussion (polymorphic target). */
 	comments(targetType: CommentTargetType, targetId: Id, page?: number): Promise<Paginated<Comment>>;

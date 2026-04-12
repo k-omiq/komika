@@ -141,8 +141,21 @@ function commentToView(c: Comment): CommentView {
 export async function loadSeriesSocial(seriesId: string, key: string): Promise<SeriesSocial> {
 	if (socialLive()) {
 		const { items } = await backend.reviews(seriesId);
-		const views = items.map(reviewToView);
-		const mine = views.find((v) => v.mine);
+		let views = items.map(reviewToView);
+		// The paginated `reviews` list only returns page 1; on a busy series the
+		// viewer's own (possibly early) review can fall off it, which would show
+		// them as unrated with an empty body. Fetch their own review directly so
+		// the widget always reflects it, and merge it in (prepend, or replace the
+		// matching row if page 1 happened to include it).
+		let mine = views.find((v) => v.mine);
+		if (auth.user && backend.myReview) {
+			const own = await backend.myReview(seriesId);
+			if (own) {
+				const ownView = reviewToView(own);
+				views = [ownView, ...views.filter((v) => v.id !== ownView.id && !v.mine)];
+				mine = ownView;
+			}
+		}
 		return {
 			myScore: mine?.score ?? 0,
 			myBody: mine?.body ?? '',

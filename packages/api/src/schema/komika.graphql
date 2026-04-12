@@ -35,6 +35,7 @@ type Query {
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
+	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out)
 	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null

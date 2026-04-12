@@ -192,6 +192,24 @@ export const REVIEWS = /* GraphQL */ `
 	}
 `;
 
+export const MY_REVIEW = /* GraphQL */ `
+	${USER_REF}
+	query MyReview($seriesId: ID!) {
+		myReview(seriesId: $seriesId) {
+			id
+			seriesId
+			author {
+				...UserRefFields
+			}
+			score
+			body
+			hasSpoiler
+			createdAt
+			updatedAt
+		}
+	}
+`;
+
 export const POST_REVIEW = /* GraphQL */ `
 	${USER_REF}
 	mutation PostReview($input: PostReviewInput!) {

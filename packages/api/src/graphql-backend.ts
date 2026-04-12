@@ -123,6 +123,10 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, { seriesId, page });
 		return d.reviews;
 	}
+	async myReview(seriesId: Id): Promise<Review | null> {
+		const d = await this.gql<{ myReview: Review | null }>(ops.MY_REVIEW, { seriesId });
+		return d.myReview;
+	}
 	async postReview(input: PostReviewInput): Promise<Review> {
 		const d = await this.gql<{ postReview: Review }>(ops.POST_REVIEW, { input });
 		return d.postReview;

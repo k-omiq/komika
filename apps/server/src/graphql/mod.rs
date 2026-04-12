@@ -1095,6 +1095,33 @@ impl QueryRoot {
         })
     }
 
+    /// The signed-in viewer's own review for a series, fetched by user identity
+    /// so it's always retrievable regardless of pagination. The paginated
+    /// `reviews` list only returns page 1 (`created_at DESC`, `PAGE_SIZE`); on a
+    /// busy series the viewer's earlier review can fall off it, which would show
+    /// them as unrated with an empty body. Returns `null` when the viewer has no
+    /// review, or when the request is anonymous. No `is_banned` filter here: this
+    /// returns the viewer's OWN review and the viewer is authenticated (a banned
+    /// user can't sign in), so the ban filter is both unnecessary and wrong.
+    async fn my_review(&self, ctx: &Context<'_>, series_id: ID) -> Result<Option<Review>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(None);
+        };
+        let st = state(ctx);
+        let row: Option<ReviewJoin> = sqlx::query_as(
+            "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
+             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
+             FROM reviews r JOIN users u ON u.id = r.user_id \
+             WHERE r.series_id = ? AND r.user_id = ?",
+        )
+        .bind(series_id.0.clone())
+        .bind(&user.id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.map(Review::from))
+    }
+
     async fn comments(
         &self,
         ctx: &Context<'_>,
@@ -3451,6 +3478,106 @@ mod tests {
         assert_eq!(a["comments"]["total"], serde_json::json!(0));
         assert!(a["reviews"]["items"].as_array().unwrap().is_empty());
         assert_eq!(a["reviews"]["total"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn my_review_survives_pagination_and_is_null_when_signed_out() {
+        let (s, pool) = setup_full(100).await;
+        // Bob reviews s1 early (created_at = now, e.g. 2026).
+        let posted = exec(
+            &s,
+            r#"mutation { postReview(input:{ seriesId:"s1", score:7, body:"my early take", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted.errors.is_empty(),
+            "post review failed: {:?}",
+            posted.errors
+        );
+        let my_id = posted.data.into_json().unwrap()["postReview"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 20 other users each post a NEWER review on s1, so a page-1 query
+        // (LIMIT PAGE_SIZE, `created_at DESC`) no longer includes bob's earlier one.
+        for i in 0..20 {
+            let uid = format!("filler-{i}");
+            seed_user(&pool, &uid, &format!("filler{i}"), 0, 0).await;
+            sqlx::query(
+                "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
+                 VALUES (?, 's1', ?, 8, 'filler', 0, ?, ?)",
+            )
+            .bind(format!("rev-{i}"))
+            .bind(&uid)
+            .bind(format!("2099-01-01T00:00:{i:02}Z"))
+            .bind(format!("2099-01-01T00:00:{i:02}Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Page 1 of the public reviews list drops bob's earlier review.
+        let page1 = exec(
+            &s,
+            r#"{ reviews(seriesId:"s1") { items { id } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let ids: Vec<String> = page1.data.into_json().unwrap()["reviews"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 20, "page 1 is capped at PAGE_SIZE");
+        assert!(
+            !ids.contains(&my_id),
+            "bob's early review should have fallen off page 1"
+        );
+
+        // But myReview retrieves bob's own review by identity, regardless of paging.
+        let mine = exec(
+            &s,
+            r#"{ myReview(seriesId:"s1") { id score body } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(mine.errors.is_empty(), "myReview failed: {:?}", mine.errors);
+        let m = mine.data.into_json().unwrap();
+        assert_eq!(m["myReview"]["id"], serde_json::json!(my_id));
+        assert_eq!(m["myReview"]["score"], serde_json::json!(7));
+        assert_eq!(m["myReview"]["body"], serde_json::json!("my early take"));
+
+        // A signed-out viewer gets null (and no error) — not `require_user`.
+        let anon = exec(&s, r#"{ myReview(seriesId:"s1") { id } }"#, None, "1.1.1.1").await;
+        assert!(
+            anon.errors.is_empty(),
+            "anon myReview should not error: {:?}",
+            anon.errors
+        );
+        assert_eq!(
+            anon.data.into_json().unwrap()["myReview"],
+            serde_json::Value::Null
+        );
+
+        // A signed-in viewer with no review on this series also gets null.
+        let admin_none = exec(
+            &s,
+            r#"{ myReview(seriesId:"s1") { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(admin_none.errors.is_empty());
+        assert_eq!(
+            admin_none.data.into_json().unwrap()["myReview"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
