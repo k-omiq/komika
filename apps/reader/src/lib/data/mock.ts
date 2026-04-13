@@ -498,6 +498,7 @@ export interface SeriesComment {
 	chapter: string;
 	time: string;
 	body: string;
+	hasSpoiler: boolean;
 	likes: number;
 	liked: boolean;
 }
@@ -546,6 +547,7 @@ export interface ReaderComment {
 	ts: number;
 	time: string;
 	isOp: boolean;
+	hasSpoiler: boolean;
 	likes: number;
 	liked: boolean;
 	replies: number;

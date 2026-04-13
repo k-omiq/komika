@@ -175,7 +175,7 @@ export async function loadSeriesSocial(seriesId: string, key: string): Promise<S
 			score: 0,
 			body: c.body,
 			time: c.time,
-			hasSpoiler: false,
+			hasSpoiler: c.hasSpoiler ?? false,
 			mine: false,
 			likes: c.likes,
 			liked: c.liked,
@@ -243,6 +243,7 @@ export async function submitSeriesReview(
 			chapter: '',
 			time: v.time,
 			body: v.body,
+			hasSpoiler: v.hasSpoiler,
 			likes: v.likes,
 			liked: v.liked,
 		})),
@@ -280,7 +281,7 @@ async function loadComments(
 		fg: c.fg,
 		body: c.body,
 		time: c.time,
-		hasSpoiler: false,
+		hasSpoiler: c.hasSpoiler ?? false,
 		isOp: c.isOp,
 		mine: false,
 		likes: c.likes,
@@ -335,6 +336,7 @@ async function submitComment(
 			ts: 999,
 			time: c.time,
 			isOp: c.isOp,
+			hasSpoiler: c.hasSpoiler,
 			likes: c.likes,
 			liked: c.liked,
 			replies: 0,
@@ -396,8 +398,8 @@ export async function deleteChapterComment(
 }
 
 /**
- * Ban a user (admin moderation). Their existing comments are left in place —
- * delete those separately — but they can no longer sign in.
+ * Ban a user (admin moderation). The server now hides banned users' comments
+ * and reviews from reads, and they can no longer sign in.
  */
 export async function banCommenter(userId: string): Promise<void> {
 	if (!socialLive()) throw new Error('Banning requires the live backend.');
