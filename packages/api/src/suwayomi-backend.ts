@@ -316,6 +316,7 @@ export class SuwayomiBackend implements Backend {
 				avgIntervalHours: 0,
 				overrideIntervalHours: null,
 				pollEveryMinutes: 30,
+				pollEveryMinutesOverride: null,
 				paused: m.status === 'COMPLETED' || m.status === 'ON_HIATUS',
 				// The Suwayomi adapter has no Komika admin overrides.
 				statusOverride: null,

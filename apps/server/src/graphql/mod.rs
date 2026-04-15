@@ -1077,10 +1077,10 @@ impl QueryRoot {
             "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id \
              WHERE r.series_id = ? AND u.is_banned = 0",
         )
-            .bind(series_id.0.clone())
-            .fetch_one(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        .bind(series_id.0.clone())
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
         let has_next = rows.len() as i64 > PAGE_SIZE;
         let items = rows
             .into_iter()
@@ -3746,7 +3746,10 @@ mod tests {
         .await
         .unwrap();
         let scan = map_series(&st, m.clone()).await.scan;
-        assert_eq!(scan.poll_every_minutes, 30, "NULL poll still folds to default");
+        assert_eq!(
+            scan.poll_every_minutes, 30,
+            "NULL poll still folds to default"
+        );
         assert_eq!(
             scan.poll_every_minutes_override, None,
             "a NULL poll column stays an unset raw override"
@@ -3758,7 +3761,10 @@ mod tests {
             .await
             .unwrap();
         let scan = map_series(&st, m).await.scan;
-        assert_eq!(scan.poll_every_minutes, 45, "effective reflects the override");
+        assert_eq!(
+            scan.poll_every_minutes, 45,
+            "effective reflects the override"
+        );
         assert_eq!(
             scan.poll_every_minutes_override,
             Some(45),
@@ -3788,7 +3794,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(poll, None, "a null poll override leaves the column NULL, not 30");
+        assert_eq!(
+            poll, None,
+            "a null poll override leaves the column NULL, not 30"
+        );
 
         // An explicit poll override persists the raw value.
         let _ = exec(
@@ -3861,12 +3870,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(work_id, "w_canon", "accept repoints the source onto the canonical work");
-        let prov_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        assert_eq!(
+            work_id, "w_canon",
+            "accept repoints the source onto the canonical work"
+        );
+        let prov_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(prov_count, 0, "the orphaned provisional work is deleted");
         let (status, resolved_at): (String, Option<String>) =
             sqlx::query_as("SELECT status, resolved_at FROM merge_candidate WHERE id = 'mc1'")
@@ -3899,7 +3910,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(work_id2, "w_canon", "second resolve does not re-repoint the source");
+        assert_eq!(
+            work_id2, "w_canon",
+            "second resolve does not re-repoint the source"
+        );
         let resolved_at2: Option<String> =
             sqlx::query_scalar("SELECT resolved_at FROM merge_candidate WHERE id = 'mc1'")
                 .fetch_one(&pool)
