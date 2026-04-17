@@ -261,3 +261,28 @@ client, all four go live.** Fix them in the same change so you never ship a live
 - **Tests are the verification of record** for the server-side logic fixes (limiters, dedup, gating, session
   expiry, aggregation). Prefer adding a failing test first where practical.
 - **Keep this checklist current** — it is the cross-session source of truth for what's done.
+
+---
+
+## Remediation status — CLOSED end to end (Phases 1–8 complete)
+
+All eight phases are landed. Phases 1–6 were merged into `main` earlier; **Phases 7 and 8** were
+implemented on `audit-fixes/phase7-8-final` (13 fix commits, one per item with its ID in the message:
+C3, D3, D5, D6, SC2, S1, D7/D8, AD1, AD2, C2, AD3, S3, S2/S4 — plus one `AD1` gate-fixup and the
+checklist commit). No new DB migrations were needed for Phases 7–8; the worker app was untouched.
+
+**Single A–Z verification gate: GREEN** (run once over the whole branch after every item was implemented):
+`cargo fmt --check` ✓ · `cargo clippy --all-targets -- -D warnings` ✓ · `cargo test` → **101 passed / 0
+failed / 1 ignored** (the expected `live_suwayomi_end_to_end`) ✓ · reader `svelte-check` 0 errors / 0
+warnings (340 files) ✓ · admin `svelte-check` 0/0 (293 files) ✓ · `docker compose config` parses ✓.
+
+**Behavioral verification of record** (resolver-level integration tests, all passing): S1
+`ban_hides_comments_and_reviews`; AD1 `scan_policy_exposes_raw_poll_override_nullable` +
+`update_series_admin_null_poll_does_not_pin_override`; AD2 `resolve_merge_candidate_is_an_atomic_claim`;
+S3 `my_review_survives_pagination_and_is_null_when_signed_out`; C2 `ban_user_guards` (isBanned). D3
+(SIGTERM) and the pure UI/deploy/doc changes are not preview-observable and rest on review + the green
+gate. Re-scopes recorded above: **C3** (already closed by CR6 → documentation guard only), **AD3**
+(client-side pager guard; a full server `hasNextPage` wrapper deferred as disproportionate), **S4**
+(refuted on recheck — the interfaces are live; S2's `hasSpoiler` addition completes them).
+
+Not pushed; no PR opened; nothing deployed — per instructions.
