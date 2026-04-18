@@ -72,6 +72,8 @@ services:
     environment:
       PORT: '8080'
       DATABASE_URL: sqlite:///data/komika.sqlite3
+      # User avatars are stored as BLOBs in the SQLite DB, so they are
+      # Litestream-replicated with it and any replica can serve any avatar.
       SUWAYOMI_URL: http://suwayomi:4567
       # Public base for image URLs handed to the browser (NOT the internal host).
       SUWAYOMI_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:${SUWAYOMI_PORT:-4567}

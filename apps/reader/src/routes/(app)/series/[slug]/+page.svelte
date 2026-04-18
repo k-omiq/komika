@@ -10,6 +10,7 @@
 	import { FLAG } from '$lib/data/mock';
 	import { setLibraryMark } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
+	import Avatar from '$lib/components/Avatar.svelte';
 	import {
 		socialLive,
 		loadSeriesSocial,
@@ -64,7 +65,6 @@
 	const seriesId = $derived(detail?.id ?? '');
 	const socialKey = $derived(data.slug ?? page.params.slug ?? '');
 	const needsAuth = $derived(socialLive() && !auth.user);
-	const myInitial = $derived((auth.user?.username ?? 'K').charAt(0).toUpperCase());
 
 	// Reflect the backend's library state on load (resets when navigating series).
 	$effect(() => {
@@ -338,7 +338,14 @@
 		</div>
 	{:else}
 		<div class="composer">
-			<div class="avatar">{myInitial}</div>
+			<div class="avatar">
+				<Avatar
+					url={auth.user?.avatarUrl}
+					name={auth.user?.username ?? 'You'}
+					colorKey={auth.user?.id}
+					size={40}
+				/>
+			</div>
 			<div class="composer-body">
 				<textarea
 					bind:value={draft}
@@ -364,7 +371,9 @@
 	<div class="c-list">
 		{#each reviews as c (c.id)}
 			<div class="comment">
-				<div class="avatar sm">{c.initial}</div>
+				<div class="avatar sm">
+					<Avatar url={c.avatarUrl} name={c.name} colorKey={c.authorId} size={40} />
+				</div>
 				<div class="c-body">
 					<div class="c-meta">
 						<span class="c-name">{c.name}</span>

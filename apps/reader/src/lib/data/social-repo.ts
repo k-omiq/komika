@@ -36,6 +36,10 @@ export interface ReviewView {
 	id: string;
 	name: string;
 	initial: string;
+	/** Author id — stable colour key for the fallback initial. */
+	authorId?: string;
+	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
+	avatarUrl?: string | null;
 	score: number; // 1..10, 0 = none
 	body: string;
 	time: string;
@@ -50,6 +54,8 @@ export interface CommentView {
 	authorId: string;
 	name: string;
 	initial: string;
+	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
+	avatarUrl?: string | null;
 	bg: string;
 	fg: string;
 	body: string;
@@ -107,6 +113,8 @@ function reviewToView(r: Review): ReviewView {
 		id: r.id,
 		name: r.author.username,
 		initial: initialOf(r.author.username),
+		authorId: r.author.id,
+		avatarUrl: r.author.avatarUrl,
 		score: r.score,
 		body: r.body,
 		time: relTime(r.createdAt),
@@ -124,6 +132,7 @@ function commentToView(c: Comment): CommentView {
 		authorId: c.author.id,
 		name: c.author.username,
 		initial: initialOf(c.author.username),
+		avatarUrl: c.author.avatarUrl,
 		bg: av.bg,
 		fg: av.fg,
 		body: c.body,

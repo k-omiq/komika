@@ -1,4 +1,5 @@
 mod auth;
+mod avatar;
 mod catalog;
 mod config;
 mod db;
@@ -16,11 +17,11 @@ use std::net::{IpAddr, SocketAddr};
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
-    extract::{ConnectInfo, FromRef, State},
-    http::{header, HeaderMap, HeaderValue, Method},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRef, Multipart, Path as UrlPath, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -178,6 +179,141 @@ async fn graphiql() -> impl IntoResponse {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
+/// A GraphQL-shaped JSON error body for the REST avatar routes, so the reader's
+/// error handling reads the same `message` field it does from `/graphql`.
+fn avatar_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (status, Json(serde_json::json!({ "message": message }))).into_response()
+}
+
+/// `POST /avatar` — authenticated multipart avatar upload. The bytes are decoded,
+/// squared, and re-encoded as budgeted lossless WebP (`avatar::process_avatar`),
+/// stored as a BLOB in `user_avatars`, and the resulting path stored on the user
+/// row. Returns `{ "avatarUrl": "/avatars/<id>.webp?v=<ts>" }`.
+async fn upload_avatar(
+    State(pool): State<sqlx::SqlitePool>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    let Some(tok) = bearer(&headers) else {
+        return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    let user = match auth::user_for_token(&pool, &tok).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
+        Err(e) => {
+            tracing::warn!(error = %e, "avatar upload: token lookup failed");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    // Take the first file part (the reader sends a single `avatar` field).
+    let mut data: Option<Vec<u8>> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let is_file = field.name() == Some("avatar") || field.file_name().is_some();
+                if is_file {
+                    match field.bytes().await {
+                        Ok(b) => {
+                            data = Some(b.to_vec());
+                            break;
+                        }
+                        Err(_) => {
+                            return avatar_error(
+                                StatusCode::BAD_REQUEST,
+                                "Upload too large or could not be read",
+                            )
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return avatar_error(StatusCode::BAD_REQUEST, "Malformed upload"),
+        }
+    }
+    let Some(bytes) = data else {
+        return avatar_error(StatusCode::BAD_REQUEST, "No image file provided");
+    };
+
+    // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
+    let webp = match tokio::task::spawn_blocking(move || avatar::process_avatar(&bytes)).await {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "avatar processing task panicked");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not process image");
+        }
+    };
+
+    let version = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now().to_rfc3339();
+    let url = avatar::avatar_url(&user.id, version);
+    // Upsert the BLOB and repoint the user row in one transaction so the stored
+    // `avatar_url` version can never disagree with the bytes on record.
+    let stored = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO user_avatars (user_id, webp, version, updated_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(user_id) DO UPDATE SET \
+               webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
+        )
+        .bind(&user.id)
+        .bind(&webp)
+        .bind(version)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
+            .bind(&url)
+            .bind(&user.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(e) = stored {
+        tracing::error!(error = %e, "avatar save failed");
+        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save avatar");
+    }
+    Json(serde_json::json!({ "avatarUrl": url })).into_response()
+}
+
+/// `GET /avatars/{file}` — serve a stored avatar from `user_avatars`. Immutable +
+/// long-cache; the stored `avatar_url` carries a `?v=<ts>` so a new upload busts
+/// the cache. `{file}` is `<user_id>.webp`; the id is looked up as a bind param
+/// (no path/SQL injection surface), returning 404 for a bad shape or unknown id.
+async fn serve_avatar(
+    State(pool): State<sqlx::SqlitePool>,
+    UrlPath(file): UrlPath<String>,
+) -> axum::response::Response {
+    let Some(user_id) = file.strip_suffix(".webp") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let webp: Option<Vec<u8>> =
+        match sqlx::query_scalar("SELECT webp FROM user_avatars WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "avatar read failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    match webp {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Liveness: cheap, dependency-free — used by the container HEALTHCHECK. A blip
 /// in the DB must not flap this (that would trigger restart loops).
 async fn health() -> &'static str {
@@ -299,6 +435,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/graphql", graphql_route)
         .route("/health", get(health))
         .route("/health/ready", get(ready))
+        // Authenticated avatar upload + public serve (VM data volume). The upload
+        // route raises the body limit above the raw-image cap enforced in
+        // `avatar::process_avatar` (axum's default is 2 MB).
+        .route(
+            "/avatar",
+            post(upload_avatar).layer(DefaultBodyLimit::max(
+                avatar::MAX_UPLOAD_BYTES + 1024 * 1024,
+            )),
+        )
+        .route("/avatars/{file}", get(serve_avatar))
         // Request-id + access-log span. SetRequestId runs first (generates an
         // x-request-id when the client didn't send one), TraceLayer's span picks
         // it up, and PropagateRequestId echoes it back on the response.

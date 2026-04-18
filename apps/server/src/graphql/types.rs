@@ -161,10 +161,38 @@ pub struct Comment {
 pub struct SessionUser {
     pub id: ID,
     pub username: String,
+    /// Optional editable display name; falls back to `username` when unset.
+    pub display_name: Option<String>,
+    /// Optional editable "about me" text.
+    pub bio: Option<String>,
     pub avatar_url: Option<String>,
     pub is_admin: bool,
     /// Whether this user has opted into seeing NSFW-flagged works (CATALOGUE.md §2).
     pub show_nsfw: bool,
+    /// Account creation timestamp (ISO 8601) — the profile "joined" date.
+    pub joined_at: String,
+}
+
+/// One entry in a user's activity feed (a review posted, a comment posted, a
+/// series added to their library). Written by the corresponding mutation.
+#[derive(SimpleObject, Clone)]
+pub struct Activity {
+    pub id: ID,
+    /// `"review"` | `"comment"` | `"library_add"`.
+    pub kind: String,
+    /// `"series"` | `"chapter"` — the kind of thing acted on, when known.
+    pub target_type: Option<String>,
+    /// The series/chapter id the action targeted; the client resolves a title.
+    pub target_id: Option<ID>,
+    pub created_at: String,
+}
+
+#[derive(InputObject)]
+pub struct UpdateProfileInput {
+    /// New display name; `null` or blank clears it (falls back to username).
+    pub display_name: Option<String>,
+    /// New bio; `null` or blank clears it.
+    pub bio: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]

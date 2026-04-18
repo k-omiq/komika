@@ -4,6 +4,7 @@
 	import { auth, logout } from '$lib/auth.svelte';
 	import { theme, cycleTheme, resolvedTheme } from '$lib/theme.svelte';
 	import Icon from './Icon.svelte';
+	import Avatar from './Avatar.svelte';
 	import SearchOverlay from './SearchOverlay.svelte';
 
 	let {
@@ -30,7 +31,6 @@
 	const loginHref = $derived(
 		path === '/login' ? '/login' : `/login?redirect=${encodeURIComponent(path)}`,
 	);
-	const initial = $derived((auth.user?.username ?? '?').charAt(0).toUpperCase());
 	const isDark = $derived(resolvedTheme(theme.pref) === 'dark');
 	const themeTitle = $derived(
 		theme.pref === 'system' ? 'System' : theme.pref === 'dark' ? 'Dark' : 'Light',
@@ -122,8 +122,10 @@
 					aria-label="Account menu"
 					aria-haspopup="menu"
 					aria-expanded={menuOpen}
-					onclick={() => (menuOpen = !menuOpen)}>{initial}</button
+					onclick={() => (menuOpen = !menuOpen)}
 				>
+					<Avatar url={auth.user.avatarUrl} name={auth.user.username} colorKey={auth.user.id} size={34} />
+				</button>
 				{#if menuOpen}
 					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
 					></button>
@@ -235,6 +237,8 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		padding: 0;
+		overflow: hidden;
 		font-weight: 700;
 		font-size: 13px;
 		color: var(--k-text-3);

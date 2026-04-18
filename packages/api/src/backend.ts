@@ -63,6 +63,19 @@ export interface Backend {
 	 * the new value. Optional: only the unified Komika API implements it. */
 	setShowNsfw?(value: boolean): Promise<boolean>;
 
+	// --- profile ---
+	/** Update the viewer's editable profile (display name + bio); a blank field
+	 * clears it. Returns the refreshed session user. Optional: only the unified
+	 * Komika API implements it. */
+	updateProfile?(input: UpdateProfileInput): Promise<Session['user']>;
+	/** Upload a new avatar (any JPEG/PNG/WebP). The server squares, downscales, and
+	 * re-encodes it as budgeted lossless WebP on the VM data volume; returns the new
+	 * avatar URL. Optional: only the unified Komika API implements it. */
+	uploadAvatar?(file: Blob): Promise<string>;
+	/** The signed-in user's recent activity feed (newest first; empty when signed
+	 * out). Optional: only the unified Komika API implements it. */
+	myActivity?(limit?: number): Promise<Activity[]>;
+
 	// --- canonical catalogue (MangaDex mirror) ---
 	/** Recently-updated mirrored MangaDex works + their latest stored chapter, newest
 	 * first, NSFW-filtered by the viewer's preference (CATALOGUE.md §6). A data feed;
@@ -139,17 +152,41 @@ export interface Session {
 	user: {
 		id: Id;
 		username: string;
+		/** Editable display name; falls back to `username` when null. */
+		displayName: string | null;
+		/** Editable "about me" text. */
+		bio: string | null;
 		avatarUrl: string | null;
 		isAdmin: boolean;
 		/** Whether this user opted into seeing NSFW-flagged works (CATALOGUE.md §2). */
 		showNsfw: boolean;
+		/** Account creation timestamp (ISO 8601) — the profile "joined" date. */
+		joinedAt: string;
 	};
+}
+
+/** One entry in a user's activity feed (see {@link Backend.myActivity}). */
+export interface Activity {
+	id: Id;
+	/** "review" | "comment" | "library_add". */
+	kind: string;
+	/** "series" | "chapter" — the kind of thing acted on, when known. */
+	targetType: string | null;
+	/** The series/chapter id acted on; the client resolves a display title. */
+	targetId: Id | null;
+	createdAt: string;
 }
 
 export interface RegisterInput {
 	username: string;
 	email: string;
 	password: string;
+}
+
+/** Editable profile fields. A blank/undefined field clears that value. */
+export interface UpdateProfileInput {
+	displayName?: string | null;
+	bio?: string | null;
 }
 
 export interface PostReviewInput {

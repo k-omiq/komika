@@ -13,6 +13,7 @@
 		type CommentView,
 	} from '$lib/data/social-repo';
 	import Icon from '$lib/components/Icon.svelte';
+	import Avatar from '$lib/components/Avatar.svelte';
 
 	interface Props {
 		/** 'chapter' for a per-chapter thread, 'series' for series-level discussion. */
@@ -35,7 +36,6 @@
 	let modError = $state<string | null>(null);
 
 	const needsAuth = $derived(socialLive() && !auth.user);
-	const myInitial = $derived((auth.user?.username ?? 'K').charAt(0).toUpperCase());
 	const canPost = $derived(draft.trim().length > 0 && !posting);
 	const canMod = $derived(canModerate());
 
@@ -127,7 +127,14 @@
 	</div>
 {:else}
 	<div class="composer">
-		<div class="avatar me">{myInitial}</div>
+		<div class="avatar me">
+			<Avatar
+				url={auth.user?.avatarUrl}
+				name={auth.user?.username ?? 'You'}
+				colorKey={auth.user?.id}
+				size={40}
+			/>
+		</div>
 		<div class="composer-body">
 			<textarea bind:value={draft} placeholder={prompt} rows="3"></textarea>
 			{#if postError}<p class="post-error">{postError}</p>{/if}
@@ -149,7 +156,9 @@
 <div class="c-list">
 	{#each comments as c (c.id)}
 		<div class="comment">
-			<div class="avatar" style="background:{c.bg};color:{c.fg}">{c.initial}</div>
+			<div class="avatar">
+				<Avatar url={c.avatarUrl} name={c.name} colorKey={c.authorId} size={40} />
+			</div>
 			<div class="c-body">
 				<div class="c-meta">
 					<span class="c-name">{c.name}</span>

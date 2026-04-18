@@ -648,13 +648,65 @@ impl From<AdminUserRow> for AdminUser {
     }
 }
 
-fn session_user(u: &User, show_nsfw: bool) -> SessionUser {
+/// Load the editable profile fields not carried on the auth `User` row loader
+/// (`display_name`, `bio`, `created_at`). Falls back to empties on any lookup
+/// failure so building a session never fails on a cold profile.
+async fn user_profile_fields(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> (Option<String>, Option<String>, String) {
+    sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
+        "SELECT display_name, bio, created_at FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((None, None, String::new()))
+}
+
+/// Build the client-facing `SessionUser` for a resolved auth `User`, loading its
+/// profile fields. Every session-returning path funnels through this so the
+/// shape stays consistent.
+async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> SessionUser {
+    let (display_name, bio, joined_at) = user_profile_fields(pool, &u.id).await;
     SessionUser {
         id: ID(u.id.clone()),
         username: u.username.clone(),
+        display_name,
+        bio,
         avatar_url: u.avatar_url.clone(),
         is_admin: u.is_admin != 0,
         show_nsfw,
+        joined_at,
+    }
+}
+
+/// Record one entry in a user's activity feed. Best-effort: a failed insert is
+/// logged and swallowed so it can never fail the user's actual action (posting
+/// a review/comment, adding to the library).
+async fn log_activity(
+    pool: &SqlitePool,
+    user_id: &str,
+    kind: &str,
+    target_type: Option<&str>,
+    target_id: Option<&str>,
+) {
+    let res = sqlx::query(
+        "INSERT INTO user_activity (id, user_id, kind, target_type, target_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(kind)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, kind, "failed to record user activity");
     }
 }
 
@@ -1263,10 +1315,56 @@ impl QueryRoot {
                 let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await;
                 Ok(Some(Session {
                     token: tok,
-                    user: session_user(&u, show_nsfw),
+                    user: build_session_user(&state(ctx).pool, &u, show_nsfw).await,
                 }))
             }
             None => Ok(None),
+        }
+    }
+
+    /// The signed-in user's recent activity feed (newest first). Empty when
+    /// signed out. `limit` is clamped to [1, 50].
+    async fn my_activity(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+    ) -> Result<Vec<Activity>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(vec![]);
+        };
+        let limit = limit.clamp(1, 50) as i64;
+        let rows = sqlx::query_as::<_, ActivityRow>(
+            "SELECT id, kind, target_type, target_id, created_at \
+             FROM user_activity WHERE user_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(&user.id)
+        .bind(limit)
+        .fetch_all(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Row loader for `user_activity`, mapped to the `Activity` GraphQL type.
+#[derive(sqlx::FromRow)]
+struct ActivityRow {
+    id: String,
+    kind: String,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    created_at: String,
+}
+
+impl From<ActivityRow> for Activity {
+    fn from(r: ActivityRow) -> Self {
+        Activity {
+            id: ID(r.id),
+            kind: r.kind,
+            target_type: r.target_type,
+            target_id: r.target_id.map(ID),
+            created_at: r.created_at,
         }
     }
 }
@@ -1295,6 +1393,14 @@ impl MutationRoot {
                 .execute(&st.pool)
                 .await
                 .map_err(gql_err)?;
+                log_activity(
+                    &st.pool,
+                    &user.id,
+                    "library_add",
+                    Some("series"),
+                    Some(&series_id.0),
+                )
+                .await;
             } else {
                 sqlx::query("DELETE FROM canonical_library WHERE user_id = ? AND work_id = ?")
                     .bind(&user.id)
@@ -1425,6 +1531,14 @@ impl MutationRoot {
         .fetch_one(&st.pool)
         .await
         .map_err(gql_err)?;
+        log_activity(
+            &st.pool,
+            &user.id,
+            "review",
+            Some("series"),
+            Some(&input.series_id.0),
+        )
+        .await;
         Ok(row.into())
     }
 
@@ -1451,6 +1565,14 @@ impl MutationRoot {
         .execute(&st.pool)
         .await
         .map_err(gql_err)?;
+        log_activity(
+            &st.pool,
+            &user.id,
+            "comment",
+            Some(target_type),
+            Some(&input.target_id.0),
+        )
+        .await;
         Ok(Comment {
             id: ID(id),
             target_type: target_type.to_string(),
@@ -1522,7 +1644,7 @@ impl MutationRoot {
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         Ok(Session {
             token: tok,
-            user: session_user(&user, show_nsfw),
+            user: build_session_user(&st.pool, &user, show_nsfw).await,
         })
     }
 
@@ -1592,9 +1714,12 @@ impl MutationRoot {
             user: SessionUser {
                 id: ID(id),
                 username: username.to_string(),
+                display_name: None,
+                bio: None,
                 avatar_url: None,
                 is_admin,
                 show_nsfw: false, // fresh accounts default to hiding NSFW
+                joined_at: now,
             },
         })
     }
@@ -1609,6 +1734,46 @@ impl MutationRoot {
                 .map_err(gql_err)?;
         }
         Ok(true)
+    }
+
+    /// Update the signed-in user's editable profile (display name + bio).
+    /// A blank/`null` field clears that value (display falls back to username).
+    /// Returns the refreshed `SessionUser`.
+    async fn update_profile(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateProfileInput,
+    ) -> Result<SessionUser> {
+        let user = require_user(ctx).await?;
+        // Trim, then treat an empty string as "clear" (store NULL).
+        let display_name = input
+            .display_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let bio = input
+            .bio
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(name) = &display_name {
+            if name.chars().count() > 50 {
+                return Err(Error::new("display name must be at most 50 characters"));
+            }
+        }
+        if let Some(b) = &bio {
+            if b.chars().count() > 500 {
+                return Err(Error::new("bio must be at most 500 characters"));
+            }
+        }
+        let st = state(ctx);
+        sqlx::query("UPDATE users SET display_name = ?, bio = ? WHERE id = ?")
+            .bind(&display_name)
+            .bind(&bio)
+            .bind(&user.id)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        Ok(build_session_user(&st.pool, &user, show_nsfw).await)
     }
 
     /// Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2).
@@ -2449,6 +2614,109 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn update_profile_persists_and_is_reflected_in_session() {
+        let s = setup().await;
+        // Fresh account: display name/bio are null, joinedAt is present.
+        let r = exec(
+            &s,
+            r#"{ session { user { displayName bio joinedAt } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let j = data_json(&r);
+        assert!(j.contains("\"displayName\":null"), "unexpected: {j}");
+        assert!(j.contains("\"bio\":null"), "unexpected: {j}");
+        assert!(j.contains("\"joinedAt\":\"2020-01-01"), "unexpected: {j}");
+
+        // Update both; the mutation returns the refreshed user.
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { displayName: "  Bob the Reader  ", bio: "I read manga." }) { displayName bio } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let j = data_json(&r);
+        assert!(
+            j.contains("\"displayName\":\"Bob the Reader\""),
+            "trimmed: {j}"
+        );
+        assert!(j.contains("\"bio\":\"I read manga.\""), "{j}");
+
+        // A blank display name clears it (falls back to username in the UI).
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { displayName: "   ", bio: "still here" }) { displayName bio } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(data_json(&r).contains("\"displayName\":null"), "cleared");
+
+        // Anonymous cannot update.
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { bio: "x" }) { bio } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn update_profile_rejects_overlong_fields() {
+        let s = setup().await;
+        let long_name = "a".repeat(51);
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ updateProfile(input: {{ displayName: "{long_name}" }}) {{ id }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "display name must be at most 50 characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn my_activity_records_reviews_and_is_empty_when_signed_out() {
+        let s = setup().await;
+        // Signed out → empty feed, never an error.
+        let r = exec(&s, r#"{ myActivity { id } }"#, None, "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"myActivity\":[]"));
+
+        // Posting a review records a 'review' activity targeting the series.
+        let r = exec(
+            &s,
+            r#"mutation { postReview(input: { seriesId: "42", score: 8, body: "great", hasSpoiler: false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+
+        let r = exec(
+            &s,
+            r#"{ myActivity { kind targetType targetId } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let j = data_json(&r);
+        assert!(j.contains("\"kind\":\"review\""), "{j}");
+        assert!(j.contains("\"targetType\":\"series\""), "{j}");
+        assert!(j.contains("\"targetId\":\"42\""), "{j}");
     }
 
     #[tokio::test]

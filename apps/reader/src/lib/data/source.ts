@@ -42,6 +42,30 @@ async function live<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
 	}
 }
 
+/** Coarse "N ago" relative time for the activity feed. */
+function relTimeAgo(iso: string | null | undefined): string {
+	if (!iso) return 'just now';
+	const then = Date.parse(iso);
+	if (Number.isNaN(then)) return 'just now';
+	const now = typeof Date !== 'undefined' && Date.now ? Date.now() : then;
+	const mins = Math.max(0, Math.round((now - then) / 60000));
+	if (mins < 1) return 'just now';
+	if (mins < 60) return `${mins}m ago`;
+	const hrs = Math.round(mins / 60);
+	if (hrs < 24) return `${hrs}h ago`;
+	const days = Math.round(hrs / 24);
+	if (days < 30) return `${days}d ago`;
+	return monthYear(iso);
+}
+
+/** "March 2023"-style month/year for the profile "joined" line. */
+function monthYear(iso: string | null | undefined): string {
+	if (!iso) return 'recently';
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return 'recently';
+	return d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+}
+
 // ---- domain → view mappers -------------------------------------------------
 
 function toViewType(t: DomainComicType): ComicType {
@@ -596,11 +620,15 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 }
 
 export interface ProfileView {
+	/** The signed-in user's id (empty for the signed-out sample profile). */
+	id: string;
 	name: string;
 	handle: string;
 	since: string;
 	bio: string;
 	badge: string;
+	/** Stored avatar path/URL, or null → render an initial. */
+	avatarUrl: string | null;
 	stats: { value: string; label: string }[];
 	reading: { id?: string; title: string; genre: string; ch: number; total: number }[];
 	favGenres: { name: string; pct: number }[];
@@ -669,29 +697,35 @@ export function getProfile(): Promise<ProfileView> {
 			total,
 		}));
 
-		const activity = [
-			...readingNow.slice(0, 4).map(({ s, read, total }) => ({
-				icon: '📖',
-				iconBg: 'rgba(255,255,255,0.07)',
-				text: `Reading ${s.title} — Ch. ${read} / ${total}`,
-				time: `${total ? Math.round((read / total) * 100) : 0}% complete`,
-			})),
-			...completed.slice(0, 2).map(({ s }) => ({
-				icon: '✓',
-				iconBg: 'rgba(95,191,126,0.16)',
-				text: `Finished ${s.title}`,
-				time: 'In your library',
-			})),
-		];
+		// Real, timestamped activity from the server's per-user event log, mapped to
+		// display text via the library title index (falls back to a generic label
+		// when the target isn't in the library, e.g. a chapter comment).
+		const titleById = new Map(lib.map((s) => [s.id, s.title]));
+		const rawActivity = backend.myActivity ? await backend.myActivity(12).catch(() => []) : [];
+		const activity = rawActivity.map((a) => {
+			const title = a.targetId ? titleById.get(a.targetId) : undefined;
+			const on = title ?? (a.targetType === 'chapter' ? 'a chapter' : 'a series');
+			const view =
+				a.kind === 'review'
+					? { icon: '★', iconBg: 'rgba(246,183,60,0.16)', text: `Reviewed ${on}` }
+					: a.kind === 'library_add'
+						? { icon: '＋', iconBg: 'rgba(95,191,126,0.16)', text: `Added ${on} to library` }
+						: { icon: '💬', iconBg: 'rgba(255,255,255,0.07)', text: `Commented on ${on}` };
+			return { ...view, time: relTimeAgo(a.createdAt) };
+		});
 
 		return {
-			name: user.username,
+			id: user.id,
+			name: user.displayName?.trim() || user.username,
 			handle: `@${user.username}`,
-			since: user.isAdmin ? 'Administrator' : 'Reader',
-			bio: lib.length
-				? `${chaptersRead} chapters read across ${lib.length} series in your library.`
-				: 'Your library is empty — add a series to start tracking your reading.',
+			since: `Joined ${monthYear(user.joinedAt)}`,
+			bio:
+				user.bio?.trim() ||
+				(lib.length
+					? `${chaptersRead} chapters read across ${lib.length} series in your library.`
+					: 'Your library is empty — add a series to start tracking your reading.'),
 			badge: user.isAdmin ? 'ADMIN' : 'READER',
+			avatarUrl: user.avatarUrl,
 			stats: [
 				{ value: String(lib.length), label: 'In library' },
 				{ value: String(chaptersRead), label: 'Chapters read' },
@@ -704,6 +738,29 @@ export function getProfile(): Promise<ProfileView> {
 			shelves,
 		};
 	}, mock.profile);
+}
+
+/**
+ * Update the signed-in user's editable profile (display name + bio). Returns the
+ * refreshed session user, or `null` when no live backend supports it (mock mode).
+ */
+export async function updateProfile(input: {
+	displayName?: string | null;
+	bio?: string | null;
+}): Promise<import('@komika/api').Session['user'] | null> {
+	if (!LIVE || !backend.updateProfile) return null;
+	return backend.updateProfile(input);
+}
+
+/**
+ * Upload a new avatar image. The server squares/downscales it and re-encodes it
+ * as budgeted lossless WebP on the VM data volume. Returns the new avatar URL.
+ */
+export async function uploadAvatar(file: Blob): Promise<string> {
+	if (!LIVE || !backend.uploadAvatar) {
+		throw new Error('Avatar upload requires the Komika backend.');
+	}
+	return backend.uploadAvatar(file);
 }
 
 export function getDonate() {

@@ -269,15 +269,25 @@ export const POST_COMMENT = /* GraphQL */ `
 
 // ---- auth ------------------------------------------------------------------
 
+const SESSION_USER_FIELDS = /* GraphQL */ `
+	fragment SessionUserFields on SessionUser {
+		id
+		username
+		displayName
+		bio
+		avatarUrl
+		isAdmin
+		showNsfw
+		joinedAt
+	}
+`;
+
 const SESSION_FIELDS = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
 	fragment SessionFields on Session {
 		token
 		user {
-			id
-			username
-			avatarUrl
-			isAdmin
-			showNsfw
+			...SessionUserFields
 		}
 	}
 `;
@@ -434,6 +444,29 @@ export const ADD_SOURCE_SERIES = /* GraphQL */ `
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)
+	}
+`;
+
+// ---- profile ---------------------------------------------------------------
+
+export const UPDATE_PROFILE = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
+	mutation UpdateProfile($input: UpdateProfileInput!) {
+		updateProfile(input: $input) {
+			...SessionUserFields
+		}
+	}
+`;
+
+export const MY_ACTIVITY = /* GraphQL */ `
+	query MyActivity($limit: Int) {
+		myActivity(limit: $limit) {
+			id
+			kind
+			targetType
+			targetId
+			createdAt
+		}
 	}
 `;
 
