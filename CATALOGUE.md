@@ -185,6 +185,12 @@ New module `apps/server/src/mangadex/` (direct `reqwest` client).
   `updatedAtSince` refresh of both catalogue and chapters. The cursor per job lives in
   `catalogue_sync_state` (migration `0006`) and only advances on success, so a failed cycle
   safely retries the same window.
+  - **Refresh model is deliberately split** — the adaptive per-series scanner
+    (`scanner.rs`, with its average-cadence / admin-override / auto-pause behavior) covers
+    Suwayomi-library series *only*, by design. MangaDex-mirrored canonical works are not
+    swept per-series; they are refreshed together on this single global interval, and their
+    new-chapter deltas are delivered through the `canonicalUpdates` feed (§6). This is the
+    intended parallel-path design, not a scanner coverage gap.
 - **Cover URL** (must be proxied — hotlinking returns a wrong response):
   `https://uploads.mangadex.org/covers/{manga-id}/{fileName}` (+ `.512.jpg` / `.256.jpg`).
 

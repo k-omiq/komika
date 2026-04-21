@@ -30,3 +30,22 @@ export const config = {
 	 */
 	imgDirect: env.PUBLIC_KOMIKA_IMG_MODE === 'direct',
 };
+
+/**
+ * Origin of the Komika API (the GraphQL endpoint minus `/graphql`). User avatars
+ * are served from this origin under `/avatars/...`, so a stored `/avatars/x.webp`
+ * path is resolved against it. Falls back to the raw endpoint if the shape is
+ * unexpected.
+ */
+export const apiOrigin = config.apiEndpoint.replace(/\/graphql\/?$/, '');
+
+/**
+ * Resolve a stored `avatarUrl` to a loadable URL. Relative `/avatars/...` paths
+ * are prefixed with the API origin; already-absolute URLs pass through; null
+ * stays null (the UI then renders an initial).
+ */
+export function avatarSrc(url: string | null | undefined): string | null {
+	if (!url) return null;
+	if (/^https?:\/\//.test(url)) return url;
+	return apiOrigin + (url.startsWith('/') ? '' : '/') + url;
+}

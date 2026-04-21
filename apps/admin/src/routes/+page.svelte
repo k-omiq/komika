@@ -95,7 +95,7 @@
 		// never mistaken for the status default (even when they coincide).
 		fStatus = s.scan.statusOverride ?? 'source';
 		fInterval = s.scan.overrideIntervalHours != null ? String(s.scan.overrideIntervalHours) : '';
-		fPoll = String(s.scan.pollEveryMinutes);
+		fPoll = s.scan.pollEveryMinutesOverride == null ? '' : String(s.scan.pollEveryMinutesOverride);
 		fScanner =
 			s.scan.pausedOverride == null ? 'auto' : s.scan.pausedOverride ? 'paused' : 'running';
 	}

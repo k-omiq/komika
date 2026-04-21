@@ -35,9 +35,11 @@ type Query {
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
+	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out)
 	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null
+	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
 	# ops / admin (all require isAdmin)
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
@@ -53,9 +55,10 @@ type Mutation {
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
 	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
+	updateProfile(input: UpdateProfileInput!): SessionUser! # [komika] update the viewer's display name + bio (avatar upload is REST: POST /avatar)
 	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
 	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
-	banUser(userId: ID!, banned: Boolean!): UserRef! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
+	banUser(userId: ID!, banned: Boolean!): AdminUser! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
@@ -116,6 +119,9 @@ type ScanPolicy {
 	# the status default even when they coincide. null => no override.
 	statusOverride: SeriesStatus
 	pausedOverride: Boolean
+	# Raw admin poll-interval override (minutes). null => no override, so the
+	# effective pollEveryMinutes above is the folded default.
+	pollEveryMinutesOverride: Int
 	lastScannedAt: String
 	nextScanAt: String
 }
@@ -196,9 +202,21 @@ type Session {
 type SessionUser {
 	id: ID!
 	username: String!
+	displayName: String # [komika] editable display name; falls back to username
+	bio: String # [komika] editable "about me" text
 	avatarUrl: String
 	isAdmin: Boolean!
 	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
+	joinedAt: String! # [komika] account creation timestamp (profile "joined" date)
+}
+
+# One entry in a user's activity feed, written by the corresponding mutation.
+type Activity {
+	id: ID!
+	kind: String! # "review" | "comment" | "library_add"
+	targetType: String # "series" | "chapter"
+	targetId: ID # series/chapter id acted on; the client resolves a title
+	createdAt: String!
 }
 
 type SeriesPage {
@@ -240,6 +258,13 @@ input RegisterInput {
 	username: String!
 	email: String!
 	password: String!
+}
+
+# Editable profile fields. A null/blank field clears that value (display name
+# then falls back to username).
+input UpdateProfileInput {
+	displayName: String
+	bio: String
 }
 
 # Admin "manga DB" overrides. Whole-state: a null field clears that override, so

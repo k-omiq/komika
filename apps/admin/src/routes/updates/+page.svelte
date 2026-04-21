@@ -4,6 +4,10 @@
 	import { auth } from '$lib/auth.svelte';
 	import { loadCanonicalUpdates } from '$lib/data';
 
+	// Mirrors the server's PAGE_SIZE (apps/server/src/graphql/mod.rs) — the pager's
+	// fullness threshold: a short page means there are no further pages.
+	const PAGE_SIZE = 20;
+
 	let updates = $state<CanonicalUpdate[]>([]);
 	let page = $state(1);
 	let loading = $state(false);
@@ -57,7 +61,7 @@
 		<div class="pager">
 			<button class="pg" disabled={loading || page === 1} onclick={() => go(-1)}>Prev</button>
 			<span class="page-num">Page {page}</span>
-			<button class="pg" disabled={loading || updates.length === 0} onclick={() => go(1)}
+			<button class="pg" disabled={loading || updates.length < PAGE_SIZE} onclick={() => go(1)}
 				>Next</button
 			>
 		</div>

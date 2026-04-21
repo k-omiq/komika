@@ -379,6 +379,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
             paused,
             status_override: ov.status_override.as_deref().and_then(komika_status),
             paused_override: ov.paused_override.map(|v| v != 0),
+            poll_every_minutes_override: ov.poll_every_minutes.map(|v| v as i32),
             last_scanned_at: scan
                 .as_ref()
                 .and_then(|s| s.last_scanned_at.clone())
@@ -479,6 +480,7 @@ async fn map_canonical_series(
             paused: false,
             status_override: None,
             paused_override: None,
+            poll_every_minutes_override: None,
             last_scanned_at: None,
             next_scan_at: None,
         },
@@ -646,13 +648,65 @@ impl From<AdminUserRow> for AdminUser {
     }
 }
 
-fn session_user(u: &User, show_nsfw: bool) -> SessionUser {
+/// Load the editable profile fields not carried on the auth `User` row loader
+/// (`display_name`, `bio`, `created_at`). Falls back to empties on any lookup
+/// failure so building a session never fails on a cold profile.
+async fn user_profile_fields(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> (Option<String>, Option<String>, String) {
+    sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
+        "SELECT display_name, bio, created_at FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((None, None, String::new()))
+}
+
+/// Build the client-facing `SessionUser` for a resolved auth `User`, loading its
+/// profile fields. Every session-returning path funnels through this so the
+/// shape stays consistent.
+async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> SessionUser {
+    let (display_name, bio, joined_at) = user_profile_fields(pool, &u.id).await;
     SessionUser {
         id: ID(u.id.clone()),
         username: u.username.clone(),
+        display_name,
+        bio,
         avatar_url: u.avatar_url.clone(),
         is_admin: u.is_admin != 0,
         show_nsfw,
+        joined_at,
+    }
+}
+
+/// Record one entry in a user's activity feed. Best-effort: a failed insert is
+/// logged and swallowed so it can never fail the user's actual action (posting
+/// a review/comment, adding to the library).
+async fn log_activity(
+    pool: &SqlitePool,
+    user_id: &str,
+    kind: &str,
+    target_type: Option<&str>,
+    target_id: Option<&str>,
+) {
+    let res = sqlx::query(
+        "INSERT INTO user_activity (id, user_id, kind, target_type, target_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(kind)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, kind, "failed to record user activity");
     }
 }
 
@@ -1063,7 +1117,7 @@ impl QueryRoot {
             "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id = ? ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
+             WHERE r.series_id = ? AND u.is_banned = 0 ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(series_id.0.clone())
         .bind(PAGE_SIZE + 1)
@@ -1071,11 +1125,14 @@ impl QueryRoot {
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE series_id = ?")
-            .bind(series_id.0.clone())
-            .fetch_one(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id \
+             WHERE r.series_id = ? AND u.is_banned = 0",
+        )
+        .bind(series_id.0.clone())
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
         let has_next = rows.len() as i64 > PAGE_SIZE;
         let items = rows
             .into_iter()
@@ -1088,6 +1145,33 @@ impl QueryRoot {
             has_next_page: has_next,
             total: Some(total as i32),
         })
+    }
+
+    /// The signed-in viewer's own review for a series, fetched by user identity
+    /// so it's always retrievable regardless of pagination. The paginated
+    /// `reviews` list only returns page 1 (`created_at DESC`, `PAGE_SIZE`); on a
+    /// busy series the viewer's earlier review can fall off it, which would show
+    /// them as unrated with an empty body. Returns `null` when the viewer has no
+    /// review, or when the request is anonymous. No `is_banned` filter here: this
+    /// returns the viewer's OWN review and the viewer is authenticated (a banned
+    /// user can't sign in), so the ban filter is both unnecessary and wrong.
+    async fn my_review(&self, ctx: &Context<'_>, series_id: ID) -> Result<Option<Review>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(None);
+        };
+        let st = state(ctx);
+        let row: Option<ReviewJoin> = sqlx::query_as(
+            "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
+             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
+             FROM reviews r JOIN users u ON u.id = r.user_id \
+             WHERE r.series_id = ? AND r.user_id = ?",
+        )
+        .bind(series_id.0.clone())
+        .bind(&user.id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.map(Review::from))
     }
 
     async fn comments(
@@ -1104,7 +1188,7 @@ impl QueryRoot {
             "SELECT c.id, c.target_type, c.target_id, c.body, c.has_spoiler, c.created_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = ? AND c.target_id = ? ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
+             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0 ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
@@ -1114,7 +1198,8 @@ impl QueryRoot {
         .await
         .map_err(gql_err)?;
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM comments WHERE target_type = ? AND target_id = ?",
+            "SELECT COUNT(*) FROM comments c JOIN users u ON u.id = c.user_id \
+             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
@@ -1230,10 +1315,56 @@ impl QueryRoot {
                 let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await;
                 Ok(Some(Session {
                     token: tok,
-                    user: session_user(&u, show_nsfw),
+                    user: build_session_user(&state(ctx).pool, &u, show_nsfw).await,
                 }))
             }
             None => Ok(None),
+        }
+    }
+
+    /// The signed-in user's recent activity feed (newest first). Empty when
+    /// signed out. `limit` is clamped to [1, 50].
+    async fn my_activity(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+    ) -> Result<Vec<Activity>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(vec![]);
+        };
+        let limit = limit.clamp(1, 50) as i64;
+        let rows = sqlx::query_as::<_, ActivityRow>(
+            "SELECT id, kind, target_type, target_id, created_at \
+             FROM user_activity WHERE user_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(&user.id)
+        .bind(limit)
+        .fetch_all(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Row loader for `user_activity`, mapped to the `Activity` GraphQL type.
+#[derive(sqlx::FromRow)]
+struct ActivityRow {
+    id: String,
+    kind: String,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    created_at: String,
+}
+
+impl From<ActivityRow> for Activity {
+    fn from(r: ActivityRow) -> Self {
+        Activity {
+            id: ID(r.id),
+            kind: r.kind,
+            target_type: r.target_type,
+            target_id: r.target_id.map(ID),
+            created_at: r.created_at,
         }
     }
 }
@@ -1262,6 +1393,14 @@ impl MutationRoot {
                 .execute(&st.pool)
                 .await
                 .map_err(gql_err)?;
+                log_activity(
+                    &st.pool,
+                    &user.id,
+                    "library_add",
+                    Some("series"),
+                    Some(&series_id.0),
+                )
+                .await;
             } else {
                 sqlx::query("DELETE FROM canonical_library WHERE user_id = ? AND work_id = ?")
                     .bind(&user.id)
@@ -1392,6 +1531,14 @@ impl MutationRoot {
         .fetch_one(&st.pool)
         .await
         .map_err(gql_err)?;
+        log_activity(
+            &st.pool,
+            &user.id,
+            "review",
+            Some("series"),
+            Some(&input.series_id.0),
+        )
+        .await;
         Ok(row.into())
     }
 
@@ -1418,6 +1565,14 @@ impl MutationRoot {
         .execute(&st.pool)
         .await
         .map_err(gql_err)?;
+        log_activity(
+            &st.pool,
+            &user.id,
+            "comment",
+            Some(target_type),
+            Some(&input.target_id.0),
+        )
+        .await;
         Ok(Comment {
             id: ID(id),
             target_type: target_type.to_string(),
@@ -1489,7 +1644,7 @@ impl MutationRoot {
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         Ok(Session {
             token: tok,
-            user: session_user(&user, show_nsfw),
+            user: build_session_user(&st.pool, &user, show_nsfw).await,
         })
     }
 
@@ -1559,9 +1714,12 @@ impl MutationRoot {
             user: SessionUser {
                 id: ID(id),
                 username: username.to_string(),
+                display_name: None,
+                bio: None,
                 avatar_url: None,
                 is_admin,
                 show_nsfw: false, // fresh accounts default to hiding NSFW
+                joined_at: now,
             },
         })
     }
@@ -1576,6 +1734,46 @@ impl MutationRoot {
                 .map_err(gql_err)?;
         }
         Ok(true)
+    }
+
+    /// Update the signed-in user's editable profile (display name + bio).
+    /// A blank/`null` field clears that value (display falls back to username).
+    /// Returns the refreshed `SessionUser`.
+    async fn update_profile(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateProfileInput,
+    ) -> Result<SessionUser> {
+        let user = require_user(ctx).await?;
+        // Trim, then treat an empty string as "clear" (store NULL).
+        let display_name = input
+            .display_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let bio = input
+            .bio
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(name) = &display_name {
+            if name.chars().count() > 50 {
+                return Err(Error::new("display name must be at most 50 characters"));
+            }
+        }
+        if let Some(b) = &bio {
+            if b.chars().count() > 500 {
+                return Err(Error::new("bio must be at most 500 characters"));
+            }
+        }
+        let st = state(ctx);
+        sqlx::query("UPDATE users SET display_name = ?, bio = ? WHERE id = ?")
+            .bind(&display_name)
+            .bind(&bio)
+            .bind(&user.id)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        Ok(build_session_user(&st.pool, &user, show_nsfw).await)
     }
 
     /// Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2).
@@ -1657,19 +1855,20 @@ impl MutationRoot {
     /// Admin moderation: suspend or restore a user account. A banned user can't
     /// sign in and their active sessions are revoked immediately. Admins can't
     /// ban themselves or another admin.
-    async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<UserRef> {
+    async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<AdminUser> {
         let admin = require_admin(ctx).await?;
         let st = state(ctx);
         if user_id.0 == admin.id {
             return Err(Error::new("You cannot ban your own account."));
         }
-        let target: Option<(String, String, Option<String>, i64)> =
-            sqlx::query_as("SELECT id, username, avatar_url, is_admin FROM users WHERE id = ?")
-                .bind(&user_id.0)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        let Some((id, username, avatar_url, is_admin)) = target else {
+        let target: Option<(String, String, String, Option<String>, i64, String)> = sqlx::query_as(
+            "SELECT id, username, email, avatar_url, is_admin, created_at FROM users WHERE id = ?",
+        )
+        .bind(&user_id.0)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let Some((id, username, email, avatar_url, is_admin, created_at)) = target else {
             return Err(Error::new("No such user."));
         };
         if is_admin != 0 {
@@ -1689,10 +1888,14 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?;
         }
-        Ok(UserRef {
+        Ok(AdminUser {
             id: ID(id),
             username,
+            email,
             avatar_url,
+            is_admin: is_admin != 0,
+            is_banned: banned,
+            created_at,
         })
     }
 
@@ -1800,7 +2003,29 @@ impl MutationRoot {
         let Some(row) = row else {
             return Err(Error::new("No such merge candidate."));
         };
+        // Fast-path only — the correctness guard is the atomic claim below.
         if row.status != "pending" {
+            return Err(Error::new("This merge candidate is already resolved."));
+        }
+
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+
+        // Atomically claim the candidate: only the admin whose UPDATE flips a
+        // still-`pending` row proceeds. A concurrent resolver that already claimed
+        // it leaves `rows_affected() == 0` here, so the loser never repoints.
+        let now = Utc::now().to_rfc3339();
+        let claim = sqlx::query(
+            "UPDATE merge_candidate SET status = ?, resolved_at = ? \
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(if accept { "confirmed" } else { "rejected" })
+        .bind(&now)
+        .bind(&id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if claim.rows_affected() == 0 {
+            tx.rollback().await.map_err(gql_err)?;
             return Err(Error::new("This merge candidate is already resolved."));
         }
 
@@ -1808,13 +2033,13 @@ impl MutationRoot {
             let old_work: Option<String> =
                 sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
                     .bind(&row.source_series_id)
-                    .fetch_optional(&st.pool)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(gql_err)?;
             sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ?")
                 .bind(&row.candidate_work_id)
                 .bind(&row.source_series_id)
-                .execute(&st.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(gql_err)?;
             // Drop the provisional work if nothing else references it now.
@@ -1826,21 +2051,14 @@ impl MutationRoot {
                     )
                     .bind(&old)
                     .bind(&old)
-                    .execute(&st.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(gql_err)?;
                 }
             }
         }
 
-        let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = ? WHERE id = ?")
-            .bind(if accept { "confirmed" } else { "rejected" })
-            .bind(&now)
-            .bind(&id.0)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
         Ok(true)
     }
 }
@@ -2396,6 +2614,109 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn update_profile_persists_and_is_reflected_in_session() {
+        let s = setup().await;
+        // Fresh account: display name/bio are null, joinedAt is present.
+        let r = exec(
+            &s,
+            r#"{ session { user { displayName bio joinedAt } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let j = data_json(&r);
+        assert!(j.contains("\"displayName\":null"), "unexpected: {j}");
+        assert!(j.contains("\"bio\":null"), "unexpected: {j}");
+        assert!(j.contains("\"joinedAt\":\"2020-01-01"), "unexpected: {j}");
+
+        // Update both; the mutation returns the refreshed user.
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { displayName: "  Bob the Reader  ", bio: "I read manga." }) { displayName bio } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let j = data_json(&r);
+        assert!(
+            j.contains("\"displayName\":\"Bob the Reader\""),
+            "trimmed: {j}"
+        );
+        assert!(j.contains("\"bio\":\"I read manga.\""), "{j}");
+
+        // A blank display name clears it (falls back to username in the UI).
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { displayName: "   ", bio: "still here" }) { displayName bio } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(data_json(&r).contains("\"displayName\":null"), "cleared");
+
+        // Anonymous cannot update.
+        let r = exec(
+            &s,
+            r#"mutation { updateProfile(input: { bio: "x" }) { bio } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn update_profile_rejects_overlong_fields() {
+        let s = setup().await;
+        let long_name = "a".repeat(51);
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ updateProfile(input: {{ displayName: "{long_name}" }}) {{ id }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "display name must be at most 50 characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn my_activity_records_reviews_and_is_empty_when_signed_out() {
+        let s = setup().await;
+        // Signed out → empty feed, never an error.
+        let r = exec(&s, r#"{ myActivity { id } }"#, None, "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"myActivity\":[]"));
+
+        // Posting a review records a 'review' activity targeting the series.
+        let r = exec(
+            &s,
+            r#"mutation { postReview(input: { seriesId: "42", score: 8, body: "great", hasSpoiler: false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+
+        let r = exec(
+            &s,
+            r#"{ myActivity { kind targetType targetId } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let j = data_json(&r);
+        assert!(j.contains("\"kind\":\"review\""), "{j}");
+        assert!(j.contains("\"targetType\":\"series\""), "{j}");
+        assert!(j.contains("\"targetId\":\"42\""), "{j}");
     }
 
     #[tokio::test]
@@ -3333,15 +3654,19 @@ mod tests {
             ),
             "No such user."
         );
-        // admin bans bob -> bob can no longer log in
+        // admin bans bob -> bob can no longer log in. The mutation now returns
+        // the full AdminUser, so `isBanned` is selectable and reflects the write.
         let ban = exec(
             &s,
-            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            r#"mutation { banUser(userId:"bob-id", banned:true) { isBanned username } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
         .await;
         assert!(ban.errors.is_empty(), "ban failed: {:?}", ban.errors);
+        let ban_data = ban.data.into_json().unwrap();
+        assert_eq!(ban_data["banUser"]["isBanned"], serde_json::json!(true));
+        assert_eq!(ban_data["banUser"]["username"], serde_json::json!("bob"));
         let login = exec(
             &s,
             r#"mutation { login(username:"bob", password:"password123") { token } }"#,
@@ -3350,6 +3675,177 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&login), "This account has been suspended.");
+    }
+
+    #[tokio::test]
+    async fn ban_hides_comments_and_reviews() {
+        let s = setup().await;
+        // Bob posts a comment on a series thread and a review on that series.
+        let posted_comment = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"great read", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted_comment.errors.is_empty(),
+            "post comment failed: {:?}",
+            posted_comment.errors
+        );
+        let posted_review = exec(
+            &s,
+            r#"mutation { postReview(input:{ seriesId:"s1", score:9, body:"loved it", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted_review.errors.is_empty(),
+            "post review failed: {:?}",
+            posted_review.errors
+        );
+
+        // Before the ban both surface, with total == 1.
+        let before = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total }
+                reviews(seriesId:"s1") { items { id } total } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let b = before.data.into_json().unwrap();
+        assert_eq!(b["comments"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(b["comments"]["total"], serde_json::json!(1));
+        assert_eq!(b["reviews"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(b["reviews"]["total"], serde_json::json!(1));
+
+        // Admin bans bob.
+        let ban = exec(
+            &s,
+            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(ban.errors.is_empty(), "ban failed: {:?}", ban.errors);
+
+        // After the ban bob's comment and review are hidden server-side and the
+        // totals decrement, so the admin's "removed" feedback is truthful on reload.
+        let after = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total }
+                reviews(seriesId:"s1") { items { id } total } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let a = after.data.into_json().unwrap();
+        assert!(a["comments"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(a["comments"]["total"], serde_json::json!(0));
+        assert!(a["reviews"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(a["reviews"]["total"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn my_review_survives_pagination_and_is_null_when_signed_out() {
+        let (s, pool) = setup_full(100).await;
+        // Bob reviews s1 early (created_at = now, e.g. 2026).
+        let posted = exec(
+            &s,
+            r#"mutation { postReview(input:{ seriesId:"s1", score:7, body:"my early take", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted.errors.is_empty(),
+            "post review failed: {:?}",
+            posted.errors
+        );
+        let my_id = posted.data.into_json().unwrap()["postReview"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 20 other users each post a NEWER review on s1, so a page-1 query
+        // (LIMIT PAGE_SIZE, `created_at DESC`) no longer includes bob's earlier one.
+        for i in 0..20 {
+            let uid = format!("filler-{i}");
+            seed_user(&pool, &uid, &format!("filler{i}"), 0, 0).await;
+            sqlx::query(
+                "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
+                 VALUES (?, 's1', ?, 8, 'filler', 0, ?, ?)",
+            )
+            .bind(format!("rev-{i}"))
+            .bind(&uid)
+            .bind(format!("2099-01-01T00:00:{i:02}Z"))
+            .bind(format!("2099-01-01T00:00:{i:02}Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Page 1 of the public reviews list drops bob's earlier review.
+        let page1 = exec(
+            &s,
+            r#"{ reviews(seriesId:"s1") { items { id } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let ids: Vec<String> = page1.data.into_json().unwrap()["reviews"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 20, "page 1 is capped at PAGE_SIZE");
+        assert!(
+            !ids.contains(&my_id),
+            "bob's early review should have fallen off page 1"
+        );
+
+        // But myReview retrieves bob's own review by identity, regardless of paging.
+        let mine = exec(
+            &s,
+            r#"{ myReview(seriesId:"s1") { id score body } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(mine.errors.is_empty(), "myReview failed: {:?}", mine.errors);
+        let m = mine.data.into_json().unwrap();
+        assert_eq!(m["myReview"]["id"], serde_json::json!(my_id));
+        assert_eq!(m["myReview"]["score"], serde_json::json!(7));
+        assert_eq!(m["myReview"]["body"], serde_json::json!("my early take"));
+
+        // A signed-out viewer gets null (and no error) — not `require_user`.
+        let anon = exec(&s, r#"{ myReview(seriesId:"s1") { id } }"#, None, "1.1.1.1").await;
+        assert!(
+            anon.errors.is_empty(),
+            "anon myReview should not error: {:?}",
+            anon.errors
+        );
+        assert_eq!(
+            anon.data.into_json().unwrap()["myReview"],
+            serde_json::Value::Null
+        );
+
+        // A signed-in viewer with no review on this series also gets null.
+        let admin_none = exec(
+            &s,
+            r#"{ myReview(seriesId:"s1") { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(admin_none.errors.is_empty());
+        assert_eq!(
+            admin_none.data.into_json().unwrap()["myReview"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]
@@ -3471,5 +3967,230 @@ mod tests {
             .await
         )
         .contains("overrideIntervalHours"));
+    }
+
+    /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
+    /// dead port; `map_series` never dials it, so read-shape tests stay offline).
+    fn state_with_pool(pool: SqlitePool) -> std::sync::Arc<AppState> {
+        std::sync::Arc::new(AppState {
+            pool,
+            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
+                "test-ua", 5.0, 40.0,
+            )),
+            admin_users: vec![],
+            scan_health: Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 30 * 24 * 60 * 60,
+        })
+    }
+
+    /// AD1: the raw poll override is exposed nullable, distinct from the folded
+    /// effective value. With no admin row `pollEveryMinutesOverride` is null while
+    /// `pollEveryMinutes` still reports the folded default (30); once an override
+    /// is set the raw field echoes it. A row whose poll column is NULL (only a
+    /// sibling override set) must keep the raw poll override null.
+    #[tokio::test]
+    async fn scan_policy_exposes_raw_poll_override_nullable() {
+        let pool = migrated_pool().await;
+        let st = state_with_pool(pool.clone());
+        let m = suwayomi_manga(3, "AD1 Fixture", &["Action"], "src1");
+
+        // No admin row: override is null, effective folds to the default.
+        let scan = map_series(&st, m.clone()).await.scan;
+        assert_eq!(scan.poll_every_minutes, 30, "effective folds to default");
+        assert_eq!(
+            scan.poll_every_minutes_override, None,
+            "no admin row => raw poll override is null"
+        );
+
+        // A sibling-only override (poll column left NULL) must NOT pin poll.
+        sqlx::query(
+            "INSERT INTO series_admin \
+               (series_id, override_interval_hours, poll_every_minutes, paused_override, status_override, updated_at) \
+             VALUES ('3', 12.0, NULL, NULL, NULL, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let scan = map_series(&st, m.clone()).await.scan;
+        assert_eq!(
+            scan.poll_every_minutes, 30,
+            "NULL poll still folds to default"
+        );
+        assert_eq!(
+            scan.poll_every_minutes_override, None,
+            "a NULL poll column stays an unset raw override"
+        );
+
+        // An explicit poll override echoes the raw value on both fields.
+        sqlx::query("UPDATE series_admin SET poll_every_minutes = 45 WHERE series_id = '3'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scan = map_series(&st, m).await.scan;
+        assert_eq!(
+            scan.poll_every_minutes, 45,
+            "effective reflects the override"
+        );
+        assert_eq!(
+            scan.poll_every_minutes_override,
+            Some(45),
+            "raw poll override echoes the explicit value"
+        );
+    }
+
+    /// AD1: saving the whole admin state with no poll override must not create or
+    /// pin a `poll_every_minutes` row — a null clears the column rather than
+    /// writing the folded default. (Suwayomi hydration of the returned Series is
+    /// unreachable in tests, so the mutation surfaces an error, but the upsert has
+    /// already committed and is what we assert on.)
+    #[tokio::test]
+    async fn update_series_admin_null_poll_does_not_pin_override() {
+        let (s, pool) = setup_full(100).await;
+
+        // Save with only a sibling override; poll omitted => null.
+        let _ = exec(
+            &s,
+            r#"mutation { updateSeriesAdmin(input:{seriesId:"3", overrideIntervalHours:12}) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let poll: Option<i64> =
+            sqlx::query_scalar("SELECT poll_every_minutes FROM series_admin WHERE series_id = '3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll, None,
+            "a null poll override leaves the column NULL, not 30"
+        );
+
+        // An explicit poll override persists the raw value.
+        let _ = exec(
+            &s,
+            r#"mutation { updateSeriesAdmin(input:{seriesId:"3", pollEveryMinutes:45}) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let poll: Option<i64> =
+            sqlx::query_scalar("SELECT poll_every_minutes FROM series_admin WHERE series_id = '3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(poll, Some(45), "explicit override persists the raw value");
+    }
+
+    /// AD2: resolving a merge candidate must be an atomic claim, not a
+    /// check-then-write TOCTOU. Once a candidate is accepted, a second resolve of
+    /// the same id must fail with the already-resolved error and must NOT re-run
+    /// the source_series repoint or the provisional-work delete — the guarded
+    /// `WHERE ... AND status='pending'` UPDATE turns the second attempt into a
+    /// no-op, so `resolved_at` stays exactly as the first (winning) call left it.
+    #[tokio::test]
+    async fn resolve_merge_candidate_is_an_atomic_claim() {
+        let (s, pool) = setup_full(100).await;
+
+        // Two works: the provisional one the source currently points at, and the
+        // canonical target the candidate proposes merging onto.
+        for wid in ["w_prov", "w_canon"] {
+            sqlx::query(
+                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
+                 VALUES (?, 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            )
+            .bind(wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss1', 'w_prov', 'suwayomi', 'k1', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO merge_candidate \
+             (id, source_series_id, candidate_work_id, score, method, status, created_at) \
+             VALUES ('mc1', 'ss1', 'w_canon', 0.8, 'title_exact', 'pending', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // First resolve (accept): repoints ss1 onto w_canon and drops the now-orphan
+        // provisional work.
+        let r = exec(
+            &s,
+            r#"mutation { resolveMergeCandidate(id: "mc1", accept: true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "first resolve failed: {:?}", r.errors);
+        assert!(data_json(&r).contains("\"resolveMergeCandidate\":true"));
+
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            work_id, "w_canon",
+            "accept repoints the source onto the canonical work"
+        );
+        let prov_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(prov_count, 0, "the orphaned provisional work is deleted");
+        let (status, resolved_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, resolved_at FROM merge_candidate WHERE id = 'mc1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "confirmed");
+        let resolved_at = resolved_at.expect("resolved_at set on first resolve");
+
+        // Second resolve of the SAME id: the guarded UPDATE matches zero pending
+        // rows, so this is rejected and mutates nothing further.
+        let r2 = exec(
+            &s,
+            r#"mutation { resolveMergeCandidate(id: "mc1", accept: true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r2),
+            "This merge candidate is already resolved.",
+            "the second resolve is refused"
+        );
+
+        // The claim made the second attempt a no-op: work_id unchanged, provisional
+        // work still gone, and resolved_at identical to the winning call (a blind
+        // re-UPDATE would have stamped a fresh timestamp here).
+        let work_id2: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            work_id2, "w_canon",
+            "second resolve does not re-repoint the source"
+        );
+        let resolved_at2: Option<String> =
+            sqlx::query_scalar("SELECT resolved_at FROM merge_candidate WHERE id = 'mc1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            resolved_at2.as_deref(),
+            Some(resolved_at.as_str()),
+            "resolved_at is untouched — the guarded UPDATE claimed nothing the second time"
+        );
     }
 }

@@ -1,8 +1,9 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
+	import Avatar from '$lib/components/Avatar.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 	import { slug } from '$lib/data/mock';
-	import { getProfile, type ProfileView } from '$lib/data/source';
+	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 
@@ -32,14 +33,74 @@
 	// result (mock when signed out / backend off) until then.
 	let liveProfile = $state<ProfileView | null>(null);
 	const profile = $derived(liveProfile ?? data.profile);
+	function refreshProfile(): void {
+		getProfile().then((p) => {
+			liveProfile = p;
+		});
+	}
 	$effect(() => {
 		void auth.ready;
 		void auth.user?.id;
 		if (!auth.ready) return;
-		getProfile().then((p) => {
-			liveProfile = p;
-		});
+		refreshProfile();
 	});
+
+	// --- Edit profile (display name + bio) + avatar upload ------------------
+	let editing = $state(false);
+	let editName = $state('');
+	let editBio = $state('');
+	let savingProfile = $state(false);
+	let profileError = $state('');
+	let uploadingAvatar = $state(false);
+	let avatarError = $state('');
+	let fileInput = $state<HTMLInputElement | null>(null);
+
+	const canEdit = $derived(!!auth.user && !!backend.updateProfile);
+
+	function openEditor(): void {
+		if (!auth.user) return;
+		editName = auth.user.displayName ?? '';
+		editBio = auth.user.bio ?? '';
+		profileError = '';
+		editing = true;
+	}
+
+	async function saveProfile(): Promise<void> {
+		if (savingProfile) return;
+		savingProfile = true;
+		profileError = '';
+		try {
+			const updated = await updateProfile({ displayName: editName, bio: editBio });
+			if (updated && auth.user) {
+				auth.user.displayName = updated.displayName;
+				auth.user.bio = updated.bio;
+			}
+			editing = false;
+			refreshProfile();
+		} catch (err) {
+			profileError = err instanceof Error ? err.message : 'Could not save your profile.';
+		} finally {
+			savingProfile = false;
+		}
+	}
+
+	async function onAvatarPicked(e: Event): Promise<void> {
+		const input = e.currentTarget as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		uploadingAvatar = true;
+		avatarError = '';
+		try {
+			const url = await uploadAvatar(file);
+			if (auth.user) auth.user.avatarUrl = url;
+			refreshProfile();
+		} catch (err) {
+			avatarError = err instanceof Error ? err.message : 'Could not upload the image.';
+		} finally {
+			uploadingAvatar = false;
+			input.value = ''; // allow re-picking the same file
+		}
+	}
 
 	let tab = $state<'reading' | 'completed' | 'favorites'>('reading');
 
@@ -67,7 +128,32 @@
 
 <div class="head k-gutter">
 	<div class="identity">
-		<div class="avatar-lg">{(profile.name.charAt(0) || 'K').toUpperCase()}</div>
+		<div class="avatar-wrap">
+			<Avatar
+				url={profile.avatarUrl}
+				name={profile.name}
+				colorKey={profile.id || profile.name}
+				size={104}
+			/>
+			{#if canEdit}
+				<button
+					class="avatar-edit"
+					aria-label="Change profile photo"
+					title="Change profile photo"
+					disabled={uploadingAvatar}
+					onclick={() => fileInput?.click()}
+				>
+					{#if uploadingAvatar}<span class="spin"></span>{:else}<span class="cam" aria-hidden="true">📷</span>{/if}
+				</button>
+				<input
+					bind:this={fileInput}
+					type="file"
+					accept="image/png,image/jpeg,image/webp"
+					class="visually-hidden"
+					onchange={onAvatarPicked}
+				/>
+			{/if}
+		</div>
 		<div class="who">
 			<div class="name-row">
 				<h1>{profile.name}</h1>
@@ -75,12 +161,36 @@
 			</div>
 			<div class="handle">{profile.handle} · {profile.since}</div>
 			<p class="bio">{profile.bio}</p>
+			{#if avatarError}<p class="setting-error">{avatarError}</p>{/if}
 		</div>
-		<div class="actions">
-			<button class="edit">Edit profile</button>
-			<button class="gear" aria-label="Settings"><Icon name="gear" size={18} /></button>
-		</div>
+		{#if canEdit}
+			<div class="actions">
+				<button class="edit" onclick={openEditor}>Edit profile</button>
+				<button class="gear" aria-label="Settings"><Icon name="gear" size={18} /></button>
+			</div>
+		{/if}
 	</div>
+
+	{#if editing}
+		<div class="editor">
+			<label class="field">
+				<span>Display name</span>
+				<input type="text" bind:value={editName} maxlength="50" placeholder={auth.user?.username} />
+			</label>
+			<label class="field">
+				<span>Bio</span>
+				<textarea bind:value={editBio} maxlength="500" rows="3" placeholder="Tell readers about yourself…"
+				></textarea>
+			</label>
+			{#if profileError}<p class="setting-error">{profileError}</p>{/if}
+			<div class="editor-actions">
+				<button class="cancel" onclick={() => (editing = false)} disabled={savingProfile}>Cancel</button>
+				<button class="save" onclick={saveProfile} disabled={savingProfile}>
+					{savingProfile ? 'Saving…' : 'Save changes'}
+				</button>
+			</div>
+		</div>
+	{/if}
 
 	<div class="stats">
 		{#each profile.stats as s (s.label)}
@@ -209,19 +319,130 @@
 		align-items: flex-start;
 		flex-wrap: wrap;
 	}
-	.avatar-lg {
+	.avatar-wrap {
 		flex: 0 0 auto;
+		position: relative;
 		width: 104px;
 		height: 104px;
+	}
+	.avatar-edit {
+		position: absolute;
+		right: -2px;
+		bottom: -2px;
+		width: 34px;
+		height: 34px;
 		border-radius: 50%;
 		background: var(--k-primary);
+		color: var(--k-on-primary);
+		border: 2px solid var(--k-bg, #0c0c0d);
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		font-family: var(--k-font-display);
+		cursor: pointer;
+		font-size: 15px;
+		line-height: 1;
+		transition: filter 0.15s;
+	}
+	.avatar-edit:hover:not(:disabled) {
+		filter: brightness(1.1);
+	}
+	.avatar-edit:disabled {
+		opacity: 0.7;
+		cursor: default;
+	}
+	.cam {
+		font-size: 15px;
+	}
+	.spin {
+		width: 15px;
+		height: 15px;
+		border-radius: 50%;
+		border: 2px solid rgba(255, 255, 255, 0.4);
+		border-top-color: #fff;
+		animation: spin 0.7s linear infinite;
+	}
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	.visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+	.editor {
+		margin-top: 24px;
+		max-width: 560px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		padding: 22px 24px;
+		border: 1px solid var(--k-border-1);
+		border-radius: 12px;
+		background: var(--k-surface);
+	}
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.field span {
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-dim);
+	}
+	.field input,
+	.field textarea {
+		width: 100%;
+		padding: 10px 12px;
+		background: var(--k-surface-2, var(--k-surface));
+		border: 1px solid var(--k-border-2);
+		border-radius: 8px;
+		color: var(--k-text);
+		font-family: var(--k-font-sans);
+		font-size: 14px;
+		resize: vertical;
+	}
+	.field input:focus,
+	.field textarea:focus {
+		outline: none;
+		border-color: var(--k-border-strong);
+	}
+	.editor-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 10px;
+	}
+	.cancel,
+	.save {
+		height: 40px;
+		padding: 0 18px;
+		border-radius: 8px;
 		font-weight: 700;
-		font-size: 44px;
+		font-size: 13.5px;
+		cursor: pointer;
+	}
+	.cancel {
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-3);
+	}
+	.save {
+		background: var(--k-primary);
+		border: none;
 		color: var(--k-on-primary);
+	}
+	.save:disabled,
+	.cancel:disabled {
+		opacity: 0.6;
+		cursor: default;
 	}
 	.who {
 		flex: 1;

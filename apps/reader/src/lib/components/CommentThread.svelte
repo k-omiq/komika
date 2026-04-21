@@ -13,6 +13,7 @@
 		type CommentView,
 	} from '$lib/data/social-repo';
 	import Icon from '$lib/components/Icon.svelte';
+	import Avatar from '$lib/components/Avatar.svelte';
 
 	interface Props {
 		/** 'chapter' for a per-chapter thread, 'series' for series-level discussion. */
@@ -27,7 +28,6 @@
 	let { targetType, targetId, storageKey, prompt = 'Share your thoughts…' }: Props = $props();
 
 	let comments = $state<CommentView[]>([]);
-	let commentSort = $state<'top' | 'newest'>('newest');
 	let revealed = $state<Record<string, boolean>>({});
 	let draft = $state('');
 	let spoiler = $state(false);
@@ -36,12 +36,8 @@
 	let modError = $state<string | null>(null);
 
 	const needsAuth = $derived(socialLive() && !auth.user);
-	const myInitial = $derived((auth.user?.username ?? 'K').charAt(0).toUpperCase());
 	const canPost = $derived(draft.trim().length > 0 && !posting);
 	const canMod = $derived(canModerate());
-	const sortedComments = $derived(
-		commentSort === 'top' ? [...comments].sort((a, b) => b.likes - a.likes) : comments,
-	);
 
 	const load = (id: string, key: string) =>
 		targetType === 'series' ? loadSeriesComments(id, key) : loadChapterComments(id, key);
@@ -73,11 +69,6 @@
 		};
 	});
 
-	function toggleLike(id: string) {
-		comments = comments.map((c) =>
-			c.id === id ? { ...c, liked: !c.liked, likes: c.likes + (c.liked ? -1 : 1) } : c,
-		);
-	}
 	function reveal(id: string) {
 		revealed = { ...revealed, [id]: true };
 	}
@@ -90,7 +81,6 @@
 			comments = await submit(targetId ?? '', storageKey, body, spoiler, comments);
 			draft = '';
 			spoiler = false;
-			commentSort = 'newest';
 		} catch (err) {
 			postError = err instanceof Error ? err.message : 'Could not post your comment.';
 		} finally {
@@ -110,7 +100,11 @@
 		if (!confirm(`Ban ${c.name}? They won't be able to sign in.`)) return;
 		try {
 			await banCommenter(c.authorId);
-			comments = comments.filter((x) => x.authorId !== c.authorId);
+			// Re-fetch from the server so the banned author's comments disappear via
+			// the authoritative response (the server now hides banned users' content).
+			// A local filter looked immediate but lied — the comments returned on reload.
+			comments = await load(targetId ?? '', storageKey);
+			revealed = {};
 		} catch (err) {
 			modError = err instanceof Error ? err.message : 'Could not ban the user.';
 		}
@@ -119,18 +113,6 @@
 
 <div class="c-head">
 	<h3><Icon name="comment" size={20} stroke="#87857f" />{comments.length} comments</h3>
-	<div class="sort-tabs">
-		<button class="stab" class:on={commentSort === 'top'} onclick={() => (commentSort = 'top')}>
-			Top
-		</button>
-		<button
-			class="stab"
-			class:on={commentSort === 'newest'}
-			onclick={() => (commentSort = 'newest')}
-		>
-			Newest
-		</button>
-	</div>
 </div>
 
 {#if needsAuth}
@@ -145,7 +127,14 @@
 	</div>
 {:else}
 	<div class="composer">
-		<div class="avatar me">{myInitial}</div>
+		<div class="avatar me">
+			<Avatar
+				url={auth.user?.avatarUrl}
+				name={auth.user?.username ?? 'You'}
+				colorKey={auth.user?.id}
+				size={40}
+			/>
+		</div>
 		<div class="composer-body">
 			<textarea bind:value={draft} placeholder={prompt} rows="3"></textarea>
 			{#if postError}<p class="post-error">{postError}</p>{/if}
@@ -165,9 +154,11 @@
 {#if modError}<p class="post-error">{modError}</p>{/if}
 
 <div class="c-list">
-	{#each sortedComments as c (c.id)}
+	{#each comments as c (c.id)}
 		<div class="comment">
-			<div class="avatar" style="background:{c.bg};color:{c.fg}">{c.initial}</div>
+			<div class="avatar">
+				<Avatar url={c.avatarUrl} name={c.name} colorKey={c.authorId} size={40} />
+			</div>
 			<div class="c-body">
 				<div class="c-meta">
 					<span class="c-name">{c.name}</span>
@@ -182,12 +173,8 @@
 				{:else}
 					<p class="c-text">{c.body}</p>
 				{/if}
-				<div class="c-actions">
-					<button class="like" class:on={c.liked} onclick={() => toggleLike(c.id)}>
-						<Icon name="heart" size={15} fill={c.liked ? 'currentColor' : 'none'} />{c.likes}
-					</button>
-					<button class="reply"><Icon name="reply" size={15} />Reply</button>
-					{#if canMod}
+				{#if canMod}
+					<div class="c-actions">
 						<button class="mod" onclick={() => removeComment(c.id)}>
 							<Icon name="x" size={14} />Delete
 						</button>
@@ -196,8 +183,8 @@
 								<Icon name="alert" size={14} />Ban
 							</button>
 						{/if}
-					{/if}
-				</div>
+					</div>
+				{/if}
 			</div>
 		</div>
 	{/each}
@@ -223,25 +210,6 @@
 		font-weight: 700;
 		font-size: 18px;
 		color: var(--k-text-bright);
-	}
-	.sort-tabs {
-		display: flex;
-		gap: 4px;
-	}
-	.stab {
-		font-size: 12.5px;
-		font-weight: 600;
-		padding: 6px 12px;
-		border-radius: var(--k-radius-pill);
-		border: 1px solid var(--k-border-4);
-		background: transparent;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-	}
-	.stab.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
 	}
 	.signin-prompt {
 		display: flex;
@@ -423,9 +391,6 @@
 		font-weight: 600;
 		cursor: pointer;
 		padding: 0;
-	}
-	.like.on {
-		color: var(--k-primary);
 	}
 	.mod {
 		color: var(--k-text-dimmer);

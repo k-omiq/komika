@@ -498,6 +498,7 @@ export interface SeriesComment {
 	chapter: string;
 	time: string;
 	body: string;
+	hasSpoiler: boolean;
 	likes: number;
 	liked: boolean;
 }
@@ -546,6 +547,7 @@ export interface ReaderComment {
 	ts: number;
 	time: string;
 	isOp: boolean;
+	hasSpoiler: boolean;
 	likes: number;
 	liked: boolean;
 	replies: number;
@@ -729,11 +731,13 @@ export const hotUpdates: Card[] = [
 // ---- Profile ---------------------------------------------------------------
 
 export const profile = {
+	id: '',
 	name: 'Kai Reyes',
 	handle: '@kaireads',
 	since: 'Member since March 2023',
 	bio: 'Seinen and dark-fantasy devotee. Always three chapters behind and perfectly fine with it. Currently obsessed with slow-burn supernatural thrillers.',
 	badge: 'PRO READER',
+	avatarUrl: null as string | null,
 	stats: [
 		{ value: '128', label: 'Series read' },
 		{ value: '3,412', label: 'Chapters read' },

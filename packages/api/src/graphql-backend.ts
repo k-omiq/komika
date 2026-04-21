@@ -13,15 +13,16 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
-	UserRef,
 } from '@komika/types';
 import type {
+	Activity,
 	Backend,
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
 	SeriesAdminInput,
 	Session,
+	UpdateProfileInput,
 } from './backend.js';
 import * as ops from './operations.js';
 
@@ -124,6 +125,10 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, { seriesId, page });
 		return d.reviews;
 	}
+	async myReview(seriesId: Id): Promise<Review | null> {
+		const d = await this.gql<{ myReview: Review | null }>(ops.MY_REVIEW, { seriesId });
+		return d.myReview;
+	}
 	async postReview(input: PostReviewInput): Promise<Review> {
 		const d = await this.gql<{ postReview: Review }>(ops.POST_REVIEW, { input });
 		return d.postReview;
@@ -162,8 +167,8 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- admin moderation ---
-	async banUser(userId: Id, banned: boolean): Promise<UserRef> {
-		const d = await this.gql<{ banUser: UserRef }>(ops.BAN_USER, { userId, banned });
+	async banUser(userId: Id, banned: boolean): Promise<AdminUser> {
+		const d = await this.gql<{ banUser: AdminUser }>(ops.BAN_USER, { userId, banned });
 		return d.banUser;
 	}
 
@@ -208,6 +213,37 @@ export class GraphQLBackend implements Backend {
 	async setShowNsfw(value: boolean): Promise<boolean> {
 		const d = await this.gql<{ setShowNsfw: boolean }>(ops.SET_SHOW_NSFW, { value });
 		return d.setShowNsfw;
+	}
+
+	// --- profile ---
+	async updateProfile(input: UpdateProfileInput): Promise<Session['user']> {
+		const d = await this.gql<{ updateProfile: Session['user'] }>(ops.UPDATE_PROFILE, { input });
+		return d.updateProfile;
+	}
+	async myActivity(limit = 20): Promise<Activity[]> {
+		const d = await this.gql<{ myActivity: Activity[] }>(ops.MY_ACTIVITY, { limit });
+		return d.myActivity;
+	}
+	/**
+	 * Avatar upload is a REST multipart POST (not GraphQL): the endpoint is the
+	 * API origin's `/avatar`, derived from the GraphQL `endpoint` by dropping the
+	 * trailing `/graphql`. Returns the new avatar URL (a `/avatars/...` path,
+	 * resolved against the API origin by the reader).
+	 */
+	async uploadAvatar(file: Blob): Promise<string> {
+		const doFetch = this.config.fetch ?? fetch;
+		const url = this.config.endpoint.replace(/\/graphql\/?$/, '') + '/avatar';
+		const form = new FormData();
+		form.append('avatar', file);
+		const res = await doFetch(url, {
+			method: 'POST',
+			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			body: form,
+		});
+		const json = (await res.json().catch(() => null)) as { avatarUrl?: string; message?: string } | null;
+		if (!res.ok) throw new Error(json?.message ?? `Upload failed (${res.status})`);
+		if (!json?.avatarUrl) throw new Error('Upload returned no avatar URL');
+		return json.avatarUrl;
 	}
 
 	// --- canonical catalogue ---

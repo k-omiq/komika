@@ -35,6 +35,7 @@ const SERIES_FIELDS = /* GraphQL */ `
 			paused
 			statusOverride
 			pausedOverride
+			pollEveryMinutesOverride
 			lastScannedAt
 			nextScanAt
 		}
@@ -191,6 +192,24 @@ export const REVIEWS = /* GraphQL */ `
 	}
 `;
 
+export const MY_REVIEW = /* GraphQL */ `
+	${USER_REF}
+	query MyReview($seriesId: ID!) {
+		myReview(seriesId: $seriesId) {
+			id
+			seriesId
+			author {
+				...UserRefFields
+			}
+			score
+			body
+			hasSpoiler
+			createdAt
+			updatedAt
+		}
+	}
+`;
+
 export const POST_REVIEW = /* GraphQL */ `
 	${USER_REF}
 	mutation PostReview($input: PostReviewInput!) {
@@ -250,15 +269,25 @@ export const POST_COMMENT = /* GraphQL */ `
 
 // ---- auth ------------------------------------------------------------------
 
+const SESSION_USER_FIELDS = /* GraphQL */ `
+	fragment SessionUserFields on SessionUser {
+		id
+		username
+		displayName
+		bio
+		avatarUrl
+		isAdmin
+		showNsfw
+		joinedAt
+	}
+`;
+
 const SESSION_FIELDS = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
 	fragment SessionFields on Session {
 		token
 		user {
-			id
-			username
-			avatarUrl
-			isAdmin
-			showNsfw
+			...SessionUserFields
 		}
 	}
 `;
@@ -327,21 +356,6 @@ export const TRIGGER_SCAN = /* GraphQL */ `
 	}
 `;
 
-export const BAN_USER = /* GraphQL */ `
-	${USER_REF}
-	mutation BanUser($userId: ID!, $banned: Boolean!) {
-		banUser(userId: $userId, banned: $banned) {
-			...UserRefFields
-		}
-	}
-`;
-
-export const DELETE_COMMENT = /* GraphQL */ `
-	mutation DeleteComment($commentId: ID!) {
-		deleteComment(commentId: $commentId)
-	}
-`;
-
 const ADMIN_USER_FIELDS = /* GraphQL */ `
 	fragment AdminUserFields on AdminUser {
 		id
@@ -351,6 +365,21 @@ const ADMIN_USER_FIELDS = /* GraphQL */ `
 		isAdmin
 		isBanned
 		createdAt
+	}
+`;
+
+export const BAN_USER = /* GraphQL */ `
+	${ADMIN_USER_FIELDS}
+	mutation BanUser($userId: ID!, $banned: Boolean!) {
+		banUser(userId: $userId, banned: $banned) {
+			...AdminUserFields
+		}
+	}
+`;
+
+export const DELETE_COMMENT = /* GraphQL */ `
+	mutation DeleteComment($commentId: ID!) {
+		deleteComment(commentId: $commentId)
 	}
 `;
 
@@ -415,6 +444,29 @@ export const ADD_SOURCE_SERIES = /* GraphQL */ `
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)
+	}
+`;
+
+// ---- profile ---------------------------------------------------------------
+
+export const UPDATE_PROFILE = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
+	mutation UpdateProfile($input: UpdateProfileInput!) {
+		updateProfile(input: $input) {
+			...SessionUserFields
+		}
+	}
+`;
+
+export const MY_ACTIVITY = /* GraphQL */ `
+	query MyActivity($limit: Int) {
+		myActivity(limit: $limit) {
+			id
+			kind
+			targetType
+			targetId
+			createdAt
+		}
 	}
 `;
 

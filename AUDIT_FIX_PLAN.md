@@ -78,18 +78,18 @@ Phases are ordered by risk-to-ship, then by subsystem to minimize context-switch
 - [x] 6.4 🟡 CR6 — per-user progress/library/rating for canonical works — migration `0014_canonical_progress.sql` adds `canonical_progress` + `canonical_library` (opaque `w_`/uuid keys, user-FK'd, mirroring `reviews`/`comments`). `mark` and `set_progress` now route on id shape: `w_` → `canonical_library` upsert/delete; non-numeric chapter uuid → `canonical_progress` upsert (owning `work_id` resolved from `chapter.external_id`, stored `''` on miss). `map_canonical_series` is now async + user-aware (`is_marked` from `canonical_library`, `rating` from the reused string-keyed `rating_summary` — **zero** schema change for ratings); `map_canonical_chapter` takes per-user `(last_page_read, read)` from one-query-per-series `canonical_progress_map`. Reader: relaxed the `saveProgress` `/^\d+$/` guard (`source.ts`) so uuid progress writes go through; `setLibraryMark` needed no change. Test `canonical_progress_library_and_rating_round_trip` covers mark/unmark, progress upsert-in-place, anon-unread, and rating aggregate. Server tests + clippy + `pnpm check` green. **Deferred follow-up (out of scope, as designed):** canonical works do not yet appear in the **Library screen / profile shelves** — `getLibrary` (`source.ts`) enumerates only `backend.library()` (Suwayomi-global); surfacing them there needs a new `canonicalLibrary` list query + merge. **Phase 6 fully closed** (6.1–6.4).
 
 **Phase 7 — Social, admin, contract polish**
-- [ ] 7.1 🟡 S1 — make `banCommenter` honest (cascade-hide, or drop the client-only filter)
-- [ ] 7.2 🟡 AD1 — nullable poll-override so Save doesn't pin `30`
-- [ ] 7.3 ⚪ AD2 — atomic `resolveMergeCandidate` (WHERE status='pending')
-- [ ] 7.4 ⚪ C2 / C3 — `banUser` return shape; guard `setLibraryMark` for `w_` ids
-- [ ] 7.5 ⚪ S2 / S3 / S4 / AD3 — social/admin low-severity cleanup
+- [x] 7.1 🟡 S1 — make `banCommenter` honest (cascade-hide, or drop the client-only filter) — server-authoritative: `AND u.is_banned = 0` added to comments+reviews LIST JOINs, and both COUNT queries converted to JOIN users so `total` matches; reader `banAuthor` now re-fetches via the existing `load()` instead of the cosmetic local filter. Test `ban_hides_comments_and_reviews` (failing-first). Adjacent (noted): rating-score aggregate `SELECT score FROM reviews` (~:234) still counts banned scores — left out of scope; and stale `social-repo.ts:387-389` "left in place" comment → fold into 7.5.
+- [x] 7.2 🟡 AD1 — nullable poll-override so Save doesn't pin `30` — added `pollEveryMinutesOverride: Int` (nullable, raw override) to `ScanPolicy` across server struct/SDL/TS-types/ops-selection, populated from raw `ov.poll_every_minutes` (None in no-row branch); effective `pollEveryMinutes` unchanged for the "every Xm" label. Admin editor decodes `fPoll` from the nullable override (blank when unset). Save path already sent `null` when blank (line 113) → a blank field now CLEARS instead of pinning 30. 2 tests (read-shape null-when-unset/echo; write-shape null-doesn't-pin).
+- [x] 7.3 ⚪ AD2 — atomic `resolveMergeCandidate` (WHERE status='pending') — reworked into a claim-first transaction: guarded `UPDATE … WHERE id=? AND status='pending'` runs FIRST inside `pool.begin()`; `rows_affected()==0` → rollback + "already resolved" (loser never repoints); the accept-side source_series repoint + orphan-work delete now run on `&mut *tx`, then `tx.commit()`. Old blind final UPDATE removed. Test `resolve_merge_candidate_is_an_atomic_claim` (2nd resolve is a byte-identical-`resolved_at` no-op). Kept the `status!="pending"` fast-path as a non-authoritative optimization.
+- [x] 7.4 ⚪ C2 / C3 — `banUser` return shape; guard `setLibraryMark` for `w_` ids — **C2:** `banUser` now returns `AdminUser!` (server widened the SELECT to fetch email/created_at, builds AdminUser with `is_banned:banned`; SDL + `@komika/api` op/backend/iface updated; `BAN_USER` reuses the `ADMIN_USER_FIELDS` fragment — agent also fixed a fragment TDZ ordering bug). `ban_user_guards` test now asserts `isBanned:true` on the return. **C3 (RE-SCOPED):** the original i64-parse bug is already closed by CR6 (server `mark` routes `w_`→`canonical_library`); a naive early-return would REGRESS that persistence, so C3 landed as a documentation guard on `setLibraryMark` (comment mirroring `saveProgress`, explicitly warning against re-adding the guard) — no behavioral change.
+- [x] 7.5 ⚪ S2 / S3 / S4 / AD3 — social/admin low-severity cleanup (4 commits: S3, AD3, S2/S4; AD3 was dispatched in parallel with C2). **S3:** new nullable `myReview(seriesId)` query (server `current_user`-optional resolver reusing the single-row `(series_id,user_id)` fetch; no `is_banned` filter — it's the viewer's own review) wired through SDL/`@komika/api`; `loadSeriesSocial` now merges it so the viewer's own review survives past page 1. Test `my_review_survives_pagination_and_is_null_when_signed_out`. **AD3 (re-scoped):** client-side guard only — admin updates pager disables Next when `updates.length < PAGE_SIZE(20)`; a fully-real server `hasNextPage` needs a `canonicalUpdates` page-wrapper touching the reader consumer too → deferred as disproportionate for a ⚪ nit (noted). **S2:** persisted `hasSpoiler` on offline `SeriesComment`/`ReaderComment` shapes (+ threaded through map & offline submit paths) so a spoiler flag survives reload; removed the fabricated engagement affordances from `CommentThread` (dead Reply button, never-persisted like button/`toggleLike`, likes-based Top sort → newest-only). **S4 (REFUTED on recheck):** the interfaces are NOT dead — they type the offline `local.getComments<T>` fallback and their fields are read during mapping; deleting them would break typing, so S2's `hasSpoiler` addition completes them instead. Fixed the stale S1-adjacent "left in place" comment. Adjacent (noted, out of scope): the series Reviews section (`series/[slug]/+page.svelte`) still has its own fabricated review-like button over `ReviewView.likes/liked`.
 
 **Phase 8 — Deploy/ops hardening + doc reconciliation**
-- [ ] 8.1 🟡 D3 — handle SIGTERM in graceful shutdown
-- [ ] 8.2 🟡 D5 — loud "NO BACKUP CONFIGURED" banner in deploy.sh
-- [ ] 8.3 🟡 D6 — document `CATALOGUE_SYNC`/`COVER_PHASH`/interval/UA in `.env.example`
-- [ ] 8.4 ⚪ D7 / D8 — CI gates the deploy path; deploy.sh dies if unhealthy
-- [ ] 8.5 ⚪ SC2 doc note — clarify the Suwayomi-vs-MangaDex monitoring split is intended
+- [x] 8.1 🟡 D3 — handle SIGTERM in graceful shutdown — `shutdown_signal` now `tokio::select!`s ctrl_c() and a `SignalKind::terminate()` handler under `#[cfg(unix)]` (non-unix keeps ctrl_c-only); the drain + `shutdown_tx.send(true)` now fires on `docker stop`. `signal` feature already enabled (Cargo.toml:13). No Cargo change.
+- [x] 8.2 🟡 D5 — loud "NO BACKUP CONFIGURED" banner in deploy.sh — end-of-`up` banner mirrors the entrypoint's exact Litestream gate (BUCKET + ACCESS_KEY_ID + SECRET all set → green "backup ENABLED"; else red/bold "⚠ NO BACKUP CONFIGURED" naming what's lost + pointing at LITESTREAM_* in .env). Partial config treated as off (matches server). `bash -n` OK.
+- [x] 8.3 🟡 D6 — document `CATALOGUE_SYNC`/`COVER_PHASH`/interval/UA in `.env.example` — documented all four (exact names/defaults from config.rs: CATALOGUE_SYNC off, MANGADEX_USER_AGENT `Komika/0.1 (+https://github.com/komika)`, CATALOGUE_SYNC_INTERVAL_SECS 21600, COVER_PHASH off) with the single-replica M4 caveat. Server uses an explicit `environment:` block (not `env_file`), so also wired pass-through in docker-compose.yml with off/default fallbacks — feature stays OFF by default. Adjacent (not folded in): MANGADEX_RATE_PER_SEC / MANGADEX_ATHOME_PER_MIN also undocumented, left out of D6 scope.
+- [x] 8.4 ⚪ D7 / D8 — CI gates the deploy path; deploy.sh dies if unhealthy — **D8:** health-wait loop (`for _ in $(seq 1 100)`, ~5min) now sets a `healthy` flag on the all-healthy break; on timeout `die "services did not become healthy: $unhealthy"` instead of bootstrapping a partial stack. **D7:** new always-on `deploy` CI job builds both images (`deploy/server.Dockerfile`, `deploy/reader.Dockerfile`, context `.`) + `docker compose -f deploy/docker-compose.yml config`. No pushes/secrets. `bash -n` + YAML validated.
+- [x] 8.5 ⚪ SC2 doc note — clarify the Suwayomi-vs-MangaDex monitoring split is intended — CATALOGUE.md §5 nested bullet + SPEC.md scanner-section cross-ref: adaptive per-series scanning is Suwayomi-library-only by design; canonical works refresh on the global catalogue interval and deliver deltas via `canonicalUpdates` (intended parallel path, not a coverage bug).
 
 ---
 
@@ -261,3 +261,28 @@ client, all four go live.** Fix them in the same change so you never ship a live
 - **Tests are the verification of record** for the server-side logic fixes (limiters, dedup, gating, session
   expiry, aggregation). Prefer adding a failing test first where practical.
 - **Keep this checklist current** — it is the cross-session source of truth for what's done.
+
+---
+
+## Remediation status — CLOSED end to end (Phases 1–8 complete)
+
+All eight phases are landed. Phases 1–6 were merged into `main` earlier; **Phases 7 and 8** were
+implemented on `audit-fixes/phase7-8-final` (13 fix commits, one per item with its ID in the message:
+C3, D3, D5, D6, SC2, S1, D7/D8, AD1, AD2, C2, AD3, S3, S2/S4 — plus one `AD1` gate-fixup and the
+checklist commit). No new DB migrations were needed for Phases 7–8; the worker app was untouched.
+
+**Single A–Z verification gate: GREEN** (run once over the whole branch after every item was implemented):
+`cargo fmt --check` ✓ · `cargo clippy --all-targets -- -D warnings` ✓ · `cargo test` → **101 passed / 0
+failed / 1 ignored** (the expected `live_suwayomi_end_to_end`) ✓ · reader `svelte-check` 0 errors / 0
+warnings (340 files) ✓ · admin `svelte-check` 0/0 (293 files) ✓ · `docker compose config` parses ✓.
+
+**Behavioral verification of record** (resolver-level integration tests, all passing): S1
+`ban_hides_comments_and_reviews`; AD1 `scan_policy_exposes_raw_poll_override_nullable` +
+`update_series_admin_null_poll_does_not_pin_override`; AD2 `resolve_merge_candidate_is_an_atomic_claim`;
+S3 `my_review_survives_pagination_and_is_null_when_signed_out`; C2 `ban_user_guards` (isBanned). D3
+(SIGTERM) and the pure UI/deploy/doc changes are not preview-observable and rest on review + the green
+gate. Re-scopes recorded above: **C3** (already closed by CR6 → documentation guard only), **AD3**
+(client-side pager guard; a full server `hasNextPage` wrapper deferred as disproportionate), **S4**
+(refuted on recheck — the interfaces are live; S2's `hasSpoiler` addition completes them).
+
+Not pushed; no PR opened; nothing deployed — per instructions.

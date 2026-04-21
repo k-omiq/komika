@@ -36,6 +36,10 @@ export interface ReviewView {
 	id: string;
 	name: string;
 	initial: string;
+	/** Author id — stable colour key for the fallback initial. */
+	authorId?: string;
+	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
+	avatarUrl?: string | null;
 	score: number; // 1..10, 0 = none
 	body: string;
 	time: string;
@@ -50,6 +54,8 @@ export interface CommentView {
 	authorId: string;
 	name: string;
 	initial: string;
+	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
+	avatarUrl?: string | null;
 	bg: string;
 	fg: string;
 	body: string;
@@ -107,6 +113,8 @@ function reviewToView(r: Review): ReviewView {
 		id: r.id,
 		name: r.author.username,
 		initial: initialOf(r.author.username),
+		authorId: r.author.id,
+		avatarUrl: r.author.avatarUrl,
 		score: r.score,
 		body: r.body,
 		time: relTime(r.createdAt),
@@ -124,6 +132,7 @@ function commentToView(c: Comment): CommentView {
 		authorId: c.author.id,
 		name: c.author.username,
 		initial: initialOf(c.author.username),
+		avatarUrl: c.author.avatarUrl,
 		bg: av.bg,
 		fg: av.fg,
 		body: c.body,
@@ -141,8 +150,21 @@ function commentToView(c: Comment): CommentView {
 export async function loadSeriesSocial(seriesId: string, key: string): Promise<SeriesSocial> {
 	if (socialLive()) {
 		const { items } = await backend.reviews(seriesId);
-		const views = items.map(reviewToView);
-		const mine = views.find((v) => v.mine);
+		let views = items.map(reviewToView);
+		// The paginated `reviews` list only returns page 1; on a busy series the
+		// viewer's own (possibly early) review can fall off it, which would show
+		// them as unrated with an empty body. Fetch their own review directly so
+		// the widget always reflects it, and merge it in (prepend, or replace the
+		// matching row if page 1 happened to include it).
+		let mine = views.find((v) => v.mine);
+		if (auth.user && backend.myReview) {
+			const own = await backend.myReview(seriesId);
+			if (own) {
+				const ownView = reviewToView(own);
+				views = [ownView, ...views.filter((v) => v.id !== ownView.id && !v.mine)];
+				mine = ownView;
+			}
+		}
 		return {
 			myScore: mine?.score ?? 0,
 			myBody: mine?.body ?? '',
@@ -162,7 +184,7 @@ export async function loadSeriesSocial(seriesId: string, key: string): Promise<S
 			score: 0,
 			body: c.body,
 			time: c.time,
-			hasSpoiler: false,
+			hasSpoiler: c.hasSpoiler ?? false,
 			mine: false,
 			likes: c.likes,
 			liked: c.liked,
@@ -230,6 +252,7 @@ export async function submitSeriesReview(
 			chapter: '',
 			time: v.time,
 			body: v.body,
+			hasSpoiler: v.hasSpoiler,
 			likes: v.likes,
 			liked: v.liked,
 		})),
@@ -267,7 +290,7 @@ async function loadComments(
 		fg: c.fg,
 		body: c.body,
 		time: c.time,
-		hasSpoiler: false,
+		hasSpoiler: c.hasSpoiler ?? false,
 		isOp: c.isOp,
 		mine: false,
 		likes: c.likes,
@@ -322,6 +345,7 @@ async function submitComment(
 			ts: 999,
 			time: c.time,
 			isOp: c.isOp,
+			hasSpoiler: c.hasSpoiler,
 			likes: c.likes,
 			liked: c.liked,
 			replies: 0,
@@ -383,8 +407,8 @@ export async function deleteChapterComment(
 }
 
 /**
- * Ban a user (admin moderation). Their existing comments are left in place —
- * delete those separately — but they can no longer sign in.
+ * Ban a user (admin moderation). The server now hides banned users' comments
+ * and reviews from reads, and they can no longer sign in.
  */
 export async function banCommenter(userId: string): Promise<void> {
 	if (!socialLive()) throw new Error('Banning requires the live backend.');

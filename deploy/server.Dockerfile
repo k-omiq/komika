@@ -48,7 +48,8 @@ RUN chmod +x /usr/local/bin/komika-entrypoint.sh
 USER komika
 WORKDIR /data
 
-# Defaults; override via compose / deploy env. DB persists under /data.
+# Defaults; override via compose / deploy env. DB persists under /data (user
+# avatars are stored as BLOBs in the DB, so they persist + back up with it).
 ENV PORT=8080 \
     DATABASE_URL=sqlite:///data/komika.sqlite3 \
     SUWAYOMI_URL=http://suwayomi:4567 \

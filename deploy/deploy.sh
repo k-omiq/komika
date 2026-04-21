@@ -54,11 +54,16 @@ $DC up --build -d
 
 say "waiting for services to report healthy…"
 # Give the stack up to ~5 min to go healthy (Suwayomi's first boot is slow).
+# Track whether we broke out because everything went healthy vs. timed out, so a
+# persistently-unhealthy stack fails loudly instead of bootstrapping half-up.
+healthy=""
 for _ in $(seq 1 100); do
   unhealthy=$($DC ps --format '{{.Service}} {{.Health}}' 2>/dev/null | awk '$2!="" && $2!="healthy"{print $1}' | tr '\n' ' ')
-  [ -z "${unhealthy// }" ] && break
+  if [ -z "${unhealthy// }" ]; then healthy=1; break; fi
   sleep 3
 done
+# Timed out with services still not healthy → don't bootstrap a partial stack.
+[ -n "$healthy" ] || die "services did not become healthy: ${unhealthy% }"
 
 # ---- bootstrap ----------------------------------------------------------------
 say "bootstrapping (extensions, Cloudflare bypass, admin, library seed)…"
@@ -72,3 +77,19 @@ printf "  ${bd}Suwayomi${z}    http://%s:%s   (source management / images)\n" "$
 printf "  admin login: ${bd}%s${z} / (KOMIKA_ADMIN_PASSWORD in deploy/.env)\n" "${KOMIKA_ADMIN_USERS%%,*}"
 printf "\n  Manage:  ./deploy.sh logs   ·   ./deploy.sh down   ·   ./deploy.sh destroy\n"
 printf "  The adaptive scanner auto-updates the seeded library — no manual refresh needed.\n"
+
+# ---- backup status ------------------------------------------------------------
+# Continuous backup is opt-in: server-entrypoint.sh only runs the DB under
+# Litestream when ALL of LITESTREAM_BUCKET / LITESTREAM_ACCESS_KEY_ID /
+# LITESTREAM_SECRET_ACCESS_KEY are set (mirror that exact gate here). If backup
+# is off, the single data volume holds accounts, argon2 hashes, session tokens,
+# reviews, comments and scan-state with NO copy — warn loudly so it isn't a
+# silent data-loss surprise.
+if [ -n "${LITESTREAM_BUCKET:-}" ] && [ -n "${LITESTREAM_ACCESS_KEY_ID:-}" ] && [ -n "${LITESTREAM_SECRET_ACCESS_KEY:-}" ]; then
+  printf "\n${gn}✓ Continuous backup ENABLED${z} — DB replicated to %s via Litestream.\n" "${LITESTREAM_BUCKET}"
+else
+  printf "\n${rd}${bd}⚠ NO BACKUP CONFIGURED${z}${rd} — the database has NO continuous backup.${z}\n"
+  printf "${rd}  A volume loss or ${bd}./deploy.sh destroy${z}${rd} is UNRECOVERABLE: accounts, password\n"
+  printf "  hashes, session tokens, reviews, comments and scan-state would be gone.${z}\n"
+  printf "${rd}  Enable it by setting the ${bd}LITESTREAM_*${z}${rd} vars in ${bd}deploy/.env${z}${rd} (see deploy/.env.example).${z}\n"
+fi
