@@ -47,3 +47,12 @@ pnpm --filter @komika/reader desktop:build   # desktop binaries
 
 Foundation only. Every **screen is a placeholder** until the Claude Design
 project can be read into the workspace — see `SPEC.md` → "Blocked: design access".
+
+## License
+
+**AGPL-3.0-only.** See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+
+Komika embeds [Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server)
+(AGPL-3.0) as its on-device content engine, so the whole project is released as
+AGPL open source with public Corresponding Source. That means no Apple App Store —
+distribution is sideload / F-Droid / desktop download (see the native plan §12a).

@@ -3,7 +3,7 @@ name = "komika-server"
 version = "0.1.0"
 edition = "2021"
 description = "Komika unified GraphQL API — federates Suwayomi + Komika-native social/auth/discovery."
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [[bin]]
 name = "komika-server"
