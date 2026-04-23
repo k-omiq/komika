@@ -13,6 +13,8 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	WorkSource,
+	WorkSourceGroup,
 } from '@komika/types';
 import type {
 	Activity,
@@ -266,6 +268,18 @@ export class GraphQLBackend implements Backend {
 	async canonicalPages(chapterId: Id): Promise<Page[]> {
 		const d = await this.gql<{ canonicalPages: Page[] }>(ops.CANONICAL_PAGES, { chapterId });
 		return d.canonicalPages;
+	}
+
+	// --- native-embedded-Suwayomi source routing ---
+	async workSources(workId: Id): Promise<WorkSource[]> {
+		const d = await this.gql<{ workSources: WorkSource[] }>(ops.WORK_SOURCES, { workId });
+		return d.workSources;
+	}
+	async workSourcesBatch(workIds: Id[]): Promise<WorkSourceGroup[]> {
+		const d = await this.gql<{ workSourcesBatch: WorkSourceGroup[] }>(ops.WORK_SOURCES_BATCH, {
+			workIds,
+		});
+		return d.workSourcesBatch;
 	}
 }
 

@@ -124,6 +124,51 @@ export interface CanonicalUpdate {
 	latestAt: string | null;
 }
 
+/**
+ * Extension coordinates for a source that a native client fetches through an
+ * embedded Suwayomi runtime: where to get the APK and which package/version to
+ * load. Null on a WorkSource that Komika fetches MangaDex-natively.
+ */
+export interface SourceExtension {
+	/** Suwayomi extension package name (e.g. `eu.kanade.tachiyomi.extension.en.mangadex`). */
+	pkgName: string;
+	/** Base URL of the extension repository serving the APK. */
+	repoUrl: string;
+	/** APK filename within the repo; null when not pinned. */
+	apkName: string | null;
+	/** Extension version code; null when unknown. */
+	versionCode: number | null;
+	/** Language code the extension targets (e.g. `en`); null when N/A. */
+	lang: string | null;
+}
+
+/**
+ * One source mapping for a canonical work: which source (and, for Suwayomi, which
+ * extension) a native client uses to fetch it, plus the source-local coordinates.
+ * The canonical dedup model (CATALOGUE.md §2) may map several of these to one work.
+ */
+export interface WorkSource {
+	/** `"mangadex"` (MangaDex-native fetch) or `"suwayomi"` (via an extension). */
+	sourceType: string;
+	/** Suwayomi source id. */
+	sourceId: string;
+	/** Manga id/slug identifying the series within the source. */
+	sourceKey: string;
+	/** Canonical source URL for the series; null when not available. */
+	sourceUrl: string | null;
+	isNsfw: boolean;
+	/** Language code of this mapping (e.g. `en`); null when N/A. */
+	lang: string | null;
+	/** Extension coordinates; null for MangaDex-native fetch. */
+	extension: SourceExtension | null;
+}
+
+/** All source mappings resolved for one canonical work (batch grouping). */
+export interface WorkSourceGroup {
+	workId: Id;
+	sources: WorkSource[];
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */

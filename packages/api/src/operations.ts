@@ -515,3 +515,44 @@ export const CANONICAL_PAGES = /* GraphQL */ `
 		}
 	}
 `;
+
+// ---- native-embedded-Suwayomi source routing -------------------------------
+
+const WORK_SOURCE_FIELDS = /* GraphQL */ `
+	fragment WorkSourceFields on WorkSource {
+		sourceType
+		sourceId
+		sourceKey
+		sourceUrl
+		isNsfw
+		lang
+		extension {
+			pkgName
+			repoUrl
+			apkName
+			versionCode
+			lang
+		}
+	}
+`;
+
+export const WORK_SOURCES = /* GraphQL */ `
+	${WORK_SOURCE_FIELDS}
+	query WorkSources($workId: ID!) {
+		workSources(workId: $workId) {
+			...WorkSourceFields
+		}
+	}
+`;
+
+export const WORK_SOURCES_BATCH = /* GraphQL */ `
+	${WORK_SOURCE_FIELDS}
+	query WorkSourcesBatch($workIds: [ID!]!) {
+		workSourcesBatch(workIds: $workIds) {
+			workId
+			sources {
+				...WorkSourceFields
+			}
+		}
+	}
+`;

@@ -14,6 +14,8 @@ import type {
 	ScanStatus,
 	Series,
 	SeriesStatus,
+	WorkSource,
+	WorkSourceGroup,
 } from '@komika/types';
 
 /**
@@ -94,6 +96,14 @@ export interface Backend {
 	 * `chapterId` is the MangaDex chapter uuid. URLs are resolved through the Worker
 	 * proxy by the ImageProvider (never hotlinked). Optional. */
 	canonicalPages?(chapterId: Id): Promise<Page[]>;
+	/** Source mappings + extension coordinates for one canonical work, so a native
+	 * client (embedded Suwayomi) can fetch it directly. `workId` is the `w_`-prefixed
+	 * canonical id. Optional: only the unified Komika API implements it. */
+	workSources?(workId: Id): Promise<WorkSource[]>;
+	/** {@link workSources} for many works at once, grouped by `workId` — for warming
+	 * a native client's source routing over a list. Optional: only the unified
+	 * Komika API implements it. */
+	workSourcesBatch?(workIds: Id[]): Promise<WorkSourceGroup[]>;
 
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;

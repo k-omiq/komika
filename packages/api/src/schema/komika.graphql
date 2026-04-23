@@ -31,6 +31,10 @@ type Query {
 	canonicalSeries(workId: ID!): Series! # [komika] a MangaDex-mirrored work as a Series
 	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
 	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
+	# native-embedded-Suwayomi source routing — per canonical work, the source
+	# mappings + extension coordinates a native client needs to fetch it directly.
+	workSources(workId: ID!): [WorkSource!]! # [komika] source mappings for one canonical work
+	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
@@ -326,6 +330,36 @@ type CanonicalUpdate {
 	latestChapter: String # latest stored chapter number (string; e.g. "10.5")
 	latestChapterTitle: String
 	latestAt: String # publish time of the latest chapter (falls back to ingest time)
+}
+
+# [komika] One source mapping for a canonical work: which source (and, for
+# Suwayomi, which extension) a native client uses to fetch it, plus source-local
+# coordinates. The dedup model (CATALOGUE.md §2) may map several to one work.
+type WorkSource {
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceId: String! # Suwayomi source id
+	sourceKey: String! # manga id/slug within the source
+	sourceUrl: String
+	isNsfw: Boolean!
+	lang: String
+	extension: SourceExtension # null for mangadex-native fetch
+}
+
+# [komika] Extension coordinates for a Suwayomi-backed source: where to get the
+# APK and which package/version a native client loads. Null on a mangadex-native
+# WorkSource.
+type SourceExtension {
+	pkgName: String!
+	repoUrl: String!
+	apkName: String
+	versionCode: Int
+	lang: String
+}
+
+# [komika] All source mappings resolved for one canonical work (batch grouping).
+type WorkSourceGroup {
+	workId: ID!
+	sources: [WorkSource!]!
 }
 
 # [komika] A pending mid-confidence match awaiting manual admin review.
