@@ -55,6 +55,27 @@ pub struct SuwayomiManga {
     pub chapters: Option<ChapterCount>,
 }
 
+/// One installed extension as reported by Suwayomi, flattened to the coordinates a
+/// native device needs to install it (§2.1). One extension can back several sources
+/// (e.g. an "all" extension), so `source_ids` carries every source it provides.
+///
+/// NOTE (could_not_verify): the upstream `ExtensionType` field names below are a
+/// best guess and cannot be confirmed without a live operator Suwayomi. Parsing is
+/// deliberately lenient (Option fields + `#[serde(default)]`) so a shape mismatch
+/// degrades to empty/None rather than panicking. The query lives in one place
+/// (`fetch_extensions`) so it's easy to correct once the real schema is checked.
+#[derive(Debug, Clone)]
+pub struct SuwayomiExtension {
+    pub pkg_name: String,
+    pub repo: Option<String>,
+    pub apk_name: Option<String>,
+    pub version_code: Option<i64>,
+    pub lang: Option<String>,
+    pub is_nsfw: bool,
+    /// Suwayomi source ids this extension provides (join key to `source_series`).
+    pub source_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuwayomiChapter {
@@ -391,6 +412,71 @@ impl SuwayomiClient {
         }
         let d: Data = self.gql(&doc, json!({})).await?;
         Ok(d.mangas.nodes)
+    }
+
+    /// List the installed extensions and their coordinates (§2.1), so the catalogue
+    /// can record, per source id, the exact extension a device must install. Only
+    /// installed extensions are relevant (they're what actually backs a source), so
+    /// the query filters on `isInstalled`.
+    ///
+    /// Best-effort + could_not_verify: the `ExtensionType` shape is a best guess and
+    /// unconfirmed without a live Suwayomi. Parsing is lenient (see `SuwayomiExtension`)
+    /// so a schema mismatch surfaces as an error the caller logs and swallows, never a
+    /// panic. Keep the query text here — it's the single place to fix if the real
+    /// upstream field names differ.
+    pub async fn fetch_extensions(&self) -> Result<Vec<SuwayomiExtension>> {
+        let doc = "query Extensions { \
+            extensions(condition: { isInstalled: true }) { \
+              nodes { pkgName repo apkName versionCode lang isNsfw source { nodes { id } } } } }";
+        #[derive(Deserialize)]
+        struct SourceId {
+            id: String,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct SourceNodes {
+            nodes: Vec<SourceId>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            pkg_name: String,
+            #[serde(default)]
+            repo: Option<String>,
+            #[serde(default)]
+            apk_name: Option<String>,
+            #[serde(default)]
+            version_code: Option<i64>,
+            #[serde(default)]
+            lang: Option<String>,
+            #[serde(default)]
+            is_nsfw: bool,
+            #[serde(default)]
+            source: SourceNodes,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            extensions: Nodes,
+        }
+        let data: Data = self.gql(doc, json!({})).await?;
+        Ok(data
+            .extensions
+            .nodes
+            .into_iter()
+            .map(|n| SuwayomiExtension {
+                pkg_name: n.pkg_name,
+                repo: n.repo,
+                apk_name: n.apk_name,
+                version_code: n.version_code,
+                lang: n.lang,
+                is_nsfw: n.is_nsfw,
+                source_ids: n.source.nodes.into_iter().map(|s| s.id).collect(),
+            })
+            .collect())
     }
 
     pub async fn set_in_library(&self, id: i64, in_library: bool) -> Result<()> {

@@ -258,9 +258,48 @@ fn is_paused(status: SeriesStatus, admin: &ScanAdmin) -> bool {
         .unwrap_or_else(|| paused_for_status(status))
 }
 
+/// Best-effort: record each installed extension's coordinates against its source id
+/// (§2.1), so a native device can install the exact extension a `source_series` came
+/// from. Runs once per tick and is fully non-fatal — any failure (Suwayomi down, an
+/// upstream schema mismatch, a write error) is logged and swallowed so it never
+/// affects the scan. Additive: it only writes `source_extension` rows.
+async fn record_source_extensions(state: &AppState) {
+    let extensions = match state.suwayomi.fetch_extensions().await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "scan tick: failed to fetch Suwayomi extensions");
+            return;
+        }
+    };
+    for ext in extensions {
+        // An extension with no repo can't be installed from coordinates; skip it.
+        let Some(repo_url) = ext.repo.clone() else {
+            continue;
+        };
+        let input = crate::catalog::SourceExtensionInput {
+            pkg_name: ext.pkg_name.clone(),
+            repo_url,
+            apk_name: ext.apk_name.clone(),
+            version_code: ext.version_code,
+            lang: ext.lang.clone(),
+            is_nsfw: ext.is_nsfw,
+        };
+        for source_id in &ext.source_ids {
+            if let Err(e) =
+                crate::catalog::upsert_source_extension(&state.pool, source_id, &input).await
+            {
+                tracing::warn!(source_id, error = %e, "scan tick: failed to record source extension");
+            }
+        }
+    }
+}
+
 /// Run one scan tick over the whole library. Returns `(library_size, overdue_seen)`
 /// for aggregate health reporting. Per-series errors are logged and skipped.
 async fn tick(state: &AppState) -> (usize, usize) {
+    // Refresh extension coordinates first (§2.1); non-fatal, never affects the scan.
+    record_source_extensions(state).await;
+
     let library = match state.suwayomi.library().await {
         Ok(l) => l,
         Err(e) => {

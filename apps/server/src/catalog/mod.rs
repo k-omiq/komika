@@ -608,6 +608,51 @@ pub async fn upsert_source_series(
     Ok(id)
 }
 
+/// The install coordinates for one Suwayomi source's extension (§2.1). Written by
+/// the scanner from the operator-side Suwayomi so a native device can install/pin the
+/// exact extension a `source_series` came from. `version_code` is the version at
+/// catalogue time — the device keeps its extension at or above it so `source_key`s
+/// still resolve.
+pub struct SourceExtensionInput {
+    pub pkg_name: String,
+    pub repo_url: String,
+    pub apk_name: Option<String>,
+    pub version_code: Option<i64>,
+    pub lang: Option<String>,
+    pub is_nsfw: bool,
+}
+
+/// Upsert one source's extension coordinates, keyed by its Suwayomi `source_id`
+/// (the same value carried on `source_series.source_id`). Idempotent — a re-scan
+/// overwrites all columns with the freshly-observed values and bumps `updated_at`.
+pub async fn upsert_source_extension(
+    pool: &SqlitePool,
+    source_id: &str,
+    input: &SourceExtensionInput,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO source_extension \
+           (source_id, pkg_name, repo_url, apk_name, version_code, lang, is_nsfw, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source_id) DO UPDATE SET \
+           pkg_name = excluded.pkg_name, repo_url = excluded.repo_url, \
+           apk_name = excluded.apk_name, version_code = excluded.version_code, \
+           lang = excluded.lang, is_nsfw = excluded.is_nsfw, updated_at = excluded.updated_at",
+    )
+    .bind(source_id)
+    .bind(&input.pkg_name)
+    .bind(&input.repo_url)
+    .bind(&input.apk_name)
+    .bind(input.version_code)
+    .bind(&input.lang)
+    .bind(input.is_nsfw as i64)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Escalate a work to NSFW. Only ever sets the flag — never clears it: "unknown =
 /// safe", but once any source signals NSFW the work stays NSFW. Idempotent. The
 /// gating reads consult `work.is_nsfw` exclusively (never `source_series.is_nsfw`),
@@ -1071,6 +1116,57 @@ mod tests {
             Some(false)
         );
         assert_eq!(chapter_owner_is_nsfw(&pool, "nope").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn source_extension_upsert_is_idempotent_on_source_id() {
+        // §2.1: the source_id is the PK, so a re-scan updates the same row in place
+        // (e.g. a bumped version_code) rather than inserting a duplicate.
+        let pool = pool().await;
+        let sid = "1024";
+        upsert_source_extension(
+            &pool,
+            sid,
+            &SourceExtensionInput {
+                pkg_name: "eu.kanade.tachiyomi.extension.en.mangadex".into(),
+                repo_url: "https://example.test/index.min.json".into(),
+                apk_name: Some("tachiyomi-en.mangadex-v1.4.60.apk".into()),
+                version_code: Some(60),
+                lang: Some("en".into()),
+                is_nsfw: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Re-observe the same source with a higher version_code.
+        upsert_source_extension(
+            &pool,
+            sid,
+            &SourceExtensionInput {
+                pkg_name: "eu.kanade.tachiyomi.extension.en.mangadex".into(),
+                repo_url: "https://example.test/index.min.json".into(),
+                apk_name: Some("tachiyomi-en.mangadex-v1.4.61.apk".into()),
+                version_code: Some(61),
+                lang: Some("en".into()),
+                is_nsfw: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_extension")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "upsert is idempotent on the source_id PK");
+        let version: i64 =
+            sqlx::query_scalar("SELECT version_code FROM source_extension WHERE source_id = ?")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 61, "the second upsert updates the row in place");
     }
 
     #[tokio::test]
