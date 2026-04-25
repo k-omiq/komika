@@ -1016,6 +1016,35 @@ impl QueryRoot {
             .collect())
     }
 
+    /// The catalogued source mappings for one canonical work, plus each source's
+    /// extension coordinates (§2.2) — what a native client needs to install the right
+    /// extension and fetch chapters. The MangaDex-native mapping sorts first, then the
+    /// rest by recency. Public (mirrors the catalogue reads); an opted-out viewer simply
+    /// doesn't see NSFW source mappings.
+    async fn work_sources(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<WorkSource>> {
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        load_work_sources(&st.pool, &work_id.0, show_nsfw).await
+    }
+
+    /// Batched `workSources`: one `WorkSourceGroup` per requested id, in input order. A
+    /// work with no (visible) sources yields an empty `sources` list. NSFW gating is
+    /// identical to `workSources`.
+    async fn work_sources_batch(
+        &self,
+        ctx: &Context<'_>,
+        work_ids: Vec<ID>,
+    ) -> Result<Vec<WorkSourceGroup>> {
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let mut groups = Vec::with_capacity(work_ids.len());
+        for work_id in work_ids {
+            let sources = load_work_sources(&st.pool, &work_id.0, show_nsfw).await?;
+            groups.push(WorkSourceGroup { work_id, sources });
+        }
+        Ok(groups)
+    }
+
     async fn search(
         &self,
         ctx: &Context<'_>,
@@ -1345,6 +1374,73 @@ impl QueryRoot {
         .map_err(gql_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+}
+
+/// One `source_series` row LEFT-JOINed to its `source_extension` coordinates. The
+/// extension columns are all `Option` because a MangaDex-native mapping (source_id
+/// `'mangadex'`) has no extension row, and a Suwayomi source may not be catalogued yet.
+#[derive(sqlx::FromRow)]
+struct WorkSourceRow {
+    source_type: String,
+    source_id: String,
+    source_key: String,
+    source_url: Option<String>,
+    is_nsfw: i64,
+    pkg_name: Option<String>,
+    repo_url: Option<String>,
+    apk_name: Option<String>,
+    version_code: Option<i64>,
+    ext_lang: Option<String>,
+}
+
+/// Load a canonical work's source mappings, MangaDex-native first then by recency,
+/// dropping NSFW rows for an opted-out viewer. The extension is populated only when the
+/// LEFT JOIN matched (`pkg_name`/`repo_url` non-null); `WorkSource.lang` is the
+/// extension's lang since `source_series` carries no per-source language.
+async fn load_work_sources(
+    pool: &SqlitePool,
+    work_id: &str,
+    show_nsfw: bool,
+) -> Result<Vec<WorkSource>> {
+    let rows = sqlx::query_as::<_, WorkSourceRow>(
+        "SELECT ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+                se.pkg_name, se.repo_url, se.apk_name, se.version_code, se.lang AS ext_lang \
+         FROM source_series ss \
+         LEFT JOIN source_extension se ON se.source_id = ss.source_id \
+         WHERE ss.work_id = ? \
+         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .map_err(gql_err)?;
+    Ok(rows
+        .into_iter()
+        // An opted-out viewer simply doesn't see NSFW source mappings (feed semantics).
+        .filter(|r| show_nsfw || r.is_nsfw == 0)
+        .map(|r| {
+            // The LEFT JOIN matches iff the source has a catalogued extension.
+            let extension = match (r.pkg_name, r.repo_url) {
+                (Some(pkg_name), Some(repo_url)) => Some(SourceExtension {
+                    pkg_name,
+                    repo_url,
+                    apk_name: r.apk_name,
+                    version_code: r.version_code.map(|v| v as i32),
+                    lang: r.ext_lang.clone(),
+                }),
+                _ => None,
+            };
+            WorkSource {
+                source_type: r.source_type,
+                source_id: r.source_id,
+                source_key: r.source_key,
+                source_url: r.source_url,
+                is_nsfw: r.is_nsfw != 0,
+                lang: r.ext_lang,
+                extension,
+            }
+        })
+        .collect())
 }
 
 /// Row loader for `user_activity`, mapped to the `Activity` GraphQL type.
@@ -3074,6 +3170,132 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn work_sources_returns_mappings_ordered_and_extension_joined() {
+        let (s, pool) = setup_full(100).await;
+        // A MangaDex-native mapping (no extension) plus a Suwayomi mapping whose
+        // source_id has catalogued extension coordinates.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-x",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Joined Work".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-x'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "1024", "slug-1", None, false,
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_extension(
+            &pool,
+            "1024",
+            &crate::catalog::SourceExtensionInput {
+                pkg_name: "pkg.x".into(),
+                repo_url: "https://r".into(),
+                apk_name: None,
+                version_code: Some(7),
+                lang: Some("en".into()),
+                is_nsfw: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let q = format!(
+            r#"{{ workSources(workId: "{work_id}") {{ sourceType sourceId sourceKey isNsfw lang extension {{ pkgName repoUrl versionCode }} }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let rows = data["workSources"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "both source mappings surface");
+        // The MangaDex-native mapping sorts first and has no extension.
+        assert_eq!(rows[0]["sourceType"], serde_json::json!("mangadex"));
+        assert_eq!(rows[0]["extension"], serde_json::Value::Null);
+        // The Suwayomi mapping carries its joined extension coordinates.
+        assert_eq!(rows[1]["sourceType"], serde_json::json!("suwayomi"));
+        assert_eq!(rows[1]["sourceKey"], serde_json::json!("slug-1"));
+        assert_eq!(rows[1]["extension"]["pkgName"], serde_json::json!("pkg.x"));
+        assert_eq!(
+            rows[1]["extension"]["repoUrl"],
+            serde_json::json!("https://r")
+        );
+        assert_eq!(rows[1]["extension"]["versionCode"], serde_json::json!(7));
+        assert_eq!(rows[1]["lang"], serde_json::json!("en"));
+    }
+
+    #[tokio::test]
+    async fn work_sources_hides_nsfw_for_opted_out_viewer() {
+        let (s, pool) = setup_full(100).await;
+        // A safe MangaDex mapping plus an NSFW Suwayomi mapping on the same work.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-y",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Mixed Work".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-y'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool,
+            &work_id,
+            "suwayomi",
+            "2048",
+            "spicy-slug",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let q =
+            format!(r#"{{ workSources(workId: "{work_id}") {{ sourceType sourceKey isNsfw }} }}"#);
+        // Opted-out viewer: only the safe mapping is visible.
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let rows = data["workSources"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "nsfw mapping hidden for opted-out viewer");
+        assert_eq!(rows[0]["sourceType"], serde_json::json!("mangadex"));
+
+        // After opting in, the NSFW mapping appears.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let rows = data["workSources"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "nsfw mapping visible after opt-in");
+        assert!(
+            rows.iter()
+                .any(|row| row["sourceKey"] == serde_json::json!("spicy-slug")),
+            "the nsfw mapping surfaces: {data}"
+        );
     }
 
     #[tokio::test]

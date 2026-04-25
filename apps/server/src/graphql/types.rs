@@ -117,6 +117,43 @@ pub struct Page {
     pub height: Option<i32>,
 }
 
+/// The install/pin coordinates for one Suwayomi source's extension (§2.2), joined
+/// onto a `WorkSource`. Absent for a MangaDex-native mapping (there is no extension
+/// to install) and for any source that hasn't been catalogued with an extension yet.
+#[derive(SimpleObject, Clone)]
+pub struct SourceExtension {
+    pub pkg_name: String,
+    pub repo_url: String,
+    pub apk_name: Option<String>,
+    /// `Int` (i32); the DB column is INTEGER — cast on read.
+    pub version_code: Option<i32>,
+    pub lang: Option<String>,
+}
+
+/// One catalogued source mapping for a canonical work, plus the extension coordinates
+/// a native client needs to install and fetch from it (§2.2). `extension` is null for
+/// the MangaDex-native mapping (fetched via MangaDex@Home, not an extension).
+#[derive(SimpleObject, Clone)]
+pub struct WorkSource {
+    pub source_type: String,
+    pub source_id: String,
+    pub source_key: String,
+    pub source_url: Option<String>,
+    pub is_nsfw: bool,
+    /// The extension's language (there is no per-source lang on `source_series`);
+    /// null when the source has no catalogued extension.
+    pub lang: Option<String>,
+    pub extension: Option<SourceExtension>,
+}
+
+/// A canonical work's source mappings, keyed by `work_id`, for the batch resolver.
+/// A work with no (visible) sources yields an empty `sources` list.
+#[derive(SimpleObject, Clone)]
+pub struct WorkSourceGroup {
+    pub work_id: ID,
+    pub sources: Vec<WorkSource>,
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct DiscoveryFeed {
     pub kind: DiscoveryFeedKind,
