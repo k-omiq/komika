@@ -31,8 +31,16 @@ export interface WebImageProviderConfig {
 	direct?: boolean;
 }
 
+/**
+ * MangaDex host patterns (uploads.mangadex.org + *.mangadex.network). Doubles as
+ * the set of hosts that must go through the Worker proxy on web (CORS + hotlink;
+ * `direct` breaks them) and the set the native provider fetches via Rust
+ * `fetch_image` (which already sets MangaDex's UA/Referer).
+ */
+const MANGADEX_HOSTS = [/(^|\.)mangadex\.org$/i, /(^|\.)mangadex\.network$/i];
+
 /** Hosts that must go through the Worker proxy (CORS + hotlink); `direct` breaks them. */
-const PROXY_REQUIRED_HOSTS = [/(^|\.)mangadex\.org$/i, /(^|\.)mangadex\.network$/i];
+const PROXY_REQUIRED_HOSTS = MANGADEX_HOSTS;
 
 /** Web provider: rewrite source URLs to Worker-proxied URLs (or pass through in direct mode). */
 export class WebImageProvider implements ImageProvider {
@@ -96,12 +104,45 @@ export class NativeImageProvider implements ImageProvider {
 		return URL.createObjectURL(blob);
 	}
 
+	/** True when `sourceUrl` is a MangaDex upload/network host; invalid URLs → false. */
+	private isMangaDexHost(sourceUrl: string): boolean {
+		let host: string;
+		try {
+			host = new URL(sourceUrl).hostname;
+		} catch {
+			return false;
+		}
+		return MANGADEX_HOSTS.some((re) => re.test(host));
+	}
+
+	/**
+	 * Resolve a non-MangaDex source image (e.g. a Keiyoushi extension) to a blob
+	 * URL. These sources need the extension's per-source request context
+	 * (headers / cookies / Referer) applied, which the generic `fetch_image`
+	 * command does not carry.
+	 *
+	 * TODO(Wave C): route through a dedicated `suwayomi_image(path)` Tauri command
+	 * that streams the bytes through the embedded local engine so the extension's
+	 * request context is applied. For Wave B this is an INERT stub that falls back
+	 * to the existing `fetch_image` path, so current native behavior is unchanged.
+	 */
+	private async resolveViaLocalProxy(sourceUrl: string): Promise<string> {
+		return this.toBlobUrl(sourceUrl);
+	}
+
+	/** Source-aware byte resolution: MangaDex → Rust `fetch_image`; others → local proxy. */
+	private async resolve(sourceUrl: string): Promise<string> {
+		return this.isMangaDexHost(sourceUrl)
+			? this.toBlobUrl(sourceUrl)
+			: this.resolveViaLocalProxy(sourceUrl);
+	}
+
 	async resolvePage(page: Page): Promise<string> {
-		return this.toBlobUrl(page.sourceUrl);
+		return this.resolve(page.sourceUrl);
 	}
 
 	async resolveCover(sourceUrl: string): Promise<string> {
-		return this.toBlobUrl(sourceUrl);
+		return this.resolve(sourceUrl);
 	}
 
 	release(url: string): void {
