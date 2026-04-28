@@ -29,6 +29,13 @@ export const config = {
 	 * hosts like Suwayomi); 'proxy' (default) routes through the Cloudflare Worker.
 	 */
 	imgDirect: env.PUBLIC_KOMIKA_IMG_MODE === 'direct',
+	/**
+	 * Native content engine (embedded Suwayomi). Off by default. When on AND running
+	 * inside Tauri, the reader fetches chapter lists/pages on-device via a
+	 * CompositeBackend; otherwise it uses the hosted backend unchanged. The engine
+	 * transport itself lands later — this flag only selects the composite wrapper.
+	 */
+	nativeEngine: env.PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
 };
 
 /**
