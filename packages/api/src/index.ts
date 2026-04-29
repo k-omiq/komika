@@ -5,3 +5,4 @@ export * from './graphql-backend.js';
 export * from './suwayomi-backend.js';
 export * from './content-backend.js';
 export * from './composite-backend.js';
+export * from './local-suwayomi-backend.js';
