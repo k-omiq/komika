@@ -1,6 +1,9 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+mod suwayomi;
 
 /// Total budget for a single native image fetch (connect + transfer).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -158,7 +161,7 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
+  let app = tauri::Builder::default()
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -167,11 +170,36 @@ pub fn run() {
             .build(),
         )?;
       }
+      // Embedded Suwayomi sidecar (N1.1). Always started; a start failure only logs +
+      // sets a degraded state and never aborts app startup. The engine binds loopback
+      // only and JS reaches it via the `suwayomi_gql` IPC proxy — the JS-side flag
+      // gates USE, and an unused engine is harmless.
+      use tauri::Manager;
+      app.manage(Arc::new(suwayomi::SuwayomiSupervisor::new()));
+      suwayomi::start(app.handle().clone());
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![fetch_image])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .invoke_handler(tauri::generate_handler![
+      fetch_image,
+      suwayomi::suwayomi_gql,
+      suwayomi::suwayomi_status,
+      suwayomi::suwayomi_base_url
+    ])
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application");
+
+  // Graceful shutdown: on exit, terminate the JVM child (Drop's kill_on_drop is a
+  // backstop). block_on is safe here — the run callback is on the main thread, not a
+  // tokio worker.
+  app.run(|handle, event| {
+    if let tauri::RunEvent::Exit = event {
+      use tauri::Manager;
+      if let Some(sup) = handle.try_state::<Arc<suwayomi::SuwayomiSupervisor>>() {
+        let sup = sup.inner().clone();
+        tauri::async_runtime::block_on(async move { sup.stop_and_wait().await });
+      }
+    }
+  });
 }
 
 #[cfg(test)]
