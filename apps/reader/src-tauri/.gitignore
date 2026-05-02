@@ -2,3 +2,10 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# Vendored embedded-Suwayomi runtime (fetched/built by scripts/, never committed).
+# The jar is 174 MB (fetched + SHA-256-verified); the JRE is jlink-built per target.
+# jre/.gitkeep IS tracked so the bundle.resources dir exists on a fresh checkout.
+/suwayomi/Suwayomi-Server.jar
+/jre/*
+!/jre/.gitkeep
