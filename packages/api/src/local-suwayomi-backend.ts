@@ -1,5 +1,6 @@
 import type { Chapter, Id, Page, Series, SeriesStatus, ComicType } from '@komika/types';
 import type { ContentBackend, SourceRef } from './content-backend.js';
+import { isTauri } from './platform.js';
 
 /**
  * Content-only adapter to the EMBEDDED Suwayomi engine, reached over an in-process
@@ -11,10 +12,11 @@ import type { ContentBackend, SourceRef } from './content-backend.js';
  * when the embedded engine is up, while auth/library/progress/social always stay
  * on the hosted server. It deliberately implements ONLY {@link ContentBackend}.
  *
- * Wave B status: INERT scaffolding. `isReady()` returns false, so the composite
- * backend never calls any content method here, and the `suwayomi_gql` command it
- * would invoke does not exist yet (it is registered in Wave C). Nothing in this
- * file runs against a live engine.
+ * Status: `isReady()` is LIVE — it queries the `suwayomi_status` Tauri command and
+ * returns true only when the embedded engine reports `state === "ready"`. Whether
+ * the composite backend ever routes content here still depends on a local backend
+ * being constructed at all (gated by the `PUBLIC_KOMIKA_NATIVE_ENGINE` flag under
+ * Tauri) and on the Wave C content-routing branches being wired.
  */
 export class LocalSuwayomiBackend implements ContentBackend {
 	/**
@@ -40,12 +42,21 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	/**
 	 * Whether the embedded engine is up and can serve content right now.
 	 *
-	 * TODO(Wave C): query the `suwayomi_status` command / readiness gate and return
-	 * true only when the engine is up. Returning false here is what keeps the whole
-	 * backend inert in Wave B — the composite never invokes the content methods.
+	 * Queries the `suwayomi_status` Tauri command and returns true iff the engine
+	 * reports `state === "ready"`; any other state (`starting` / `degraded` /
+	 * `stopped`) yields false. Never throws: on the web target `@tauri-apps/api` is
+	 * absent, so we short-circuit via {@link isTauri} before importing it, and any
+	 * failure of the invoke (engine not up, command missing) is swallowed as false.
 	 */
 	async isReady(): Promise<boolean> {
-		return false;
+		if (!isTauri()) return false;
+		try {
+			const { invoke } = await import('@tauri-apps/api/core');
+			const status = await invoke<{ state?: string }>('suwayomi_status');
+			return status?.state === 'ready';
+		} catch {
+			return false;
+		}
 	}
 
 	async series(ref: SourceRef): Promise<Series> {
