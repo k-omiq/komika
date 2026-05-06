@@ -182,6 +182,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       fetch_image,
       suwayomi::suwayomi_gql,
+      suwayomi::suwayomi_image,
       suwayomi::suwayomi_status,
       suwayomi::suwayomi_base_url
     ])

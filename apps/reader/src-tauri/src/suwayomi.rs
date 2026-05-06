@@ -33,6 +33,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Per-request timeout for the readiness poll and the `suwayomi_gql` proxy.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on an engine image body. Kept in lockstep with lib.rs's
+/// `MAX_IMAGE_BYTES` (32 MiB) so `suwayomi_image` and `fetch_image` bound bytes
+/// identically; `read_capped` lives in lib.rs and is private, so we mirror its
+/// value + streaming logic here rather than reach across modules.
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Restart-storm cap: more than this many restarts inside 60 s trips a long backoff.
 const MAX_RESTARTS_PER_MIN: usize = 5;
 /// Grace period to let a killed JVM reap before we force it again.
@@ -585,6 +590,78 @@ pub async fn suwayomi_gql(
   serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
 }
 
+/// Guard for `suwayomi_image`'s `path`: our narrow, deliberate loopback exemption
+/// (plan §13). The engine's image/proxy routes all live under `/api/`, so we require
+/// `path` to be exactly that shape — this is the SSRF containment that keeps the
+/// command from ever being turned into an arbitrary-URL fetch on 127.0.0.1. Reject
+/// anything that isn't a rooted `/api/...` path, and reject any `..` traversal outright.
+fn validate_image_path(path: &str) -> Result<(), String> {
+  // Must be a rooted path beginning with `/api/`. This rejects empty strings,
+  // absolute URLs (`http://…`), scheme-relative (`//evil`), backslashes, and any
+  // other route (`/etc/passwd`, `/foo`). Byte-level `starts_with` is exact — a
+  // leading `//` fails because the second char must be `a`.
+  if !path.starts_with("/api/") {
+    return Err(format!("suwayomi_image: path must start with /api/, got {path:?}"));
+  }
+  // Belt-and-braces: no path traversal, even though it can't escape `/api/` on the
+  // engine — a `/api/../secret` must never be forwarded.
+  if path.contains("..") {
+    return Err(format!("suwayomi_image: path must not contain '..', got {path:?}"));
+  }
+  // No backslashes (a Windows-y separator that could confuse downstream parsing).
+  if path.contains('\\') {
+    return Err(format!("suwayomi_image: path must not contain '\\', got {path:?}"));
+  }
+  Ok(())
+}
+
+/// IPC-proxy transport for engine image bytes: stream a page/proxy image from the
+/// LOOPBACK engine's own `/api/` routes over IPC and hand the raw bytes to JS. This is
+/// the image counterpart to `suwayomi_gql` — the native `NativeImageProvider` passes a
+/// relative Suwayomi path (e.g. `/api/v1/manga/3/chapter/1/page/0`) and gets back an
+/// `ArrayBuffer`, so the engine (not the JS side) applies the extension's request
+/// context, the port stays hidden, and CSP stays `connect-src 'self' ipc:`.
+///
+/// Loopback is INTENTIONAL here (the inverse of `fetch_image`, whose host guard blocks
+/// 127.0.0.1). The SSRF containment is the `/api/` path guard in `validate_image_path`:
+/// this command can only ever hit the engine's own routes, never an arbitrary URL. The
+/// body is size-capped exactly like `fetch_image`'s `read_capped` (`MAX_IMAGE_BYTES`).
+#[tauri::command]
+pub async fn suwayomi_image(
+  state: State<'_, Arc<SuwayomiSupervisor>>,
+  path: String,
+) -> Result<tauri::ipc::Response, String> {
+  validate_image_path(&path)?;
+  let (port, client) = state
+    .ready_endpoint()
+    .ok_or_else(|| "suwayomi engine not ready".to_string())?;
+  let resp = client
+    .get(format!("http://127.0.0.1:{port}{path}"))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+  let status = resp.status();
+  if !status.is_success() {
+    return Err(format!("engine returned {status}"));
+  }
+  // Mirror lib.rs's `read_capped`: fail fast on an oversized Content-Length, then
+  // enforce the cap again while streaming (a missing/understated header can't OOM us).
+  if let Some(len) = resp.content_length() {
+    if len > MAX_IMAGE_BYTES as u64 {
+      return Err(format!("image too large: {len} bytes"));
+    }
+  }
+  let mut buf: Vec<u8> = Vec::new();
+  let mut resp = resp;
+  while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+    if buf.len() + chunk.len() > MAX_IMAGE_BYTES {
+      return Err("image exceeds size cap".to_string());
+    }
+    buf.extend_from_slice(&chunk);
+  }
+  Ok(tauri::ipc::Response::new(buf))
+}
+
 // ---- Tests -----------------------------------------------------------------
 
 #[cfg(test)]
@@ -602,6 +679,33 @@ mod tests {
     // The two lines that keep the JVM from crashing / phoning out.
     assert!(conf.contains("server.kcefEnabled = false"));
     assert!(conf.contains("server.flareSolverrEnabled = false"));
+  }
+
+  #[test]
+  fn image_path_guard_accepts_engine_api_routes() {
+    // The real relative path shape the engine returns (GQL-SCHEMA-FINDINGS.md §C).
+    assert!(validate_image_path("/api/v1/manga/3/chapter/1/page/0").is_ok());
+    assert!(validate_image_path("/api/v1/manga/3/thumbnail").is_ok());
+  }
+
+  #[test]
+  fn image_path_guard_rejects_non_api_and_traversal() {
+    for bad in [
+      "",                        // empty
+      "/foo",                    // wrong route
+      "/etc/passwd",             // absolute-looking non-api
+      "http://evil",             // absolute URL
+      "//evil",                  // scheme-relative host
+      "/api/../secret",          // traversal out of /api/
+      "../x",                    // relative traversal
+      "/api/\\windows",          // backslash separator
+      "api/v1/manga",            // not rooted
+    ] {
+      assert!(
+        validate_image_path(bad).is_err(),
+        "{bad:?} must be rejected"
+      );
+    }
   }
 
   #[test]
