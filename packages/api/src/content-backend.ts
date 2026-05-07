@@ -4,8 +4,25 @@ import type { Chapter, Id, Page, Series } from '@komika/types';
 export interface SourceRef {
 	/** Suwayomi source id (or "mangadex"). */
 	sourceId: string;
-	/** Manga id/slug within that source. */
+	/** Manga id/slug within that source — corresponds to `MangaType.url`. */
 	sourceKey: string;
+	/**
+	 * Extension package id, used for on-device provisioning. Sourced from
+	 * `workSources.extension.pkgName`. When present, the local backend installs the
+	 * extension (once) before resolving/fetching; when absent, provisioning is skipped.
+	 */
+	pkgName?: string;
+	/**
+	 * Extension store index url, used to register the extension repo before install.
+	 * Sourced from `workSources.extension.repoUrl`. Optional — omitted for extensions
+	 * whose store is already configured.
+	 */
+	repoUrl?: string;
+	/**
+	 * Human-readable title hint for the general search fallback when resolving
+	 * `sourceKey` → internal engine id fails via the fast/by-id paths.
+	 */
+	title?: string;
 }
 
 /**
@@ -21,6 +38,10 @@ export interface ContentBackend {
 	series(ref: SourceRef): Promise<Series>;
 	/** Live chapter list for one source mapping. */
 	chapters(ref: SourceRef): Promise<Chapter[]>;
-	/** Page image URLs for a chapter (chapterId is source-local). */
+	/**
+	 * Page image URLs for a chapter. `chapterId` is the engine's internal integer
+	 * chapter id (passed as a string `Id`) — the same value returned as `Chapter.id`
+	 * from {@link chapters}, not a source-local slug.
+	 */
 	pages(chapterId: Id): Promise<Page[]>;
 }
