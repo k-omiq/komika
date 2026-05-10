@@ -3,6 +3,42 @@ import type { ContentBackend, SourceRef } from './content-backend.js';
 import { isTauri } from './platform.js';
 
 /**
+ * The engine extension package that provides MangaDex. The "all" package exposes a
+ * per-language `SourceType` for every MangaDex language, so it is a single install
+ * that serves all of them; the desired language is selected by `SourceType.id` at
+ * resolve time (see {@link LocalSuwayomiBackend.resolveMangaDexSourceId}).
+ */
+const MANGADEX_PKG = 'eu.kanade.tachiyomi.extension.all.mangadex';
+
+/**
+ * The curated Keiyoushi extension-store index url the engine installs MangaDex from.
+ * The engine canonicalizes this to its `.pb` form internally; adding the store is
+ * idempotent. This mirrors Komika's hardcoded two-tier source strategy — MangaDex
+ * provisioning coords are supplied by the client, not by `workSources` (whose
+ * `extension` is null for MangaDex works).
+ */
+const KEIYOUSHI_REPO = 'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
+
+/**
+ * The minimal structural view of a hosted `WorkSource` that {@link LocalSuwayomiBackend.refFor}
+ * consumes — only the fields it reads. Declared locally (rather than importing the full
+ * `@komika/types` `WorkSource`) so this content-only adapter stays decoupled from the
+ * hosted catalogue shape and accepts any structurally-compatible mapping.
+ */
+export interface WorkSourceLike {
+	/** `"mangadex"` (MangaDex-native) or `"suwayomi"` (via an extension). */
+	sourceType: string;
+	/** Engine source id for a suwayomi source; the literal `"mangadex"` for a MangaDex work. */
+	sourceId: string;
+	/** Source-local manga key (= `MangaType.url`); the bare MangaDex uuid for a MangaDex work. */
+	sourceKey: string;
+	/** Preferred language of this mapping (e.g. `en`); selects the MangaDex `SourceType`. */
+	lang?: string | null;
+	/** Extension provisioning coords for a suwayomi source; null/absent for a MangaDex work. */
+	extension?: { pkgName?: string; repoUrl?: string } | null;
+}
+
+/**
  * Content-only adapter to the EMBEDDED Suwayomi engine, reached over an in-process
  * IPC transport (a Tauri `suwayomi_gql` command) instead of an HTTP `fetch`.
  *
@@ -37,6 +73,13 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	 * for the same extension install it exactly once (install-once / in-flight dedupe).
 	 */
 	private readonly provisioning = new Map<string, Promise<void>>();
+
+	/**
+	 * Cache of resolved MangaDex `SourceType.id` keyed by language, so the `sources`
+	 * round-trip in {@link refFor} runs at most once per language for the instance
+	 * lifetime. The MangaDex source ids are stable within an engine datadir.
+	 */
+	private readonly mangaDexSourceIdCache = new Map<string, string>();
 
 	/**
 	 * Execute a GraphQL document against the embedded engine over IPC.
@@ -110,6 +153,67 @@ export class LocalSuwayomiBackend implements ContentBackend {
 		// `/api/v1/manga/3/chapter/1/page/0`) are passed through unchanged. The
 		// NativeImageProvider / local proxy resolves them against the engine base URL.
 		return (d.fetchChapterPages?.pages ?? []).map((url, index) => ({ index, sourceUrl: url }));
+	}
+
+	/**
+	 * Map a hosted {@link WorkSourceLike} to the engine {@link SourceRef} the content
+	 * methods consume, or null when the mapping can't be resolved on-device.
+	 *
+	 * Two cases, per Komika's two-tier source strategy:
+	 *   - **suwayomi source** — straight passthrough: the engine source id and key
+	 *     already match, and the extension coords ride along from `ws.extension`.
+	 *   - **mangadex source** — the client supplies the MangaDex provisioning coords
+	 *     ({@link MANGADEX_PKG} / {@link KEIYOUSHI_REPO}) because `ws.extension` is null
+	 *     for MangaDex works. The engine source id is resolved DYNAMICALLY from the
+	 *     desired language (never hardcoded), which requires the MangaDex extension to
+	 *     be installed first, so this provisions before the `sources` lookup. The engine
+	 *     wants a `/manga/<uuid>` key, so a bare uuid is prefixed.
+	 *
+	 * Returns null (rather than throwing) for a resolution/provisioning miss so the
+	 * composite falls back to hosted; genuinely unexpected errors propagate to the
+	 * composite's catch.
+	 */
+	async refFor(ws: WorkSourceLike, title?: string): Promise<SourceRef | null> {
+		if (ws.sourceType === 'suwayomi') {
+			return {
+				sourceId: ws.sourceId,
+				sourceKey: ws.sourceKey,
+				pkgName: ws.extension?.pkgName,
+				repoUrl: ws.extension?.repoUrl,
+				title,
+			};
+		}
+		if (ws.sourceType === 'mangadex') {
+			// Install MangaDex before the `sources` query — the SourceType only exists
+			// once the extension is present. A provisioning failure is swallowed here so
+			// the subsequent resolve simply misses and we return null (composite falls back).
+			await this.ensureProvisionedPkg(MANGADEX_PKG, KEIYOUSHI_REPO).catch(() => undefined);
+			const sourceId = await this.resolveMangaDexSourceId(ws.lang || 'en');
+			if (sourceId == null) return null;
+			const sourceKey = ws.sourceKey.startsWith('/manga/') ? ws.sourceKey : `/manga/${ws.sourceKey}`;
+			return { sourceId, sourceKey, pkgName: MANGADEX_PKG, repoUrl: KEIYOUSHI_REPO, title };
+		}
+		return null;
+	}
+
+	/**
+	 * Resolve the engine's MangaDex `SourceType.id` for a language, or null. Picks the
+	 * source whose `extension.pkgName === MANGADEX_PKG` and `lang === lang`, falling back
+	 * to the first MangaDex source when the exact language isn't present. Requires the
+	 * MangaDex extension to be installed already (callers provision first). Cached per
+	 * language for the instance lifetime; never throws (returns null on a query miss).
+	 */
+	private async resolveMangaDexSourceId(lang = 'en'): Promise<string | null> {
+		const cached = this.mangaDexSourceIdCache.get(lang);
+		if (cached != null) return cached;
+		const d = await this.gql<{ sources: { nodes: SuwayomiSource[] } }>(MANGADEX_SOURCES).catch(
+			() => null,
+		);
+		const mangaDex = (d?.sources?.nodes ?? []).filter((s) => s.extension?.pkgName === MANGADEX_PKG);
+		const match = mangaDex.find((s) => s.lang === lang) ?? mangaDex[0];
+		if (!match) return null;
+		this.mangaDexSourceIdCache.set(lang, match.id);
+		return match.id;
 	}
 
 	/**
@@ -194,13 +298,21 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	 * handled upstream by the composite — here we install exactly what we're asked.
 	 */
 	private async ensureProvisioned(ref: SourceRef): Promise<void> {
-		const pkg = ref.pkgName;
+		return this.ensureProvisionedPkg(ref.pkgName, ref.repoUrl);
+	}
+
+	/**
+	 * The pkg-keyed core of {@link ensureProvisioned}, so callers that hold raw
+	 * provisioning coords rather than a full `SourceRef` (e.g. {@link refFor} resolving
+	 * MangaDex) can install through the same install-once / in-flight-deduped path.
+	 */
+	private async ensureProvisionedPkg(pkg: string | undefined, repoUrl?: string): Promise<void> {
 		if (!pkg || this.installed.has(pkg)) return;
 
 		const inflight = this.provisioning.get(pkg);
 		if (inflight) return inflight;
 
-		const task = this.provision(pkg, ref.repoUrl)
+		const task = this.provision(pkg, repoUrl)
 			.then(() => {
 				this.installed.add(pkg);
 			})
@@ -382,6 +494,24 @@ const INSTALL_EXTENSION = /* GraphQL */ `
 	}
 `;
 
+// List installed sources with their language + owning extension, so a MangaDex
+// `SourceType.id` can be resolved dynamically for a language (the "all" MangaDex
+// extension exposes one SourceType per language). `SourceType.id` is a `LongString`
+// (serialized as a string). Requires the MangaDex extension installed first.
+const MANGADEX_SOURCES = /* GraphQL */ `
+	query MangaDexSources {
+		sources {
+			nodes {
+				id
+				lang
+				extension {
+					pkgName
+				}
+			}
+		}
+	}
+`;
+
 interface SuwayomiManga {
 	id: number;
 	title: string;
@@ -397,6 +527,13 @@ interface SuwayomiManga {
 	sourceId: string;
 	source: { lang: string } | null;
 	chapters: { totalCount: number };
+}
+
+interface SuwayomiSource {
+	/** `SourceType.id` — a `LongString`, serialized as a string. */
+	id: string;
+	lang: string;
+	extension: { pkgName: string } | null;
 }
 
 interface SuwayomiChapter {

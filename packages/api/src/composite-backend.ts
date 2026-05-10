@@ -26,7 +26,18 @@ import type {
 	Session,
 	UpdateProfileInput,
 } from './backend.js';
-import type { ContentBackend } from './content-backend.js';
+import type { ContentBackend, SourceRef } from './content-backend.js';
+import type { WorkSourceLike } from './local-suwayomi-backend.js';
+
+/**
+ * The optional source-ref mapping capability layered on the local content backend by
+ * {@link LocalSuwayomiBackend}. `ContentBackend` intentionally stays mapping-agnostic
+ * (it takes a resolved `SourceRef`), so the composite feature-detects `refFor` on the
+ * concrete local backend to translate a hosted `WorkSource` into an engine `SourceRef`.
+ */
+interface RefMapper {
+	refFor(ws: WorkSourceLike, title?: string): Promise<SourceRef | null>;
+}
 
 /**
  * A {@link Backend} that splits work between a hosted server and an optional
@@ -43,6 +54,17 @@ import type { ContentBackend } from './content-backend.js';
  */
 export class CompositeBackend implements Backend {
 	constructor(private opts: { hosted: Backend; local?: ContentBackend | null }) {}
+
+	/**
+	 * Reconciliation map from a hosted canonical chapter id (a globally-unique uuid) to
+	 * the embedded engine's integer chapter id (as a string), populated during
+	 * {@link canonicalChapters} and consulted by {@link canonicalPages} to serve page
+	 * bytes on-device. Keyed flat by canonical chapter id — safe because canonical
+	 * chapter ids are globally unique, and it keeps `canonicalPages` (which has no
+	 * workId) a single lookup. The engine id NEVER reaches `setProgress`: only page
+	 * image bytes are served locally; chapter identity/list/progress stay canonical.
+	 */
+	private readonly localChapterMap = new Map<string, string>();
 
 	/** Whether the local content engine exists and reports itself ready right now. */
 	private async localReady(): Promise<boolean> {
@@ -78,31 +100,21 @@ export class CompositeBackend implements Backend {
 	search(query: string, page?: number): Promise<Paginated<Series>> {
 		return this.opts.hosted.search(query, page);
 	}
-	async series(id: Id): Promise<Series> {
-		// Wave C: when the local engine is ready, resolve (sourceId, sourceKey) for this
-		// work via workSources and fetch the live metadata from `this.opts.local`. Until
-		// that transport lands, the local branch is inert and we always use the hosted server.
-		if (await this.localReady()) {
-			// TODO(Wave C): return this.opts.local!.series(ref)
-		}
+	series(id: Id): Promise<Series> {
+		// Always hosted. Local serving for canonical works happens in the `canonical*`
+		// overrides — the reader routes `w_` canonical ids there. These plain methods
+		// are only hit for non-canonical numeric/source ids, which the native+canonical
+		// path never produces, so there is no on-device branch to take here.
 		return this.opts.hosted.series(id);
 	}
-	async chapters(seriesId: Id): Promise<Chapter[]> {
-		// Wave C: when the local engine is ready, resolve (sourceId, sourceKey) for this
-		// work via workSources and fetch the live list from `this.opts.local`. Until that
-		// transport lands, the local branch is inert and we always use the hosted server.
-		if (await this.localReady()) {
-			// TODO(Wave C): return this.opts.local!.chapters(ref)
-		}
+	chapters(seriesId: Id): Promise<Chapter[]> {
+		// Always hosted — see `series` above. Canonical chapter reconciliation (and any
+		// on-device serving) lives in `canonicalChapters` / `canonicalPages`.
 		return this.opts.hosted.chapters(seriesId);
 	}
-	async pages(chapterId: Id): Promise<Page[]> {
-		// Wave C: when the local engine is ready, fetch the page image URLs on-device from
-		// `this.opts.local` using the source-local chapter id. Until that transport lands,
-		// the local branch is inert and we always use the hosted server.
-		if (await this.localReady()) {
-			// TODO(Wave C): return this.opts.local!.pages(chapterId)
-		}
+	pages(chapterId: Id): Promise<Page[]> {
+		// Always hosted — see `series` above. On-device page bytes for canonical works
+		// are served by `canonicalPages`, not here.
 		return this.opts.hosted.pages(chapterId);
 	}
 
@@ -140,10 +152,67 @@ export class CompositeBackend implements Backend {
 	canonicalSeries(workId: Id): Promise<Series> {
 		return this.opts.hosted.canonicalSeries!(workId);
 	}
-	canonicalChapters(workId: Id): Promise<Chapter[]> {
-		return this.opts.hosted.canonicalChapters!(workId);
+	/**
+	 * The hosted canonical chapter list is ALWAYS the authoritative return — its uuid
+	 * ids, order, and shape are untouched, so the reader's `setProgress(chapter.id)`
+	 * keeps routing canonical uuids to canonical progress. As a best-effort side effect,
+	 * when the local engine is ready this reconciles the hosted chapters against the
+	 * engine's live chapters BY NUMBER (D7) and records `canonicalChapterId → engineChapterId`
+	 * in {@link localChapterMap}, which {@link canonicalPages} later consults to serve
+	 * page bytes on-device. Any local failure is swallowed — reconciliation never
+	 * changes the returned list and never hard-fails the read.
+	 */
+	async canonicalChapters(workId: Id): Promise<Chapter[]> {
+		const chs = await this.opts.hosted.canonicalChapters!(workId);
+		if (await this.localReady()) {
+			try {
+				const sources = await this.opts.hosted.workSources!(workId);
+				// MangaDex-preferred is already first; require a usable mapping (MangaDex, or
+				// a suwayomi source carrying extension provisioning coords).
+				const ws = sources.find((s) => s.sourceType === 'mangadex' || s.extension != null);
+				const mapper = this.opts.local as unknown as Partial<RefMapper>;
+				if (ws && typeof mapper.refFor === 'function') {
+					// Title hint is skipped: MangaDex resolves by uuid without it (a Keiyoushi
+					// title-search fallback would cost an extra canonicalSeries round-trip).
+					const ref = await mapper.refFor(ws);
+					if (ref) {
+						const engineChs = await this.opts.local!.chapters(ref);
+						for (const ch of chs) {
+							const matches = engineChs.filter((e) => Math.abs(e.number - ch.number) < 1e-6);
+							if (matches.length === 0) continue;
+							// Disambiguate same-number engine chapters by scanlator, else take the first.
+							const pick =
+								matches.length > 1
+									? (matches.find((e) => e.scanlator != null && e.scanlator === ch.scanlator) ??
+										matches[0])
+									: matches[0];
+							this.localChapterMap.set(ch.id, String(pick.id));
+						}
+					}
+				}
+			} catch (err) {
+				// Best-effort only: leave the map as-is; canonicalPages falls back to hosted.
+				console.warn('[composite] local chapter reconciliation failed:', err);
+			}
+		}
+		return chs;
 	}
-	canonicalPages(chapterId: Id): Promise<Page[]> {
+	/**
+	 * Page image bytes are served live from the embedded engine when this canonical
+	 * chapter was reconciled to an engine chapter (see {@link canonicalChapters}) and
+	 * the engine is ready; on ANY local error we fall through to the hosted proxy. The
+	 * chapter id here is the canonical uuid, looked up in {@link localChapterMap} to the
+	 * engine's integer chapter id — the engine id never leaks back to identity/progress.
+	 */
+	async canonicalPages(chapterId: Id): Promise<Page[]> {
+		if ((await this.localReady()) && this.localChapterMap.has(chapterId)) {
+			try {
+				return await this.opts.local!.pages(this.localChapterMap.get(chapterId)!);
+			} catch (err) {
+				// Fall through to hosted on any local failure — never hard-fail the read.
+				console.warn('[composite] local canonicalPages failed, using hosted:', err);
+			}
+		}
 		return this.opts.hosted.canonicalPages!(chapterId);
 	}
 	workSources(workId: Id): Promise<WorkSource[]> {
