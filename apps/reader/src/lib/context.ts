@@ -1,6 +1,7 @@
 import {
 	createBackend,
 	createCompositeBackend,
+	createLocalSuwayomiBackend,
 	createSuwayomiBackend,
 	createImageProvider,
 	currentPlatform,
@@ -24,7 +25,7 @@ export const backend =
 	config.backendKind === 'suwayomi'
 		? createSuwayomiBackend({ baseUrl: config.suwayomiUrl })
 		: config.nativeEngine && isTauri()
-			? createCompositeBackend({ hosted: komikaHosted })
+			? createCompositeBackend({ hosted: komikaHosted, local: createLocalSuwayomiBackend() })
 			: komikaHosted;
 export const images = createImageProvider({
 	workerBaseUrl: config.imgWorkerBaseUrl,
