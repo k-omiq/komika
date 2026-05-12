@@ -7,9 +7,51 @@
 > repos), **(3)** content fetching **for web users only** (Suwayomi + Cloudflare Worker images).
 > This is the TachiManga model for the client, plus our server for the value-add.
 
-> **Status:** design/plan only. Nothing here is built yet. The current native path fetches only image
-> *bytes* (`src-tauri/src/lib.rs::fetch_image`); chapter/page **resolution** still comes from the
-> server's Suwayomi even on native. This plan closes that gap.
+> **Status:** Phase 0 + Licensing done; Phase 1 (desktop sidecar) + the core of Phase 2 built and
+> behind `PUBLIC_KOMIKA_NATIVE_ENGINE` (default off). See **§0a Implementation status** below.
+
+---
+
+## 0a. Implementation status (updated; supersedes stale "nothing built yet" notes inline)
+
+**Landed on `feat/native-suwayomi` (all gates green: reader svelte-check 344/0/0, src-tauri 13/0,
+server 112/0):** Phase 0 bridge (`workSources`/`source_extension`), AGPL licensing, the Rust sidecar
+supervisor (`src-tauri/src/suwayomi.rs`: brokered loopback port, `server.conf` boot with
+`kcefEnabled=false`, readiness gate, capped-backoff restart, `suwayomi_gql`/`suwayomi_status`/
+`suwayomi_base_url`/`suwayomi_image` commands), the Tauri bundle wiring (`bundle.resources` + jlink-JRE
+`build-jre.sh` (61 MB) + SHA-verified `fetch-suwayomi-jar.sh` + tightened IPC-only CSP), the
+`native-sidecar.yml` CI matrix, the `LocalSuwayomiBackend` (real v2.3.2243 contract + on-device
+extension provisioning + work→engine-id resolution), the `CompositeBackend` local-serving wiring, the
+`NativeImageProvider` engine-path branch, and `context.ts` activation.
+
+**Model corrections discovered by the N-GQL-SPIKE (see
+`apps/reader/src-tauri/suwayomi/GQL-SCHEMA-FINDINGS.md` for the evidence) — these override the plan
+where it conflicts:**
+- **No getOrInsert-by-url.** `fetchSourceManga` is a browse/search (needs `type`+`page`), there is no
+  `fetchSourceChapters`, and per-manga ops key off the engine's **integer** `MangaType.id`. Resolve a
+  work's `sourceKey`(=`MangaType.url`) → id via `mangas(condition:{sourceId,url})` (fast path) then a
+  MangaDex `fetchSourceManga(SEARCH,"id:<uuid>")` (exact + persists). This replaces D6/§7's clean
+  "one-hop by-key fetch." Non-MangaDex sources use a title-search fallback.
+- **Embedded-engine page URLs are relative `/api/...` proxy paths, not CDN URLs** — served over IPC by
+  the new `suwayomi_image` command (not `fetch_image`). §8's "MangaDex→`fetch_image`" applies only to
+  the hosted-fallback path.
+- **MangaDex needs its extension on-device** (`eu.kanade.tachiyomi.extension.all.mangadex` from the
+  Keiyoushi store) and its engine source id resolved dynamically by language — none of that is in
+  `workSources` (extension is null for MangaDex), so the client supplies it (hardcoded two-tier coords).
+
+**MVP scoping of the live read (deliberate, to preserve progress correctness):** chapter identity +
+list + progress stay canonical/hosted (unchanged); only **page image bytes** serve live from the engine
+via a number-matched (D7) reconciliation map in the composite (`canonicalChapters` builds it,
+`canonicalPages` consults it; engine integer ids never reach `setProgress`). Merging *live/new* chapters
+into the list and progress-keyed-by-number are **deferred to N2.3**.
+
+**Gate C (§3.5) scorecard:** ✅ cold-start `<30 s` + status states (proven) · ✅ no orphaned java
+(proven) · 🟡 kill→degraded+restart (implemented + unit-covered accounting; live kill not automated) ·
+🟡 **live MangaDex read** — the whole path is built and **proven end-to-end via curl** against
+v2.3.2243 (provision → resolve → chapters → 37 relative page paths → `200 image/jpeg` bytes) and every
+code layer is typecheck/clippy/review-verified, but **full in-app render is `could_not_verify` here** —
+it needs a running hosted server with a catalogued MangaDex work **+** the built Tauri desktop app (a
+device-class integration this headless environment can't stand up).
 
 ---
 
