@@ -28,6 +28,7 @@ import type {
 } from './backend.js';
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import type { WorkSourceLike } from './local-suwayomi-backend.js';
+import type { OfflineWriteQueue, WriteOp } from './offline-queue.js';
 
 /**
  * The optional source-ref mapping capability layered on the local content backend by
@@ -51,9 +52,52 @@ interface RefMapper {
  * delegates to `hosted`, making this wrapper behaviorally identical to the plain
  * hosted backend. When Wave C wires a real {@link ContentBackend}, the three
  * content branches resolve a source mapping and fetch on-device instead.
+ *
+ * When an optional {@link OfflineWriteQueue} is supplied (native only; plan §9),
+ * the two on-device writes — `mark` and `setProgress` — are captured into that
+ * durable queue if the hosted write throws, and replayed when connectivity
+ * returns (reconciled by the canonical id the write carries). Without a queue the
+ * class behaves exactly as before: writes delegate straight to `hosted` and a
+ * failure propagates unchanged, so web / flag-off / existing callers are
+ * unaffected.
  */
 export class CompositeBackend implements Backend {
-	constructor(private opts: { hosted: Backend; local?: ContentBackend | null }) {}
+	constructor(
+		private opts: { hosted: Backend; local?: ContentBackend | null; queue?: OfflineWriteQueue },
+	) {
+		// Best-effort: replay any backlog persisted from a previous session, and
+		// re-drain whenever the browser reports connectivity is back. Both are guarded
+		// so a reject can never escape construction or the event handler.
+		if (this.opts.queue) {
+			void this.flushQueue();
+			const g = globalThis as unknown as {
+				addEventListener?: (type: string, cb: () => void) => void;
+			};
+			if (typeof g.addEventListener === 'function') {
+				g.addEventListener('online', () => void this.flushQueue());
+			}
+		}
+	}
+
+	/**
+	 * Drain the offline write-queue against the hosted backend, oldest-first. A
+	 * no-op when no queue is configured. Never throws into a caller: {@link
+	 * OfflineWriteQueue.drain} already swallows a rejecting flush (incrementing
+	 * `tries` and stopping), and the whole call is additionally guarded.
+	 */
+	private async flushQueue(): Promise<void> {
+		const queue = this.opts.queue;
+		if (!queue) return;
+		try {
+			await queue.drain((op: WriteOp) =>
+				op.kind === 'progress'
+					? this.opts.hosted.setProgress(op.chapterId, op.lastPageRead, op.read)
+					: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {}),
+			);
+		} catch {
+			/* defensive: drain is self-contained, but never let a drain reject a caller */
+		}
+	}
 
 	/**
 	 * Reconciliation map from a hosted canonical chapter id (a globally-unique uuid) to
@@ -119,14 +163,44 @@ export class CompositeBackend implements Backend {
 	}
 
 	// --- library & progress ---
-	mark(seriesId: Id, marked: boolean): Promise<Series> {
-		return this.opts.hosted.mark(seriesId, marked);
+	/**
+	 * Library membership is a hosted write (D2). Without a queue this delegates
+	 * straight through (unchanged). With a queue: on a hosted throw (offline) the
+	 * membership is captured for later replay and the error is RETHROWN — the
+	 * reader's `setLibraryMark` catch then keeps its optimistic UI, and we avoid
+	 * fabricating a `Series` we don't have. A success opportunistically drains any
+	 * backlog (connectivity is clearly back).
+	 */
+	async mark(seriesId: Id, marked: boolean): Promise<Series> {
+		if (!this.opts.queue) return this.opts.hosted.mark(seriesId, marked);
+		try {
+			const s = await this.opts.hosted.mark(seriesId, marked);
+			void this.flushQueue();
+			return s;
+		} catch (err) {
+			this.opts.queue.enqueue({ kind: 'mark', seriesId, marked });
+			throw err;
+		}
 	}
 	library(): Promise<Series[]> {
 		return this.opts.hosted.library();
 	}
-	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
-		return this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+	/**
+	 * Reading progress is a hosted write (D2). Without a queue this delegates
+	 * straight through (unchanged). With a queue: on a hosted throw (offline) the
+	 * progress is captured for later replay and the write RESOLVES — progress is
+	 * fire-and-forget and the reader already swallows it, so surfacing the error
+	 * would change nothing but risk an unhandled rejection. A success
+	 * opportunistically drains any backlog.
+	 */
+	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
+		if (!this.opts.queue) return this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+		try {
+			await this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+			void this.flushQueue();
+		} catch {
+			this.opts.queue.enqueue({ kind: 'progress', chapterId, lastPageRead, read });
+		}
 	}
 
 	// --- viewer preferences ---
@@ -283,6 +357,7 @@ export class CompositeBackend implements Backend {
 export function createCompositeBackend(opts: {
 	hosted: Backend;
 	local?: ContentBackend | null;
+	queue?: OfflineWriteQueue;
 }): Backend {
 	return new CompositeBackend(opts);
 }

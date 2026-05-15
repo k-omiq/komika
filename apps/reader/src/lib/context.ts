@@ -1,11 +1,13 @@
 import {
 	createBackend,
 	createCompositeBackend,
+	createLocalStorageAdapter,
 	createLocalSuwayomiBackend,
 	createSuwayomiBackend,
 	createImageProvider,
 	currentPlatform,
 	isTauri,
+	OfflineWriteQueue,
 } from '@komika/api';
 import { config } from './config';
 
@@ -25,7 +27,13 @@ export const backend =
 	config.backendKind === 'suwayomi'
 		? createSuwayomiBackend({ baseUrl: config.suwayomiUrl })
 		: config.nativeEngine && isTauri()
-			? createCompositeBackend({ hosted: komikaHosted, local: createLocalSuwayomiBackend() })
+			? createCompositeBackend({
+					hosted: komikaHosted,
+					local: createLocalSuwayomiBackend(),
+					// Durable offline write-queue (native only; plan §9): captures failed
+					// `mark`/`setProgress` writes and replays them when connectivity returns.
+					queue: new OfflineWriteQueue(createLocalStorageAdapter('komika.offlineWrites')),
+				})
 			: komikaHosted;
 export const images = createImageProvider({
 	workerBaseUrl: config.imgWorkerBaseUrl,
