@@ -110,6 +110,25 @@ export class CompositeBackend implements Backend {
 	 */
 	private readonly localChapterMap = new Map<string, string>();
 
+	/**
+	 * Best-effort, session-lifetime memo of canonical work ids (as strings) whose local
+	 * resolution GENUINELY failed — no engine-resolvable source, {@link RefMapper.refFor}
+	 * returned null / threw (extension can't install, repo down, incompatible), or the
+	 * engine's `chapters` fetch threw. Once memoed, {@link canonicalChapters} skips the
+	 * expensive provision+resolve+reconcile for that work and serves hosted-only, so a
+	 * doomed local path isn't re-hammered on every open (plan §4: "mark that source_series
+	 * unusable on-device and fall back to server fetch ... Never hard-fail the read").
+	 *
+	 * This is deliberately a plain in-memory `Set`: it is cleared only by constructing a
+	 * new backend instance (app restart), which is acceptable per §4 — a merely transient
+	 * failure just costs hosted-fetch for that work until the next launch. It is NOT
+	 * populated for the not-ready engine state (that's a transient rung handled by
+	 * {@link localReady}) nor for a zero-match reconciliation (a data mismatch that a later
+	 * catalogue update may resolve), only for genuine per-source provisioning/resolution
+	 * failures.
+	 */
+	private readonly localUnusable = new Set<string>();
+
 	/** Whether the local content engine exists and reports itself ready right now. */
 	private async localReady(): Promise<boolean> {
 		return !!this.opts.local && (await this.opts.local.isReady());
@@ -235,38 +254,74 @@ export class CompositeBackend implements Backend {
 	 * in {@link localChapterMap}, which {@link canonicalPages} later consults to serve
 	 * page bytes on-device. Any local failure is swallowed — reconciliation never
 	 * changes the returned list and never hard-fails the read.
+	 *
+	 * Fallback ladder (plan §4/§7): rung 2 is this local reconciliation; when a work
+	 * proves unusable on-device it is memoed in {@link localUnusable} and every later
+	 * open skips straight to the hosted list (rung 1) instead of re-provisioning a
+	 * doomed source. The engine being not-ready is a transient state handled by
+	 * {@link localReady} and is never memoed.
 	 */
 	async canonicalChapters(workId: Id): Promise<Chapter[]> {
 		const chs = await this.opts.hosted.canonicalChapters!(workId);
-		if (await this.localReady()) {
+		// Skip local entirely once this work is known-unusable on-device (memo short-circuit),
+		// and skip when the engine isn't ready (transient — do NOT poison the memo for it).
+		if (!this.localUnusable.has(String(workId)) && (await this.localReady())) {
+			// `workSources` is a HOSTED read: a throw here is a transient hosted failure, not a
+			// local-source problem, so fetch it OUTSIDE the mark-unusable region — it must never
+			// poison the memo.
+			let sources: WorkSource[];
 			try {
-				const sources = await this.opts.hosted.workSources!(workId);
-				// MangaDex-preferred is already first; require a usable mapping (MangaDex, or
-				// a suwayomi source carrying extension provisioning coords).
-				const ws = sources.find((s) => s.sourceType === 'mangadex' || s.extension != null);
-				const mapper = this.opts.local as unknown as Partial<RefMapper>;
-				if (ws && typeof mapper.refFor === 'function') {
-					// Title hint is skipped: MangaDex resolves by uuid without it (a Keiyoushi
-					// title-search fallback would cost an extra canonicalSeries round-trip).
-					const ref = await mapper.refFor(ws);
-					if (ref) {
-						const engineChs = await this.opts.local!.chapters(ref);
-						for (const ch of chs) {
-							const matches = engineChs.filter((e) => Math.abs(e.number - ch.number) < 1e-6);
-							if (matches.length === 0) continue;
-							// Disambiguate same-number engine chapters by scanlator, else take the first.
-							const pick =
-								matches.length > 1
-									? (matches.find((e) => e.scanlator != null && e.scanlator === ch.scanlator) ??
-										matches[0])
-									: matches[0];
-							this.localChapterMap.set(ch.id, String(pick.id));
-						}
-					}
-				}
+				sources = await this.opts.hosted.workSources!(workId);
 			} catch (err) {
-				// Best-effort only: leave the map as-is; canonicalPages falls back to hosted.
-				console.warn('[composite] local chapter reconciliation failed:', err);
+				console.warn('[composite] workSources fetch failed; leaving local memo intact:', err);
+				return chs;
+			}
+			const mapper = this.opts.local as unknown as Partial<RefMapper>;
+			// A local backend with no `refFor` is a missing capability (instance-wide, not a
+			// per-work failure), so skip without memoing — nothing to provision here.
+			if (typeof mapper.refFor !== 'function') return chs;
+			// MangaDex-preferred is already first; require a usable mapping (MangaDex, or
+			// a suwayomi source carrying extension provisioning coords).
+			const ws = sources.find((s) => s.sourceType === 'mangadex' || s.extension != null);
+			if (!ws) {
+				// No source this engine can resolve/provision → unusable on-device for this work.
+				this.localUnusable.add(String(workId));
+				return chs;
+			}
+			try {
+				// Title hint is skipped: MangaDex resolves by uuid without it (a Keiyoushi
+				// title-search fallback would cost an extra canonicalSeries round-trip).
+				const ref = await mapper.refFor(ws);
+				if (!ref) {
+					// Provisioning/resolution genuinely failed (extension can't install, repo down,
+					// incompatible, source errored) → memo so subsequent opens skip the doomed path.
+					this.localUnusable.add(String(workId));
+					return chs;
+				}
+				const engineChs = await this.opts.local!.chapters(ref);
+				for (const ch of chs) {
+					const matches = engineChs.filter((e) => Math.abs(e.number - ch.number) < 1e-6);
+					if (matches.length === 0) continue;
+					// Disambiguate same-number engine chapters by scanlator, else take the first.
+					const pick =
+						matches.length > 1
+							? (matches.find((e) => e.scanlator != null && e.scanlator === ch.scanlator) ??
+								matches[0])
+							: matches[0];
+					this.localChapterMap.set(ch.id, String(pick.id));
+				}
+				// A zero-match reconciliation is intentionally NOT memoed: the source resolved
+				// fine, it's a data/number mismatch a later catalogue update may fix. Leaving it
+				// unmarked lets a future open retry the match; canonicalPages still falls back to
+				// hosted in the meantime.
+			} catch (err) {
+				// `refFor`/`chapters` threw — a genuine per-source provisioning/resolution failure
+				// (§4). Memo it and fall back to hosted; reconciliation never hard-fails the read.
+				this.localUnusable.add(String(workId));
+				console.warn(
+					'[composite] local chapter reconciliation failed; marking work unusable on-device:',
+					err,
+				);
 			}
 		}
 		return chs;
