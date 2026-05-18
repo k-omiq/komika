@@ -29,6 +29,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Async DNS resolution for the pre-fetch host guard (client-side SSRF defense) and the
 # embedded Suwayomi sidecar supervisor (child process, readiness poll, log pumps).
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }
+# Tiny sync HTTP listener for the on-device Cloudflare FlareSolverr-v1 shim (N-CF).
+# Chosen over axum/hyper to keep the dep tree small: tiny_http pulls only ascii /
+# chunked_transfer / httpdate / log. It runs on a dedicated thread and bridges to the
+# async WebView solver via `tauri::async_runtime::block_on`.
+tiny_http = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }

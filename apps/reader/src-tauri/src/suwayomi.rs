@@ -111,6 +111,10 @@ pub struct SuwayomiSupervisor {
   stopping: AtomicBool,
   /// Held for the app's lifetime; dropping removes the lockfile.
   lock: Mutex<Option<LockGuard>>,
+  /// Loopback URL of the on-device Cloudflare shim (N-CF), if it started. Set once at
+  /// `start()`; the supervisor points the engine at it via `setSettings` on each `Ready`
+  /// transition (the shim URL is only known post-broker, so this must run after ready).
+  cf_shim_url: Mutex<Option<String>>,
 }
 
 impl SuwayomiSupervisor {
@@ -131,7 +135,14 @@ impl SuwayomiSupervisor {
       notify: tokio::sync::Notify::new(),
       stopping: AtomicBool::new(false),
       lock: Mutex::new(None),
+      cf_shim_url: Mutex::new(None),
     }
+  }
+
+  /// Record the on-device Cloudflare shim URL so `setSettings` can point the engine at it
+  /// once ready. Called at most once, before the supervision loop runs.
+  pub fn set_cf_shim_url(&self, url: String) {
+    *self.cf_shim_url.lock().unwrap() = Some(url);
   }
 
   fn set_ready(&self, port: u16, version: String) {
@@ -373,6 +384,13 @@ async fn run_supervisor(sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
       Ok((mut child, port, version)) => {
         log::info!(target: "suwayomi", "engine ready ({version}) on port {port}");
         sup.set_ready(port, version);
+        // Point the engine's Cloudflare interceptor at our on-device shim (N-CF). Best
+        // effort and fire-and-forget: a failure only logs and CF sources fall back to
+        // server-fetch — it must never stall or crash the supervision loop.
+        if let Some(shim_url) = sup.cf_shim_url.lock().unwrap().clone() {
+          let client = sup.client.clone();
+          tauri::async_runtime::spawn(crate::cloudflare::apply_settings(client, port, shim_url));
+        }
         tokio::select! {
           _ = sup.notify.notified() => {
             stop_child(&mut child).await;
@@ -544,6 +562,15 @@ pub fn start(app: AppHandle) {
       sup.transition(EngineState::Degraded, Some(e));
       return;
     }
+  }
+
+  // On-device Cloudflare shim (N-CF): start the loopback FlareSolverr-v1 listener and
+  // record its URL so the supervisor wires it into the engine once ready. Best effort;
+  // if it doesn't start, CF sources just fall back to server-fetch. The shim is inert
+  // until the engine POSTs to it (which only happens when the engine hits a challenge).
+  if let Some(shim) = crate::cloudflare::start(&app) {
+    sup.set_cf_shim_url(shim.url());
+    app.manage(shim);
   }
 
   tauri::async_runtime::spawn(run_supervisor(sup, cfg));

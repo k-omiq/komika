@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+mod cloudflare;
 mod suwayomi;
 
 /// Total budget for a single native image fetch (connect + transfer).
