@@ -64,6 +64,12 @@ MODULES="java.base,java.desktop,java.sql,java.sql.rowset,java.naming,java.manage
   --compress=zip-9 \
   --output "${OUT_DIR}"
 
+# jlink writes module legal notices read-only (mode 444). Tauri's bundler copies this
+# tree into target/<profile>/jre and, on a later rebuild, `fs::copy` fails to overwrite
+# those read-only files ("Permission denied"). Make the whole output user-writable so
+# every re-copy succeeds.
+chmod -R u+w "${OUT_DIR}"
+
 # Sanity: the launcher the supervisor probes must exist.
 JAVA_BIN="${OUT_DIR}/bin/java"
 [[ "${OS}" == "windows" ]] && JAVA_BIN="${OUT_DIR}/bin/java.exe"
