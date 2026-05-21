@@ -58,6 +58,23 @@ real hosted server returning `workSources` for a network-scanned MangaDex work (
 `load_work_sources` shapes; hosted resolvers have 112 passing tests). The native Tauri desktop window
 itself can't be automated headless.
 
+**Wave D (Phase 2) — COMPLETE:** **N2.1** on-device extension provisioning (install-once/in-flight
+dedupe; curl+harness-verified) · **N2.2** three-rung fallback ladder (local→hosted with a session
+`localUnusable` memo so a doomed source isn't re-provisioned each open; rung-3 is the reader's existing
+`readerFallback`; 13-assertion check) · **N2.3** durable offline write-queue (`mark`/`setProgress`
+captured to a `localStorage`-backed queue, collapse + `MAX_TRIES` poison-drop, replays on reconnect;
+19-assertion check) · **N-CF** on-device Cloudflare bypass — **fork-avoidable** (spike): a loopback Rust
+FlareSolverr-v1 shim + Tauri-WebView solver, wired via `setSettings(flareSolverrUrl=<shim>)` on engine
+ready; stock Suwayomi injects `cf_clearance`/UA, no fork. Verified: shim protocol + engine-fallback
+contract + loopback health (7 tests), live `setSettings` acceptance against v2.3.2243. **N-CF
+`could_not_verify`:** a live CF challenge solved in the WebView with `cf_clearance` replayed through the
+engine (needs a real display + a gated source), per-OS webview UA-override/cookie-read behavior, and the
+interactive-Turnstile UX. Deterministic checks live under `apps/reader/src-tauri/e2e/`.
+
+**Remaining after Wave D:** Wave E (Android/iOS) is spike-first research, not started; the client layers
+above the JVM transport (composite, backends, offline queue, fallback, image provider) carry over
+unchanged. Phase-∞ offline downloads/storage UI untouched.
+
 ---
 
 ## 0. Decisions locked up front (change these here, not inline)
