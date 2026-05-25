@@ -71,9 +71,25 @@ contract + loopback health (7 tests), live `setSettings` acceptance against v2.3
 engine (needs a real display + a gated source), per-OS webview UA-override/cookie-read behavior, and the
 interactive-Turnstile UX. Deterministic checks live under `apps/reader/src-tauri/e2e/`.
 
-**Remaining after Wave D:** Wave E (Android/iOS) is spike-first research, not started; the client layers
-above the JVM transport (composite, backends, offline queue, fallback, image provider) carry over
-unchanged. Phase-∞ offline downloads/storage UI untouched.
+**Wave E spikes — COMPLETE (research only, review-gated; no impl):** **N3-SPIKE**
+(`docs/plans/n3-android-spike.md`) — Android verdict: path (b), bundle an arm64 OpenJDK and run the
+STOCK v2.3.2243 jar in-process (`JNI_CreateJavaVM` in a foreground service; API-29 exec ban rules out
+a child process); TachiManga's shipping `master` is legacy pre-GraphQL REST (behind_by 1026, no
+`graphql` package) so fork-adoption would abandon our GraphQL stack — harvest its few MPL files
+(AWT-free graphics, WebView/cookie) only if the N3.7 AWT probe demands it; GraalVM native-image ruled
+out (runtime URLClassLoader); CF = existing shim + Kotlin plugin over `android.webkit.CookieManager`.
+**N4-SPIKE** (`docs/plans/n4-ios-spike.md`) — iOS verdict: FEASIBLE via OpenJDK-mobile Zero
+interpreter (no-JIT is a kernel rule that binds on every §12a channel); the feared dex-extension
+blocker dissolves (stock Suwayomi already dex2jars APKs to plain JVM bytecode); WKHTTPCookieStore
+works (unlike Tauri-Android) so N-CF ports; gating prototype = boot the stock jar in-process on a
+physical ≥4 GB iPhone and measure cold-start/latency/RSS. **N-RUNBOOK**
+(`docs/plans/device-verify-runbook.md`) — the standing manual device-class verification (in-app
+engine read + live CF solve), with the `.env` `BACKEND_KIND=komika` and dev-build-only-logging traps
+documented.
+
+**Remaining after Wave E spikes:** execute the runbook on a display (the standing `could_not_verify`);
+review the spikes and green-light the N4 gating prototype / N3.1 headless probe. Phase-∞ offline
+downloads/storage UI untouched.
 
 ---
 
