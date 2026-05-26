@@ -370,6 +370,26 @@ jar + SHA, any harvested MPL files with notices, and the shim sources.
 
 ---
 
+## 4a. Addendum — N3.1 headless acceptance: PASS (2026-07-16)
+
+The N3.1 headless probe (`apps/reader/src-tauri/e2e/android-jdk-probe/run.sh`, findings in the
+adjacent `FINDINGS.md`) ran green: **11/11 assertions, cold-start 3–4 s** — the stock `v2.3.2243`
+jar boots and runs the full content path (GraphQL, extension install, forced dex2jar APK→JAR,
+MangaDex browse + DB persist) on stock `eclipse-temurin:21` Linux-aarch64, no fork, no changes.
+Two premise corrections to this doc:
+
+- **N3.5 is moot for this pin:** the embedded DB is **H2 (pure-Java)** — the jar bundles no
+  `sqlite-jdbc` and needs **no native DB `.so`** on Android. (Contingency verified: if Suwayomi ever
+  adopts sqlite-jdbc, the Android aarch64 native ships inside the ordinary main jar at
+  `org/sqlite/native/Linux-Android/aarch64/`; there is no separate `natives-android` classifier.)
+- **The common extension-install path skips dex2jar entirely:** the Keiyoushi `repo` index publishes
+  a pre-built `jarUrl`, so store installs download the converted jar (0 `d2j` class-loads); dex2jar
+  runs only on the raw-apk path (`installExternalExtension`) — which the probe forced and proved
+  (235 converter class-loads). Both paths work on the stock JDK.
+- **Early AWT signal (indicative, N3.7 still required):** 0 `java.awt`/`sun.font`/`javax.imageio`
+  class-loads across 16.8k total loads for boot + install + convert + browse; image-decode/cover
+  endpoints not exercised.
+
 ## 5. Sources
 
 - TachiManga fork (MPL‑2.0, parent Suwayomi): <https://github.com/tachimanga/Tachidesk-Server> — verified

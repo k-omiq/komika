@@ -78,6 +78,10 @@ a child process); TachiManga's shipping `master` is legacy pre-GraphQL REST (beh
 `graphql` package) so fork-adoption would abandon our GraphQL stack — harvest its few MPL files
 (AWT-free graphics, WebView/cookie) only if the N3.7 AWT probe demands it; GraalVM native-image ruled
 out (runtime URLClassLoader); CF = existing shim + Kotlin plugin over `android.webkit.CookieManager`.
+**N3.1 headless acceptance PASS** (`e2e/android-jdk-probe/`, 11/11, cold-start 3–4 s): the stock jar
+runs the full content path on stock Temurin 21 Linux-aarch64; embedded DB is H2 (no native `.so`
+needed — N3.5 moot); store installs use pre-built Keiyoushi jars (dex2jar only on raw-apk path,
+forced + proven); 0 AWT class-loads observed (indicative for N3.7).
 **N4-SPIKE** (`docs/plans/n4-ios-spike.md`) — iOS verdict: FEASIBLE via OpenJDK-mobile Zero
 interpreter (no-JIT is a kernel rule that binds on every §12a channel); the feared dex-extension
 blocker dissolves (stock Suwayomi already dex2jars APKs to plain JVM bytecode); WKHTTPCookieStore
