@@ -7,7 +7,29 @@
 > yields real size numbers. Companion: `n4-ios-spike.md` (feasibility), `native-embedded-suwayomi.md`
 > §6/§12a. Machine: macOS arm64, Xcode 26.6, Tauri CLI 2.11.4. Date: 2026-07-16.
 
-## Result: iOS shell builds, packages, launches, and runs the frontend on iOS. Device install is signing-gated.
+## Result: iOS shell builds, signs, and **installs on the physical iPhone**. Launch pending one on-device "trust developer" tap.
+
+**Update (device install completed):** after the Apple ID was added to Xcode, the signed device build
+succeeded and installed on a physical **iPhone 13 Pro (iOS 26.5)**. Sequence that worked:
+- Correct **Team ID is `KYA5U323MC`** (the cert's OU / org "Wtf Wegovy") — *not* `5X397B2JPK`, which is
+  the parenthetical in the cert common-name and is **not** the team id. (This cost two failed builds.)
+- CLI automatic signing does **not** auto-register a device. Fix: one direct
+  `xcodebuild -destination 'platform=iOS,id=<udid>' -allowProvisioningUpdates -allowProvisioningDeviceRegistration build`
+  registered the device + minted the profile (that standalone run then fails at the Rust script phase —
+  expected, it lacks tauri's CLI socket — but registration sticks). Then a plain
+  `tauri ios build --export-method debugging` produced `gen/apple/build/arm64/Komika.ipa`, installed via
+  `xcrun devicectl device install app`.
+- **Last gate (user, on-device):** first launch is denied — *"profile has not been explicitly trusted by
+  the user."* Trust it on the phone: **Settings → General → VPN & Device Management → [the Apple-ID
+  developer profile] → Trust**. Then it launches. This is an on-device security action an assistant
+  cannot perform.
+- **`.ipa` size = 218 MB (still wrong):** the `tauri.ios.conf.json` `resources:[]` override did **not**
+  strip the desktop jar/JRE for the device build — the resource-copy phase is baked into the Xcode
+  project at the *first* `tauri ios init` and re-init doesn't regenerate it. Real shell is still < 10 MB;
+  a clean iOS bundle needs a fresh `gen/apple` generated with the override present (or an explicit build
+  phase removal) — folded into N4.2 packaging.
+
+## (Original) Result: iOS shell builds, packages, launches, and runs the frontend on iOS.
 
 ### What was proven (verifiable, reproduced)
 
