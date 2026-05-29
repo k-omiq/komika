@@ -41,6 +41,9 @@
 		],
 		"android": {
 			"debugApplicationIdSuffix": ".debug"
+		},
+		"iOS": {
+			"developmentTeam": "KYA5U323MC"
 		}
 	}
 }
