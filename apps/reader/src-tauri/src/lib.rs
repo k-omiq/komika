@@ -3,7 +3,17 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+// The embedded engine is a child-process JVM supervisor (`suwayomi.rs`) plus a
+// WebView Cloudflare shim (`cloudflare.rs`); both are desktop-only. On mobile
+// (iOS/Android) they are compiled out and `suwayomi_mobile.rs` provides clean
+// "engine unavailable" stubs under the SAME `suwayomi` module name, so the rest of
+// `run()` (manage/start/invoke_handler/exit) is platform-agnostic.
+#[cfg(desktop)]
 mod cloudflare;
+#[cfg(desktop)]
+mod suwayomi;
+#[cfg(not(desktop))]
+#[path = "suwayomi_mobile.rs"]
 mod suwayomi;
 
 /// Total budget for a single native image fetch (connect + transfer).
@@ -171,10 +181,12 @@ pub fn run() {
             .build(),
         )?;
       }
-      // Embedded Suwayomi sidecar (N1.1). Always started; a start failure only logs +
-      // sets a degraded state and never aborts app startup. The engine binds loopback
-      // only and JS reaches it via the `suwayomi_gql` IPC proxy — the JS-side flag
-      // gates USE, and an unused engine is harmless.
+      // Embedded Suwayomi sidecar (N1.1). On desktop this starts the JVM supervisor; a
+      // start failure only logs + sets a degraded state and never aborts app startup. The
+      // engine binds loopback only and JS reaches it via the `suwayomi_gql` IPC proxy —
+      // the JS-side flag gates USE, and an unused engine is harmless. On mobile
+      // (`suwayomi_mobile.rs`) both `new()` and `start()` are inert no-ops: the engine
+      // reports "unavailable" and JS routes content to the hosted backend.
       use tauri::Manager;
       app.manage(Arc::new(suwayomi::SuwayomiSupervisor::new()));
       suwayomi::start(app.handle().clone());
