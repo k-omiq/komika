@@ -1,4 +1,4 @@
-//! Mobile (iOS/Android) stubs for the embedded Suwayomi engine.
+//! Mobile stubs for the embedded Suwayomi engine — Android and the iOS SIMULATOR.
 //!
 //! The desktop engine (`suwayomi.rs`) is a child-process JVM supervisor: it spawns a
 //! `java` sidecar, brokers a loopback port, and runs a WebView Cloudflare shim
@@ -7,7 +7,10 @@
 //! is compiled out (`#[cfg(desktop)]`) and this module takes its place under the same
 //! `suwayomi` module name (see `lib.rs`'s `#[path]` alias).
 //!
-//! An in-process JVM (a "Zero JVM") is a later phase. Until then these stubs keep the
+//! REAL iOS devices no longer use this stub: they boot an in-process Zero JVM
+//! (`suwayomi_ios.rs`, N4.2). The stub remains for Android (in-process JVM is a later
+//! phase there) and for the iOS SIMULATOR, whose builds must keep compiling+linking
+//! even though the vendored static JVM has no sim slice. These stubs keep the
 //! four IPC commands REGISTERED (the JS side always invokes them by name), but they
 //! report the engine as unavailable so the JS fallback ladder routes to the hosted
 //! backend rather than hanging or crashing:

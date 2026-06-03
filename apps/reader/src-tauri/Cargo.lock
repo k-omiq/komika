@@ -1779,6 +1779,7 @@ dependencies = [
 name = "komika"
 version = "0.1.0"
 dependencies = [
+ "jni-sys 0.3.1",
  "log",
  "reqwest 0.12.28",
  "serde",

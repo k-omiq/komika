@@ -3,16 +3,27 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-// The embedded engine is a child-process JVM supervisor (`suwayomi.rs`) plus a
-// WebView Cloudflare shim (`cloudflare.rs`); both are desktop-only. On mobile
-// (iOS/Android) they are compiled out and `suwayomi_mobile.rs` provides clean
-// "engine unavailable" stubs under the SAME `suwayomi` module name, so the rest of
-// `run()` (manage/start/invoke_handler/exit) is platform-agnostic.
+// The embedded engine has three per-platform implementations under the SAME
+// `suwayomi` module name, so the rest of `run()` (manage/start/invoke_handler/exit)
+// stays platform-agnostic:
+//   * desktop            -> suwayomi.rs        (child-process JVM supervisor + the
+//                           WebView Cloudflare shim `cloudflare.rs`, both desktop-only)
+//   * iOS REAL DEVICE    -> suwayomi_ios.rs    (in-process JNI boot of the statically
+//                           linked Zero JVM, N4.2 — device only: the vendored .a files
+//                           have no simulator slice, so the sim keeps the stub)
+//   * other mobile       -> suwayomi_mobile.rs ("engine unavailable" stubs; Android
+//                           and the iOS simulator)
 #[cfg(desktop)]
 mod cloudflare;
 #[cfg(desktop)]
 mod suwayomi;
-#[cfg(not(desktop))]
+#[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+#[path = "suwayomi_ios.rs"]
+mod suwayomi;
+#[cfg(all(
+  not(desktop),
+  not(all(target_os = "ios", not(target_abi = "sim")))
+))]
 #[path = "suwayomi_mobile.rs"]
 mod suwayomi;
 

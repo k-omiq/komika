@@ -1,5 +1,7 @@
 {
 	"bundle": {
-		"resources": []
+		"resources": [
+			"suwayomi/Suwayomi-Server.jar"
+		]
 	}
 }
