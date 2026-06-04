@@ -1,6 +1,6 @@
 {
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-	"productName": "Komika",
+	"productName": "Komiq",
 	"version": "0.1.0",
 	"identifier": "app.komika.reader",
 	"build": {
@@ -12,7 +12,7 @@
 	"app": {
 		"windows": [
 			{
-				"title": "Komika",
+				"title": "Komiq",
 				"width": 1200,
 				"height": 820,
 				"minWidth": 360,

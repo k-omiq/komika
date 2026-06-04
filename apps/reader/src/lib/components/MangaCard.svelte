@@ -2,7 +2,7 @@
 	import Icon from './Icon.svelte';
 	import FlagBadge from './FlagBadge.svelte';
 	import Cover from './Cover.svelte';
-	import { slug, type ComicType } from '$lib/data/mock';
+	import { slug, type ComicType } from '$lib/data/types';
 
 	let {
 		title,

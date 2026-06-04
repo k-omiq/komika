@@ -2,7 +2,7 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Footer from '$lib/components/Footer.svelte';
-	import { slug } from '$lib/data/mock';
+	import { slug } from '$lib/data/types';
 	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
@@ -30,7 +30,7 @@
 	// Re-fetch once auth has restored the session token onto the backend — the
 	// initial `load` can race ahead of `initAuth`, so without this the signed-in
 	// user's real profile wouldn't resolve on first paint. Falls back to the load
-	// result (mock when signed out / backend off) until then.
+	// result (null when signed out / backend off) until then.
 	let liveProfile = $state<ProfileView | null>(null);
 	const profile = $derived(liveProfile ?? data.profile);
 	function refreshProfile(): void {
@@ -105,9 +105,9 @@
 	let tab = $state<'reading' | 'completed' | 'favorites'>('reading');
 
 	const counts = $derived({
-		reading: profile.shelves.filter((c) => c.shelf === 'reading').length,
-		completed: profile.shelves.filter((c) => c.shelf === 'completed').length,
-		favorites: profile.shelves.filter((c) => c.shelf === 'favorites').length,
+		reading: (profile?.shelves ?? []).filter((c) => c.shelf === 'reading').length,
+		completed: (profile?.shelves ?? []).filter((c) => c.shelf === 'completed').length,
+		favorites: (profile?.shelves ?? []).filter((c) => c.shelf === 'favorites').length,
 	});
 
 	const tabDefs = [
@@ -117,7 +117,7 @@
 	] as const;
 
 	const shelfItems = $derived(
-		profile.shelves
+		(profile?.shelves ?? [])
 			.filter((c) => c.shelf === tab)
 			.map((c) => ({
 				...c,
@@ -126,6 +126,15 @@
 	);
 </script>
 
+{#if !profile}
+	<!-- Signed out (or the backend is unavailable) — no sample profile is shown. -->
+	<div class="signed-out k-gutter">
+		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
+		<h1>Your profile</h1>
+		<p>Sign in to track your reading, shelves, and activity.</p>
+		<a class="so-btn" href="/login?redirect=%2Fprofile">Sign in</a>
+	</div>
+{:else}
 <div class="head k-gutter">
 	<div class="identity">
 		<div class="avatar-wrap">
@@ -306,10 +315,55 @@
 		</div>
 	</div>
 </div>
+{/if}
 
 <Footer />
 
 <style>
+	.signed-out {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 14px;
+		padding: 120px 20px;
+		text-align: center;
+	}
+	.so-icon {
+		width: 56px;
+		height: 56px;
+		border-radius: 50%;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-1);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--k-text-disabled);
+	}
+	.signed-out h1 {
+		font-size: 28px;
+		margin: 0;
+		color: var(--k-text-bright);
+	}
+	.signed-out p {
+		margin: 0;
+		max-width: 340px;
+		font-size: 14px;
+		line-height: 1.5;
+		color: var(--k-text-dimmer);
+	}
+	.so-btn {
+		margin-top: 6px;
+		height: 42px;
+		padding: 0 22px;
+		display: inline-flex;
+		align-items: center;
+		border-radius: 8px;
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+		font-weight: 700;
+		font-size: 13.5px;
+		text-decoration: none;
+	}
 	.head {
 		padding-top: 52px;
 	}

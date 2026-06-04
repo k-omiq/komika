@@ -11,7 +11,7 @@
 		type CatalogEntry,
 		type ComicType,
 		type Status,
-	} from '$lib/data/mock';
+	} from '$lib/data/types';
 
 	let { data } = $props();
 	// Filters stay interactive while the catalog streams in; the results area

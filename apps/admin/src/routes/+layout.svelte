@@ -29,7 +29,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
-	<title>Komika · manga DB</title>
+	<title>Komiq · manga DB</title>
 </svelte:head>
 
 {#if !auth.ready}
@@ -38,7 +38,7 @@
 	{#if auth.user && !onLogin}
 		<header class="admin-header">
 			<div class="brand">
-				<span class="mark">KOMIKA</span>
+				<span class="mark">KOMIQ</span>
 				<span class="sub">manga DB</span>
 				<nav class="nav">
 					{#each nav as item (item.href)}

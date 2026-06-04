@@ -3,7 +3,7 @@
 	import Footer from '$lib/components/Footer.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
-	import { slug } from '$lib/data/mock';
+	import { slug } from '$lib/data/types';
 	import type { FeaturedView } from '$lib/data/source';
 
 	let { data } = $props();
@@ -18,7 +18,8 @@
 	}
 
 	// Mirror the resolved featured list into local state (drives the hero +
-	// auto-rotate). `data.home` never rejects (mock fallback on error).
+	// auto-rotate). `data.home` never rejects (empty results on error); an empty
+	// featured list keeps the placeholder hero (same look as the loading hero).
 	$effect(() => {
 		data.home.then((h) => {
 			featured = h.featured;
@@ -106,68 +107,76 @@
 		</section>
 
 		<!-- LATEST UPDATES -->
-		<section class="block">
-			<div class="row-head">
-				<h2>Latest Updates</h2>
-				<a class="view-all" href="/updates">View all</a>
-			</div>
-			<div class="row">
-				{#each home.latestUpdates as item (item.title + item.ch)}
-					<MangaCard
-						title={item.title}
-						sub={`${item.ch} · ${item.time}`}
-						rating={item.rating}
-						cover={item.cover}
-						id={item.id}
-						fixed
-					/>
-				{/each}
-			</div>
-		</section>
+		{#if home.latestUpdates.length}
+			<section class="block">
+				<div class="row-head">
+					<h2>Latest Updates</h2>
+					<a class="view-all" href="/updates">View all</a>
+				</div>
+				<div class="row">
+					{#each home.latestUpdates as item (item.title + item.ch)}
+						<MangaCard
+							title={item.title}
+							sub={`${item.ch} · ${item.time}`}
+							rating={item.rating}
+							cover={item.cover}
+							id={item.id}
+							fixed
+						/>
+					{/each}
+				</div>
+			</section>
+		{/if}
 
 		<!-- TRENDING -->
-		<section class="block">
-			<h2>Trending</h2>
-			<div class="row">
-				{#each home.trending as item (item.title + item.ch)}
-					<MangaCard
-						title={item.title}
-						sub={`${item.ch} · ${item.time}`}
-						rating={item.rating}
-						cover={item.cover}
-						id={item.id}
-						fixed
-					/>
-				{/each}
-			</div>
-		</section>
+		{#if home.trending.length}
+			<section class="block">
+				<h2>Trending</h2>
+				<div class="row">
+					{#each home.trending as item (item.title + item.ch)}
+						<MangaCard
+							title={item.title}
+							sub={`${item.ch} · ${item.time}`}
+							rating={item.rating}
+							cover={item.cover}
+							id={item.id}
+							fixed
+						/>
+					{/each}
+				</div>
+			</section>
+		{/if}
 
 		<!-- LATEST ADDED -->
-		<section class="block">
-			<h2>Latest Added</h2>
-			<div class="row">
-				{#each home.latestAdded as item (item.title + item.ch)}
-					<MangaCard
-						title={item.title}
-						sub={`${item.ch} · Added ${item.time}`}
-						rating={item.rating}
-						cover={item.cover}
-						id={item.id}
-						fixed
-					/>
-				{/each}
-			</div>
-		</section>
+		{#if home.latestAdded.length}
+			<section class="block">
+				<h2>Latest Added</h2>
+				<div class="row">
+					{#each home.latestAdded as item (item.title + item.ch)}
+						<MangaCard
+							title={item.title}
+							sub={`${item.ch} · Added ${item.time}`}
+							rating={item.rating}
+							cover={item.cover}
+							id={item.id}
+							fixed
+						/>
+					{/each}
+				</div>
+			</section>
+		{/if}
 
 		<!-- GENRES -->
-		<section class="block">
-			<h2>Genres</h2>
-			<div class="genres">
-				{#each home.homeGenres as g (g)}
-					<a class="genre" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
-				{/each}
-			</div>
-		</section>
+		{#if home.homeGenres.length}
+			<section class="block">
+				<h2>Genres</h2>
+				<div class="genres">
+					{#each home.homeGenres as g (g)}
+						<a class="genre" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
+					{/each}
+				</div>
+			</section>
+		{/if}
 	</div>
 {/await}
 

@@ -17,9 +17,9 @@
 
 <section class="hero k-gutter">
 	<div class="hero-badge"><Icon name="heart" size={28} fill="currentColor" /></div>
-	<h1>Keep YOMU ad-free and paying its creators</h1>
+	<h1>Keep komiq ad-free and paying its creators</h1>
 	<p>
-		YOMU runs on reader support — no ads, no data resold. Every contribution funds server costs and
+		komiq runs on reader support — no ads, no data resold. Every contribution funds server costs and
 		goes directly to the artists and translators behind the series you love.
 	</p>
 </section>

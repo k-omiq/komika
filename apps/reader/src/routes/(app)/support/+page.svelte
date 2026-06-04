@@ -1,7 +1,7 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
 	import Footer from '$lib/components/Footer.svelte';
-	import { type ComicType } from '$lib/data/mock';
+	import { type ComicType } from '$lib/data/types';
 
 	let { data } = $props();
 	const supportCategories = $derived(data.supportCategories);
@@ -41,7 +41,7 @@
 		{
 			icon: 'mail',
 			title: 'Email us',
-			desc: 'help@yomu.app — we answer within one business day.',
+			desc: 'help@komiq.app — we answer within one business day.',
 			bg: 'rgba(224,179,84,0.14)',
 			color: 'var(--k-hiatus)',
 			note: 'Include your account email',

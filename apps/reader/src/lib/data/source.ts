@@ -3,9 +3,9 @@
  *
  * Each getter returns the exact view shapes the screens render. When the backend
  * is enabled (`PUBLIC_KOMIKA_BACKEND=on`) it maps live `@komika/api` domain data
- * into those shapes; otherwise — or if a live call throws — it falls back to
- * `mock.ts`, so the app is always renderable. This is the single seam to swap as
- * the backend fills in: screens never import `mock.ts` directly.
+ * into those shapes. Getters never reject: when the backend is off, errors, or
+ * returns nothing, they resolve to honest empty results (empty arrays / null) and
+ * the screens render their empty states. No sample content is ever fabricated.
  */
 import type {
 	CanonicalUpdate,
@@ -16,8 +16,9 @@ import type {
 } from '@komika/types';
 import { backend, images } from '$lib/context';
 import { config } from '$lib/config';
-import * as mock from './mock';
-import type { Card, CatalogEntry, ComicType, Status } from './mock';
+import * as content from './content';
+import { FLAG, FORMAT_CARDS } from './types';
+import type { Card, CatalogEntry, ComicType, Shelf, Status } from './types';
 
 const LIVE = config.backendEnabled;
 
@@ -31,13 +32,13 @@ function isCanonicalId(id: string): boolean {
 	return id.startsWith('w_');
 }
 
-/** Run a live mapping, falling back to mock on any failure. */
+/** Run a live mapping, resolving to the (empty) fallback on any failure. */
 async function live<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
 	if (!LIVE) return fallback;
 	try {
 		return await fn();
 	} catch (err) {
-		console.warn('[komika] backend call failed, using mock fallback:', err);
+		console.warn('[komika] backend call failed:', err);
 		return fallback;
 	}
 }
@@ -101,6 +102,7 @@ function toCard(s: Series): Card {
 		rating: s.rating.average.toFixed(1),
 		cover: s.coverUrl,
 		id: s.id,
+		type: toViewType(s.type),
 	};
 }
 
@@ -166,12 +168,12 @@ function toFeatured(s: Series): FeaturedView {
 
 /**
  * Per-format counts backed by the live catalog sample (the union of discovery
- * feeds), keeping the mock cards' presentation metadata. Not the true global
- * total — the federated catalog isn't fully enumerated client-side — but a real
+ * feeds), keeping the cards' presentation metadata. Not the true global total —
+ * the federated catalog isn't fully enumerated client-side — but a real
  * reflection of what's currently surfaced.
  */
-function deriveFormatCards(pool: Series[]): typeof mock.formatCards {
-	return mock.formatCards.map((card) => {
+function deriveFormatCards(pool: Series[]): typeof FORMAT_CARDS {
+	return FORMAT_CARDS.map((card) => {
 		const n = pool.filter((s) => toViewType(s.type) === card.type).length;
 		return { ...card, count: `${n} ${n === 1 ? 'title' : 'titles'}` };
 	});
@@ -198,16 +200,17 @@ function shelfFor(read: number, total: number): 'reading' | 'completed' | 'plan'
 
 export function getHome() {
 	const fallback = {
-		featured: mock.featured.map((f): FeaturedView => ({ ...f, cover: '' })),
-		latestUpdates: mock.latestUpdates,
-		trending: mock.trending,
-		latestAdded: mock.latestAdded,
-		formatCards: mock.formatCards,
-		homeGenres: mock.homeGenres,
+		featured: [] as FeaturedView[],
+		latestUpdates: [] as Card[],
+		trending: [] as Card[],
+		latestAdded: [] as Card[],
+		formatCards: FORMAT_CARDS,
+		homeGenres: [] as string[],
 	};
 	return live(async () => {
 		// Discovery drives the curated rows; the scanner-backed `updates` feed drives
-		// "Latest Updates" (not Suwayomi's source "Latest").
+		// "Latest Updates" (not Suwayomi's source "Latest"). The hero is the top of
+		// the live Popular feed (first feed as fallback) — empty when nothing is live.
 		const [feeds, updates] = await Promise.all([
 			backend.discovery(),
 			backend.updates().catch(() => ({ items: [] as Series[] })),
@@ -219,12 +222,12 @@ export function getHome() {
 			.slice(0, 5)
 			.map(toFeatured);
 		return {
-			featured: featured.length ? featured : fallback.featured,
+			featured,
 			latestUpdates: updates.items.map(toCard),
 			trending: byKind('TRENDING').map(toCard),
 			latestAdded: byKind('RECENTLY_ADDED').map(toCard),
-			formatCards: pool.length ? deriveFormatCards(pool) : mock.formatCards,
-			homeGenres: pool.length ? deriveGenres(pool) : mock.homeGenres,
+			formatCards: pool.length ? deriveFormatCards(pool) : FORMAT_CARDS,
+			homeGenres: deriveGenres(pool),
 		};
 	}, fallback);
 }
@@ -233,20 +236,19 @@ export function getBrowseCatalog(): Promise<CatalogEntry[]> {
 	return live(async () => {
 		const { items } = await backend.search('');
 		return items.map(toCatalogEntry);
-	}, mock.catalog);
+	}, []);
 }
 
 export function getUpdates() {
 	const fallback = {
-		trendingGroups: mock.trendingGroups,
-		newUpdates: mock.newUpdates,
-		hotUpdates: mock.hotUpdates,
+		trendingGroups: [] as { label: string; items: Card[] }[],
+		newUpdates: [] as Card[],
+		hotUpdates: [] as Card[],
 	};
 	return live(async () => {
 		// "New" is the scanner-driven Updates feed (series with freshly-detected
 		// chapters, newest-first). "Trending"/"Hot" reuse the discovery Trending
-		// feed. Empty (no detections yet) renders the page's empty state rather than
-		// silently substituting mock — mock is only the off/error fallback.
+		// feed. Empty (no detections yet) renders the page's empty state.
 		const [feeds, updates, canonical] = await Promise.all([
 			backend.discovery(),
 			backend.updates(),
@@ -268,12 +270,29 @@ export function getUpdates() {
 	}, fallback);
 }
 
+export interface LibraryRowView {
+	id?: string;
+	title: string;
+	genre: string;
+	rating: string;
+	shelf: Shelf;
+	read: number;
+	total: number;
+}
+export interface ContinueRowView {
+	id?: string;
+	title: string;
+	ch: string;
+	progress: number;
+	genre: string;
+}
+
 export function getLibrary() {
 	const fallback = {
-		libraryCatalog: mock.libraryCatalog.map((c) => ({ ...c, id: undefined as string | undefined })),
-		continueRow: mock.continueRow.map((c) => ({ ...c, id: undefined as string | undefined })),
+		libraryCatalog: [] as LibraryRowView[],
+		continueRow: [] as ContinueRowView[],
 	};
-	return live(async () => {
+	return live<typeof fallback>(async () => {
 		const lib = await backend.library();
 		// Per-series read progress from real chapter state (one fetch per series —
 		// fine for a modest library).
@@ -363,40 +382,6 @@ const STATUS_WORD: Record<SeriesStatus, string> = {
 	UNKNOWN: 'ONGOING',
 };
 
-function seriesFallback(id: string): SeriesView {
-	const totalCh = mock.seriesDetail.chapters;
-	const readUpTo = Math.min(totalCh, Math.round(totalCh * 0.427));
-	return {
-		detail: {
-			id,
-			title: mock.seriesDetail.title,
-			type: 'Manga',
-			flag: mock.FLAG.Manga,
-			rating: mock.seriesDetail.rating,
-			votes: mock.seriesDetail.votes,
-			totalCh,
-			updated: mock.seriesDetail.updated,
-			statusLabel: mock.seriesDetail.status,
-			author: mock.seriesDetail.author,
-			artist: mock.seriesDetail.artist,
-			genres: mock.seriesDetail.genres,
-			synopsis: mock.seriesDetail.synopsis,
-			cover: '',
-			continueCh: Math.min(totalCh, readUpTo + 1),
-			startChapterId: undefined,
-			isMarked: false,
-		},
-		chapters: mock.buildChapters(totalCh, readUpTo).map((c) => ({
-			n: c.n,
-			title: c.title,
-			date: c.date,
-			isNew: c.isNew,
-			read: c.read,
-		})),
-		related: mock.relatedSeries.map((r) => ({ ...r })),
-	};
-}
-
 function toRelated(p: Series): RelatedView {
 	return {
 		title: p.title,
@@ -433,7 +418,7 @@ function mapSeriesView(
 			id: s.id,
 			title: s.title,
 			type,
-			flag: mock.FLAG[type],
+			flag: FLAG[type],
 			rating: s.rating.average.toFixed(1),
 			votes: String(s.rating.count),
 			totalCh: s.chapterCount || chs.length,
@@ -460,8 +445,8 @@ function mapSeriesView(
 	};
 }
 
-export function getSeries(id: string): Promise<SeriesView> {
-	return live(async () => {
+export function getSeries(id: string): Promise<SeriesView | null> {
+	return live<SeriesView | null>(async () => {
 		// Canonical (MangaDex-mirrored) works resolve through the canonical path; there
 		// is no genre-related pool for them yet, so related is empty.
 		if (isCanonicalId(id) && backend.canonicalSeries && backend.canonicalChapters) {
@@ -482,7 +467,7 @@ export function getSeries(id: string): Promise<SeriesView> {
 				.catch(() => [] as Series[]),
 		]);
 		return mapSeriesView(s, chs, pool);
-	}, seriesFallback(id));
+	}, null);
 }
 
 /**
@@ -549,25 +534,16 @@ export interface ReaderView {
 	nextChapterId?: string;
 }
 
-function readerFallback(seriesId: string): ReaderView {
-	const chNum = 62;
+/** Honest empty reader view — no chapter/pages available for this series. */
+function emptyReader(seriesId: string): ReaderView {
 	return {
 		seriesId,
-		seriesTitle: 'Vermilion Hours',
+		seriesTitle: '',
 		chapterId: undefined,
-		chNum,
-		chTitle: mock.chapterTitle(chNum),
-		pages: mock.readerPages().map((p) => ({
-			url: '',
-			index: p.n - 1,
-			ratio: p.ratio,
-			label: p.label,
-			dim: p.dim,
-		})),
-		chapters: Array.from({ length: 8 }, (_, k) => {
-			const n = chNum + 2 - k;
-			return { n, title: mock.chapterTitle(n) };
-		}),
+		chNum: 0,
+		chTitle: '',
+		pages: [],
+		chapters: [],
 		prevChapterId: undefined,
 		nextChapterId: undefined,
 	};
@@ -580,7 +556,7 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 		const chs = canonical
 			? await backend.canonicalChapters!(seriesId)
 			: await backend.chapters(seriesId);
-		if (!chs.length) return readerFallback(seriesId);
+		if (!chs.length) return emptyReader(seriesId);
 		// Canonical chapters already arrive server-ordered ascending with number-less/
 		// oneshot rows last; re-sorting by number here would float a oneshot (wire value
 		// 0) to the front, contradicting that order (CR4). Only the Suwayomi path — whose
@@ -616,7 +592,7 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 			prevChapterId: idx > 0 ? asc[idx - 1].id : undefined,
 			nextChapterId: idx >= 0 && idx < asc.length - 1 ? asc[idx + 1].id : undefined,
 		};
-	}, readerFallback(seriesId));
+	}, emptyReader(seriesId));
 }
 
 export interface ProfileView {
@@ -646,16 +622,17 @@ export interface ProfileView {
 
 /**
  * The signed-in user's profile, built from their session identity + real reading
- * state. Signed-out (or backend off/error) falls back to the sample profile.
+ * state. Resolves to `null` when signed out (or backend off/error) — the profile
+ * screen renders its sign-in state.
  *
  * NOTE: reading/library reflects the shared Suwayomi state this MVP federates,
  * and "activity" is derived from that progress — there is no per-user timestamped
  * event log yet, so a true activity stream would need a new server capability.
  */
-export function getProfile(): Promise<ProfileView> {
-	return live<ProfileView>(async () => {
+export function getProfile(): Promise<ProfileView | null> {
+	return live<ProfileView | null>(async () => {
 		const session = await backend.session();
-		if (!session) return mock.profile;
+		if (!session) return null;
 		const user = session.user;
 		const lib = await backend.library().catch(() => [] as Series[]);
 		const rows = await Promise.all(
@@ -737,7 +714,7 @@ export function getProfile(): Promise<ProfileView> {
 			activity,
 			shelves,
 		};
-	}, mock.profile);
+	}, null);
 }
 
 /**
@@ -758,19 +735,19 @@ export async function updateProfile(input: {
  */
 export async function uploadAvatar(file: Blob): Promise<string> {
 	if (!LIVE || !backend.uploadAvatar) {
-		throw new Error('Avatar upload requires the Komika backend.');
+		throw new Error('Avatar upload requires the Komiq backend.');
 	}
 	return backend.uploadAvatar(file);
 }
 
 export function getDonate() {
 	return Promise.resolve({
-		donateTiers: mock.donateTiers,
-		donateAmounts: mock.donateAmounts,
-		donateAllocation: mock.donateAllocation,
+		donateTiers: content.donateTiers,
+		donateAmounts: content.donateAmounts,
+		donateAllocation: content.donateAllocation,
 	});
 }
 
 export function getSupport() {
-	return Promise.resolve({ supportCategories: mock.supportCategories, faqs: mock.faqs });
+	return Promise.resolve({ supportCategories: content.supportCategories, faqs: content.faqs });
 }

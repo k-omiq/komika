@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import Icon from './Icon.svelte';
-	import { searchFilterSections } from '$lib/data/mock';
+	import { searchFilterSections } from '$lib/data/types';
 
 	let {
 		open = $bindable(false),

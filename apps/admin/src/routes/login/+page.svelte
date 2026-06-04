@@ -30,7 +30,7 @@
 <div class="wrap">
 	<form class="card" onsubmit={submit}>
 		<div class="head">
-			<div class="brand"><span class="mark">KOMIKA</span><span class="sub">manga DB</span></div>
+			<div class="brand"><span class="mark">KOMIQ</span><span class="sub">manga DB</span></div>
 			<h1>Admin sign in</h1>
 			<p class="hint">Catalog management, scan overrides, and status flags.</p>
 		</div>

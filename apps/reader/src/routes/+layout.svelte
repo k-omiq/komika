@@ -22,7 +22,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
-	<title>YOMU</title>
+	<title>komiq</title>
 </svelte:head>
 
 {@render children()}

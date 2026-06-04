@@ -45,7 +45,7 @@
 
 <header>
 	<div class="left">
-		<a class="brand" href="/">YOMU</a>
+		<a class="brand" href="/">komiq</a>
 		<nav>
 			{#each nav as item (item.href)}
 				<a href={item.href} class="nav-link" class:active={isActive(item.href)}>{item.label}</a>
@@ -99,7 +99,7 @@
 			class:on={isActive('/donate')}
 			href="/donate"
 			aria-label="Donate"
-			title="Support YOMU"
+			title="Support komiq"
 		>
 			<Icon name="heart" size={19} fill={isActive('/donate') ? 'currentColor' : 'none'} />
 		</a>

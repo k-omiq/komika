@@ -4,7 +4,7 @@
 	import Footer from '$lib/components/Footer.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
-	import { FLAG, typeOf, type ComicType } from '$lib/data/mock';
+	import { FLAG, type ComicType } from '$lib/data/types';
 
 	type UpdatesData = Awaited<ReturnType<typeof import('$lib/data/source').getUpdates>>;
 
@@ -30,10 +30,9 @@
 	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
 
 	const updates = $derived.by(() => {
-		let list = (tab === 'hot' ? hotUpdates : newUpdates).map((u) => ({
-			...u,
-			type: typeOf(u.title),
-		}));
+		let list = tab === 'hot' ? hotUpdates : newUpdates;
+		// Cards carry their format from the live feed; ones without it (e.g. the
+		// canonical-updates mirror) only show under "All".
 		if (typeFilter !== '__all') list = list.filter((u) => u.type === typeFilter);
 		return list;
 	});
@@ -99,7 +98,7 @@
 					rating={item.rating}
 					cover={item.cover}
 					id={item.id}
-					flagEmoji={FLAG[item.type]}
+					flagEmoji={item.type ? FLAG[item.type] : ''}
 				/>
 			{/each}
 		</div>

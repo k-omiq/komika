@@ -3,7 +3,7 @@
 </script>
 
 <footer class:with-links={links}>
-	<span>YOMU</span>
+	<span>komiq</span>
 	{#if links}
 		<div class="links">
 			<a href="/donate">Donate</a>

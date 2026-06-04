@@ -23,7 +23,7 @@ import { backend } from '$lib/context';
 import { config } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
 import * as local from './social';
-import type { ReaderComment, SeriesComment } from './mock';
+import type { ReaderComment, SeriesComment } from './types';
 
 /** Live social requires the unified backend (Suwayomi/mock have no auth layer). */
 export function socialLive(): boolean {

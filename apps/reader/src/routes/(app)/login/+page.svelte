@@ -45,13 +45,13 @@
 </script>
 
 <svelte:head>
-	<title>{mode === 'login' ? 'Sign in' : 'Create account'} · YOMU</title>
+	<title>{mode === 'login' ? 'Sign in' : 'Create account'} · komiq</title>
 </svelte:head>
 
 <div class="wrap">
 	<div class="card">
 		<div class="head">
-			<h1>{mode === 'login' ? 'Welcome back' : 'Join YOMU'}</h1>
+			<h1>{mode === 'login' ? 'Welcome back' : 'Join komiq'}</h1>
 			<p class="sub">
 				{mode === 'login'
 					? 'Sign in to rate series and join the discussion.'
@@ -126,7 +126,7 @@
 
 		<p class="foot">
 			{#if mode === 'login'}
-				New to YOMU?
+				New to komiq?
 				<button class="link" onclick={() => switchMode('register')}>Create an account</button>
 			{:else}
 				Already have an account?

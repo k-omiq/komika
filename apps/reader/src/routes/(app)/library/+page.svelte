@@ -2,7 +2,7 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
-	import { SHELF_META, slug, type Shelf } from '$lib/data/mock';
+	import { SHELF_META, slug, type Shelf } from '$lib/data/types';
 
 	type LibraryData = Awaited<ReturnType<typeof import('$lib/data/source').getLibrary>>;
 

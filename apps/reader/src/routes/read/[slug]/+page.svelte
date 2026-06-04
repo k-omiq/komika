@@ -91,7 +91,7 @@
 
 	function persist() {
 		try {
-			localStorage.setItem('yomu-reader', JSON.stringify({ mode, width }));
+			localStorage.setItem('komiq-reader', JSON.stringify({ mode, width }));
 		} catch {
 			/* ignore */
 		}
@@ -112,7 +112,7 @@
 		if (!restored) {
 			restored = true;
 			try {
-				const saved = JSON.parse(localStorage.getItem('yomu-reader') || '{}');
+				const saved = JSON.parse(localStorage.getItem('komiq-reader') || '{}');
 				if (saved) {
 					mode = saved.mode || 'strip';
 					width = saved.width || 720;
@@ -235,11 +235,14 @@
 			><Icon name="chevron-left" size={18} /></a
 		>
 		<div class="titlebox">
-			<a class="series" href={seriesHref}>{seriesTitle}</a>
-			<div class="chsub">Ch. {chNum} · {chTitle}</div>
+			<a class="series" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
+			{#if data.chapterId}
+				<div class="chsub">Ch. {chNum} · {chTitle}</div>
+			{/if}
 		</div>
 	</div>
 	<div class="top-right">
+		{#if data.chapters.length}
 		<div class="ch-select">
 			<button
 				class="ch-btn"
@@ -265,6 +268,7 @@
 				</div>
 			{/if}
 		</div>
+		{/if}
 		<button
 			class="settings-btn"
 			class:on={settingsOpen}
@@ -330,10 +334,12 @@
 
 <!-- reading area -->
 <main style="--w:{width}px">
-	<div class="chapter-header">
-		<div class="chapter-kicker">CHAPTER {chNum}</div>
-		<h1>{chTitle}</h1>
-	</div>
+	{#if data.chapterId}
+		<div class="chapter-header">
+			<div class="chapter-kicker">CHAPTER {chNum}</div>
+			<h1>{chTitle}</h1>
+		</div>
+	{/if}
 
 	{#if !hasPages}
 		<div class="no-pages">

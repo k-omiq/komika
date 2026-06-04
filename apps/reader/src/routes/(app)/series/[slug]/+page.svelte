@@ -7,7 +7,7 @@
 	import Footer from '$lib/components/Footer.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
-	import { FLAG } from '$lib/data/mock';
+	import { FLAG } from '$lib/data/types';
 	import { setLibraryMark } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -23,7 +23,7 @@
 
 	let { data } = $props();
 	// Stream the series detail; the page shows a hero/chapter skeleton until it
-	// resolves. `data.series` never rejects (mock fallback on error).
+	// resolves. `data.series` never rejects (null on error → not-found state).
 	let view = $state<SeriesView | null>(null);
 	let loading = $state(true);
 	$effect(() => {

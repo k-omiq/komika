@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ComicType } from '$lib/data/mock';
+	import type { ComicType } from '$lib/data/types';
 
 	let {
 		type,
