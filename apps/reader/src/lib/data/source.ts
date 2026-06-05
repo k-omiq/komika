@@ -742,9 +742,7 @@ export async function uploadAvatar(file: Blob): Promise<string> {
 
 export function getDonate() {
 	return Promise.resolve({
-		donateTiers: content.donateTiers,
 		donateAmounts: content.donateAmounts,
-		donateAllocation: content.donateAllocation,
 	});
 }
 

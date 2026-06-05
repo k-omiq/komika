@@ -24,20 +24,11 @@
 	const catIcon: Record<string, ComicType | 'user' | 'book' | 'card' | 'flag'> = {
 		Account: 'user',
 		Reading: 'book',
-		'Billing & membership': 'card',
+		Donations: 'card',
 		'Report an issue': 'flag',
 	};
 
 	const contacts = [
-		{
-			icon: 'comment',
-			title: 'Live chat',
-			desc: 'Chat with our team — typical reply under 5 minutes.',
-			bg: 'rgba(143,184,255,0.14)',
-			color: 'var(--k-completed)',
-			note: 'Online now',
-			noteDot: true,
-		},
 		{
 			icon: 'mail',
 			title: 'Email us',
@@ -45,16 +36,6 @@
 			bg: 'rgba(224,179,84,0.14)',
 			color: 'var(--k-hiatus)',
 			note: 'Include your account email',
-			noteDot: false,
-		},
-		{
-			icon: 'bookmark',
-			title: 'Community',
-			desc: 'Join the forums and Discord to swap recs and get help from readers.',
-			bg: 'rgba(198,156,240,0.14)',
-			color: 'var(--k-accent-purple)',
-			note: '128K members',
-			noteDot: false,
 		},
 	] as const;
 </script>
@@ -77,7 +58,6 @@
 				</div>
 				<span class="cat-title">{c.title}</span>
 				<span class="cat-desc">{c.desc}</span>
-				<span class="cat-count">{c.count} articles</span>
 			</div>
 		{/each}
 	</div>
@@ -115,9 +95,7 @@
 				</div>
 				<span class="contact-title">{c.title}</span>
 				<span class="contact-desc">{c.desc}</span>
-				<span class="contact-note" style={c.noteDot ? 'color:var(--k-ongoing)' : ''}>
-					{#if c.noteDot}<span class="note-dot"></span>{/if}{c.note}
-				</span>
+				<span class="contact-note">{c.note}</span>
 			</div>
 		{/each}
 	</div>
@@ -221,11 +199,6 @@
 		font-size: 13px;
 		color: var(--k-text-dimmer);
 		line-height: 1.5;
-	}
-	.cat-count {
-		font-size: 12.5px;
-		color: var(--k-text-fainter);
-		margin-top: 2px;
 	}
 	.faq-wrap,
 	.contact-wrap {
@@ -336,11 +309,5 @@
 		color: var(--k-text-fainter);
 		margin-top: 2px;
 		font-weight: 600;
-	}
-	.note-dot {
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		background: var(--k-ongoing);
 	}
 </style>
