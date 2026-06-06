@@ -106,6 +106,10 @@ pub struct AppState {
     pub scan_health: Mutex<ScanHealth>,
     /// Per-key sliding-window limiter for `login` / `register`.
     pub auth_limiter: RateLimiter,
+    /// Per-user sliding-window limiter for `searchAllSources` (C1). That endpoint
+    /// fans out to many sources and performs writes (library enrollment + dedup
+    /// persist), so an authenticated client must not be able to hammer it.
+    pub federated_limiter: RateLimiter,
     /// Absolute session lifetime in seconds (see `Config::session_ttl_secs`).
     pub session_ttl_secs: i64,
 }
@@ -185,6 +189,79 @@ impl async_graphql::extensions::Extension for ErrorLoggerExtension {
 
 fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
     ctx.data_unchecked::<std::sync::Arc<AppState>>()
+}
+
+/// Resolver fields on `Series` that read the S2 enrichment tables (H2). Opt-in
+/// per query — a feed that doesn't select them pays nothing. `self.id` is the
+/// work id for a canonical series (`w_…`); for a numeric Suwayomi series id there
+/// are no rows (those works aren't MangaDex-anchored) and both return empty.
+#[async_graphql::ComplexObject]
+impl Series {
+    /// Every localized description of this work (all languages MangaDex carries),
+    /// newest-language-agnostic, ordered by language tag. Empty for a work with no
+    /// enrichment yet (run `backfillMangadexMetadata`) or a non-canonical series.
+    async fn localized_descriptions(&self, ctx: &Context<'_>) -> Result<Vec<LocalizedDescription>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT lang, description FROM work_description WHERE work_id = ? ORDER BY lang",
+        )
+        .bind(&self.id.0)
+        .fetch_all(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(lang, description)| LocalizedDescription { lang, description })
+            .collect())
+    }
+
+    /// The full author/artist credit list for this work (S2). The singular
+    /// `author`/`artist` fields keep only the first of each; this returns all.
+    async fn credits(&self, ctx: &Context<'_>) -> Result<Vec<Credit>> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT role, name FROM work_credit WHERE work_id = ? ORDER BY role, name",
+        )
+        .bind(&self.id.0)
+        .fetch_all(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(role, name)| Credit { role, name })
+            .collect())
+    }
+
+    /// The work's full cover set (F2), primary first then by volume. Empty for a
+    /// work with no covers stored yet or a non-canonical series. `coverUrl` (the
+    /// primary) keeps working independently.
+    async fn covers(&self, ctx: &Context<'_>) -> Result<Vec<Cover>> {
+        let pool = &state(ctx).pool;
+        // Cover URLs are `covers/{mangadex_id}/{fileName}` — resolve the anchor.
+        let mangadex_id: Option<String> = sqlx::query_scalar(
+            "SELECT source_key FROM source_series \
+             WHERE work_id = ? AND source_type = 'mangadex' LIMIT 1",
+        )
+        .bind(&self.id.0)
+        .fetch_optional(pool)
+        .await
+        .map_err(gql_err)?;
+        let Some(mid) = mangadex_id else {
+            return Ok(Vec::new());
+        };
+        let covers = catalog::load_work_covers(pool, &self.id.0)
+            .await
+            .map_err(gql_err)?;
+        Ok(covers
+            .into_iter()
+            .map(|c| Cover {
+                url: crate::mangadex::cover_url(&mid, &c.file_name),
+                thumbnail_url: crate::mangadex::cover_thumb_url(&mid, &c.file_name),
+                file_name: c.file_name,
+                lang: c.lang,
+                volume: c.volume,
+                is_primary: c.is_primary,
+            })
+            .collect())
+    }
 }
 
 /// The current session token, if the request carried one.
@@ -1074,6 +1151,40 @@ impl QueryRoot {
         })
     }
 
+    /// Federated multi-extension catalogue search (S3). Fans the query out to
+    /// every installed Suwayomi source (bounded concurrency + per-source timeout,
+    /// failures skipped), runs each hit through the dedup matcher against the
+    /// native catalogue, PERSISTS the matching/top-N source mappings so results
+    /// consolidate under one canonical work, and returns deduped canonical entries
+    /// each with its per-source translator list. User-facing: NSFW sources/results
+    /// are hidden unless the viewer opted in (same posture as `search`).
+    async fn search_all_sources(
+        &self,
+        ctx: &Context<'_>,
+        query: String,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<FederatedSearchPage> {
+        // C1: authenticated only — this endpoint fans out to many sources AND
+        // persists (library enrollment + dedup writes), so anonymous callers are
+        // rejected outright (no anonymous writes).
+        let user = require_user(ctx).await?;
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(Error::new("query must not be empty"));
+        }
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        // C1: per-user rate limit so an authed client can't hammer the engine /
+        // MangaDex through the fan-out + persist path.
+        if let Some(retry) = st.federated_limiter.is_limited(&format!("fed:{}", user.id)) {
+            return Err(Error::new(format!(
+                "Too many source searches — retry in {retry}s"
+            )));
+        }
+        st.federated_limiter.record(&format!("fed:{}", user.id));
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        federated_search(&st, &trimmed, page.max(1), show_nsfw, Some(user)).await
+    }
+
     async fn series(&self, ctx: &Context<'_>, id: ID) -> Result<Series> {
         let st = state(ctx);
         let n = id.0.parse::<i64>().map_err(gql_err)?;
@@ -1374,6 +1485,353 @@ impl QueryRoot {
         .map_err(gql_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+
+    /// Admin "Sources & Extensions" console (EXT-1): every Keiyoushi/Mihon
+    /// extension known to the Suwayomi engine, installed or not. On first use it
+    /// seeds the curated Keiyoushi index as the default store (idempotent) and
+    /// refreshes the list when the engine has never fetched one. NSFW extensions
+    /// are hidden unless the admin opted in via `show_nsfw` (CATALOGUE.md §2).
+    async fn extensions(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = false)] installed_only: bool,
+        lang: Option<String>,
+        nsfw: Option<bool>,
+        // Re-fetch the store indexes before listing so `hasUpdate`/versions are
+        // fresh (a network round-trip per store). Default false: list from the
+        // engine's cached index.
+        #[graphql(
+            default = false,
+            desc = "Re-fetch the store indexes before listing so hasUpdate/versions are fresh."
+        )]
+        refresh: bool,
+    ) -> Result<Vec<ExtensionInfo>> {
+        let user = require_admin(ctx).await?;
+        let st = state(ctx);
+        ensure_default_extension_store(st).await?;
+        if refresh {
+            st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
+        }
+        let mut list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
+        // Fresh engine: the store may be registered but its index never fetched.
+        if list.is_empty() && !refresh {
+            st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
+            list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
+        }
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        Ok(
+            filter_extensions(list, installed_only, lang.as_deref(), nsfw, show_nsfw)
+                .into_iter()
+                .map(|e| map_extension_info(st, e))
+                .collect(),
+        )
+    }
+
+    /// Admin: the installed Suwayomi sources — the picker that feeds
+    /// `sourceBrowse(sourceId)` (EXT-1). NSFW sources are hidden unless the
+    /// admin opted in via `show_nsfw` (same posture as the extension listing and
+    /// the browse gate).
+    async fn sources(&self, ctx: &Context<'_>) -> Result<Vec<SourceInfo>> {
+        let user = require_admin(ctx).await?;
+        let st = state(ctx);
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        let list = st.suwayomi.list_sources().await.map_err(gql_err)?;
+        Ok(list
+            .into_iter()
+            .filter(|s| show_nsfw || !s.is_nsfw)
+            .map(|s| {
+                let icon = st.suwayomi.abs(s.icon_url.as_deref());
+                SourceInfo {
+                    id: ID(s.id),
+                    name: s.name,
+                    lang: s.lang,
+                    is_nsfw: s.is_nsfw,
+                    icon_url: (!icon.is_empty()).then_some(icon),
+                    pkg_name: s.pkg_name,
+                }
+            })
+            .collect())
+    }
+
+    /// Admin: "add all from source" ingest jobs, newest first (S1). Pass
+    /// `active: true` for only the currently-running ones. Poll this for job
+    /// progress — counters are flushed after every page.
+    async fn source_ingest_jobs(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = false)] active: bool,
+    ) -> Result<Vec<SourceIngestJob>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        Ok(crate::ingest::list_jobs(&st.pool, active)
+            .await
+            .map_err(gql_err)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Admin catalogue provenance, batched: for each Suwayomi series id, the
+    /// canonical work it's linked to and every `source_series` mapping on that
+    /// work with its extension coordinates — what the console needs to render an
+    /// "extension"/source column next to search results. One group per requested
+    /// id, in input order; an uncatalogued series yields `workId: null` and an
+    /// empty `sources` list. NSFW mappings are hidden for an opted-out admin
+    /// (same posture as `workSources`).
+    async fn series_sources_batch(
+        &self,
+        ctx: &Context<'_>,
+        series_ids: Vec<ID>,
+    ) -> Result<Vec<SeriesSourceGroup>> {
+        require_admin(ctx).await?;
+        if series_ids.len() > 200 {
+            return Err(Error::new("At most 200 ids per seriesSourcesBatch call"));
+        }
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // X2: one lookup for every requested key (was one query_scalar per id).
+        // A series key can map twice — the migration-0005 backfill minted
+        // placeholder works with a BLANK source_id, and a later real ingest links
+        // the same key under its real source id. Fetch all rows and pick, per key,
+        // the real mapping (then most-recent) so provenance never surfaces the shell.
+        let keys: Vec<String> = series_ids.iter().map(|id| id.0.clone()).collect();
+        let placeholders = std::iter::repeat_n("?", keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_key, work_id, (source_id != '') AS is_real, last_seen \
+             FROM source_series \
+             WHERE source_type = 'suwayomi' AND source_key IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, String, i64, String)>(&sql);
+        for k in &keys {
+            q = q.bind(k);
+        }
+        let rows = q.fetch_all(&st.pool).await.map_err(gql_err)?;
+        // Best work_id per key: real mapping first, then latest last_seen.
+        let mut best: HashMap<String, (i64, String, String)> = HashMap::new();
+        for (key, wid, is_real, last_seen) in rows {
+            let cand = (is_real, last_seen, wid);
+            match best.get(&key) {
+                Some((r, ls, _)) if (*r, ls.as_str()) >= (cand.0, cand.1.as_str()) => {}
+                _ => {
+                    best.insert(key, cand);
+                }
+            }
+        }
+        let key_to_work: HashMap<String, String> =
+            best.into_iter().map(|(k, (_, _, wid))| (k, wid)).collect();
+
+        // X2: one batched work-sources load for all distinct linked works.
+        let distinct_works: Vec<String> = {
+            let mut v: Vec<String> = key_to_work.values().cloned().collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let sources_by_work = load_work_sources_batch(&st.pool, &distinct_works, show_nsfw).await?;
+
+        // Assemble in input order.
+        let groups = series_ids
+            .into_iter()
+            .map(|series_id| {
+                let work_id = key_to_work.get(&series_id.0).cloned();
+                let sources = work_id
+                    .as_ref()
+                    .and_then(|w| sources_by_work.get(w).cloned())
+                    .unwrap_or_default();
+                SeriesSourceGroup {
+                    series_id,
+                    work_id: work_id.map(ID),
+                    sources,
+                }
+            })
+            .collect();
+        Ok(groups)
+    }
+
+    /// Admin bulk-ingest picker (EXT-1): browse/search one Suwayomi source's
+    /// catalogue. Every returned manga is persisted by Suwayomi and gets the
+    /// internal id `bulkAddSourceSeries` consumes (GQL-SCHEMA-FINDINGS.md §A0).
+    /// An NSFW source is refused unless the admin opted in (show_nsfw posture).
+    async fn source_browse(
+        &self,
+        ctx: &Context<'_>,
+        source_id: ID,
+        #[graphql(name = "type")] ty: SourceBrowseType,
+        #[graphql(default = 1)] page: i32,
+        query: Option<String>,
+    ) -> Result<SourceBrowsePage> {
+        let user = require_admin(ctx).await?;
+        let st = state(ctx);
+        if !user_show_nsfw(&st.pool, &user.id).await {
+            let (_, source_nsfw) = st
+                .suwayomi
+                .source_meta(&source_id.0)
+                .await
+                .map_err(gql_err)?;
+            if source_nsfw {
+                return Err(Error::new(
+                    "This source is NSFW — enable NSFW in your settings to browse it",
+                ));
+            }
+        }
+        let (has_next, mangas) = st
+            .suwayomi
+            .browse_source(&source_id.0, ty.into(), page, query.as_deref())
+            .await
+            .map_err(gql_err)?;
+        let items = mangas
+            .into_iter()
+            .map(|m| {
+                let thumb = st.suwayomi.abs(m.thumbnail_url.as_deref());
+                SourceBrowseEntry {
+                    suwayomi_manga_id: ID(m.id.to_string()),
+                    title: m.title,
+                    thumbnail_url: (!thumb.is_empty()).then_some(thumb),
+                    in_library: m.in_library,
+                }
+            })
+            .collect();
+        Ok(SourceBrowsePage {
+            items,
+            page,
+            has_next_page: has_next,
+        })
+    }
+}
+
+/// The curated Keiyoushi extension index — the hardcoded default store
+/// (CATALOGUE.md §Tier-2: curated, not crawled; `keiyoushi.github.io` 404s, the
+/// raw `repo` branch is the working host).
+const KEIYOUSHI_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
+
+/// Seed the Keiyoushi index as the default extension store when the engine has
+/// NONE configured. Presence can't be checked by URL equality (Suwayomi
+/// canonicalizes `index.min.json` → `index.pb` on add), so "any store exists"
+/// is the idempotency signal — an operator who removed the default on purpose
+/// and added another store is left alone.
+async fn ensure_default_extension_store(st: &AppState) -> Result<()> {
+    let count = st.suwayomi.extension_store_count().await.map_err(gql_err)?;
+    if count == 0 {
+        let name = st
+            .suwayomi
+            .add_extension_store(KEIYOUSHI_INDEX_URL)
+            .await
+            .map_err(gql_err)?;
+        tracing::info!(store = name, "seeded default Keiyoushi extension store");
+    }
+    Ok(())
+}
+
+/// Derive a browser-reachable, store-hosted icon URL for an extension from its
+/// repo index URL: the Mihon/Keiyoushi repo layout hosts icons next to the index
+/// at `icon/{pkgName}.png` (verified live: 200 image/png for installed and
+/// not-installed extensions alike). GitHub `/raw/` paths are rewritten to the
+/// direct `raw.githubusercontent.com` host to skip the 302 redirect. `None` when
+/// the repo URL doesn't end in an index file (unknown layout — caller falls back
+/// to the engine icon endpoint).
+fn store_icon_url(repo: &str, pkg_name: &str) -> Option<String> {
+    let (base, index) = repo.rsplit_once('/')?;
+    if !index.starts_with("index.") {
+        return None;
+    }
+    let base = match base.strip_prefix("https://github.com/") {
+        Some(rest) if rest.contains("/raw/") => format!(
+            "https://raw.githubusercontent.com/{}",
+            rest.replacen("/raw/", "/", 1)
+        ),
+        _ => base.to_string(),
+    };
+    Some(format!("{base}/icon/{pkg_name}.png"))
+}
+
+/// Map a Suwayomi extension row onto the GraphQL `ExtensionInfo`. The icon URL
+/// prefers the STORE-hosted icon (derived from the repo index URL): the engine's
+/// own `/api/v1/extension/icon/…` endpoint serves them too, but only where the
+/// engine host is browser-reachable — in deployments where Suwayomi stays
+/// internal, those icons never load in the admin UI. The engine URL (absolutized
+/// against the public image base) remains the fallback for extensions without a
+/// derivable store icon (e.g. locally-uploaded APKs).
+fn map_extension_info(st: &AppState, mut e: crate::suwayomi::ExtensionListEntry) -> ExtensionInfo {
+    let store_icon = e
+        .repo
+        .as_deref()
+        .and_then(|r| store_icon_url(r, &e.pkg_name));
+    let icon = store_icon.or_else(|| {
+        // L1: `store_icon_url` only knows the GitHub raw / `index.*` layout. For a
+        // repo it can't map, we fall back to the engine icon endpoint — which only
+        // loads where the Suwayomi host is browser-reachable. Log it so a
+        // non-loading icon in a non-GitHub-repo deployment is diagnosable rather
+        // than silent.
+        if e.repo.is_some() {
+            tracing::debug!(
+                pkg = %e.pkg_name,
+                repo = e.repo.as_deref().unwrap_or(""),
+                "extension icon: no store-hosted URL for this repo layout; falling back to engine icon"
+            );
+        }
+        let a = st.suwayomi.abs(e.icon_url.as_deref());
+        (!a.is_empty()).then_some(a)
+    });
+    e.icon_url = icon;
+    e.into()
+}
+
+/// Pure filter for the `extensions` listing. The viewer's `show_nsfw` posture
+/// wins over any explicit `nsfw` filter: an opted-out admin never sees NSFW
+/// extensions, even asking for them (CATALOGUE.md §2).
+fn filter_extensions(
+    list: Vec<crate::suwayomi::ExtensionListEntry>,
+    installed_only: bool,
+    lang: Option<&str>,
+    nsfw: Option<bool>,
+    show_nsfw: bool,
+) -> Vec<crate::suwayomi::ExtensionListEntry> {
+    list.into_iter()
+        .filter(|e| !installed_only || e.is_installed)
+        .filter(|e| lang.is_none_or(|l| e.lang == l))
+        .filter(|e| nsfw.is_none_or(|n| e.is_nsfw == n))
+        .filter(|e| show_nsfw || !e.is_nsfw)
+        .collect()
+}
+
+/// Fold per-id `bulkAddSourceSeries` outcomes into the summary counts.
+fn summarize_bulk(entries: Vec<BulkAddEntry>) -> BulkAddResult {
+    let total = entries.len() as i32;
+    let (mut succeeded, mut failed) = (0, 0);
+    let (mut new_works, mut auto_merged, mut queued_for_review, mut already_existing) =
+        (0, 0, 0, 0);
+    for e in &entries {
+        match &e.result {
+            Some(r) => {
+                succeeded += 1;
+                match r.decision.as_str() {
+                    "new" => new_works += 1,
+                    "auto_merge" => auto_merged += 1,
+                    "review" => queued_for_review += 1,
+                    "existing" => already_existing += 1,
+                    _ => {}
+                }
+            }
+            None => failed += 1,
+        }
+    }
+    BulkAddResult {
+        entries,
+        total,
+        succeeded,
+        failed,
+        new_works,
+        auto_merged,
+        queued_for_review,
+        already_existing,
+    }
 }
 
 /// One `source_series` row LEFT-JOINed to its `source_extension` coordinates. The
@@ -1381,6 +1839,7 @@ impl QueryRoot {
 /// `'mangadex'`) has no extension row, and a Suwayomi source may not be catalogued yet.
 #[derive(sqlx::FromRow)]
 struct WorkSourceRow {
+    work_id: String,
     source_type: String,
     source_id: String,
     source_key: String,
@@ -1393,6 +1852,40 @@ struct WorkSourceRow {
     ext_lang: Option<String>,
 }
 
+/// Map a joined row to a `WorkSource`, honoring the opted-out NSFW filter (returns
+/// `None` for an NSFW mapping a non-opted-in viewer must not see).
+fn work_source_from_row(r: WorkSourceRow, show_nsfw: bool) -> Option<WorkSource> {
+    if !show_nsfw && r.is_nsfw != 0 {
+        return None;
+    }
+    // The LEFT JOIN matches iff the source has a catalogued extension.
+    let extension = match (r.pkg_name, r.repo_url) {
+        (Some(pkg_name), Some(repo_url)) => Some(SourceExtension {
+            pkg_name,
+            repo_url,
+            apk_name: r.apk_name,
+            version_code: r.version_code.map(|v| v as i32),
+            lang: r.ext_lang.clone(),
+        }),
+        _ => None,
+    };
+    Some(WorkSource {
+        source_type: r.source_type,
+        source_id: r.source_id,
+        source_key: r.source_key,
+        source_url: r.source_url,
+        is_nsfw: r.is_nsfw != 0,
+        lang: r.ext_lang,
+        extension,
+    })
+}
+
+const WORK_SOURCE_SELECT: &str =
+    "SELECT ss.work_id, ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+            se.pkg_name, se.repo_url, se.apk_name, se.version_code, se.lang AS ext_lang \
+     FROM source_series ss \
+     LEFT JOIN source_extension se ON se.source_id = ss.source_id";
+
 /// Load a canonical work's source mappings, MangaDex-native first then by recency,
 /// dropping NSFW rows for an opted-out viewer. The extension is populated only when the
 /// LEFT JOIN matched (`pkg_name`/`repo_url` non-null); `WorkSource.lang` is the
@@ -1402,45 +1895,346 @@ async fn load_work_sources(
     work_id: &str,
     show_nsfw: bool,
 ) -> Result<Vec<WorkSource>> {
-    let rows = sqlx::query_as::<_, WorkSourceRow>(
-        "SELECT ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
-                se.pkg_name, se.repo_url, se.apk_name, se.version_code, se.lang AS ext_lang \
-         FROM source_series ss \
-         LEFT JOIN source_extension se ON se.source_id = ss.source_id \
-         WHERE ss.work_id = ? \
-         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC",
-    )
+    let rows = sqlx::query_as::<_, WorkSourceRow>(&format!(
+        "{WORK_SOURCE_SELECT} WHERE ss.work_id = ? \
+         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
+    ))
     .bind(work_id)
     .fetch_all(pool)
     .await
     .map_err(gql_err)?;
     Ok(rows
         .into_iter()
-        // An opted-out viewer simply doesn't see NSFW source mappings (feed semantics).
-        .filter(|r| show_nsfw || r.is_nsfw == 0)
-        .map(|r| {
-            // The LEFT JOIN matches iff the source has a catalogued extension.
-            let extension = match (r.pkg_name, r.repo_url) {
-                (Some(pkg_name), Some(repo_url)) => Some(SourceExtension {
-                    pkg_name,
-                    repo_url,
-                    apk_name: r.apk_name,
-                    version_code: r.version_code.map(|v| v as i32),
-                    lang: r.ext_lang.clone(),
-                }),
-                _ => None,
-            };
-            WorkSource {
-                source_type: r.source_type,
-                source_id: r.source_id,
-                source_key: r.source_key,
-                source_url: r.source_url,
-                is_nsfw: r.is_nsfw != 0,
-                lang: r.ext_lang,
-                extension,
+        .filter_map(|r| work_source_from_row(r, show_nsfw))
+        .collect())
+}
+
+/// Batched `load_work_sources` (X2): one query for many work ids, returning a map
+/// `work_id -> [WorkSource]`. Each work's list keeps the same MangaDex-first,
+/// recency order as the single-work loader. Empty input → empty map.
+async fn load_work_sources_batch(
+    pool: &SqlitePool,
+    work_ids: &[String],
+    show_nsfw: bool,
+) -> Result<HashMap<String, Vec<WorkSource>>> {
+    if work_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat_n("?", work_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "{WORK_SOURCE_SELECT} WHERE ss.work_id IN ({placeholders}) \
+         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
+    );
+    let mut q = sqlx::query_as::<_, WorkSourceRow>(&sql);
+    for wid in work_ids {
+        q = q.bind(wid);
+    }
+    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let mut map: HashMap<String, Vec<WorkSource>> = HashMap::new();
+    for r in rows {
+        let wid = r.work_id.clone();
+        if let Some(ws) = work_source_from_row(r, show_nsfw) {
+            map.entry(wid).or_default().push(ws);
+        }
+    }
+    Ok(map)
+}
+
+// ---- Federated multi-extension search (S3) ---------------------------------
+
+/// Deterministic relevance ranking for federated hits (X4): exact normalized-title
+/// matches to `query` first, ties keeping the incoming (source-index) order — a
+/// stable sort. Pure so the ordering is unit-testable without a live fan-out.
+fn rank_federated_hits(hits: &mut [crate::suwayomi::SuwayomiManga], query: &str) {
+    let nq = crate::catalog::normalize::normalize_title(query);
+    hits.sort_by_key(|m| crate::catalog::normalize::normalize_title(&m.title) != nq);
+}
+
+/// Max installed sources fanned out per federated search. The MangaDex extension
+/// alone exposes ~60 per-language sources; searching all of them for one query is
+/// wasteful, so the fan-out dedupes to one source per extension (English-preferred)
+/// and caps the total here.
+const FEDERATED_MAX_SOURCES: usize = 24;
+/// Bounded concurrency for the fan-out (polite toward the shared engine).
+const FEDERATED_CONCURRENCY: usize = 6;
+/// Per-source search timeout — a slow/hanging source is skipped, not awaited.
+const FEDERATED_SOURCE_TIMEOUT_SECS: u64 = 8;
+/// Anti-bloat policy (S3): a hit that does NOT match an existing work is persisted
+/// only when it's among the first N ranked hits; matches always persist. Bounds how
+/// many brand-new works a single user search can mint.
+const FEDERATED_TOPN_NEW: usize = 20;
+/// Hard ceiling on total persists per search, so a pathological fan-out can't run
+/// hundreds of detail-fetch + library-write round-trips.
+const FEDERATED_MAX_PERSIST: usize = 40;
+
+/// Pick the sources to fan out to: drop NSFW ones for an opted-out viewer, then
+/// keep ONE source per extension package (English-preferred, else first seen),
+/// capped at `FEDERATED_MAX_SOURCES`. Deduping by pkg avoids the 60×-per-language
+/// MangaDex explosion. Pure so it's unit-testable.
+fn select_federated_sources(
+    mut sources: Vec<crate::suwayomi::SuwayomiSource>,
+    show_nsfw: bool,
+) -> Vec<crate::suwayomi::SuwayomiSource> {
+    sources.retain(|s| s.id != "0" && (show_nsfw || !s.is_nsfw));
+    // Stable English-first ordering so the per-pkg pick is deterministic.
+    sources.sort_by(|a, b| {
+        let ae = (a.lang != "en") as u8;
+        let be = (b.lang != "en") as u8;
+        ae.cmp(&be).then_with(|| a.id.cmp(&b.id))
+    });
+    let mut seen_pkg: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for s in sources {
+        // Key on the extension pkg when known, else the source id (a source with no
+        // pkg is its own extension for dedup purposes).
+        let key = s.pkg_name.clone().unwrap_or_else(|| s.id.clone());
+        if seen_pkg.insert(key) {
+            out.push(s);
+            if out.len() >= FEDERATED_MAX_SOURCES {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Map a work's `WorkSource` rows onto `Translator`s, enriching each Suwayomi
+/// mapping with its source's live display name + icon from `sources_by_id`
+/// (built once per search from the installed-source list). The MangaDex spine
+/// mapping becomes a "MangaDex" translator with no `suwayomiMangaId`.
+fn work_sources_to_translators(
+    st: &AppState,
+    sources: Vec<WorkSource>,
+    sources_by_id: &HashMap<String, crate::suwayomi::SuwayomiSource>,
+) -> Vec<Translator> {
+    sources
+        .into_iter()
+        .map(|ws| {
+            if ws.source_type == "mangadex" {
+                return Translator {
+                    source_type: ws.source_type,
+                    source_id: ws.source_id,
+                    source_name: Some("MangaDex".to_string()),
+                    lang: ws.lang,
+                    suwayomi_manga_id: None,
+                    extension_pkg_name: None,
+                    extension_icon_url: None,
+                };
+            }
+            let live = sources_by_id.get(&ws.source_id);
+            // Prefer the STORE-hosted extension icon (browser-reachable even when
+            // the engine host is internal), like the `extensions` surface; fall
+            // back to the live source's engine icon (absolutized).
+            let icon = ws
+                .extension
+                .as_ref()
+                .and_then(|e| store_icon_url(&e.repo_url, &e.pkg_name))
+                .or_else(|| {
+                    live.and_then(|s| s.icon_url.as_deref())
+                        .map(|u| st.suwayomi.abs(Some(u)))
+                        .filter(|u| !u.is_empty())
+                });
+            Translator {
+                source_name: live.map(|s| s.name.clone()),
+                lang: live
+                    .map(|s| s.lang.clone())
+                    .or(ws.lang.clone())
+                    .filter(|l| !l.is_empty()),
+                extension_pkg_name: ws
+                    .extension
+                    .as_ref()
+                    .map(|e| e.pkg_name.clone())
+                    .or_else(|| live.and_then(|s| s.pkg_name.clone())),
+                extension_icon_url: icon,
+                // The Suwayomi manga id the reader fetches chapters with.
+                suwayomi_manga_id: Some(ID(ws.source_key)),
+                source_type: ws.source_type,
+                source_id: ws.source_id,
             }
         })
-        .collect())
+        .collect()
+}
+
+/// The federated search core. Fans out, consolidates via dedup, and builds the
+/// per-work translator lists. Separated from the resolver so the pieces
+/// (`select_federated_sources`) stay unit-testable.
+async fn federated_search(
+    st: &std::sync::Arc<AppState>,
+    query: &str,
+    page: i32,
+    show_nsfw: bool,
+    user: Option<User>,
+) -> Result<FederatedSearchPage> {
+    // Installed sources → the fan-out set + a lookup for translator enrichment.
+    let all_sources = st.suwayomi.list_sources().await.map_err(gql_err)?;
+    let sources_by_id: HashMap<String, crate::suwayomi::SuwayomiSource> = all_sources
+        .iter()
+        .cloned()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    let targets = select_federated_sources(all_sources, show_nsfw);
+    let sources_queried = targets.len() as i32;
+
+    // Fan out with bounded concurrency + a per-source timeout. A failing or slow
+    // source is skipped (logged), never fatal. Each task carries its source's
+    // selection INDEX so results can be reassembled deterministically regardless of
+    // completion order (X4).
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(FEDERATED_CONCURRENCY));
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, src) in targets.into_iter().enumerate() {
+        let st2 = st.clone();
+        let sem2 = sem.clone();
+        let q = query.to_string();
+        set.spawn(async move {
+            let _permit = sem2.acquire().await.ok()?;
+            let fut = st2
+                .suwayomi
+                .browse_source(&src.id, FetchType::Search, page, Some(&q));
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(FEDERATED_SOURCE_TIMEOUT_SECS),
+                fut,
+            )
+            .await
+            {
+                Ok(Ok((has_next, mangas))) => Some((idx, has_next, mangas)),
+                Ok(Err(e)) => {
+                    tracing::warn!(source_id = src.id, error = %e, "federated: source search failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(source_id = src.id, "federated: source search timed out");
+                    None
+                }
+            }
+        });
+    }
+    // Gather per-source results, then reassemble in source-index order (X4: NOT
+    // JoinSet completion order, which is nondeterministic and made which hits fell
+    // inside the top-N vary per request).
+    let mut per_source: Vec<(usize, Vec<crate::suwayomi::SuwayomiManga>)> = Vec::new();
+    let mut any_has_next = false;
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some((idx, has_next, mangas))) = joined {
+            any_has_next = any_has_next || has_next;
+            per_source.push((idx, mangas));
+        }
+    }
+    per_source.sort_by_key(|(idx, _)| *idx);
+    // Flatten preserving source order + per-source position, deduped by manga id.
+    let mut hits: Vec<crate::suwayomi::SuwayomiManga> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (_, mangas) in per_source {
+        for m in mangas {
+            if seen_ids.insert(m.id) {
+                hits.push(m);
+            }
+        }
+    }
+    // Rank exact-title matches first (relevance), keeping source order within ties
+    // — a stable sort over the already source-ordered list. This makes the top-N
+    // cutoff deterministic and relevance-led rather than fastest-source-led (X4).
+    rank_federated_hits(&mut hits, query);
+
+    // Consolidate: persist matching / top-N hits so they resolve to canonical
+    // works. The ranked order above makes the top-N deterministic (X4).
+    let mut work_order: Vec<String> = Vec::new();
+    let mut seen_works: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut persisted = 0usize;
+    for (idx, m) in hits.iter().enumerate() {
+        if persisted >= FEDERATED_MAX_PERSIST {
+            break;
+        }
+        // Cheap match probe: does this title resolve to an existing work? (Title
+        // only — the full corroborated dedup runs inside federated_ingest.)
+        let cand = crate::dedup::Candidate {
+            title: m.title.clone(),
+            ..Default::default()
+        };
+        let probe = crate::dedup::resolve(&st.pool, &cand)
+            .await
+            .map_err(gql_err)?;
+        let matched_work = match &probe {
+            crate::dedup::Decision::AutoMerge { work_id, .. }
+            | crate::dedup::Decision::Review { work_id, .. } => Some(work_id.clone()),
+            crate::dedup::Decision::New => None,
+        };
+        // M1: never persist NOR library-enroll an NSFW hit for an opted-out viewer.
+        // NSFW = genre signal on the hit, OR it matches an already-NSFW work.
+        if !show_nsfw {
+            let matched_nsfw = match &matched_work {
+                Some(wid) => {
+                    sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM work WHERE id = ?")
+                        .bind(wid)
+                        .fetch_optional(&st.pool)
+                        .await
+                        .map_err(gql_err)?
+                        .unwrap_or(0)
+                        != 0
+                }
+                None => false,
+            };
+            if genre_is_nsfw(&m.genre) || matched_nsfw {
+                continue;
+            }
+        }
+        // Anti-bloat: persist a match always; a non-match only within the top-N.
+        if matched_work.is_none() && idx >= FEDERATED_TOPN_NEW {
+            continue;
+        }
+        match federated_ingest(st, &m.id.to_string()).await {
+            Ok(res) => {
+                persisted += 1;
+                if seen_works.insert(res.work_id.clone()) {
+                    work_order.push(res.work_id);
+                }
+            }
+            Err(e) => tracing::warn!(manga_id = m.id, error = %e, "federated: persist failed"),
+        }
+    }
+
+    // Build one FederatedSeries per consolidated work, in discovery order.
+    let uid = user.as_ref().map(|u| u.id.as_str());
+    let mut items = Vec::new();
+    for wid in work_order {
+        let Some(work) = catalog::load_canonical_work(&st.pool, &wid)
+            .await
+            .map_err(gql_err)?
+        else {
+            continue;
+        };
+        // NSFW works are hidden from an opted-out viewer (same gate as feeds).
+        if work.is_nsfw && !show_nsfw {
+            continue;
+        }
+        let chapters = catalog::load_canonical_chapters(&st.pool, &wid)
+            .await
+            .map_err(gql_err)?;
+        let series = map_canonical_series(&st.pool, uid, work, chapters.len() as i32).await;
+        let translators = work_sources_to_translators(
+            st,
+            load_work_sources(&st.pool, &wid, show_nsfw).await?,
+            &sources_by_id,
+        );
+        items.push(FederatedSeries {
+            series,
+            translators,
+        });
+    }
+
+    // L2 (known limitation): `has_next_page` is a coarse OR across sources — true
+    // if ANY queried source reported more results. Because each source paginates
+    // independently and the results consolidate under canonical works, page N+1 can
+    // re-yield works already seen on page N (from a source that had no more, while
+    // another did). Treat it as "there may be more", not a clean cursor. A precise
+    // cursor would need per-source page state carried across requests; deferred.
+    Ok(FederatedSearchPage {
+        items,
+        page,
+        has_next_page: any_has_next,
+        sources_queried,
+    })
 }
 
 /// Row loader for `user_activity`, mapped to the `Activity` GraphQL type.
@@ -1937,6 +2731,43 @@ impl MutationRoot {
         Ok(map_series(st, m).await)
     }
 
+    /// Admin: pause or unpause one series' scanning — the targeted toggle
+    /// (`updateSeriesAdmin` is whole-state and would clobber the other overrides).
+    /// Sets the forced `paused_override` (winning over the auto-by-status pause);
+    /// unpausing also triggers an immediate re-scan so the chapter list and count
+    /// refresh at once instead of waiting for the next cadence. Returns the
+    /// recomputed series. To CLEAR the override (back to auto-by-status), use
+    /// `updateSeriesAdmin` with `paused: null`.
+    async fn set_series_paused(
+        &self,
+        ctx: &Context<'_>,
+        series_id: ID,
+        paused: bool,
+    ) -> Result<Series> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        // Resolve the series first so a bogus id fails before any write.
+        let m = st.suwayomi.series(n).await.map_err(gql_err)?;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO series_admin (series_id, paused_override, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(series_id) DO UPDATE SET \
+               paused_override = excluded.paused_override, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&series_id.0)
+        .bind(paused as i64)
+        .bind(now.to_rfc3339())
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        if !paused {
+            scan_series(st, &m, now).await.map_err(gql_err)?;
+        }
+        Ok(map_series(st, m).await)
+    }
+
     /// Admin: force an immediate re-scan of one series, bypassing the adaptive
     /// overdue/pause gating. Returns the series with its refreshed scan state.
     async fn trigger_scan(&self, ctx: &Context<'_>, series_id: ID) -> Result<Series> {
@@ -2071,6 +2902,31 @@ impl MutationRoot {
             .map_err(gql_err)
     }
 
+    /// Admin (D1): fold one canonical work into another — for cleaning up two
+    /// already-created duplicates (the `merge_candidate` review flow only handles a
+    /// source-series-vs-provisional at add time, not two existing works). All of
+    /// the source work's source-series mappings + user data (library, progress,
+    /// reviews, comments) re-point to the target; the target keeps its identity and
+    /// gains the source's aliases/external-ids (and cover pHash if it had none); the
+    /// empty source work is deleted. Pick `target` as the canonical/enriched one
+    /// (e.g. the MangaDex-anchored work).
+    async fn merge_works(
+        &self,
+        ctx: &Context<'_>,
+        source_work_id: ID,
+        target_work_id: ID,
+    ) -> Result<MergeWorksResult> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let outcome = catalog::merge_works(&st.pool, &source_work_id.0, &target_work_id.0)
+            .await
+            .map_err(gql_err)?;
+        Ok(MergeWorksResult {
+            target_work_id,
+            moved_source_series: outcome.moved_source_series as i32,
+        })
+    }
+
     /// Resolve a pending dedup review. `accept` repoints the source series onto the
     /// candidate work and drops the now-orphaned provisional work; rejecting keeps the
     /// provisional work as a distinct first-class entry. Either way the row is closed.
@@ -2157,6 +3013,443 @@ impl MutationRoot {
         tx.commit().await.map_err(gql_err)?;
         Ok(true)
     }
+
+    // ---- Sources & Extensions admin surface (EXT-1) --------------------------
+
+    /// Admin: register an extension repo (store) on the Suwayomi engine by its
+    /// index URL and refresh the available-extension list from every store.
+    /// Idempotent upstream (re-adding an existing store is a no-op). Returns how
+    /// many extensions are now known.
+    async fn add_extension_repo(&self, ctx: &Context<'_>, index_url: String) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let url = index_url.trim();
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(Error::new("indexUrl must be an http(s) URL"));
+        }
+        st.suwayomi
+            .add_extension_store(url)
+            .await
+            .map_err(gql_err)?;
+        let count = st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
+        Ok(count as i32)
+    }
+
+    /// Admin: install a store extension onto the Suwayomi engine. An NSFW
+    /// extension is refused unless the admin opted in (show_nsfw posture — the
+    /// listing hides it, and it can't be installed by pkgName either).
+    async fn install_extension(
+        &self,
+        ctx: &Context<'_>,
+        pkg_name: String,
+    ) -> Result<ExtensionInfo> {
+        let user = require_admin(ctx).await?;
+        let st = state(ctx);
+        if !user_show_nsfw(&st.pool, &user.id).await {
+            let ext = st
+                .suwayomi
+                .get_extension(&pkg_name)
+                .await
+                .map_err(gql_err)?;
+            if ext.is_nsfw {
+                return Err(Error::new(
+                    "This extension is NSFW — enable NSFW in your settings to install it",
+                ));
+            }
+        }
+        let e = st
+            .suwayomi
+            .install_extension(&pkg_name)
+            .await
+            .map_err(gql_err)?;
+        Ok(map_extension_info(st, e))
+    }
+
+    /// Admin: uninstall an extension from the Suwayomi engine. No NSFW gate —
+    /// removing content is always allowed.
+    async fn uninstall_extension(
+        &self,
+        ctx: &Context<'_>,
+        pkg_name: String,
+    ) -> Result<ExtensionInfo> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let e = st
+            .suwayomi
+            .uninstall_extension(&pkg_name)
+            .await
+            .map_err(gql_err)?;
+        Ok(map_extension_info(st, e))
+    }
+
+    /// Admin: update an installed extension to the store's latest version. Gated
+    /// like `installExtension` (an update installs a new APK).
+    async fn update_extension(&self, ctx: &Context<'_>, pkg_name: String) -> Result<ExtensionInfo> {
+        let user = require_admin(ctx).await?;
+        let st = state(ctx);
+        if !user_show_nsfw(&st.pool, &user.id).await {
+            let ext = st
+                .suwayomi
+                .get_extension(&pkg_name)
+                .await
+                .map_err(gql_err)?;
+            if ext.is_nsfw {
+                return Err(Error::new(
+                    "This extension is NSFW — enable NSFW in your settings to update it",
+                ));
+            }
+        }
+        let e = st
+            .suwayomi
+            .update_extension(&pkg_name)
+            .await
+            .map_err(gql_err)?;
+        Ok(map_extension_info(st, e))
+    }
+
+    /// Admin (S2/H1/F2): backfill MangaDex enrichment — all-language alt titles,
+    /// localized descriptions, full author/artist credits, AND the full per-volume
+    /// cover set (F2) — for works anchored to MangaDex not yet enriched. Selects on
+    /// `metadata_synced_at IS NULL OR covers_synced_at IS NULL`, and marks both, so
+    /// it advances past works legitimately lacking descriptions/covers instead of
+    /// re-selecting them forever (drains, doesn't thrash). Metadata is fetched
+    /// batched (100/req); covers are one `/cover` request per work, so the default
+    /// `limit` is modest — call repeatedly until it returns 0.
+    async fn backfill_mangadex_metadata(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: i32,
+    ) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let limit = limit.clamp(1, 500) as i64;
+        let ids = works_needing_enrichment(&st.pool, limit).await?;
+        enrich_works(st, &ids).await
+    }
+
+    /// Admin: start an "add all from this source" background ingest job (S1).
+    /// Walks the source's POPULAR listing page by page and runs every entry
+    /// through the Tier-2 dedup add flow; progress is persisted on the job row
+    /// (poll `sourceIngestJobs`). Refused while a job is already running for the
+    /// source, and NSFW sources are refused unless the admin opted in.
+    async fn start_source_ingest(
+        &self,
+        ctx: &Context<'_>,
+        source_id: ID,
+    ) -> Result<SourceIngestJob> {
+        let user = require_admin(ctx).await?;
+        let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        // Validates the source exists AND carries the NSFW posture gate.
+        let (_, source_nsfw) = st_arc
+            .suwayomi
+            .source_meta(&source_id.0)
+            .await
+            .map_err(gql_err)?;
+        if source_nsfw && !user_show_nsfw(&st_arc.pool, &user.id).await {
+            return Err(Error::new(
+                "This source is NSFW — enable NSFW in your settings to ingest it",
+            ));
+        }
+        let Some(job) = crate::ingest::try_start_job(&st_arc.pool, &source_id.0)
+            .await
+            .map_err(gql_err)?
+        else {
+            return Err(Error::new(
+                "An ingest job is already running for this source",
+            ));
+        };
+        crate::ingest::spawn_runner(st_arc, job.id.clone(), source_id.0.clone());
+        Ok(job.into())
+    }
+
+    /// Admin: request cancellation of a running ingest job. The runner observes
+    /// it between items and stops; progress up to that point is preserved.
+    /// Cancelling an already-finished job is a no-op returning the row as-is.
+    async fn cancel_source_ingest(&self, ctx: &Context<'_>, job_id: ID) -> Result<SourceIngestJob> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        crate::ingest::cancel_job(&st.pool, &job_id.0)
+            .await
+            .map_err(gql_err)?
+            .map(Into::into)
+            .ok_or_else(|| Error::new("No such ingest job"))
+    }
+
+    /// Admin (F1): "add all from the whole EXTENSION" — start an ingest job for
+    /// EVERY installed Suwayomi source belonging to `pkgName` in one action (an
+    /// extension like MangaDex exposes ~60 per-language sources). NSFW sources are
+    /// skipped for an opted-out admin; a source that already has a running job is
+    /// skipped (its existing job is still returned so the UI can track them
+    /// together), never erroring the whole call. Errors only when no source
+    /// matches the package. Returns every started + already-running job.
+    async fn start_extension_ingest(
+        &self,
+        ctx: &Context<'_>,
+        pkg_name: ID,
+    ) -> Result<Vec<SourceIngestJob>> {
+        let user = require_admin(ctx).await?;
+        let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        let show_nsfw = user_show_nsfw(&st_arc.pool, &user.id).await;
+        let sources = st_arc.suwayomi.list_sources().await.map_err(gql_err)?;
+        let matching: Vec<_> = sources
+            .into_iter()
+            .filter(|s| s.pkg_name.as_deref() == Some(pkg_name.0.as_str()))
+            .filter(|s| show_nsfw || !s.is_nsfw)
+            .collect();
+        if matching.is_empty() {
+            return Err(Error::new(
+                "No installed (visible) sources for this extension",
+            ));
+        }
+        let mut jobs = Vec::new();
+        for src in matching {
+            match crate::ingest::try_start_job(&st_arc.pool, &src.id)
+                .await
+                .map_err(gql_err)?
+            {
+                Some(job) => {
+                    crate::ingest::spawn_runner(st_arc.clone(), job.id.clone(), src.id.clone());
+                    jobs.push(job.into());
+                }
+                // Already running for this source — surface its existing job.
+                None => {
+                    if let Some(existing) = crate::ingest::load_running_job(&st_arc.pool, &src.id)
+                        .await
+                        .map_err(gql_err)?
+                    {
+                        jobs.push(existing.into());
+                    }
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Admin (F1): cancel every running ingest job for an extension's sources.
+    /// Returns the cancelled job rows (empty if none were running).
+    async fn cancel_extension_ingest(
+        &self,
+        ctx: &Context<'_>,
+        pkg_name: ID,
+    ) -> Result<Vec<SourceIngestJob>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let source_ids: Vec<String> = st
+            .suwayomi
+            .list_sources()
+            .await
+            .map_err(gql_err)?
+            .into_iter()
+            .filter(|s| s.pkg_name.as_deref() == Some(pkg_name.0.as_str()))
+            .map(|s| s.id)
+            .collect();
+        let cancelled = crate::ingest::cancel_running_for_sources(&st.pool, &source_ids)
+            .await
+            .map_err(gql_err)?;
+        Ok(cancelled.into_iter().map(Into::into).collect())
+    }
+
+    /// Admin bulk catalogue ingest (EXT-1): for each Suwayomi manga id, ensure
+    /// the manga is in the Suwayomi library (so the adaptive scanner tracks it)
+    /// and run the Tier-2 dedup add flow (`add_source_series` semantics). A
+    /// failing id is recorded in its entry — it never aborts the batch.
+    async fn bulk_add_source_series(
+        &self,
+        ctx: &Context<'_>,
+        suwayomi_manga_ids: Vec<ID>,
+    ) -> Result<BulkAddResult> {
+        require_admin(ctx).await?;
+        if suwayomi_manga_ids.is_empty() {
+            return Err(Error::new("suwayomiMangaIds must not be empty"));
+        }
+        if suwayomi_manga_ids.len() > 100 {
+            return Err(Error::new("At most 100 ids per bulkAddSourceSeries call"));
+        }
+        let st = state(ctx);
+        let mut entries = Vec::with_capacity(suwayomi_manga_ids.len());
+        for id in suwayomi_manga_ids {
+            let entry = match ingest_source_series(st, &id.0).await {
+                Ok(r) => BulkAddEntry {
+                    suwayomi_manga_id: id,
+                    result: Some(r),
+                    error: None,
+                },
+                Err(e) => BulkAddEntry {
+                    suwayomi_manga_id: id,
+                    result: None,
+                    error: Some(e.to_string()),
+                },
+            };
+            entries.push(entry);
+        }
+        Ok(summarize_bulk(entries))
+    }
+}
+
+/// One id of the bulk-ingest flow: resolve the Suwayomi manga, put it in the
+/// Suwayomi library, compute the cover pHash (best-effort, DD1) and run the
+/// shared Tier-2 dedup core. Mirrors `add_source_series` plus the library step.
+pub(crate) async fn ingest_source_series(
+    st: &AppState,
+    raw_id: &str,
+) -> anyhow::Result<MatchResult> {
+    let mid: i64 = raw_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("suwayomiMangaId must be an integer id"))?;
+    let m = st.suwayomi.series(mid).await?;
+    st.suwayomi.set_in_library(mid, true).await?;
+    let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+        Some(bytes) => crate::phash::dhash(&bytes),
+        None => None,
+    };
+    add_source_series_core(&st.pool, &m, cover_phash).await
+}
+
+/// Minimum normalized-title length for a federated silent consolidation (C2).
+/// Below this, a common short title (e.g. "hero", "love") could collide across
+/// unrelated series, so even a corroborated match falls back to cautious review.
+const FEDERATED_MIN_TITLE_CHARS: usize = 5;
+
+/// C2 guard: a federated direct-link (silent, un-mergeable consolidation) is only
+/// safe when a mid-confidence (`Decision::Review`) match is CORROBORATED beyond the
+/// bare title. A title-only exact-alias hit scores exactly `dedup::MID` (0.6 =
+/// 0.6·1.0 title + 0 corroboration); any cover-pHash / description / author / year
+/// signal pushes it strictly above. We additionally require a non-trivial title
+/// length so a short common title can't merge two different series. Matches that
+/// fail this fall back to the cautious provisional + `merge_candidate` path — never
+/// an irreversible merge.
+fn federated_consolidate_ok(score: f64, title: &str) -> bool {
+    score > crate::dedup::MID + 1e-9
+        && crate::catalog::normalize::normalize_title(title)
+            .chars()
+            .count()
+            >= FEDERATED_MIN_TITLE_CHARS
+}
+
+/// Derive a source-level NSFW signal from a Suwayomi manga's genres (CATALOGUE.md
+/// §2). Shared by the Tier-2 add flow and the federated persist gate (M1).
+fn genre_is_nsfw(genre: &[String]) -> bool {
+    genre.iter().any(|g| {
+        let g = g.to_ascii_lowercase();
+        ["hentai", "erotica", "smut", "pornographic", "adult"]
+            .iter()
+            .any(|k| g.contains(k))
+    })
+}
+
+/// Select up to `batch` MangaDex-anchored works still needing enrichment
+/// (missing metadata OR cover set), oldest first. Shared by the backfill mutation
+/// and the X1 scheduler.
+async fn works_needing_enrichment(pool: &SqlitePool, batch: i64) -> Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT ss.source_key FROM source_series ss \
+         JOIN work w ON w.id = ss.work_id \
+         WHERE ss.source_type = 'mangadex' \
+           AND (w.metadata_synced_at IS NULL OR w.covers_synced_at IS NULL) \
+         ORDER BY ss.created_at ASC LIMIT ?",
+    )
+    .bind(batch)
+    .fetch_all(pool)
+    .await
+    .map_err(gql_err)
+}
+
+/// X1: recurring auto-enrichment. Every `interval_secs` it drains a small batch of
+/// un-enriched MangaDex-anchored works (S2 metadata + F2 covers) so newly-ingested
+/// works self-enrich without an operator. Shares the MangaDex rate limiter (via
+/// `enrich_works`), logs what it did, and does nothing — no thrash — when the
+/// backlog is empty. Mirrors `scanner::spawn`. Off unless `METADATA_BACKFILL=on`.
+pub fn spawn_metadata_backfill(
+    state: std::sync::Arc<AppState>,
+    interval_secs: u64,
+    batch: i64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::info!(interval_secs, batch, "metadata auto-enrichment started");
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let ids = match works_needing_enrichment(&state.pool, batch).await {
+                        Ok(ids) => ids,
+                        Err(e) => { tracing::warn!(error = %e.message, "enrich tick: selection failed"); continue; }
+                    };
+                    if ids.is_empty() {
+                        tracing::debug!("enrich tick: nothing to enrich");
+                        continue;
+                    }
+                    match enrich_works(&state, &ids).await {
+                        Ok(n) => tracing::info!(selected = ids.len(), refreshed = n, "enrich tick: done"),
+                        Err(e) => tracing::warn!(error = %e.message, "enrich tick: enrich_works failed"),
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("metadata auto-enrichment stopping");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Enrich a set of MangaDex-anchored works (S2 metadata + F2 full cover set) and
+/// mark them so the backfill cursor advances. Shared by the interactive backfill
+/// mutation and the recurring auto-enrichment scheduler (X1). Metadata is fetched
+/// batched (100/req); covers are one `/cover` request per work. Every requested id
+/// is marked (even if MangaDex returns nothing) so the drain terminates. Returns
+/// how many works were upserted.
+pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
+    let mut refreshed = 0i32;
+    for chunk in ids.chunks(100) {
+        let mangas = st.mangadex.get_manga_by_ids(chunk).await.map_err(gql_err)?;
+        for m in &mangas {
+            let (id, mut input) = crate::mangadex::to_work_input(m);
+            // F2: fetch the full per-volume cover set and mark the primary (the one
+            // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
+            // failure just leaves the sweep's primary cover.
+            let primary = crate::mangadex::cover_file_name(m);
+            match st.mangadex.list_covers(&id, 100).await {
+                Ok(fetched) if !fetched.is_empty() => {
+                    input.covers = crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed"),
+            }
+            match catalog::upsert_work_from_mangadex(&st.pool, &id, &input).await {
+                Ok(_) => refreshed += 1,
+                Err(e) => tracing::warn!(manga = %id, error = %e, "enrich: upsert failed"),
+            }
+        }
+        // Advance the cursor past every requested id — including ones MangaDex
+        // didn't return — so the drain can't loop (H1/F2).
+        catalog::mark_metadata_synced(&st.pool, chunk)
+            .await
+            .map_err(gql_err)?;
+        catalog::mark_covers_synced(&st.pool, chunk)
+            .await
+            .map_err(gql_err)?;
+    }
+    Ok(refreshed)
+}
+
+/// Federated-search persist (S3): like `ingest_source_series` but consolidating —
+/// a mid-confidence title match links straight to the existing work so the same
+/// series across extensions resolves to ONE canonical entry.
+async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchResult> {
+    let mid: i64 = raw_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("suwayomiMangaId must be an integer id"))?;
+    let m = st.suwayomi.series(mid).await?;
+    st.suwayomi.set_in_library(mid, true).await?;
+    let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+        Some(bytes) => crate::phash::dhash(&bytes),
+        None => None,
+    };
+    add_source_series_core_ex(&st.pool, &m, cover_phash, true).await
 }
 
 /// Create a session row and return its opaque token.
@@ -2194,6 +3487,23 @@ async fn add_source_series_core(
     m: &crate::suwayomi::SuwayomiManga,
     cover_phash: Option<String>,
 ) -> anyhow::Result<MatchResult> {
+    add_source_series_core_ex(pool, m, cover_phash, false).await
+}
+
+/// As `add_source_series_core`, but `consolidate` controls the mid-confidence
+/// (Review-band) branch. When false (the Tier-2 admin add flow): a Review match
+/// mints a PROVISIONAL work + a `merge_candidate` for a human to confirm — cautious
+/// by design. When true (federated search, S3): a Review match links DIRECTLY to
+/// the matched work so the same series across extensions consolidates under ONE
+/// canonical entry in search results, as the reader UX requires. Federated
+/// consolidation is optimistic and does NOT enqueue a review row (that would
+/// re-split the very entry the feature is meant to unify).
+async fn add_source_series_core_ex(
+    pool: &SqlitePool,
+    m: &crate::suwayomi::SuwayomiManga,
+    cover_phash: Option<String>,
+    consolidate: bool,
+) -> anyhow::Result<MatchResult> {
     let source_key = m.id.to_string();
 
     // DD2 idempotency: if this source series is already linked to a work, return
@@ -2212,17 +3522,9 @@ async fn add_source_series_core(
         });
     }
 
-    // N1/N5: source-level NSFW. Suwayomi's schema exposes no confirmed
-    // source/manga nsfw boolean (no live instance was available to probe, and
-    // requesting an unconfirmed `source.isNsfw` would break every manga query if
-    // absent), so derive it from the genres already fetched. CATALOGUE.md §2:
-    // NSFW = source flag OR contentRating; this is the source-flag half.
-    let source_nsfw = m.genre.iter().any(|g| {
-        let g = g.to_ascii_lowercase();
-        ["hentai", "erotica", "smut", "pornographic", "adult"]
-            .iter()
-            .any(|k| g.contains(k))
-    });
+    // N1/N5: source-level NSFW derived from the genres already fetched (Suwayomi
+    // exposes no confirmed manga nsfw boolean). CATALOGUE.md §2.
+    let source_nsfw = genre_is_nsfw(&m.genre);
 
     // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
     // `external_ids` stays empty — the external-ID dedup rung is a no-op here.
@@ -2267,11 +3569,28 @@ async fn add_source_series_core(
             Some(method.clone()),
             work_id.clone(),
         ),
+        // Federated (S3/C2): consolidate onto the matched work ONLY when the match
+        // is corroborated beyond the bare title and the title is non-trivial —
+        // otherwise this falls through to the cautious provisional arm below.
+        Decision::Review {
+            work_id,
+            score,
+            method,
+        } if consolidate && federated_consolidate_ok(*score, &m.title) => (
+            "review_consolidated",
+            Some(work_id.clone()),
+            Some(*score),
+            Some(method.clone()),
+            work_id.clone(),
+        ),
         Decision::Review {
             work_id,
             score,
             method,
         } => {
+            // Cautious path: a provisional work + (below) a merge_candidate for a
+            // human. Reached by the admin add flow AND by federated matches that
+            // failed the C2 corroboration/length guard — never a silent merge.
             let provisional = crate::catalog::create_work(pool, &make_work()).await?;
             (
                 "review",
@@ -2305,13 +3624,20 @@ async fn add_source_series_core(
         crate::catalog::mark_work_nsfw(pool, &work_id).await?;
     }
 
-    if let Decision::Review {
-        work_id: cand_work,
-        score,
-        method,
-    } = &decision
-    {
-        crate::catalog::insert_merge_candidate(pool, &ssid, cand_work, *score, method).await?;
+    // Enqueue a review row whenever we took the PROVISIONAL review path (decision
+    // "review") — the admin add flow, and the federated fallback for an
+    // uncorroborated match. A directly-consolidated federated match
+    // ("review_consolidated") already linked to the matched work, so a candidate
+    // would ask a human to re-split the very entry we consolidated.
+    if decision_str == "review" {
+        if let Decision::Review {
+            work_id: cand_work,
+            score,
+            method,
+        } = &decision
+        {
+            crate::catalog::insert_merge_candidate(pool, &ssid, cand_work, *score, method).await?;
+        }
     }
 
     Ok(MatchResult {
@@ -2559,6 +3885,115 @@ mod tests {
         assert_eq!(mc_after, mc_before, "DD2: no duplicate merge_candidate");
     }
 
+    #[test]
+    fn federated_consolidate_ok_requires_corroboration_and_title_length() {
+        use crate::dedup::MID;
+        // A bare title-only exact match scores exactly MID → never consolidates.
+        assert!(!federated_consolidate_ok(MID, "Twin Star Exorcists"));
+        // Any corroboration pushes score above MID → consolidates (long title).
+        assert!(federated_consolidate_ok(MID + 0.05, "Twin Star Exorcists"));
+        // Even corroborated, a too-short/common title is refused.
+        assert!(!federated_consolidate_ok(0.9, "ao"));
+        assert!(!federated_consolidate_ok(0.9, "hero")); // 4 chars < 5
+        assert!(federated_consolidate_ok(0.9, "naruto"));
+    }
+
+    #[tokio::test]
+    async fn federated_corroborated_match_consolidates_to_existing_work() {
+        // C2: a mid-confidence match CORROBORATED beyond the title (here a shared
+        // description) links DIRECTLY to the existing work — one work, no review row.
+        let pool = migrated_pool().await;
+        let blurb = "Twin exorcists destined to marry and birth the Miko.";
+        let existing = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Twin Star Exorcists".into()),
+                description: Some(blurb.into()),
+                aliases: vec![crate::catalog::Alias {
+                    raw: "Twin Star Exorcists".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
+        m.description = Some(blurb.into()); // corroborating description
+        let r = add_source_series_core_ex(&pool, &m, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r.decision, "review_consolidated");
+        assert_eq!(r.work_id, existing, "links to the existing work");
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(works, 1, "no provisional work created");
+        let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mc, 0, "corroborated consolidation enqueues no review row");
+    }
+
+    #[tokio::test]
+    async fn federated_bare_title_collision_does_not_silently_merge() {
+        // C2 (the critical guard): a bare title-only match — zero corroboration,
+        // exactly MID — must NOT be silently merged even in the federated
+        // (consolidate) path. It falls back to the cautious provisional + a
+        // merge_candidate for human review, so two different same-titled series
+        // are never irreversibly joined.
+        let pool = migrated_pool().await;
+        let existing = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Twin Star Exorcists".into()),
+                aliases: vec![crate::catalog::Alias {
+                    raw: "Twin Star Exorcists".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Same title, NO description/cover → title-only, score == MID.
+        let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
+        let r = add_source_series_core_ex(&pool, &m, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r.decision, "review", "bare title-only is NOT consolidated");
+        assert_ne!(
+            r.work_id, existing,
+            "a distinct provisional work is minted, not a silent merge"
+        );
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(works, 2, "two distinct works remain (no merge)");
+        let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mc, 1, "a merge_candidate is queued for human review");
+        // The new mapping points at the provisional, and the candidate is the existing.
+        let linked: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_id = 'src-ext2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, r.work_id);
+        let cand: String = sqlx::query_scalar("SELECT candidate_work_id FROM merge_candidate")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cand, existing, "the review candidate is the existing work");
+    }
+
     #[tokio::test]
     async fn add_source_series_safe_genre_is_not_nsfw() {
         let pool = migrated_pool().await;
@@ -2644,6 +4079,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
+            federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         });
         (build_schema(state, false), pool)
@@ -2837,6 +4273,7 @@ mod tests {
                 admin_users: vec![],
                 scan_health: Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
+                federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 30 * 24 * 60 * 60,
             })
         };
@@ -2940,6 +4377,7 @@ mod tests {
             admin_users: vec!["admin".into()],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         });
         let s = build_schema(state, false);
@@ -3170,6 +4608,55 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn series_exposes_localized_descriptions_and_credits() {
+        // H2: the S2 enrichment tables are now readable via resolver fields on the
+        // Series type (canonicalSeries path).
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-enr",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Enriched Work".into()),
+                cover_file_name: Some("c.jpg".into()),
+                descriptions: vec![
+                    ("en".into(), "English blurb.".into()),
+                    ("ja".into(), "日本語の紹介".into()),
+                ],
+                credits: vec![
+                    ("author".into(), "Author One".into()),
+                    ("artist".into(), "Artist Two".into()),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-enr'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let q = format!(
+            r#"{{ canonicalSeries(workId: "{work_id}") {{ localizedDescriptions {{ lang description }} credits {{ role name }} }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let descs = data["canonicalSeries"]["localizedDescriptions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(descs.len(), 2, "both languages surface");
+        assert_eq!(descs[0]["lang"], serde_json::json!("en"));
+        assert_eq!(descs[0]["description"], serde_json::json!("English blurb."));
+        assert_eq!(descs[1]["lang"], serde_json::json!("ja"));
+        let credits = data["canonicalSeries"]["credits"].as_array().unwrap();
+        assert_eq!(credits.len(), 2);
+        assert_eq!(credits[0]["role"], serde_json::json!("artist"));
+        assert_eq!(credits[0]["name"], serde_json::json!("Artist Two"));
+        assert_eq!(credits[1]["role"], serde_json::json!("author"));
     }
 
     #[tokio::test]
@@ -4134,6 +5621,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         });
         let s = build_schema(state, false);
@@ -4203,6 +5691,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
         })
     }
@@ -4413,6 +5902,360 @@ mod tests {
             resolved_at2.as_deref(),
             Some(resolved_at.as_str()),
             "resolved_at is untouched — the guarded UPDATE claimed nothing the second time"
+        );
+    }
+
+    // ---- Sources & Extensions admin surface (EXT-1) ------------------------
+
+    fn ext(
+        pkg: &str,
+        lang: &str,
+        installed: bool,
+        nsfw: bool,
+    ) -> crate::suwayomi::ExtensionListEntry {
+        crate::suwayomi::ExtensionListEntry {
+            pkg_name: pkg.into(),
+            name: pkg.into(),
+            lang: lang.into(),
+            version_name: "1.0".into(),
+            is_installed: installed,
+            has_update: false,
+            is_nsfw: nsfw,
+            icon_url: None,
+            repo: None,
+        }
+    }
+
+    #[test]
+    fn filter_extensions_show_nsfw_posture_wins_over_explicit_filter() {
+        let list = vec![ext("a", "en", false, false), ext("b", "en", false, true)];
+        // Opted-out viewer never sees NSFW — even asking for nsfw:true yields none.
+        let out = filter_extensions(list.clone(), false, None, Some(true), false);
+        assert!(out.is_empty(), "opted-out viewer sees no NSFW extensions");
+        // Opted-out default listing drops the NSFW entry.
+        let out = filter_extensions(list.clone(), false, None, None, false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pkg_name, "a");
+        // Opted-in viewer can filter to NSFW-only.
+        let out = filter_extensions(list, false, None, Some(true), true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pkg_name, "b");
+    }
+
+    #[test]
+    fn filter_extensions_installed_and_lang() {
+        let list = vec![
+            ext("a", "en", true, false),
+            ext("b", "en", false, false),
+            ext("c", "ja", true, false),
+        ];
+        let out = filter_extensions(list.clone(), true, None, None, true);
+        assert_eq!(
+            out.iter().map(|e| e.pkg_name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "installedOnly keeps only installed"
+        );
+        let out = filter_extensions(list, false, Some("ja"), None, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pkg_name, "c");
+    }
+
+    #[test]
+    fn summarize_bulk_counts_decisions_and_failures() {
+        let mk = |decision: &str| MatchResult {
+            decision: decision.into(),
+            work_id: "w_x".into(),
+            matched_work_id: None,
+            score: None,
+            method: None,
+            source_series_id: "ss_x".into(),
+        };
+        let entries = vec![
+            BulkAddEntry {
+                suwayomi_manga_id: ID("1".into()),
+                result: Some(mk("new")),
+                error: None,
+            },
+            BulkAddEntry {
+                suwayomi_manga_id: ID("2".into()),
+                result: Some(mk("auto_merge")),
+                error: None,
+            },
+            BulkAddEntry {
+                suwayomi_manga_id: ID("3".into()),
+                result: Some(mk("review")),
+                error: None,
+            },
+            BulkAddEntry {
+                suwayomi_manga_id: ID("4".into()),
+                result: Some(mk("existing")),
+                error: None,
+            },
+            BulkAddEntry {
+                suwayomi_manga_id: ID("5".into()),
+                result: None,
+                error: Some("boom".into()),
+            },
+        ];
+        let r = summarize_bulk(entries);
+        assert_eq!(r.total, 5);
+        assert_eq!(r.succeeded, 4);
+        assert_eq!(r.failed, 1);
+        assert_eq!(r.new_works, 1);
+        assert_eq!(r.auto_merged, 1);
+        assert_eq!(r.queued_for_review, 1);
+        assert_eq!(r.already_existing, 1);
+    }
+
+    #[test]
+    fn federated_source_selection_dedupes_by_pkg_and_gates_nsfw() {
+        use crate::suwayomi::SuwayomiSource;
+        let src = |id: &str, lang: &str, nsfw: bool, pkg: Option<&str>| SuwayomiSource {
+            id: id.into(),
+            name: format!("src-{id}"),
+            lang: lang.into(),
+            is_nsfw: nsfw,
+            icon_url: None,
+            pkg_name: pkg.map(Into::into),
+        };
+        // Two per-language MangaDex sources (same pkg) + a separate SFW extension +
+        // an NSFW extension + the local source (id "0").
+        let sources = vec![
+            src("0", "und", false, Some("local")),
+            src("md-ja", "ja", true, Some("pkg.mangadex")),
+            src("md-en", "en", true, Some("pkg.mangadex")),
+            src("pill", "en", false, Some("pkg.pill")),
+            src("adult", "en", true, Some("pkg.adult")),
+        ];
+
+        // Opted-out viewer: NSFW sources dropped, local dropped, one per pkg.
+        let sfw = select_federated_sources(sources.clone(), false);
+        let ids: Vec<&str> = sfw.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pill"],
+            "only the SFW non-local extension survives"
+        );
+
+        // Opted-in viewer: NSFW allowed, but MangaDex still deduped to ONE source,
+        // and the English one wins the per-pkg pick.
+        let all = select_federated_sources(sources, true);
+        let ids: std::collections::HashSet<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains("md-en"),
+            "English MangaDex source is the pkg pick"
+        );
+        assert!(
+            !ids.contains("md-ja"),
+            "the other MangaDex language is deduped out"
+        );
+        assert!(ids.contains("pill") && ids.contains("adult"));
+        assert!(!ids.contains("0"), "the local source is never fanned out");
+        assert_eq!(all.len(), 3, "one source per extension pkg");
+    }
+
+    #[test]
+    fn rank_federated_hits_exact_title_first_stable() {
+        // X4: exact-title matches sort first; ties keep incoming (source) order, so
+        // the ranking is deterministic regardless of fan-out completion order.
+        let mk = |id: i64, title: &str| crate::suwayomi::SuwayomiManga {
+            id,
+            title: title.into(),
+            thumbnail_url: None,
+            author: None,
+            artist: None,
+            description: None,
+            genre: vec![],
+            status: "ONGOING".into(),
+            in_library: false,
+            in_library_at: None,
+            last_fetched_at: None,
+            source_id: "s".into(),
+            source: None,
+            chapters: None,
+        };
+        // Incoming already in source order: a fuzzy, then two exact, then fuzzy.
+        let mut hits = vec![
+            mk(1, "Naruto Gaiden"),
+            mk(2, "Naruto"),
+            mk(3, "NARUTO"), // normalizes equal to "naruto"
+            mk(4, "Boruto"),
+        ];
+        rank_federated_hits(&mut hits, "naruto");
+        let ids: Vec<i64> = hits.iter().map(|m| m.id).collect();
+        // The two exact matches (2,3) come first in their original relative order,
+        // then the non-exact ones (1,4) in original order.
+        assert_eq!(ids, vec![2, 3, 1, 4]);
+    }
+
+    #[test]
+    fn store_icon_url_derives_store_hosted_icons() {
+        // Keiyoushi's canonicalized repo URL → the direct raw.githubusercontent icon.
+        assert_eq!(
+            store_icon_url(
+                "https://github.com/keiyoushi/extensions/raw/repo/index.pb",
+                "eu.kanade.tachiyomi.extension.en.foo"
+            )
+            .as_deref(),
+            Some(
+                "https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/eu.kanade.tachiyomi.extension.en.foo.png"
+            )
+        );
+        // The pre-canonicalization min.json form works too.
+        assert_eq!(
+            store_icon_url(
+                "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json",
+                "pkg.x"
+            )
+            .as_deref(),
+            Some("https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/pkg.x.png")
+        );
+        // A repo URL that doesn't end in an index file → None (fall back to engine).
+        assert_eq!(store_icon_url("https://example.com/store", "pkg.x"), None);
+        assert_eq!(store_icon_url("", "pkg.x"), None);
+    }
+
+    #[tokio::test]
+    async fn series_sources_batch_returns_provenance_in_input_order() {
+        let (s, pool) = setup_full(100).await;
+        // A canonical work with a MangaDex mapping + a Suwayomi mapping whose
+        // source_key is the Suwayomi series id the console holds ("42").
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-y",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Prov Work".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-y'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "2048", "42", None, false,
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_extension(
+            &pool,
+            "2048",
+            &crate::catalog::SourceExtensionInput {
+                pkg_name: "pkg.prov".into(),
+                repo_url: "https://r".into(),
+                apk_name: None,
+                version_code: None,
+                lang: Some("en".into()),
+                is_nsfw: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let q = r#"{ seriesSourcesBatch(seriesIds: ["42", "999"]) {
+            seriesId workId sources { sourceType sourceId extension { pkgName } } } }"#;
+        let r = exec(&s, q, Some("admintok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let groups = data["seriesSourcesBatch"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "one group per requested id, in order");
+        // Catalogued series: linked work + both mappings, extension joined.
+        assert_eq!(groups[0]["seriesId"], serde_json::json!("42"));
+        assert_eq!(groups[0]["workId"], serde_json::json!(work_id));
+        let sources = groups[0]["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["sourceType"], serde_json::json!("mangadex"));
+        assert_eq!(sources[1]["sourceType"], serde_json::json!("suwayomi"));
+        assert_eq!(
+            sources[1]["extension"]["pkgName"],
+            serde_json::json!("pkg.prov")
+        );
+        // Uncatalogued series: null work, empty sources.
+        assert_eq!(groups[1]["seriesId"], serde_json::json!("999"));
+        assert_eq!(groups[1]["workId"], serde_json::Value::Null);
+        assert!(groups[1]["sources"].as_array().unwrap().is_empty());
+
+        // Admin-gated: a non-admin viewer is refused.
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Admin access required");
+    }
+
+    #[tokio::test]
+    async fn extension_surface_requires_admin() {
+        // Every EXT-1 query/mutation is admin-gated — a signed-in non-admin (and
+        // an anonymous caller) is refused before any Suwayomi round-trip (the
+        // test client points at a dead port, so passing the gate would error
+        // differently).
+        let s = setup().await;
+        for (q, who) in [
+            (r#"{ extensions { pkgName } }"#, Some("bobtok")),
+            (r#"{ extensions { pkgName } }"#, None),
+            (r#"{ sources { id } }"#, Some("bobtok")),
+            (r#"{ sources { id } }"#, None),
+            (
+                r#"{ sourceBrowse(sourceId: "1", type: POPULAR) { page } }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { addExtensionRepo(indexUrl: "https://example.com/index.json") }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { installExtension(pkgName: "x") { pkgName } }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { uninstallExtension(pkgName: "x") { pkgName } }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { updateExtension(pkgName: "x") { pkgName } }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { bulkAddSourceSeries(suwayomiMangaIds: ["1"]) { total } }"#,
+                Some("bobtok"),
+            ),
+            (
+                r#"mutation { setSeriesPaused(seriesId: "1", paused: false) { id } }"#,
+                Some("bobtok"),
+            ),
+        ] {
+            let r = exec(&s, q, who, "1.1.1.1").await;
+            let msg = first_error(&r);
+            assert!(
+                msg == "Admin access required" || msg == "Not authenticated",
+                "expected auth refusal for {q}, got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_add_source_series_validates_input_size() {
+        let s = setup().await;
+        let r = exec(
+            &s,
+            r#"mutation { bulkAddSourceSeries(suwayomiMangaIds: []) { total } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "suwayomiMangaIds must not be empty");
+
+        let ids = (0..101)
+            .map(|i| format!("\"{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let q =
+            format!(r#"mutation {{ bulkAddSourceSeries(suwayomiMangaIds: [{ids}]) {{ total }} }}"#);
+        let r = exec(&s, &q, Some("admintok"), "1.1.1.1").await;
+        assert_eq!(
+            first_error(&r),
+            "At most 100 ids per bulkAddSourceSeries call"
         );
     }
 }

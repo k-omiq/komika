@@ -2,7 +2,14 @@
 	import Icon from './Icon.svelte';
 	import FlagBadge from './FlagBadge.svelte';
 	import Cover from './Cover.svelte';
+	import TranslatorChips from './TranslatorChips.svelte';
 	import { slug, type ComicType } from '$lib/data/types';
+
+	interface Chip {
+		name: string;
+		lang: string | null;
+		iconUrl: string | null;
+	}
 
 	let {
 		title,
@@ -15,6 +22,7 @@
 		status = null,
 		fixed = false,
 		width = 150,
+		translators = [],
 	}: {
 		title: string;
 		sub?: string;
@@ -26,6 +34,7 @@
 		status?: { label: string; color: string } | null;
 		fixed?: boolean;
 		width?: number;
+		translators?: Chip[];
 	} = $props();
 
 	const href = $derived(`/series/${id || slug(title)}`);
@@ -51,6 +60,9 @@
 	<div class="meta">
 		<div class="title">{title}</div>
 		{#if sub}<div class="sub">{sub}</div>{/if}
+		{#if translators.length}
+			<div class="tchips"><TranslatorChips chips={translators} size={18} max={4} /></div>
+		{/if}
 	</div>
 </a>
 
@@ -144,5 +156,8 @@
 		font-size: 12px;
 		color: var(--k-text-faint);
 		margin-top: 3px;
+	}
+	.tchips {
+		margin-top: 7px;
 	}
 </style>

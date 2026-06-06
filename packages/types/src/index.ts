@@ -125,6 +125,108 @@ export interface CanonicalUpdate {
 }
 
 /**
+ * One Keiyoushi/Mihon extension as known to the Suwayomi engine — the admin
+ * management view (installed or not). CATALOGUE.md §2 Tier-2.
+ */
+export interface ExtensionInfo {
+	/** Extension package name (e.g. `eu.kanade.tachiyomi.extension.all.mangadex`). */
+	pkgName: string;
+	name: string;
+	lang: string;
+	versionName: string;
+	isInstalled: boolean;
+	/** True when the store carries a newer version than the installed one. */
+	hasUpdate: boolean;
+	isNsfw: boolean;
+	iconUrl: string | null;
+	/** The store/repo the extension came from, when reported. */
+	repo: string | null;
+}
+
+/** One installed Suwayomi source — the admin picker feeding `sourceBrowse`. */
+export interface SourceInfo {
+	/** The Suwayomi source id (the `sourceBrowse` input). */
+	id: Id;
+	/** User-facing display name (per-language variants, e.g. "MangaDex (EN)"). */
+	name: string;
+	lang: string;
+	isNsfw: boolean;
+	iconUrl: string | null;
+	/** The owning extension's pkgName, when reported. */
+	pkgName: string | null;
+}
+
+/** Which listing of a source to browse. */
+export type SourceBrowseType = 'POPULAR' | 'LATEST' | 'SEARCH';
+
+/**
+ * One manga returned by browsing a source (admin bulk-ingest picker). The id is
+ * Suwayomi's internal manga id — exactly what `bulkAddSourceSeries` consumes.
+ */
+export interface SourceBrowseEntry {
+	suwayomiMangaId: Id;
+	title: string;
+	thumbnailUrl: string | null;
+	inLibrary: boolean;
+}
+
+/** A page of source-browse results. */
+export interface SourceBrowsePage {
+	items: SourceBrowseEntry[];
+	page: number;
+	hasNextPage: boolean;
+}
+
+/**
+ * Per-id outcome of `bulkAddSourceSeries`: the dedup {@link MatchResult} on
+ * success, or the error that made this one id fail (other ids still proceed).
+ */
+export interface BulkAddEntry {
+	suwayomiMangaId: Id;
+	result: MatchResult | null;
+	error: string | null;
+}
+
+/**
+ * A background "add all from this source" ingest job (S1): walks a source's
+ * listing page by page and runs every entry through the Tier-2 dedup add flow,
+ * persisting progress counters on the row. Poll {@link Backend.sourceIngestJobs}
+ * for updates.
+ */
+export interface SourceIngestJob {
+	id: Id;
+	sourceId: string;
+	/** `running` | `completed` | `cancelled` | `failed`. */
+	state: string;
+	pagesDone: number;
+	itemsSeen: number;
+	succeeded: number;
+	failed: number;
+	newWorks: number;
+	autoMerged: number;
+	queuedForReview: number;
+	alreadyExisting: number;
+	/** Failure detail when `state` is `failed`; null otherwise. */
+	error: string | null;
+	startedAt: string;
+	/** Set once the job reaches a terminal state (completed/cancelled/failed). */
+	finishedAt: string | null;
+}
+
+/** Result of a bulk catalogue ingest: per-id entries plus a decision summary. */
+export interface BulkAddResult {
+	entries: BulkAddEntry[];
+	total: number;
+	succeeded: number;
+	failed: number;
+	/** Decision counts across the succeeded entries. */
+	newWorks: number;
+	autoMerged: number;
+	queuedForReview: number;
+	alreadyExisting: number;
+}
+
+/**
  * Extension coordinates for a source that a native client fetches through an
  * embedded Suwayomi runtime: where to get the APK and which package/version to
  * load. Null on a WorkSource that Komika fetches MangaDex-natively.
@@ -169,6 +271,57 @@ export interface WorkSourceGroup {
 	sources: WorkSource[];
 }
 
+/**
+ * One source/extension that carries a canonical work — a "translator" in the
+ * reader UI (federated multi-extension search, S3). For a Suwayomi source,
+ * `suwayomiMangaId` is exactly the id the reader passes to `chapters(seriesId:)`
+ * to fetch THIS translator's chapters; for the MangaDex canonical spine
+ * (`sourceType = "mangadex"`), `suwayomiMangaId` is null and chapters come from
+ * `canonicalChapters(workId)` instead.
+ */
+export interface Translator {
+	/** `"mangadex"` (the canonical spine) or `"suwayomi"` (an installed extension). */
+	sourceType: string;
+	sourceId: string;
+	/** Display name (e.g. "MangaDex (EN)", "MANGA Plus by SHUEISHA (EN)"); null when
+	 * the source isn't currently installed on the engine. */
+	sourceName: string | null;
+	lang: string | null;
+	/** Suwayomi manga id to fetch this translator's chapters with
+	 * (`chapters(seriesId:)`). Null for the MangaDex canonical spine. */
+	suwayomiMangaId: Id | null;
+	extensionPkgName: string | null;
+	/** Browser-reachable store-hosted PNG icon for the extension; null when unknown. */
+	extensionIconUrl: string | null;
+}
+
+/** One consolidated federated-search hit: a canonical work as a `Series`, plus
+ * the per-source translator list gathered across every installed extension. */
+export interface FederatedSeries {
+	series: Series;
+	translators: Translator[];
+}
+
+/** A page of federated multi-extension search results (S3). */
+export interface FederatedSearchPage {
+	items: FederatedSeries[];
+	page: number;
+	hasNextPage: boolean;
+	/** How many installed sources were actually queried in the fan-out (diagnostic). */
+	sourcesQueried: number;
+}
+
+/**
+ * Admin catalogue provenance for one Suwayomi series (batched): the canonical
+ * work it's linked to and every source mapping on that work. `workId` is null
+ * (and `sources` empty) when the series hasn't been catalogued into a work yet.
+ */
+export interface SeriesSourceGroup {
+	seriesId: Id;
+	workId: Id | null;
+	sources: WorkSource[];
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */
@@ -205,6 +358,50 @@ export interface Series {
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;
+	/**
+	 * Opt-in enrichment (S2), populated only when selected AND the series id is a
+	 * canonical `w_` work id — MangaDex's per-language descriptions and the full
+	 * author/artist credit list. Undefined on documents that don't select them and
+	 * empty for a non-canonical series or an un-enriched work.
+	 */
+	localizedDescriptions?: LocalizedDescription[];
+	credits?: Credit[];
+	/**
+	 * The full MangaDex cover set (F2), opt-in and canonical-`w_`-works only:
+	 * primary first, then volume-ordered. `coverUrl` (the single primary) is
+	 * unchanged. Undefined on documents that don't select it, empty for a
+	 * non-canonical/un-enriched work.
+	 */
+	covers?: Cover[];
+}
+
+/** One MangaDex-sourced description in a specific language (S2 enrichment). */
+export interface LocalizedDescription {
+	/** BCP-47-ish language tag, e.g. `en`, `ja`, `pt-br`. */
+	lang: string;
+	description: string;
+}
+
+/** One MangaDex cover for a canonical work (F2). `url`/`thumbnailUrl` are
+ *  proxy-ready (`uploads.mangadex.org` hosts) — resolve through the ImageProvider. */
+export interface Cover {
+	fileName: string;
+	/** Proxy-ready full-resolution cover URL. */
+	url: string;
+	/** Proxy-ready 512px thumbnail URL. */
+	thumbnailUrl: string;
+	/** Cover language tag, when known (e.g. `ja`, `en`). */
+	lang: string | null;
+	/** Volume label this cover belongs to, when known (e.g. `1`, `27`). */
+	volume: string | null;
+	isPrimary: boolean;
+}
+
+/** One author/artist credit on a canonical work (S2 enrichment). */
+export interface Credit {
+	/** `"author"` or `"artist"`. */
+	role: string;
+	name: string;
 }
 
 export interface Chapter {

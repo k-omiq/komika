@@ -12,22 +12,106 @@
 		type ComicType,
 		type Status,
 	} from '$lib/data/types';
+	import {
+		getBrowseCatalog,
+		getFederatedSearch,
+		getNativeSearch,
+		type FederatedResultView,
+	} from '$lib/data/source';
+	import { auth } from '$lib/auth.svelte';
 
 	let { data } = $props();
 	// Filters stay interactive while the catalog streams in; the results area
 	// shows a skeleton until it resolves. `data.catalog` never rejects.
 	let catalog = $state<CatalogEntry[]>([]);
 	let loading = $state(true);
+	let catalogError = $state(false);
 	$effect(() => {
 		loading = true;
-		data.catalog.then((list) => {
-			catalog = list;
+		catalogError = false;
+		data.catalog.then((r) => {
+			catalog = r.items;
+			catalogError = r.error;
 			loading = false;
 		});
 	});
 
+	async function retryCatalog(): Promise<void> {
+		loading = true;
+		catalogError = false;
+		const r = await getBrowseCatalog();
+		catalog = r.items;
+		catalogError = r.error;
+		loading = false;
+	}
+
 	const params = page.url.searchParams;
 	let query = $state(params.get('q') ?? '');
+
+	// Search: signed-in viewers get FEDERATED search across every installed
+	// extension (deduped works tagged with their sources/"translators"). The
+	// federated query is login-gated + rate-limited on the server, so signed-out
+	// viewers fall back to the public NATIVE catalogue search (no translator tags),
+	// and rate-limit/errors surface an honest notice instead of an empty grid.
+	// Debounced so we don't fan out on every keystroke.
+	let federated = $state<FederatedResultView[]>([]);
+	let fedLoading = $state(false);
+	let searchNotice = $state<string | null>(null);
+	const queryActive = $derived(query.trim().length > 0);
+
+	$effect(() => {
+		const q = query.trim();
+		const loggedIn = !!auth.user; // re-run when sign-in state flips
+		if (!q) {
+			fedLoading = false;
+			federated = [];
+			searchNotice = null;
+			return;
+		}
+		fedLoading = true;
+		let cancelled = false;
+		const t = setTimeout(async () => {
+			try {
+				// Signed-out (or no federation backend): public native search.
+				if (!loggedIn) {
+					const rows = await getNativeSearch(q);
+					if (!cancelled) {
+						federated = rows;
+						searchNotice = null;
+					}
+					return;
+				}
+				const outcome = await getFederatedSearch(q);
+				if (cancelled) return;
+				if (outcome.kind === 'ok') {
+					federated = outcome.rows;
+					searchNotice = null;
+				} else if (outcome.kind === 'rateLimited') {
+					// Keep any prior results visible; show a transient message, not "0 results".
+					searchNotice =
+						outcome.retryAfter != null
+							? `Too many searches — try again in ${outcome.retryAfter}s.`
+							: 'Too many searches — try again in a moment.';
+				} else {
+					// Not authenticated / unexpected error → public native fallback so results
+					// still appear; flag genuine errors distinctly from "no matches".
+					const rows = await getNativeSearch(q);
+					if (cancelled) return;
+					federated = rows;
+					searchNotice =
+						outcome.kind === 'error'
+							? 'Live search had a problem — showing catalogue results.'
+							: null;
+				}
+			} finally {
+				if (!cancelled) fedLoading = false;
+			}
+		}, 280);
+		return () => {
+			cancelled = true;
+			clearTimeout(t);
+		};
+	});
 	let types = $state<ComicType[]>(params.get('type') ? [params.get('type') as ComicType] : []);
 	let genres = $state<string[]>(params.get('genre') ? [params.get('genre')!] : []);
 	let status = $state<Status | 'any'>('any');
@@ -40,19 +124,14 @@
 		return arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v];
 	}
 
+	// When a query is active, results come from the federated (all-extensions)
+	// search — already matched server-side, so we don't substring-filter again.
+	// With no query, the native catalog is browsed. The facet filters + sort apply
+	// to both. Federated rows carry `translators`; native rows don't.
+	type ResultRow = CatalogEntry & { translators?: FederatedResultView['translators'] };
 	const results = $derived.by(() => {
-		const q = query.trim().toLowerCase();
-		let list = catalog.filter((m) => {
-			if (
-				q &&
-				!(
-					m.title.toLowerCase().includes(q) ||
-					m.author.toLowerCase().includes(q) ||
-					m.genre.toLowerCase().includes(q) ||
-					m.type.toLowerCase().includes(q)
-				)
-			)
-				return false;
+		const base: ResultRow[] = queryActive ? federated : catalog;
+		const list = base.filter((m) => {
 			if (types.length && !types.includes(m.type)) return false;
 			if (genres.length && !genres.includes(m.genre)) return false;
 			if (status !== 'any' && m.status !== status) return false;
@@ -60,13 +139,16 @@
 			return true;
 		});
 		const sorters = {
-			trending: (a: (typeof list)[0], b: (typeof list)[0]) => b.rating - a.rating || b.ch - a.ch,
-			rating: (a: (typeof list)[0], b: (typeof list)[0]) => b.rating - a.rating,
-			newest: (a: (typeof list)[0], b: (typeof list)[0]) => a.added - b.added,
-			chapters: (a: (typeof list)[0], b: (typeof list)[0]) => b.ch - a.ch,
+			trending: (a: ResultRow, b: ResultRow) => b.rating - a.rating || b.ch - a.ch,
+			rating: (a: ResultRow, b: ResultRow) => b.rating - a.rating,
+			newest: (a: ResultRow, b: ResultRow) => a.added - b.added,
+			chapters: (a: ResultRow, b: ResultRow) => b.ch - a.ch,
 		};
 		return [...list].sort(sorters[sort]);
 	});
+
+	// The results area is loading when the relevant source is still resolving.
+	const resultsLoading = $derived(queryActive ? fedLoading : loading);
 
 	const anyFilter = $derived(
 		types.length > 0 || genres.length > 0 || status !== 'any' || minRating > 0,
@@ -212,7 +294,13 @@
 		<div class="results-head">
 			<div class="results-title">
 				<span class="rt">{query.trim() ? `"${query.trim()}"` : 'All series'}</span>
-				<span class="rc">{loading ? 'Loading…' : `${results.length} series`}</span>
+				<span class="rc"
+					>{resultsLoading
+						? queryActive
+							? 'Searching all sources…'
+							: 'Loading…'
+						: `${results.length} series`}</span
+				>
 			</div>
 			<div class="sort">
 				<span class="sort-label">Sort</span>
@@ -236,11 +324,18 @@
 			</div>
 		{/if}
 
-		{#if loading}
+		{#if searchNotice}
+			<div class="notice" role="status">
+				<Icon name="alert" size={16} />
+				<span>{searchNotice}</span>
+			</div>
+		{/if}
+
+		{#if resultsLoading}
 			<CardGridSkeleton count={12} />
 		{:else if results.length}
 			<div class="grid">
-				{#each results as m (m.title)}
+				{#each results as m (m.id ?? m.title)}
 					<MangaCard
 						title={m.title}
 						sub={`${m.genre} · ${m.ch} ch`}
@@ -249,10 +344,20 @@
 						id={m.id}
 						flagType={m.type}
 						status={{ label: STATUS_META[m.status].label, color: STATUS_META[m.status].color }}
+						translators={m.translators ?? []}
 					/>
 				{/each}
 			</div>
-		{:else}
+		{:else if !queryActive && catalogError}
+			<div class="empty">
+				<div class="empty-icon error"><Icon name="alert" size={24} /></div>
+				<div class="empty-title">Couldn't load the catalogue</div>
+				<div class="empty-desc">
+					Something went wrong reaching the server. Check your connection and try again.
+				</div>
+				<button class="empty-btn" onclick={retryCatalog}>Retry</button>
+			</div>
+		{:else if !searchNotice}
 			<div class="empty">
 				<div class="empty-icon"><Icon name="search" size={24} /></div>
 				<div class="empty-title">No matches found</div>
@@ -511,6 +616,18 @@
 		color: var(--k-text-1);
 		cursor: pointer;
 	}
+	.notice {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px 16px;
+		border-radius: 10px;
+		background: rgba(246, 183, 60, 0.1);
+		border: 1px solid rgba(246, 183, 60, 0.34);
+		color: var(--k-text-2);
+		font-size: 13.5px;
+		font-weight: 600;
+	}
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
@@ -534,6 +651,10 @@
 		align-items: center;
 		justify-content: center;
 		color: var(--k-text-disabled);
+	}
+	.empty-icon.error {
+		color: var(--k-hiatus);
+		border-color: rgba(246, 183, 60, 0.4);
 	}
 	.empty-title {
 		font-family: var(--k-font-display);

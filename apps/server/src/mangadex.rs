@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::catalog::{self, Alias, WorkInput};
+use crate::catalog::{self, Alias, Cover, WorkInput};
 
 const API_BASE: &str = "https://api.mangadex.org";
 const COVERS_BASE: &str = "https://uploads.mangadex.org/covers";
@@ -234,6 +234,69 @@ impl MangaDexClient {
         Ok((mangas, body.total))
     }
 
+    /// Fetch specific manga by MangaDex ids (max 100 per call — the API's ids[]
+    /// ceiling), author/artist/cover expanded. Powers the metadata backfill (S2).
+    pub async fn get_manga_by_ids(&self, ids: &[String]) -> Result<Vec<MdManga>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut params: Vec<(String, String)> = vec![
+            ("limit".into(), (ids.len().min(100)).to_string()),
+            ("includes[]".into(), "cover_art".into()),
+            ("includes[]".into(), "author".into()),
+            ("includes[]".into(), "artist".into()),
+            ("contentRating[]".into(), "safe".into()),
+            ("contentRating[]".into(), "suggestive".into()),
+            ("contentRating[]".into(), "erotica".into()),
+            ("contentRating[]".into(), "pornographic".into()),
+        ];
+        for id in ids.iter().take(100) {
+            params.push(("ids[]".into(), id.clone()));
+        }
+        let res = self
+            .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga?ids")
+            .await?;
+        let body: RawList = res.json().await?;
+        let mut mangas = Vec::with_capacity(body.data.len());
+        for raw in body.data {
+            if let Ok(m) = serde_json::from_value::<MdManga>(raw) {
+                mangas.push(m);
+            }
+        }
+        Ok(mangas)
+    }
+
+    /// The full cover set for a manga via `/cover?manga[]=` (F2), volume-ordered.
+    /// Returns `(file_name, locale, volume)` per cover, up to `limit` (100 max —
+    /// plenty for a cover gallery; very long series are truncated). Rate-limited
+    /// like the other calls.
+    pub async fn list_covers(
+        &self,
+        manga_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+        let params: Vec<(String, String)> = vec![
+            ("manga[]".into(), manga_id.to_string()),
+            ("limit".into(), limit.clamp(1, 100).to_string()),
+            ("order[volume]".into(), "asc".into()),
+        ];
+        let res = self
+            .get_with_retry(&format!("{API_BASE}/cover"), &params, false, "/cover")
+            .await?;
+        let body: RawList = res.json().await?;
+        let mut out = Vec::with_capacity(body.data.len());
+        for raw in body.data {
+            if let Ok(c) = serde_json::from_value::<MdCover>(raw) {
+                if let Some(fname) = c.attributes.file_name {
+                    if !fname.is_empty() {
+                        out.push((fname, c.attributes.locale, c.attributes.volume));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// One page of the global `/chapter` firehose, ordered by `createdAt` asc.
     pub async fn list_chapters(
         &self,
@@ -397,6 +460,23 @@ pub struct MdRel {
 pub struct MdRelAttrs {
     pub file_name: Option<String>,
     pub name: Option<String>,
+    /// Cover locale (F2) — `cover_art` relationships carry `locale` + `volume`.
+    pub locale: Option<String>,
+    pub volume: Option<String>,
+}
+
+/// A `/cover` record (F2). Only the fields F2 stores.
+#[derive(Debug, Deserialize)]
+struct MdCover {
+    attributes: MdCoverAttrs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MdCoverAttrs {
+    file_name: Option<String>,
+    locale: Option<String>,
+    volume: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,6 +542,22 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
         Some("erotica") | Some("pornographic")
     );
 
+    // S2 enrichment: every localized description, and the FULL credit list (a
+    // work can have several authors/artists; the singular fields keep the first).
+    let mut descriptions: Vec<(String, String)> = a
+        .description
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    descriptions.sort();
+    let mut credits: Vec<(String, String)> = Vec::new();
+    for role in ["author", "artist"] {
+        for name in rel_names(m, role) {
+            credits.push((role.to_string(), name));
+        }
+    }
+
     (
         m.id.clone(),
         WorkInput {
@@ -482,8 +578,64 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             cover_file_name: cover_file_name(m),
             aliases,
             external_ids,
+            descriptions,
+            credits,
+            // ALL cover_art relationships the manga response carries (F2). In
+            // practice the manga endpoint expands only the primary (one entry) —
+            // the full per-volume set is fetched separately via `/cover` in the
+            // enrichment path. The first cover_art is the primary.
+            covers: relationship_covers(m),
         },
     )
+}
+
+/// Every `cover_art` relationship on a manga, mapped to `Cover` (F2). The first is
+/// marked primary (the manga endpoint expands only the primary in practice).
+fn relationship_covers(m: &MdManga) -> Vec<Cover> {
+    let mut out = Vec::new();
+    for r in m.relationships.iter().filter(|r| r.kind == "cover_art") {
+        if let Some(a) = r.attributes.as_ref() {
+            if let Some(fname) = a.file_name.clone() {
+                if !fname.is_empty() {
+                    out.push(Cover {
+                        file_name: fname,
+                        lang: a.locale.clone(),
+                        volume: a.volume.clone(),
+                        is_primary: out.is_empty(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the full cover set for a work from a `/cover` fetch (F2), marking the one
+/// matching `primary_file_name` as primary (falling back to the first). Used by
+/// the enrichment/backfill path to complete a work's cover gallery.
+pub fn covers_from_fetch(
+    fetched: Vec<(String, Option<String>, Option<String>)>,
+    primary_file_name: Option<&str>,
+) -> Vec<Cover> {
+    let mut out: Vec<Cover> = fetched
+        .into_iter()
+        .map(|(file_name, lang, volume)| {
+            let is_primary = primary_file_name == Some(file_name.as_str());
+            Cover {
+                file_name,
+                lang,
+                volume,
+                is_primary,
+            }
+        })
+        .collect();
+    // Ensure exactly one primary: if none matched, promote the first.
+    if !out.iter().any(|c| c.is_primary) {
+        if let Some(first) = out.first_mut() {
+            first.is_primary = true;
+        }
+    }
+    out
 }
 
 /// Prefer an English value, then a romanized Japanese one, then any entry.
@@ -508,6 +660,19 @@ fn rel_name(m: &MdManga, kind: &str) -> Option<String> {
         .and_then(|r| r.attributes.as_ref())
         .and_then(|a| a.name.clone())
         .filter(|s| !s.is_empty())
+}
+
+/// EVERY relationship name of a kind, deduped in order (S2 full credit list).
+fn rel_names(m: &MdManga, kind: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in m.relationships.iter().filter(|r| r.kind == kind) {
+        if let Some(name) = r.attributes.as_ref().and_then(|a| a.name.clone()) {
+            if !name.is_empty() && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// MangaDex cover fileName for a manga (first cover_art relationship), if expanded.
@@ -953,6 +1118,99 @@ mod tests {
             cover_thumb_url("md-uuid-1", "abc.jpg"),
             "https://uploads.mangadex.org/covers/md-uuid-1/abc.jpg.512.jpg"
         );
+    }
+
+    #[test]
+    fn maps_multilang_descriptions_and_full_credits() {
+        // S2: a manga with descriptions in several languages and multiple
+        // authors + artists must surface ALL of them (not just the primary).
+        let mut v = manga_json();
+        v["attributes"]["description"] = serde_json::json!({
+            "en": "English blurb.",
+            "es": "Sinopsis en español.",
+            "fr": "" // empty is dropped
+        });
+        v["relationships"] = serde_json::json!([
+            { "id": "a1", "type": "author", "attributes": { "name": "Fuse" } },
+            { "id": "a2", "type": "author", "attributes": { "name": "Co-Author" } },
+            { "id": "ar1", "type": "artist", "attributes": { "name": "Mitz Vah" } },
+            { "id": "ar1dup", "type": "artist", "attributes": { "name": "Mitz Vah" } }, // dedup
+            { "id": "cov", "type": "cover_art", "attributes": { "fileName": "abc.jpg" } }
+        ]);
+        let m: MdManga = serde_json::from_value(v).unwrap();
+        let (_, input) = to_work_input(&m);
+
+        // Descriptions: en + es present, empty fr dropped, sorted by lang.
+        assert_eq!(
+            input.descriptions,
+            vec![
+                ("en".to_string(), "English blurb.".to_string()),
+                ("es".to_string(), "Sinopsis en español.".to_string()),
+            ]
+        );
+        // Credits: both authors + the artist, artist de-duplicated.
+        assert!(input.credits.contains(&("author".into(), "Fuse".into())));
+        assert!(input
+            .credits
+            .contains(&("author".into(), "Co-Author".into())));
+        assert_eq!(
+            input
+                .credits
+                .iter()
+                .filter(|(r, n)| r == "artist" && n == "Mitz Vah")
+                .count(),
+            1,
+            "artist is de-duplicated"
+        );
+        // The singular fields keep the FIRST of each (reader-shape primary).
+        assert_eq!(input.author.as_deref(), Some("Fuse"));
+        assert_eq!(input.artist.as_deref(), Some("Mitz Vah"));
+    }
+
+    #[test]
+    fn relationship_cover_and_cover_fetch_mapping() {
+        // F2: the manga's cover_art relationship maps to a primary Cover...
+        let mut v = manga_json();
+        v["relationships"] = serde_json::json!([
+            { "id": "cov1", "type": "cover_art",
+              "attributes": { "fileName": "primary.jpg", "locale": "ja", "volume": "1" } },
+            { "id": "a1", "type": "author", "attributes": { "name": "Fuse" } }
+        ]);
+        let m: MdManga = serde_json::from_value(v).unwrap();
+        let (_, input) = to_work_input(&m);
+        assert_eq!(input.covers.len(), 1);
+        assert_eq!(input.covers[0].file_name, "primary.jpg");
+        assert!(input.covers[0].is_primary);
+        assert_eq!(input.covers[0].volume.as_deref(), Some("1"));
+
+        // ...and a /cover fetch maps to the full set, marking the primary by name.
+        let fetched = vec![
+            (
+                "primary.jpg".to_string(),
+                Some("ja".into()),
+                Some("1".into()),
+            ),
+            ("vol2.jpg".to_string(), Some("ja".into()), Some("2".into())),
+            ("en3.jpg".to_string(), Some("en".into()), Some("3".into())),
+        ];
+        let covers = covers_from_fetch(fetched, Some("primary.jpg"));
+        assert_eq!(covers.len(), 3);
+        assert_eq!(covers.iter().filter(|c| c.is_primary).count(), 1);
+        assert!(
+            covers
+                .iter()
+                .find(|c| c.file_name == "primary.jpg")
+                .unwrap()
+                .is_primary
+        );
+
+        // No match → first is promoted to primary (exactly one primary always).
+        let covers = covers_from_fetch(
+            vec![("x.jpg".into(), None, None), ("y.jpg".into(), None, None)],
+            Some("missing.jpg"),
+        );
+        assert!(covers[0].is_primary);
+        assert_eq!(covers.iter().filter(|c| c.is_primary).count(), 1);
     }
 
     #[test]

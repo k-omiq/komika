@@ -4,12 +4,20 @@
  */
 import type {
 	AdminUser,
+	BulkAddResult,
 	CanonicalUpdate,
+	ExtensionInfo,
+	Id,
 	MatchResult,
 	MergeCandidate,
 	Paginated,
 	Series,
+	SeriesSourceGroup,
 	SeriesStatus,
+	SourceBrowsePage,
+	SourceBrowseType,
+	SourceIngestJob,
+	SourceInfo,
 } from '@komika/types';
 import type { SeriesAdminInput } from '@komika/api';
 import { backend } from './context';
@@ -98,6 +106,145 @@ export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]>
 	if (!backend.canonicalUpdates)
 		throw new Error('Catalogue updates are unavailable on this backend.');
 	return backend.canonicalUpdates(page);
+}
+
+// ---- Sources & Extensions console (EXT-2) -----------------------------------
+
+/**
+ * Every Keiyoushi/Mihon extension known to the Suwayomi engine (installed or
+ * not). First use auto-seeds the curated Keiyoushi store; NSFW extensions are
+ * hidden unless the admin opted in via show_nsfw (CATALOGUE.md §2).
+ * `refresh: true` re-fetches the store indexes so hasUpdate/versions are fresh.
+ */
+export async function loadExtensions(refresh = false): Promise<ExtensionInfo[]> {
+	if (!backend.extensions)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.extensions(refresh);
+}
+
+/** Register an extension repo by index URL; returns the extension count after refresh. */
+export async function addExtensionRepo(indexUrl: string): Promise<number> {
+	if (!backend.addExtensionRepo)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.addExtensionRepo(indexUrl);
+}
+
+/** Install a store extension onto the Suwayomi engine (NSFW-gated server-side). */
+export async function installExtension(pkgName: string): Promise<ExtensionInfo> {
+	if (!backend.installExtension)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.installExtension(pkgName);
+}
+
+/** Uninstall an extension from the Suwayomi engine. */
+export async function uninstallExtension(pkgName: string): Promise<ExtensionInfo> {
+	if (!backend.uninstallExtension)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.uninstallExtension(pkgName);
+}
+
+/** Update an installed extension to the store's latest version. */
+export async function updateExtension(pkgName: string): Promise<ExtensionInfo> {
+	if (!backend.updateExtension)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.updateExtension(pkgName);
+}
+
+/** The installed Suwayomi sources — the picker feeding {@link browseSource}. */
+export async function loadSources(): Promise<SourceInfo[]> {
+	if (!backend.sources) throw new Error('Source browsing is unavailable on this backend.');
+	return backend.sources();
+}
+
+/** Browse/search one source's catalogue (paged) for the bulk-ingest picker. */
+export async function browseSource(
+	sourceId: Id,
+	type: SourceBrowseType,
+	page = 1,
+	query?: string,
+): Promise<SourceBrowsePage> {
+	if (!backend.sourceBrowse) throw new Error('Source browsing is unavailable on this backend.');
+	return backend.sourceBrowse(sourceId, type, page, query);
+}
+
+/**
+ * Bulk Tier-2 catalogue ingest: library-track each Suwayomi manga and run the
+ * dedup add flow. Per-id failures never abort the batch; at most 100 ids.
+ */
+export async function bulkAddSourceSeries(suwayomiMangaIds: Id[]): Promise<BulkAddResult> {
+	if (!backend.bulkAddSourceSeries)
+		throw new Error('Bulk catalogue ingest is unavailable on this backend.');
+	return backend.bulkAddSourceSeries(suwayomiMangaIds);
+}
+
+/**
+ * Catalogue provenance for many Suwayomi series at once: which canonical work
+ * each is linked to and every source mapping (with extension coordinates) on
+ * that work. One group per id, in input order; max 200 ids per call.
+ */
+export async function loadSeriesSources(seriesIds: Id[]): Promise<SeriesSourceGroup[]> {
+	if (!backend.seriesSourcesBatch)
+		throw new Error('Catalogue provenance is unavailable on this backend.');
+	return backend.seriesSourcesBatch(seriesIds);
+}
+
+/**
+ * Pause or unpause one series' scanning (targeted override — leaves the other
+ * admin overrides alone). Unpausing triggers an immediate server-side re-scan;
+ * returns the recomputed series.
+ */
+export async function setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
+	if (!backend.setSeriesPaused)
+		throw new Error('Pause management is unavailable on this backend.');
+	return backend.setSeriesPaused(seriesId, paused);
+}
+
+/**
+ * The "add all from this source" ingest jobs (S1), newest first. Pass
+ * `active: true` for only the currently-running ones — poll it for live
+ * progress while a job runs.
+ */
+export async function loadSourceIngestJobs(active = false): Promise<SourceIngestJob[]> {
+	if (!backend.sourceIngestJobs)
+		throw new Error('Source ingest is unavailable on this backend.');
+	return backend.sourceIngestJobs(active);
+}
+
+/**
+ * Start a background ingest that walks a source's whole catalogue through the
+ * Tier-2 dedup add flow. Refused while one is already running for the source,
+ * and for an NSFW source unless the admin opted in.
+ */
+export async function startSourceIngest(sourceId: Id): Promise<SourceIngestJob> {
+	if (!backend.startSourceIngest)
+		throw new Error('Source ingest is unavailable on this backend.');
+	return backend.startSourceIngest(sourceId);
+}
+
+/** Request cancellation of a running ingest job; progress so far is preserved. */
+export async function cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {
+	if (!backend.cancelSourceIngest)
+		throw new Error('Source ingest is unavailable on this backend.');
+	return backend.cancelSourceIngest(jobId);
+}
+
+/**
+ * Start one ingest job per installed source of an extension (F1). NSFW sources
+ * are skipped for an opted-out admin; a source already running returns its
+ * existing job instead of erroring. Errors only when no source matches. Returns
+ * every started + already-running job.
+ */
+export async function startExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+	if (!backend.startExtensionIngest)
+		throw new Error('Extension ingest is unavailable on this backend.');
+	return backend.startExtensionIngest(pkgName);
+}
+
+/** Cancel every running ingest job for an extension's sources; returns the cancelled jobs. */
+export async function cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+	if (!backend.cancelExtensionIngest)
+		throw new Error('Extension ingest is unavailable on this backend.');
+	return backend.cancelExtensionIngest(pkgName);
 }
 
 export const STATUS_OPTIONS: SeriesStatus[] = [

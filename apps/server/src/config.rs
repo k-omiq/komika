@@ -52,6 +52,12 @@ pub struct Config {
     pub auth_rate_limit_max: u32,
     /// Sliding window (seconds) over which `auth_rate_limit_max` is counted.
     pub auth_rate_limit_window_secs: u64,
+    /// Max `searchAllSources` calls per user within its window before further
+    /// calls are rejected (C1). Federated search fans out + writes, so it needs
+    /// its own budget separate from auth.
+    pub federated_rate_limit_max: u32,
+    /// Sliding window (seconds) for `federated_rate_limit_max`.
+    pub federated_rate_limit_window_secs: u64,
     /// Absolute lifetime of a session token (seconds). After this, the token
     /// stops resolving and the user must sign in again. Default 30 days.
     pub session_ttl_secs: i64,
@@ -76,6 +82,14 @@ pub struct Config {
     /// Interval between recurring incremental catalogue/chapter refresh cycles
     /// (`updatedAtSince`). The first cycle seeds on startup; default 6h.
     pub catalogue_sync_interval_secs: u64,
+    /// Recurring auto-enrichment drainer (X1). Off by default — it hits MangaDex
+    /// (`/manga?ids[]` + one `/cover` per work), so it's opt-in via `METADATA_BACKFILL=on`.
+    pub metadata_backfill_enabled: bool,
+    /// Interval between auto-enrichment ticks (seconds). Default 5 min.
+    pub metadata_backfill_interval_secs: u64,
+    /// Works enriched per auto-enrichment tick. Kept small (one `/cover` request
+    /// each) so a tick stays polite. Default 25.
+    pub metadata_backfill_batch: i64,
 }
 
 impl Config {
@@ -137,6 +151,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(300);
+        let federated_rate_limit_max = env::var("FEDERATED_RATE_LIMIT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(20);
+        let federated_rate_limit_window_secs = env::var("FEDERATED_RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(60);
         let session_ttl_secs = env::var("SESSION_TTL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -182,6 +206,22 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(6 * 60 * 60);
+        let metadata_backfill_enabled = env::var("METADATA_BACKFILL")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "on" || v == "1" || v == "true"
+            })
+            .unwrap_or(false);
+        let metadata_backfill_interval_secs = env::var("METADATA_BACKFILL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(300);
+        let metadata_backfill_batch = env::var("METADATA_BACKFILL_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &i64| v > 0)
+            .unwrap_or(25);
         Self {
             port,
             database_url,
@@ -196,6 +236,8 @@ impl Config {
             scan_tick_seconds,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,
+            federated_rate_limit_max,
+            federated_rate_limit_window_secs,
             session_ttl_secs,
             graphiql_enabled,
             catalogue_sync_enabled,
@@ -204,6 +246,9 @@ impl Config {
             mangadex_user_agent,
             catalogue_cover_phash,
             catalogue_sync_interval_secs,
+            metadata_backfill_enabled,
+            metadata_backfill_interval_secs,
+            metadata_backfill_batch,
         }
     }
 }

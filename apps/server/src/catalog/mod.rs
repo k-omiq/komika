@@ -24,6 +24,17 @@ pub struct Alias {
     pub lang: Option<String>,
 }
 
+/// One cover of a work (F2). `file_name` is the `covers/{mangadex_id}/{leaf}`
+/// path leaf; `is_primary` marks the work's main cover (the one mirrored on
+/// `work.cover_file_name`).
+#[derive(Debug, Clone)]
+pub struct Cover {
+    pub file_name: String,
+    pub lang: Option<String>,
+    pub volume: Option<String>,
+    pub is_primary: bool,
+}
+
 /// Everything needed to upsert one canonical work. Built from a MangaDex manga, or
 /// synthesized for a first-class non-MangaDex work added via a Tier-2 source.
 #[derive(Debug, Clone, Default)]
@@ -46,6 +57,16 @@ pub struct WorkInput {
     pub aliases: Vec<Alias>,
     /// `(provider, external_id)` — e.g. `("al", "12345")`, `("mangadex", "<uuid>")`.
     pub external_ids: Vec<(String, String)>,
+    /// Every localized description as `(lang, text)` (S2). The singular
+    /// `description` above stays the English-preferred primary.
+    pub descriptions: Vec<(String, String)>,
+    /// Full credit list as `(role, name)` with role `author`/`artist` (S2). The
+    /// singular `author`/`artist` above keep the first of each.
+    pub credits: Vec<(String, String)>,
+    /// Covers to store for this work (F2). Empty leaves any existing covers
+    /// untouched; non-empty REPLACES the work's cover set (the sweep passes just
+    /// the primary, the enrichment path passes the full `/cover` set).
+    pub covers: Vec<Cover>,
 }
 
 /// One mirrored chapter to upsert under a `source_series`.
@@ -394,11 +415,14 @@ pub async fn upsert_work_from_mangadex(
 
     // cover_phash uses COALESCE so a sync that hasn't computed the hash yet doesn't
     // wipe a previously-computed one.
+    // `metadata_synced_at` is stamped on every MangaDex upsert (H1): it marks that
+    // this work's all-language metadata was ATTEMPTED, so the backfill advances
+    // past works whose upstream record carries no localized description.
     sqlx::query(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
-            demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at, metadata_synced_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(id) DO UPDATE SET \
            primary_title = excluded.primary_title, primary_lang = excluded.primary_lang, \
            description = excluded.description, year = excluded.year, \
@@ -407,7 +431,7 @@ pub async fn upsert_work_from_mangadex(
            is_nsfw = excluded.is_nsfw, author = excluded.author, artist = excluded.artist, \
            cover_phash = COALESCE(excluded.cover_phash, work.cover_phash), \
            cover_file_name = COALESCE(excluded.cover_file_name, work.cover_file_name), \
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at, metadata_synced_at = excluded.metadata_synced_at",
     )
     .bind(&work_id)
     .bind(&input.primary_title)
@@ -425,6 +449,7 @@ pub async fn upsert_work_from_mangadex(
     .bind(&input.cover_file_name)
     .bind(&now)
     .bind(&now)
+    .bind(&now) // metadata_synced_at
     .execute(&mut *tx)
     .await?;
 
@@ -451,6 +476,7 @@ pub async fn upsert_work_from_mangadex(
     }
 
     insert_aliases(&mut tx, &work_id, &input.aliases).await?;
+    insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
     ensure_source_series(
         &mut tx,
         &work_id,
@@ -511,8 +537,85 @@ pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String>
         .await?;
     }
     insert_aliases(&mut tx, &work_id, &input.aliases).await?;
+    insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
     tx.commit().await?;
     Ok(work_id)
+}
+
+/// Upsert the localized descriptions + credit rows (S2). Idempotent: a
+/// re-sync overwrites each `(work, lang)` description in place and `INSERT OR
+/// IGNORE`s credits (names never mutate, they only accumulate).
+async fn insert_descriptions_and_credits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work_id: &str,
+    input: &WorkInput,
+) -> Result<()> {
+    for (lang, text) in &input.descriptions {
+        if lang.is_empty() || text.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO work_description (work_id, lang, description) VALUES (?, ?, ?) \
+             ON CONFLICT(work_id, lang) DO UPDATE SET description = excluded.description",
+        )
+        .bind(work_id)
+        .bind(lang)
+        .bind(text)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (role, name) in &input.credits {
+        if name.trim().is_empty() || !matches!(role.as_str(), "author" | "artist") {
+            continue;
+        }
+        sqlx::query("INSERT OR IGNORE INTO work_credit (work_id, role, name) VALUES (?, ?, ?)")
+            .bind(work_id)
+            .bind(role)
+            .bind(name.trim())
+            .execute(&mut **tx)
+            .await?;
+    }
+    // F2: covers ACCUMULATE (INSERT OR IGNORE — never delete), so the recurring
+    // sweep (which only knows the primary) can't wipe an already-enriched full
+    // cover set. The enrichment path adds the rest via the same call.
+    for c in &input.covers {
+        if c.file_name.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(work_id)
+        .bind(&c.file_name)
+        .bind(&c.lang)
+        .bind(&c.volume)
+        .bind(c.is_primary as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Load a work's cover set (F2), primary first then by volume/file name.
+pub async fn load_work_covers(pool: &SqlitePool, work_id: &str) -> Result<Vec<Cover>> {
+    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
+        "SELECT cover_file_name, lang, volume, is_primary FROM work_cover WHERE work_id = ? \
+         ORDER BY is_primary DESC, \
+                  CAST(COALESCE(NULLIF(volume, ''), '0') AS REAL), cover_file_name",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(file_name, lang, volume, is_primary)| Cover {
+            file_name,
+            lang,
+            volume,
+            is_primary: is_primary != 0,
+        })
+        .collect())
 }
 
 async fn insert_aliases(
@@ -653,6 +756,41 @@ pub async fn upsert_source_extension(
     Ok(())
 }
 
+/// Mark the works behind these MangaDex ids as metadata-attempted (H1), so the
+/// backfill advances past ids MangaDex didn't return. Idempotent; a no-op for ids
+/// with no `mangadex` source_series.
+pub async fn mark_metadata_synced(pool: &SqlitePool, mangadex_ids: &[String]) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    for mid in mangadex_ids {
+        sqlx::query(
+            "UPDATE work SET metadata_synced_at = ? WHERE id IN \
+             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?)",
+        )
+        .bind(&now)
+        .bind(mid)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Mark the works behind these MangaDex ids as full-cover-fetched (F2), so the
+/// cover backfill advances past ids `/cover` returned nothing for. Idempotent.
+pub async fn mark_covers_synced(pool: &SqlitePool, mangadex_ids: &[String]) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    for mid in mangadex_ids {
+        sqlx::query(
+            "UPDATE work SET covers_synced_at = ? WHERE id IN \
+             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?)",
+        )
+        .bind(&now)
+        .bind(mid)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Escalate a work to NSFW. Only ever sets the flag — never clears it: "unknown =
 /// safe", but once any source signals NSFW the work stays NSFW. Idempotent. The
 /// gating reads consult `work.is_nsfw` exclusively (never `source_series.is_nsfw`),
@@ -664,6 +802,148 @@ pub async fn mark_work_nsfw(pool: &SqlitePool, work_id: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Outcome of folding one work into another (D1 admin merge).
+#[derive(Debug, Clone, Default)]
+pub struct MergeOutcome {
+    pub moved_source_series: u64,
+}
+
+/// Fold `source_work` into `target_work` (D1): re-point every mapping + user-data
+/// row from source to target, fold the source's identity signals (aliases,
+/// external ids, and cover_phash if the target lacks one) into target, then delete
+/// the now-empty source (cascade cleans its remaining child rows). Idempotent-ish:
+/// a mapping the target already has is dropped rather than duplicated. Returns how
+/// many `source_series` rows moved. Errors if either work is missing or they're equal.
+pub async fn merge_works(
+    pool: &SqlitePool,
+    source_work: &str,
+    target_work: &str,
+) -> Result<MergeOutcome> {
+    if source_work == target_work {
+        anyhow::bail!("cannot merge a work into itself");
+    }
+    let mut tx = pool.begin().await?;
+    for id in [source_work, target_work] {
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM work WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            anyhow::bail!("no such work: {id}");
+        }
+    }
+
+    // Fold aliases (fresh ids; UNIQUE(work_id,normalized_title,lang) de-dupes).
+    let src_aliases = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT normalized_title, raw_title, lang FROM work_alias WHERE work_id = ?",
+    )
+    .bind(source_work)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (norm, raw, lang) in src_aliases {
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(new_id("al_"))
+        .bind(target_work)
+        .bind(&norm)
+        .bind(&raw)
+        .bind(&lang)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // Fold external ids.
+    sqlx::query(
+        "INSERT OR IGNORE INTO work_external_id (work_id, provider, external_id) \
+         SELECT ?, provider, external_id FROM work_external_id WHERE work_id = ?",
+    )
+    .bind(target_work)
+    .bind(source_work)
+    .execute(&mut *tx)
+    .await?;
+    // Give the target a cover_phash if it has none (strengthens future dedup).
+    sqlx::query(
+        "UPDATE work SET cover_phash = (SELECT cover_phash FROM work WHERE id = ?) \
+         WHERE id = ? AND cover_phash IS NULL",
+    )
+    .bind(source_work)
+    .bind(target_work)
+    .execute(&mut *tx)
+    .await?;
+
+    // Re-point mappings + user data. `UPDATE OR IGNORE` skips a row that would
+    // collide with one the target already has; the leftover source rows are then
+    // removed (source_series explicitly, the rest by the final cascade delete).
+    let moved = sqlx::query("UPDATE OR IGNORE source_series SET work_id = ? WHERE work_id = ?")
+        .bind(target_work)
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    sqlx::query("DELETE FROM source_series WHERE work_id = ?")
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+
+    for (table, col) in [
+        ("merge_candidate", "candidate_work_id"),
+        ("canonical_library", "work_id"),
+        ("reviews", "series_id"),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE OR IGNORE {table} SET {col} = ? WHERE {col} = ?"
+        ))
+        .bind(target_work)
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // canonical_progress.work_id isn't part of any unique key → plain repoint.
+    sqlx::query("UPDATE canonical_progress SET work_id = ? WHERE work_id = ?")
+        .bind(target_work)
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+    // Series comments (polymorphic) re-point to the target series id.
+    sqlx::query(
+        "UPDATE OR IGNORE comments SET target_id = ? WHERE target_type = 'series' AND target_id = ?",
+    )
+    .bind(target_work)
+    .bind(source_work)
+    .execute(&mut *tx)
+    .await?;
+
+    // Explicitly remove the source's remaining child rows before deleting it.
+    // Production has ON DELETE CASCADE, but being explicit makes the merge correct
+    // regardless of the connection's `foreign_keys` pragma (and testable in-memory).
+    for table in [
+        "work_alias",
+        "work_external_id",
+        "work_description",
+        "work_credit",
+        "work_cover",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE work_id = ?"))
+            .bind(source_work)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM merge_candidate WHERE candidate_work_id = ?")
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM work WHERE id = ?")
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(MergeOutcome {
+        moved_source_series: moved,
+    })
 }
 
 /// Resolve the id of an existing source_series by its natural key.
@@ -1167,6 +1447,285 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(version, 61, "the second upsert updates the row in place");
+    }
+
+    #[tokio::test]
+    async fn metadata_sync_marker_advances_past_descriptionless_works() {
+        // H1: a work whose upstream record has NO description still gets
+        // `metadata_synced_at` set on upsert (and via mark_metadata_synced for ids
+        // MangaDex never returns), so the backfill selector (metadata_synced_at IS
+        // NULL) drains instead of looping on it forever.
+        let pool = pool().await;
+
+        // A description-less MangaDex work: upsert must still stamp the marker.
+        let no_desc = WorkInput {
+            primary_title: Some("Description-less Title".into()),
+            aliases: vec![Alias {
+                raw: "Description-less Title".into(),
+                lang: None,
+            }],
+            ..Default::default()
+        };
+        let w = upsert_work_from_mangadex(&pool, "md-nodesc", &no_desc)
+            .await
+            .unwrap();
+        // No work_description row (nothing to insert)...
+        let descs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_description WHERE work_id = ?")
+                .bind(&w)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(descs, 0, "no localized description upstream");
+        // ...but the marker IS set, so the backfill selector won't re-pick it.
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 0, "the upsert advanced the backfill cursor");
+
+        // A pre-S2 work with a NULL marker is selectable, then mark_metadata_synced
+        // clears it even without MangaDex returning the record.
+        sqlx::query("UPDATE work SET metadata_synced_at = NULL WHERE id = ?")
+            .bind(&w)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1, "reset marker makes it selectable again");
+        mark_metadata_synced(&pool, &["md-nodesc".to_string()])
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending, 0,
+            "mark_metadata_synced advances a not-returned id"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_works_folds_source_into_target() {
+        // D1: fold a federation-only duplicate into the MangaDex-anchored work.
+        let pool = pool().await;
+        // Target: MangaDex-anchored, enriched.
+        let target = upsert_work_from_mangadex(
+            &pool,
+            "md-naruto",
+            &WorkInput {
+                primary_title: Some("Naruto".into()),
+                author: Some("Kishimoto Masashi".into()),
+                aliases: vec![Alias {
+                    raw: "Naruto".into(),
+                    lang: Some("en".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Source: a federation-only work with its own Suwayomi mapping + an alias
+        // the target lacks.
+        let source = create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Naruto".into()),
+                aliases: vec![Alias {
+                    raw: "ナルト".into(),
+                    lang: Some("ja".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        upsert_source_series(&pool, &source, "suwayomi", "998", "357", None, false)
+            .await
+            .unwrap();
+
+        let out = merge_works(&pool, &source, &target).await.unwrap();
+        assert_eq!(out.moved_source_series, 1, "the Suwayomi mapping moved");
+
+        // Source work is gone; the Suwayomi mapping now points at the target.
+        let src_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = ?")
+            .bind(&source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(src_exists, 0, "source work deleted");
+        let mapped: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = '357'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mapped, target);
+        // The source's ja alias was folded into the target.
+        let ja: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_alias WHERE work_id = ? AND raw_title = 'ナルト'",
+        )
+        .bind(&target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ja, 1, "source alias folded into target");
+        // No orphaned source_series/aliases remain for the deleted work.
+        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_alias WHERE work_id = ?")
+            .bind(&source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(orphans, 0);
+
+        // Merging a work into itself is rejected.
+        assert!(merge_works(&pool, &target, &target).await.is_err());
+        // A missing work is rejected.
+        assert!(merge_works(&pool, "w_nope", &target).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn covers_accumulate_and_load_primary_first() {
+        // F2: covers accumulate (a later sweep with just the primary must NOT wipe
+        // an enriched full set), and load returns primary first then by volume.
+        let pool = pool().await;
+        // Enrichment stores the full set.
+        let full = WorkInput {
+            primary_title: Some("Cover Test".into()),
+            covers: vec![
+                Cover {
+                    file_name: "v2.jpg".into(),
+                    lang: Some("ja".into()),
+                    volume: Some("2".into()),
+                    is_primary: false,
+                },
+                Cover {
+                    file_name: "v1.jpg".into(),
+                    lang: Some("ja".into()),
+                    volume: Some("1".into()),
+                    is_primary: true,
+                },
+                Cover {
+                    file_name: "v10.jpg".into(),
+                    lang: Some("ja".into()),
+                    volume: Some("10".into()),
+                    is_primary: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let w = upsert_work_from_mangadex(&pool, "md-cov", &full)
+            .await
+            .unwrap();
+
+        // A later sweep upsert carrying ONLY the primary must not delete v2/v10.
+        let sweep = WorkInput {
+            primary_title: Some("Cover Test".into()),
+            covers: vec![Cover {
+                file_name: "v1.jpg".into(),
+                lang: Some("ja".into()),
+                volume: Some("1".into()),
+                is_primary: true,
+            }],
+            ..Default::default()
+        };
+        upsert_work_from_mangadex(&pool, "md-cov", &sweep)
+            .await
+            .unwrap();
+
+        let covers = load_work_covers(&pool, &w).await.unwrap();
+        assert_eq!(
+            covers.len(),
+            3,
+            "accumulated set survives a primary-only sweep"
+        );
+        // Primary first, then volume-ascending numerically (10 after 2).
+        assert!(covers[0].is_primary);
+        assert_eq!(covers[0].file_name, "v1.jpg");
+        let order: Vec<&str> = covers.iter().map(|c| c.file_name.as_str()).collect();
+        assert_eq!(order, vec!["v1.jpg", "v2.jpg", "v10.jpg"]);
+    }
+
+    #[tokio::test]
+    async fn descriptions_and_credits_persist_and_upsert() {
+        // S2: multi-lang descriptions + full credit list are stored and a re-sync
+        // updates a description in place while credits accumulate without dupes.
+        let pool = pool().await;
+        let mut input = slime_input();
+        input.descriptions = vec![
+            ("en".into(), "English blurb.".into()),
+            ("ja".into(), "日本語のあらすじ".into()),
+        ];
+        input.credits = vec![
+            ("author".into(), "Fuse".into()),
+            ("artist".into(), "Mitz Vah".into()),
+        ];
+        let w = upsert_work_from_mangadex(&pool, "md-desc", &input)
+            .await
+            .unwrap();
+
+        let descs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT lang, description FROM work_description WHERE work_id = ? ORDER BY lang",
+        )
+        .bind(&w)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            descs,
+            vec![
+                ("en".to_string(), "English blurb.".to_string()),
+                ("ja".to_string(), "日本語のあらすじ".to_string()),
+            ]
+        );
+        let credits: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, name FROM work_credit WHERE work_id = ? ORDER BY role, name",
+        )
+        .bind(&w)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            credits,
+            vec![
+                ("artist".to_string(), "Mitz Vah".to_string()),
+                ("author".to_string(), "Fuse".to_string()),
+            ]
+        );
+
+        // Re-sync: an updated English description overwrites in place; the same
+        // credits don't duplicate (composite PK / INSERT OR IGNORE).
+        input.descriptions = vec![("en".into(), "Revised English blurb.".into())];
+        upsert_work_from_mangadex(&pool, "md-desc", &input)
+            .await
+            .unwrap();
+        let en: String = sqlx::query_scalar(
+            "SELECT description FROM work_description WHERE work_id = ? AND lang = 'en'",
+        )
+        .bind(&w)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(en, "Revised English blurb.");
+        let credit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_credit WHERE work_id = ?")
+                .bind(&w)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(credit_count, 2, "credits don't duplicate on re-sync");
     }
 
     #[tokio::test]

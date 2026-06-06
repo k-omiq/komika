@@ -3,6 +3,7 @@
 	import { untrack } from 'svelte';
 	import { getRating, setRating } from '$lib/data/social';
 	import { saveProgress } from '$lib/data/source';
+	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
@@ -17,6 +18,22 @@
 	const chNum = $derived(data.chNum);
 	const chTitle = $derived(data.chTitle);
 	const nextChapter = $derived(data.chapters.find((c) => c.id === data.nextChapterId));
+
+	// Translators (sources) for this work — switchable from reader settings. Picking
+	// a different source persists the preference and reopens the work under it
+	// (chapter ids differ per source, so we land on the new source's first/unread
+	// chapter rather than a stale ch param).
+	const translators = $derived(data.translators ?? []);
+	function switchTranslator(key: string): void {
+		if (!data.workId || key === data.selectedTranslatorKey) return;
+		setPreferredTranslator(data.workId, key);
+		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
+		settingsOpen = false;
+		// Drop any `?ch=` (chapter ids differ per source) and force the load to re-run
+		// even when we're already at the bare `/read/<workId>` URL — otherwise
+		// SvelteKit treats it as the same URL and the source wouldn't actually swap.
+		goto(`/read/${data.workId}`, { invalidateAll: true });
+	}
 
 	let mode = $state<'strip' | 'page'>('strip');
 	let pageIdx = $state(0);
@@ -291,6 +308,39 @@
 	></button>
 	<div class="settings">
 		<div class="settings-title">Reader settings</div>
+		{#if translators.length > 1}
+			<div class="setting">
+				<span class="setting-label">Translation source</span>
+				<div class="tr-opts">
+					{#each translators as t (t.key)}
+						<button
+							class="tr-opt"
+							class:on={t.key === data.selectedTranslatorKey}
+							onclick={() => switchTranslator(t.key)}
+							title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
+						>
+							{#if t.iconUrl}
+								<img
+									class="tr-logo"
+									src={t.iconUrl}
+									alt=""
+									loading="lazy"
+									decoding="async"
+									referrerpolicy="no-referrer"
+								/>
+							{:else}
+								<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
+							{/if}
+							<span class="tr-name">{t.name}</span>
+							<span class="tr-count">{t.chapterCount}</span>
+							{#if t.key === data.selectedTranslatorKey}
+								<Icon name="check" size={14} strokeWidth={2.6} />
+							{/if}
+						</button>
+					{/each}
+				</div>
+			</div>
+		{/if}
 		<div class="setting">
 			<span class="setting-label">Reading mode</span>
 			<div class="mode-btns">
@@ -745,6 +795,62 @@
 		background: var(--k-primary);
 		border-color: var(--k-primary);
 		color: var(--k-on-primary);
+	}
+	.tr-opts {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.tr-opt {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 12px;
+		border-radius: 10px;
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-2);
+		cursor: pointer;
+		transition: all 0.15s;
+		text-align: left;
+	}
+	.tr-opt:hover {
+		border-color: var(--k-border-strong);
+	}
+	.tr-opt.on {
+		border-color: var(--k-primary);
+		background: rgba(224, 131, 105, 0.12);
+		color: var(--k-text-bright);
+	}
+	.tr-logo {
+		width: 26px;
+		height: 26px;
+		flex: 0 0 auto;
+		border-radius: 6px;
+		object-fit: cover;
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-2);
+	}
+	.tr-initial {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 12px;
+		font-weight: 800;
+	}
+	.tr-name {
+		flex: 1;
+		min-width: 0;
+		font-size: 13px;
+		font-weight: 700;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.tr-count {
+		font-size: 11px;
+		font-weight: 700;
+		color: var(--k-text-faint);
 	}
 	.setting input[type='range'] {
 		width: 100%;

@@ -69,7 +69,38 @@ pub struct ScanPolicy {
     pub next_scan_at: Option<String>,
 }
 
+/// One localized description of a work (S2/H2), keyed by BCP-47-ish language tag.
 #[derive(SimpleObject, Clone)]
+pub struct LocalizedDescription {
+    pub lang: String,
+    pub description: String,
+}
+
+/// One author/artist credit of a work (S2/H2). `role` is `"author"` or `"artist"`.
+#[derive(SimpleObject, Clone)]
+pub struct Credit {
+    pub role: String,
+    pub name: String,
+}
+
+/// One cover of a work (F2). `url` is a proxy-ready MangaDex cover URL (the client
+/// resolves it through the Worker, like `coverUrl`); `isPrimary` marks the main
+/// cover mirrored on `Series.coverUrl`.
+#[derive(SimpleObject, Clone)]
+pub struct Cover {
+    /// The cover's `fileName` leaf (`covers/{mangadexId}/{fileName}`).
+    pub file_name: String,
+    /// Proxy-ready full cover URL (`uploads.mangadex.org/covers/...`).
+    pub url: String,
+    /// Proxy-ready 512px thumbnail URL.
+    pub thumbnail_url: String,
+    pub lang: Option<String>,
+    pub volume: Option<String>,
+    pub is_primary: bool,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct Series {
     pub id: ID,
     pub title: String,
@@ -151,6 +182,18 @@ pub struct WorkSource {
 #[derive(SimpleObject, Clone)]
 pub struct WorkSourceGroup {
     pub work_id: ID,
+    pub sources: Vec<WorkSource>,
+}
+
+/// Source provenance for one catalogue `Series` (admin console): the canonical
+/// work the series is linked to and every `source_series` mapping on that work,
+/// with each source's extension coordinates (`WorkSource.extension.pkgName` is
+/// the "extension" column). `workId` is null — and `sources` empty — for a
+/// series that hasn't been catalogued into a work yet.
+#[derive(SimpleObject, Clone)]
+pub struct SeriesSourceGroup {
+    pub series_id: ID,
+    pub work_id: Option<ID>,
     pub sources: Vec<WorkSource>,
 }
 
@@ -330,6 +373,206 @@ pub struct SeriesAdminInput {
     pub paused: Option<bool>,
     /// Override the source status; null uses the source-derived status.
     pub status: Option<SeriesStatus>,
+}
+
+// ---- Sources & Extensions admin surface (EXT-1) ------------------------------
+
+/// Which listing of a source to browse (mirrors Suwayomi's `FetchSourceMangaType`).
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum SourceBrowseType {
+    Popular,
+    Latest,
+    Search,
+}
+
+impl From<SourceBrowseType> for crate::suwayomi::FetchType {
+    fn from(t: SourceBrowseType) -> Self {
+        match t {
+            SourceBrowseType::Popular => crate::suwayomi::FetchType::Popular,
+            SourceBrowseType::Latest => crate::suwayomi::FetchType::Latest,
+            SourceBrowseType::Search => crate::suwayomi::FetchType::Search,
+        }
+    }
+}
+
+/// One Keiyoushi/Mihon extension as known to the Suwayomi engine — the admin
+/// management view (installed or not). Mirrors `suwayomi::ExtensionListEntry`.
+#[derive(SimpleObject, Clone)]
+pub struct ExtensionInfo {
+    pub pkg_name: String,
+    pub name: String,
+    pub lang: String,
+    pub version_name: String,
+    pub is_installed: bool,
+    pub has_update: bool,
+    pub is_nsfw: bool,
+    pub icon_url: Option<String>,
+    /// The store/repo the extension came from, when reported.
+    pub repo: Option<String>,
+}
+
+impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
+    fn from(e: crate::suwayomi::ExtensionListEntry) -> Self {
+        ExtensionInfo {
+            pkg_name: e.pkg_name,
+            name: e.name,
+            lang: e.lang,
+            version_name: e.version_name,
+            is_installed: e.is_installed,
+            has_update: e.has_update,
+            is_nsfw: e.is_nsfw,
+            icon_url: e.icon_url,
+            repo: e.repo,
+        }
+    }
+}
+
+/// One installed Suwayomi source — the admin picker feeding `sourceBrowse(sourceId)`.
+#[derive(SimpleObject, Clone)]
+pub struct SourceInfo {
+    /// The Suwayomi source id (the `sourceBrowse` input).
+    pub id: ID,
+    /// User-facing display name (per-language variants, e.g. "MangaDex (EN)").
+    pub name: String,
+    pub lang: String,
+    pub is_nsfw: bool,
+    pub icon_url: Option<String>,
+    /// The owning extension's pkgName, when reported.
+    pub pkg_name: Option<String>,
+}
+
+/// One manga returned by browsing a source (admin bulk-ingest picker). The id is
+/// Suwayomi's internal manga id — exactly what `bulkAddSourceSeries` consumes.
+#[derive(SimpleObject, Clone)]
+pub struct SourceBrowseEntry {
+    pub suwayomi_manga_id: ID,
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+    pub in_library: bool,
+}
+
+/// A page of source-browse results.
+#[derive(SimpleObject)]
+pub struct SourceBrowsePage {
+    pub items: Vec<SourceBrowseEntry>,
+    pub page: i32,
+    pub has_next_page: bool,
+}
+
+/// One "add all from source" background ingest job (S1). Mirrors
+/// `ingest::IngestJob` / the `source_ingest_job` row.
+#[derive(SimpleObject, Clone)]
+pub struct SourceIngestJob {
+    pub id: ID,
+    pub source_id: String,
+    /// `running` | `completed` | `cancelled` | `failed`.
+    pub state: String,
+    pub pages_done: i32,
+    pub items_seen: i32,
+    pub succeeded: i32,
+    pub failed: i32,
+    pub new_works: i32,
+    pub auto_merged: i32,
+    pub queued_for_review: i32,
+    pub already_existing: i32,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+impl From<crate::ingest::IngestJob> for SourceIngestJob {
+    fn from(j: crate::ingest::IngestJob) -> Self {
+        SourceIngestJob {
+            id: ID(j.id),
+            source_id: j.source_id,
+            state: j.state,
+            pages_done: j.pages_done as i32,
+            items_seen: j.items_seen as i32,
+            succeeded: j.succeeded as i32,
+            failed: j.failed as i32,
+            new_works: j.new_works as i32,
+            auto_merged: j.auto_merged as i32,
+            queued_for_review: j.queued_for_review as i32,
+            already_existing: j.already_existing as i32,
+            error: j.error,
+            started_at: j.started_at,
+            finished_at: j.finished_at,
+        }
+    }
+}
+
+/// Per-id outcome of `bulkAddSourceSeries`: the dedup `MatchResult` on success,
+/// or the error that made this one id fail (other ids still proceed).
+#[derive(SimpleObject)]
+pub struct BulkAddEntry {
+    pub suwayomi_manga_id: ID,
+    pub result: Option<super::MatchResult>,
+    pub error: Option<String>,
+}
+
+/// Result of a bulk catalogue ingest: per-id entries plus a decision summary.
+#[derive(SimpleObject)]
+pub struct BulkAddResult {
+    pub entries: Vec<BulkAddEntry>,
+    pub total: i32,
+    pub succeeded: i32,
+    pub failed: i32,
+    /// Decision counts across the succeeded entries.
+    pub new_works: i32,
+    pub auto_merged: i32,
+    pub queued_for_review: i32,
+    pub already_existing: i32,
+}
+
+// ---- Federated multi-extension search + translators (S3) ---------------------
+
+/// One source/extension that carries a canonical work — a "translator" in the
+/// reader UI (S3). For a Suwayomi source, `suwayomiMangaId` (= the source
+/// mapping's `source_key`) is exactly the id the reader passes to
+/// `chapters(seriesId:)` to fetch THIS translator's chapters; for the MangaDex
+/// spine (`sourceType = "mangadex"`), chapters come from
+/// `canonicalChapters(workId)` instead and `suwayomiMangaId` is null.
+#[derive(SimpleObject, Clone)]
+pub struct Translator {
+    /// `"mangadex"` (the canonical spine) or `"suwayomi"` (an installed extension).
+    pub source_type: String,
+    pub source_id: String,
+    /// The source's display name (e.g. "MangaDex (EN)", "Manga Plus"); null when
+    /// the source isn't currently installed on the engine.
+    pub source_name: Option<String>,
+    pub lang: Option<String>,
+    /// The Suwayomi manga id to fetch this translator's chapters with
+    /// (`chapters(seriesId:)`). Null for the MangaDex spine mapping.
+    pub suwayomi_manga_id: Option<ID>,
+    pub extension_pkg_name: Option<String>,
+    pub extension_icon_url: Option<String>,
+}
+
+/// One consolidated federated-search hit: a canonical work as a `Series`, plus
+/// the per-source translator list gathered across every installed extension (S3).
+#[derive(SimpleObject, Clone)]
+pub struct FederatedSeries {
+    pub series: Series,
+    pub translators: Vec<Translator>,
+}
+
+/// A page of federated search results (S3).
+#[derive(SimpleObject)]
+pub struct FederatedSearchPage {
+    pub items: Vec<FederatedSeries>,
+    pub page: i32,
+    pub has_next_page: bool,
+    /// How many installed sources were actually queried in the fan-out (diagnostic).
+    pub sources_queried: i32,
+}
+
+/// Result of folding one canonical work into another (D1 admin merge).
+#[derive(SimpleObject, Clone)]
+pub struct MergeWorksResult {
+    /// The surviving (target) work id.
+    pub target_work_id: ID,
+    /// How many `source_series` mappings were re-pointed onto the target.
+    pub moved_source_series: i32,
 }
 
 /// Serialize a `SeriesStatus` to its SDL name (for storage).

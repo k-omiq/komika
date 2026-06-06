@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod dedup;
 mod graphql;
+mod ingest;
 mod mangadex;
 mod phash;
 mod scanner;
@@ -383,8 +384,21 @@ async fn main() -> anyhow::Result<()> {
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),
+        federated_limiter: RateLimiter::new(
+            cfg.federated_rate_limit_max,
+            cfg.federated_rate_limit_window_secs,
+        ),
         session_ttl_secs: cfg.session_ttl_secs,
     });
+
+    // Startup recovery: an ingest job still `running` was interrupted by the
+    // previous shutdown — its task is gone, so mark it failed (otherwise the
+    // partial unique index blocks new jobs for that source forever).
+    match ingest::mark_interrupted_jobs(&pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(n, "marked interrupted source-ingest jobs as failed"),
+        Err(e) => tracing::warn!(error = %e, "failed to sweep interrupted ingest jobs"),
+    }
 
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -408,6 +422,20 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
+    }
+
+    // Recurring auto-enrichment drainer (X1) — opt-in. Keeps newly-ingested
+    // MangaDex-anchored works self-enriching (S2 metadata + F2 covers) in small
+    // polite batches; shares the MangaDex rate limiter.
+    if cfg.metadata_backfill_enabled {
+        graphql::spawn_metadata_backfill(
+            state.clone(),
+            cfg.metadata_backfill_interval_secs,
+            cfg.metadata_backfill_batch,
+            shutdown_tx.subscribe(),
+        );
+    } else {
+        tracing::info!("metadata auto-enrichment disabled (set METADATA_BACKFILL=on to enable)");
     }
 
     let schema = build_schema(state, !cfg.graphiql_enabled);

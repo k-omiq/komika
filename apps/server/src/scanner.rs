@@ -315,13 +315,22 @@ async fn tick(state: &AppState) -> (usize, usize) {
         let series_id = m.id.to_string();
         let admin = scan_admin(&state.pool, &series_id).await;
         let status = effective_status(&m, &admin);
+        let prior_state = scan_state(&state.pool, &series_id).await;
         if is_paused(status, &admin) {
+            // Paused skips *polling* — but a never-observed series still gets ONE
+            // baseline scan so its chapter list is fetched into the engine and its
+            // chapter count / cadence exist for the console. Without this, a
+            // series that enters the library already COMPLETED/HIATUS (auto-pause)
+            // was skipped forever and showed 0 chapters indefinitely.
+            if prior_state.is_none() {
+                if let Err(e) = scan_series(state, &m, now).await {
+                    tracing::warn!(series_id, error = %e, "scan: paused baseline scan failed; skipping");
+                }
+            }
             continue;
         }
 
-        let prior = scan_state(&state.pool, &series_id)
-            .await
-            .unwrap_or_default();
+        let prior = prior_state.unwrap_or_default();
 
         // Gate on the persisted `next_scan_at`, which `scan_series` schedules from
         // the steady cadence normally and from the accelerated poll cadence while a

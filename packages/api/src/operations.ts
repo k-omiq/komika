@@ -121,6 +121,34 @@ export const SERIES = /* GraphQL */ `
 	}
 `;
 
+// Federated multi-extension search (S3): fans out to every installed source,
+// dedupes to one canonical work per series, and returns each work with its
+// per-source translator list. User-facing; NSFW-gated by the viewer's posture.
+export const SEARCH_ALL_SOURCES = /* GraphQL */ `
+	${SERIES_FIELDS}
+	query SearchAllSources($query: String!, $page: Int) {
+		searchAllSources(query: $query, page: $page) {
+			items {
+				series {
+					...SeriesFields
+				}
+				translators {
+					sourceType
+					sourceId
+					sourceName
+					lang
+					suwayomiMangaId
+					extensionPkgName
+					extensionIconUrl
+				}
+			}
+			page
+			hasNextPage
+			sourcesQueried
+		}
+	}
+`;
+
 export const CHAPTERS = /* GraphQL */ `
 	${CHAPTER_FIELDS}
 	query Chapters($seriesId: ID!) {
@@ -441,6 +469,118 @@ export const ADD_SOURCE_SERIES = /* GraphQL */ `
 	}
 `;
 
+// ---- admin sources & extensions (EXT-1/EXT-2) --------------------------------
+
+const EXTENSION_FIELDS = /* GraphQL */ `
+	fragment ExtensionFields on ExtensionInfo {
+		pkgName
+		name
+		lang
+		versionName
+		isInstalled
+		hasUpdate
+		isNsfw
+		iconUrl
+		repo
+	}
+`;
+
+export const EXTENSIONS = /* GraphQL */ `
+	${EXTENSION_FIELDS}
+	query Extensions($refresh: Boolean!) {
+		extensions(refresh: $refresh) {
+			...ExtensionFields
+		}
+	}
+`;
+
+export const SOURCES = /* GraphQL */ `
+	query Sources {
+		sources {
+			id
+			name
+			lang
+			isNsfw
+			iconUrl
+			pkgName
+		}
+	}
+`;
+
+export const SOURCE_BROWSE = /* GraphQL */ `
+	query SourceBrowse($sourceId: ID!, $type: SourceBrowseType!, $page: Int!, $query: String) {
+		sourceBrowse(sourceId: $sourceId, type: $type, page: $page, query: $query) {
+			page
+			hasNextPage
+			items {
+				suwayomiMangaId
+				title
+				thumbnailUrl
+				inLibrary
+			}
+		}
+	}
+`;
+
+export const ADD_EXTENSION_REPO = /* GraphQL */ `
+	mutation AddExtensionRepo($indexUrl: String!) {
+		addExtensionRepo(indexUrl: $indexUrl)
+	}
+`;
+
+export const INSTALL_EXTENSION = /* GraphQL */ `
+	${EXTENSION_FIELDS}
+	mutation InstallExtension($pkgName: String!) {
+		installExtension(pkgName: $pkgName) {
+			...ExtensionFields
+		}
+	}
+`;
+
+export const UNINSTALL_EXTENSION = /* GraphQL */ `
+	${EXTENSION_FIELDS}
+	mutation UninstallExtension($pkgName: String!) {
+		uninstallExtension(pkgName: $pkgName) {
+			...ExtensionFields
+		}
+	}
+`;
+
+export const UPDATE_EXTENSION = /* GraphQL */ `
+	${EXTENSION_FIELDS}
+	mutation UpdateExtension($pkgName: String!) {
+		updateExtension(pkgName: $pkgName) {
+			...ExtensionFields
+		}
+	}
+`;
+
+export const BULK_ADD_SOURCE_SERIES = /* GraphQL */ `
+	mutation BulkAddSourceSeries($suwayomiMangaIds: [ID!]!) {
+		bulkAddSourceSeries(suwayomiMangaIds: $suwayomiMangaIds) {
+			total
+			succeeded
+			failed
+			newWorks
+			autoMerged
+			queuedForReview
+			alreadyExisting
+			entries {
+				suwayomiMangaId
+				error
+				result {
+					decision
+					workId
+					matchedWorkId
+					score
+					method
+					sourceSeriesId
+				}
+			}
+		}
+	}
+`;
+
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)
@@ -487,11 +627,30 @@ export const CANONICAL_UPDATES = /* GraphQL */ `
 
 // ---- canonical reader path -------------------------------------------------
 
+// The two enrichment fields (S2) are opt-in resolver fields keyed on the canonical
+// `w_` work id, so they're selected ONLY here (canonicalSeries), never on the shared
+// SeriesFields fragment used by native/numeric-id queries.
 export const CANONICAL_SERIES = /* GraphQL */ `
 	${SERIES_FIELDS}
 	query CanonicalSeries($workId: ID!) {
 		canonicalSeries(workId: $workId) {
 			...SeriesFields
+			localizedDescriptions {
+				lang
+				description
+			}
+			credits {
+				role
+				name
+			}
+			covers {
+				fileName
+				url
+				thumbnailUrl
+				lang
+				volume
+				isPrimary
+			}
 		}
 	}
 `;
@@ -553,6 +712,96 @@ export const WORK_SOURCES_BATCH = /* GraphQL */ `
 			sources {
 				...WorkSourceFields
 			}
+		}
+	}
+`;
+
+// ---- admin catalogue provenance + scan pause (EXT-2) -------------------------
+
+export const SERIES_SOURCES_BATCH = /* GraphQL */ `
+	${WORK_SOURCE_FIELDS}
+	query SeriesSourcesBatch($seriesIds: [ID!]!) {
+		seriesSourcesBatch(seriesIds: $seriesIds) {
+			seriesId
+			workId
+			sources {
+				...WorkSourceFields
+			}
+		}
+	}
+`;
+
+// ---- admin background source-ingest jobs (S1) --------------------------------
+
+const SOURCE_INGEST_JOB_FIELDS = /* GraphQL */ `
+	fragment SourceIngestJobFields on SourceIngestJob {
+		id
+		sourceId
+		state
+		pagesDone
+		itemsSeen
+		succeeded
+		failed
+		newWorks
+		autoMerged
+		queuedForReview
+		alreadyExisting
+		error
+		startedAt
+		finishedAt
+	}
+`;
+
+export const SOURCE_INGEST_JOBS = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	query SourceIngestJobs($active: Boolean!) {
+		sourceIngestJobs(active: $active) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const START_SOURCE_INGEST = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	mutation StartSourceIngest($sourceId: ID!) {
+		startSourceIngest(sourceId: $sourceId) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const CANCEL_SOURCE_INGEST = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	mutation CancelSourceIngest($jobId: ID!) {
+		cancelSourceIngest(jobId: $jobId) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const START_EXTENSION_INGEST = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	mutation StartExtensionIngest($pkgName: ID!) {
+		startExtensionIngest(pkgName: $pkgName) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const CANCEL_EXTENSION_INGEST = /* GraphQL */ `
+	${SOURCE_INGEST_JOB_FIELDS}
+	mutation CancelExtensionIngest($pkgName: ID!) {
+		cancelExtensionIngest(pkgName: $pkgName) {
+			...SourceIngestJobFields
+		}
+	}
+`;
+
+export const SET_SERIES_PAUSED = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation SetSeriesPaused($seriesId: ID!, $paused: Boolean!) {
+		setSeriesPaused(seriesId: $seriesId, paused: $paused) {
+			...SeriesFields
 		}
 	}
 `;

@@ -1,10 +1,13 @@
 import type {
 	AdminUser,
+	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
 	Comment,
 	CommentTargetType,
 	DiscoveryFeed,
+	ExtensionInfo,
+	FederatedSearchPage,
 	Id,
 	MatchResult,
 	MergeCandidate,
@@ -13,7 +16,12 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesSourceGroup,
 	SeriesStatus,
+	SourceBrowsePage,
+	SourceBrowseType,
+	SourceIngestJob,
+	SourceInfo,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -51,6 +59,14 @@ export interface Backend {
 	 */
 	updates(page?: number): Promise<Paginated<Series>>;
 	search(query: string, page?: number): Promise<Paginated<Series>>;
+	/**
+	 * Federated multi-extension catalogue search (S3): fans the query out to every
+	 * installed source, dedupes to one canonical work per series, and returns each
+	 * work with its per-source translator list. User-facing; NSFW-gated by the
+	 * viewer's `show_nsfw` posture (same as {@link search}). Optional: only the
+	 * unified Komika API implements it.
+	 */
+	searchAllSources?(query: string, page?: number): Promise<FederatedSearchPage>;
 	series(id: Id): Promise<Series>;
 	chapters(seriesId: Id): Promise<Chapter[]>;
 	pages(chapterId: Id): Promise<Page[]>;
@@ -155,6 +171,69 @@ export interface Backend {
 	 * work (auto-merge / queue for review / create new), idempotently. Optional:
 	 * only the unified Komika API implements it. */
 	addSourceSeries?(suwayomiMangaId: Id): Promise<MatchResult>;
+
+	// --- admin sources & extensions (requires an admin session; EXT-1/EXT-2) ---
+	/** Every Keiyoushi/Mihon extension known to the Suwayomi engine, installed or
+	 * not. First use seeds the curated Keiyoushi store; NSFW extensions are hidden
+	 * unless the admin opted in via show_nsfw. `refresh: true` re-fetches the
+	 * store indexes first so hasUpdate/versions are fresh. Optional: only the
+	 * unified Komika API implements it. */
+	extensions?(refresh?: boolean): Promise<ExtensionInfo[]>;
+	/** The installed Suwayomi sources — the picker feeding {@link sourceBrowse}.
+	 * NSFW sources are hidden unless the admin opted in. Optional. */
+	sources?(): Promise<SourceInfo[]>;
+	/** Browse/search one source's catalogue for bulk ingest. Every returned manga
+	 * carries the Suwayomi id {@link bulkAddSourceSeries} consumes. Optional. */
+	sourceBrowse?(
+		sourceId: Id,
+		type: SourceBrowseType,
+		page?: number,
+		query?: string,
+	): Promise<SourceBrowsePage>;
+	/** Register an extension repo (store) by its index URL and refresh the list;
+	 * returns how many extensions are now known. Optional. */
+	addExtensionRepo?(indexUrl: string): Promise<number>;
+	/** Install a store extension onto the Suwayomi engine (NSFW-gated). Optional. */
+	installExtension?(pkgName: string): Promise<ExtensionInfo>;
+	/** Uninstall an extension from the Suwayomi engine. Optional. */
+	uninstallExtension?(pkgName: string): Promise<ExtensionInfo>;
+	/** Update an installed extension to the store's latest version. Optional. */
+	updateExtension?(pkgName: string): Promise<ExtensionInfo>;
+	/** Bulk Tier-2 catalogue ingest: for each Suwayomi manga id, library-track it
+	 * and run the dedup add flow. Per-id failures never abort the batch; at most
+	 * 100 ids per call. Optional. */
+	bulkAddSourceSeries?(suwayomiMangaIds: Id[]): Promise<BulkAddResult>;
+	/** Catalogue provenance for many Suwayomi series at once: which canonical
+	 * work each is linked to and every source mapping (with extension
+	 * coordinates) on that work. One group per id, in input order; max 200 ids.
+	 * Optional. */
+	seriesSourcesBatch?(seriesIds: Id[]): Promise<SeriesSourceGroup[]>;
+	/** Pause or unpause one series' scanning (targeted paused_override write —
+	 * `updateSeriesAdmin` is whole-state). Unpausing triggers an immediate
+	 * server-side re-scan; returns the recomputed series. Optional. */
+	setSeriesPaused?(seriesId: Id, paused: boolean): Promise<Series>;
+
+	// --- admin background source-ingest jobs (requires an admin session; S1) ---
+	/** The "add all from this source" ingest jobs, newest first. Pass
+	 * `active: true` for only currently-running ones — poll it for live progress.
+	 * Optional: only the unified Komika API implements it. */
+	sourceIngestJobs?(active?: boolean): Promise<SourceIngestJob[]>;
+	/** Start a background ingest walking a source's catalogue through the Tier-2
+	 * dedup add flow. Refused while one is already running for the source, and for
+	 * an NSFW source unless the admin opted in. Optional. */
+	startSourceIngest?(sourceId: Id): Promise<SourceIngestJob>;
+	/** Request cancellation of a running ingest job; the runner stops between
+	 * items, preserving progress. Optional. */
+	cancelSourceIngest?(jobId: Id): Promise<SourceIngestJob>;
+	/** Start one ingest job per installed source of an extension (F1). NSFW
+	 * sources are skipped for an opted-out admin, and a source already running is
+	 * returned with its existing job rather than erroring. Errors only when no
+	 * source matches the package. Returns every started + already-running job.
+	 * Optional: only the unified Komika API implements it. */
+	startExtensionIngest?(pkgName: Id): Promise<SourceIngestJob[]>;
+	/** Cancel every running ingest job for an extension's sources; returns the
+	 * cancelled jobs (empty if none were running). Optional. */
+	cancelExtensionIngest?(pkgName: Id): Promise<SourceIngestJob[]>;
 }
 
 export interface Session {

@@ -1,7 +1,19 @@
 <script lang="ts">
 	import { images } from '$lib/context';
 
-	let { src = '', alt = '' }: { src?: string; alt?: string } = $props();
+	let {
+		src = '',
+		alt = '',
+		loading = 'eager',
+		fit = 'cover',
+	}: {
+		src?: string;
+		alt?: string;
+		/** Native lazy-load hint — pass 'lazy' for offscreen thumbnails (galleries). */
+		loading?: 'eager' | 'lazy';
+		/** object-fit; 'contain' for a full-cover viewer, 'cover' (default) to fill. */
+		fit?: 'cover' | 'contain';
+	} = $props();
 
 	let resolved = $state('');
 	let broken = $state(false);
@@ -28,7 +40,16 @@
 </script>
 
 {#if resolved && !broken}
-	<img class="cover-img" src={resolved} {alt} onerror={() => (broken = true)} />
+	<img
+		class="cover-img"
+		src={resolved}
+		{alt}
+		{loading}
+		decoding="async"
+		referrerpolicy="no-referrer"
+		style="object-fit:{fit}"
+		onerror={() => (broken = true)}
+	/>
 {:else}
 	<div class="cover-ph k-cover"></div>
 {/if}
@@ -40,8 +61,5 @@
 		inset: 0;
 		width: 100%;
 		height: 100%;
-	}
-	.cover-img {
-		object-fit: cover;
 	}
 </style>

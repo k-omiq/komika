@@ -2,6 +2,18 @@
 	"version": "0.0.1",
 	"configurations": [
 		{
+			"name": "server",
+			"runtimeExecutable": "bash",
+			"runtimeArgs": ["-lc", "cd apps/server && PORT=8080 GRAPHIQL_ENABLED=on CATALOGUE_SYNC=on CORS_ORIGINS='http://localhost:5173,http://localhost:5273' cargo run"],
+			"port": 8080
+		},
+		{
+			"name": "suwayomi",
+			"runtimeExecutable": "bash",
+			"runtimeArgs": ["-lc", "D=$HOME/.cache/komika-suwayomi-dev; mkdir -p $D; printf 'server.ip = \"127.0.0.1\"\nserver.port = 4567\nserver.webUIEnabled = false\nserver.initialOpenInBrowserEnabled = false\nserver.systemTrayEnabled = false\nserver.flareSolverrEnabled = false\nserver.kcefEnabled = false\n' > $D/server.conf; exec /Users/caved/dev/komika/apps/reader/src-tauri/jre/aarch64-macos/bin/java -Djava.awt.headless=true -Xmx512m -Dsuwayomi.tachidesk.config.server.rootDir=$D -jar /Users/caved/dev/komika/apps/reader/src-tauri/suwayomi/Suwayomi-Server.jar"],
+			"port": 4567
+		},
+		{
 			"name": "reader",
 			"runtimeExecutable": "pnpm",
 			"runtimeArgs": ["--filter", "@komika/reader", "dev"],

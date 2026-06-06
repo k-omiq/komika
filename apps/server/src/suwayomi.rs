@@ -92,6 +92,39 @@ pub struct SuwayomiChapter {
     pub page_count: i64,
 }
 
+/// One extension row from the configured extension stores — the admin-facing
+/// management view (EXT-1), covering the FULL store index, not just installed
+/// ones (`SuwayomiExtension` is the installed-only catalogue view). Verified
+/// against Suwayomi v2.3.2243 `ExtensionType` (GQL-SCHEMA-FINDINGS.md §B2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionListEntry {
+    pub pkg_name: String,
+    pub name: String,
+    pub lang: String,
+    pub version_name: String,
+    pub is_installed: bool,
+    pub has_update: bool,
+    pub is_nsfw: bool,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// One installed Suwayomi source, flattened for the admin picker (EXT-1): the
+/// coordinates the UI needs to feed `sourceBrowse(sourceId)`. `name` is the
+/// user-facing display name; `pkg_name` joins back to the owning extension.
+#[derive(Debug, Clone)]
+pub struct SuwayomiSource {
+    pub id: String,
+    pub name: String,
+    pub lang: String,
+    pub is_nsfw: bool,
+    pub icon_url: Option<String>,
+    pub pkg_name: Option<String>,
+}
+
 /// Which source-manga listing to fetch.
 #[derive(Clone, Copy)]
 pub enum FetchType {
@@ -252,6 +285,21 @@ impl SuwayomiClient {
         query: Option<&str>,
     ) -> Result<(bool, Vec<SuwayomiManga>)> {
         let source = self.resolve_source().await?;
+        self.browse_source(&source, ty, page, query).await
+    }
+
+    /// Browse/search one EXPLICIT source (`fetchSourceManga`, GQL-SCHEMA-FINDINGS.md
+    /// §A1) — the admin "Sources & Extensions" surface picks the source id itself
+    /// instead of going through the resolved default (EXT-1). Every returned manga
+    /// is persisted by Suwayomi and gets an internal id (§A0), which is what the
+    /// bulk-ingest flow feeds to `add_source_series`.
+    pub async fn browse_source(
+        &self,
+        source_id: &str,
+        ty: FetchType,
+        page: i32,
+        query: Option<&str>,
+    ) -> Result<(bool, Vec<SuwayomiManga>)> {
         let doc = format!(
             "{MANGA_FIELDS}\n\
              mutation F($source: LongString!, $type: FetchSourceMangaType!, $page: Int!, $query: String) {{\
@@ -272,7 +320,7 @@ impl SuwayomiClient {
         let data: Data = self
             .gql(
                 &doc,
-                json!({ "source": source, "type": ty.as_str(), "page": page, "query": query }),
+                json!({ "source": source_id, "type": ty.as_str(), "page": page, "query": query }),
             )
             .await?;
         Ok((
@@ -477,6 +525,210 @@ impl SuwayomiClient {
                 source_ids: n.source.nodes.into_iter().map(|s| s.id).collect(),
             })
             .collect())
+    }
+
+    // ---- Extension management (EXT-1, GQL-SCHEMA-FINDINGS.md §B) ------------
+
+    /// Number of configured extension stores (repos). Used by the idempotent
+    /// Keiyoushi default-store seeding: Suwayomi canonicalizes the index URL on
+    /// add (min.json → index.pb), so presence can't be checked by URL equality.
+    pub async fn extension_store_count(&self) -> Result<i64> {
+        let doc = "query { extensionStores { totalCount } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Stores {
+            total_count: i64,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            extension_stores: Stores,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.extension_stores.total_count)
+    }
+
+    /// Register an extension store (repo) by its index URL. Idempotent upstream:
+    /// re-adding an existing store returns it unchanged (verified on v2.3.2243).
+    /// Returns the store's display name.
+    pub async fn add_extension_store(&self, index_url: &str) -> Result<String> {
+        let doc = "mutation A($url: String!) { \
+            addExtensionStore(input: { indexUrl: $url }) { extensionStore { name } } }";
+        #[derive(Deserialize)]
+        struct Store {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Payload {
+            extension_store: Store,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            add_extension_store: Payload,
+        }
+        let d: Data = self.gql(doc, json!({ "url": index_url })).await?;
+        Ok(d.add_extension_store.extension_store.name)
+    }
+
+    /// Refresh the available-extension list from every configured store
+    /// (`fetchExtensions` — a network fetch of each store index). Returns how
+    /// many extensions are now known.
+    pub async fn refresh_extensions(&self) -> Result<i64> {
+        let doc = "mutation { fetchExtensions(input: {}) { extensions { pkgName } } }";
+        #[derive(Deserialize)]
+        struct Payload {
+            extensions: Vec<Value>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            fetch_extensions: Payload,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.fetch_extensions.extensions.len() as i64)
+    }
+
+    /// List ALL extensions known from the configured stores (installed or not) —
+    /// the admin management view. `fetch_extensions` above stays the installed-only
+    /// catalogue view (§2.1 coordinates); this one is the EXT-1 surface.
+    pub async fn list_extensions(&self) -> Result<Vec<ExtensionListEntry>> {
+        let doc = "query { extensions { \
+            nodes { pkgName name lang versionName isInstalled hasUpdate isNsfw iconUrl repo } } }";
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<ExtensionListEntry>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            extensions: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.extensions.nodes)
+    }
+
+    /// Shared `updateExtension(input:{id, patch})` call — `id` is the pkgName and
+    /// the patch carries exactly one of install/uninstall/update (§B3). Returns
+    /// the extension's post-mutation state.
+    async fn patch_extension(&self, pkg_name: &str, patch: Value) -> Result<ExtensionListEntry> {
+        let doc = "mutation U($id: String!, $patch: UpdateExtensionPatchInput!) { \
+            updateExtension(input: { id: $id, patch: $patch }) { \
+              extension { pkgName name lang versionName isInstalled hasUpdate isNsfw iconUrl repo } } }";
+        #[derive(Deserialize)]
+        struct Payload {
+            extension: Option<ExtensionListEntry>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            update_extension: Payload,
+        }
+        let d: Data = self
+            .gql(doc, json!({ "id": pkg_name, "patch": patch }))
+            .await?;
+        d.update_extension
+            .extension
+            .ok_or_else(|| anyhow!("Suwayomi returned no extension for {pkg_name}"))
+    }
+
+    pub async fn install_extension(&self, pkg_name: &str) -> Result<ExtensionListEntry> {
+        self.patch_extension(pkg_name, json!({ "install": true }))
+            .await
+    }
+
+    pub async fn uninstall_extension(&self, pkg_name: &str) -> Result<ExtensionListEntry> {
+        self.patch_extension(pkg_name, json!({ "uninstall": true }))
+            .await
+    }
+
+    pub async fn update_extension(&self, pkg_name: &str) -> Result<ExtensionListEntry> {
+        self.patch_extension(pkg_name, json!({ "update": true }))
+            .await
+    }
+
+    /// One extension by pkgName (`extension(pkgName:)`, §B2) — used to check the
+    /// NSFW flag before an install/update is allowed through the posture gate.
+    pub async fn get_extension(&self, pkg_name: &str) -> Result<ExtensionListEntry> {
+        let doc = "query E($pkg: String!) { extension(pkgName: $pkg) { \
+            pkgName name lang versionName isInstalled hasUpdate isNsfw iconUrl repo } }";
+        #[derive(Deserialize)]
+        struct Data {
+            extension: ExtensionListEntry,
+        }
+        let d: Data = self.gql(doc, json!({ "pkg": pkg_name })).await?;
+        Ok(d.extension)
+    }
+
+    /// List the installed Suwayomi sources (`sources` query, §B4) — the admin
+    /// picker that feeds `sourceBrowse(sourceId)`. Lenient on the nested
+    /// extension so a shape mismatch degrades to `pkg_name: None`, not an error.
+    pub async fn list_sources(&self) -> Result<Vec<SuwayomiSource>> {
+        let doc = "query { sources { nodes { \
+            id name displayName lang isNsfw iconUrl extension { pkgName } } } }";
+        #[derive(Deserialize, Default)]
+        #[serde(default, rename_all = "camelCase")]
+        struct Ext {
+            pkg_name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            id: String,
+            name: String,
+            #[serde(default)]
+            display_name: Option<String>,
+            lang: String,
+            is_nsfw: bool,
+            #[serde(default)]
+            icon_url: Option<String>,
+            #[serde(default)]
+            extension: Option<Ext>,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            sources: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.sources
+            .nodes
+            .into_iter()
+            .map(|n| SuwayomiSource {
+                id: n.id,
+                // displayName is the user-facing one (e.g. per-language variants);
+                // fall back to the raw name when absent/blank.
+                name: match n.display_name {
+                    Some(d) if !d.is_empty() => d,
+                    _ => n.name,
+                },
+                lang: n.lang,
+                is_nsfw: n.is_nsfw,
+                icon_url: n.icon_url,
+                pkg_name: n.extension.and_then(|e| e.pkg_name),
+            })
+            .collect())
+    }
+
+    /// A source's display name + NSFW flag, for gating the admin browse surface
+    /// on the show_nsfw posture (a source id is user input there).
+    pub async fn source_meta(&self, source_id: &str) -> Result<(String, bool)> {
+        let doc = "query S($id: LongString!) { source(id: $id) { displayName isNsfw } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Src {
+            display_name: String,
+            is_nsfw: bool,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            source: Src,
+        }
+        let d: Data = self.gql(doc, json!({ "id": source_id })).await?;
+        Ok((d.source.display_name, d.source.is_nsfw))
     }
 
     pub async fn set_in_library(&self, id: i64, in_library: bool) -> Result<()> {

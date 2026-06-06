@@ -21,6 +21,7 @@
 	);
 	const nav = [
 		{ href: '/', label: 'Catalog' },
+		{ href: '/sources', label: 'Sources' },
 		{ href: '/review', label: 'Review' },
 		{ href: '/updates', label: 'Updates' },
 		{ href: '/users', label: 'Users' },

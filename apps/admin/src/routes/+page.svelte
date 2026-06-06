@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import type { MatchResult, Series, SeriesStatus } from '@komika/types';
+	import type { MatchResult, Series, SeriesSourceGroup, SeriesStatus, WorkSource } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import {
 		loadCatalog,
+		loadSeriesSources,
 		saveSeriesAdmin,
+		setSeriesPaused,
 		triggerScan,
 		addSourceSeries,
 		STATUS_OPTIONS,
@@ -14,6 +16,52 @@
 	let series = $state<Series[]>([]);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
+
+	// ---- source/extension provenance (seriesSourcesBatch) ----
+	let provenance = $state<Record<string, SeriesSourceGroup>>({});
+	let provenanceError = $state<string | null>(null);
+
+	/** Fetch provenance for the loaded page in one batched call (≤200 ids). */
+	async function loadProvenance(list: Series[]): Promise<void> {
+		provenanceError = null;
+		provenance = {};
+		if (list.length === 0) return;
+		try {
+			const groups = await loadSeriesSources(list.slice(0, 200).map((s) => s.id));
+			const map: Record<string, SeriesSourceGroup> = {};
+			for (const g of groups) map[String(g.seriesId)] = g;
+			provenance = map;
+		} catch (err) {
+			provenanceError =
+				err instanceof Error ? err.message : 'Failed to load source provenance.';
+		}
+	}
+
+	/** Compact label for one source mapping: extension pkg tail + lang, or the source type. */
+	function extLabel(src: WorkSource): string {
+		const pkg = src.extension?.pkgName;
+		const name = pkg ? (pkg.split('.').pop() ?? pkg) : src.sourceType;
+		return src.lang ? `${name} (${src.lang})` : name;
+	}
+
+	// ---- targeted pause toggle ----
+	let unpausing = $state<string | null>(null);
+	let pauseMsg = $state<Record<string, string>>({});
+
+	async function unpause(s: Series): Promise<void> {
+		if (unpausing) return;
+		unpausing = s.id;
+		const { [s.id]: _drop, ...rest } = pauseMsg;
+		pauseMsg = rest;
+		try {
+			const updated = await setSeriesPaused(s.id, false);
+			series = series.map((x) => (x.id === updated.id ? updated : x));
+		} catch (err) {
+			pauseMsg = { ...pauseMsg, [s.id]: err instanceof Error ? err.message : 'Unpause failed.' };
+		} finally {
+			unpausing = null;
+		}
+	}
 
 	// Redirect out if we're not an admin.
 	$effect(() => {
@@ -31,9 +79,11 @@
 		loadError = null;
 		try {
 			series = await loadCatalog(q);
+			void loadProvenance(series);
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load catalog.';
 			series = [];
+			provenance = {};
 		} finally {
 			loading = false;
 		}
@@ -191,6 +241,9 @@
 	{#if loadError}
 		<div class="notice error">{loadError}</div>
 	{/if}
+	{#if provenanceError}
+		<div class="notice error">Source provenance unavailable: {provenanceError}</div>
+	{/if}
 
 	<div class="table" class:dim={loading}>
 		<div class="thead">
@@ -198,6 +251,7 @@
 			<span class="col-type">Type</span>
 			<span class="col-status">Status</span>
 			<span class="col-ch">Chapters</span>
+			<span class="col-src">Source</span>
 			<span class="col-scan">Scan</span>
 			<span class="col-actions"></span>
 		</div>
@@ -210,7 +264,13 @@
 				<div class="row">
 					<div class="col-series cell-series">
 						{#if s.coverUrl}
-							<img class="cover" src={s.coverUrl} alt="" loading="lazy" />
+							<img
+								class="cover"
+								src={s.coverUrl}
+								alt=""
+								loading="lazy"
+								referrerpolicy="no-referrer"
+							/>
 						{:else}
 							<div class="cover placeholder"></div>
 						{/if}
@@ -224,11 +284,36 @@
 						<span class="badge {STATUS_CLASS[s.status]}">{s.status}</span>
 					</span>
 					<span class="col-ch">{s.chapterCount}</span>
+					<span class="col-src">
+						{#if provenance[s.id]}
+							{#if provenance[s.id].workId && provenance[s.id].sources.length > 0}
+								{#each provenance[s.id].sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
+									<span
+										class="src-entry"
+										title="{src.extension?.pkgName ?? src.sourceType} · source {src.sourceId}"
+									>
+										<span class="src-name">{extLabel(src)}</span>
+										<span class="src-id">{src.sourceId}</span>
+									</span>
+								{/each}
+							{:else}
+								<span class="src-none">not catalogued</span>
+							{/if}
+						{:else}
+							<span class="src-none">—</span>
+						{/if}
+					</span>
 					<span class="col-scan">
 						<span class="cadence">{cadence(s)}</span>
-						<span class="scan-state {s.scan.paused ? 'paused' : 'active'}"
-							>{s.scan.paused ? 'paused' : `every ${s.scan.pollEveryMinutes}m`}</span
-						>
+						{#if s.scan.paused}
+							<span class="paused-badge">Paused</span>
+							<button class="unpause" onclick={() => unpause(s)} disabled={unpausing === s.id}>
+								{unpausing === s.id ? 'Unpausing…' : 'Unpause'}
+							</button>
+						{:else}
+							<span class="scan-state active">every {s.scan.pollEveryMinutes}m</span>
+						{/if}
+						{#if pauseMsg[s.id]}<span class="pause-err">{pauseMsg[s.id]}</span>{/if}
 					</span>
 					<span class="col-actions">
 						<button class="edit" onclick={() => openEditor(s)}>Edit</button>
@@ -396,7 +481,7 @@
 	.thead,
 	.row {
 		display: grid;
-		grid-template-columns: minmax(240px, 3fr) 90px 130px 90px 160px 80px;
+		grid-template-columns: minmax(220px, 3fr) 80px 120px 80px minmax(130px, 1.6fr) 150px 80px;
 		align-items: center;
 		gap: 16px;
 		padding: 12px 20px;
@@ -493,9 +578,42 @@
 		background: var(--k-hover-fill);
 		border-color: var(--k-border-3);
 	}
+	.col-src {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		min-width: 0;
+	}
+	.src-entry {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+	.src-name {
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-1);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.src-id {
+		font-size: 10.5px;
+		color: var(--k-text-fainter);
+		font-family: var(--k-font-mono, monospace);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.src-none {
+		font-size: 12px;
+		color: var(--k-text-faint);
+	}
 	.col-scan {
 		display: flex;
 		flex-direction: column;
+		align-items: flex-start;
 		gap: 3px;
 	}
 	.cadence {
@@ -509,8 +627,41 @@
 	.scan-state.active {
 		color: var(--k-text-faint);
 	}
-	.scan-state.paused {
+	.paused-badge {
+		display: inline-block;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
 		color: var(--k-hiatus);
+		background: rgba(224, 179, 84, 0.12);
+		border: 1px solid rgba(224, 179, 84, 0.35);
+		border-radius: var(--k-radius-sm);
+		padding: 2px 6px;
+	}
+	.unpause {
+		height: 24px;
+		padding: 0 10px;
+		border-radius: var(--k-radius);
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-1);
+		font-family: var(--k-font-sans);
+		font-weight: 600;
+		font-size: 11.5px;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.unpause:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+	}
+	.unpause:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.pause-err {
+		font-size: 11px;
+		color: #f0808a;
 	}
 	.col-actions {
 		text-align: right;

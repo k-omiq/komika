@@ -21,6 +21,7 @@ type Query {
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
 	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, newest-first
 	search(query: String!, page: Int = 1): SeriesPage! # [suwayomi] source/library search
+	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
@@ -48,6 +49,11 @@ type Query {
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
 	mergeQueue: [MergeCandidate!]! # [komika] dedup review queue — pending mid-confidence matches (requires isAdmin)
+	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes; NSFW hidden unless opted in (requires isAdmin)
+	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker; NSFW hidden unless opted in (requires isAdmin)
+	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
+	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
+	sourceIngestJobs(active: Boolean = false): [SourceIngestJob!]! # [komika] "add all from source" ingest jobs, newest first; active:true for only running ones — poll for progress (requires isAdmin)
 }
 
 type Mutation {
@@ -67,6 +73,18 @@ type Mutation {
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
+	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
+	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
+	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension; NSFW-gated by show_nsfw (requires isAdmin)
+	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
+	updateExtension(pkgName: String!): ExtensionInfo! # [komika] update an installed extension; NSFW-gated (requires isAdmin)
+	bulkAddSourceSeries(suwayomiMangaIds: [ID!]!): BulkAddResult! # [komika] bulk Tier-2 catalogue ingest, ≤100 ids; per-id failures don't abort (requires isAdmin)
+	setSeriesPaused(seriesId: ID!, paused: Boolean!): Series! # [komika] targeted pause/unpause of one series' scanning; unpause re-scans immediately (requires isAdmin)
+	startSourceIngest(sourceId: ID!): SourceIngestJob! # [komika] start a background "add all from source" ingest; refused if one already running or NSFW source not opted in (requires isAdmin)
+	cancelSourceIngest(jobId: ID!): SourceIngestJob! # [komika] request cancellation of a running ingest job; preserves progress (requires isAdmin)
+	startExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: start an ingest job for EVERY installed source of an extension (e.g. MangaDex's per-language sources); skips NSFW sources for opted-out admin + sources with a job already running (returns their existing job); errors only if no source matches (requires isAdmin)
+	cancelExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: cancel all running ingest jobs for an extension's sources; returns the cancelled jobs (requires isAdmin)
+	backfillMangadexMetadata(limit: Int = 200): Int! # [komika] S2 enrichment backfill — processes up to `limit` un-enriched MangaDex-anchored works (all-language alt titles/descriptions + full credits); returns count processed; call until it returns 0 to drain (requires isAdmin)
 }
 
 enum ComicType {
@@ -106,6 +124,29 @@ type Series {
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
 	updatedAt: String!
+	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
+	localizedDescriptions: [LocalizedDescription!]! # every-language MangaDex descriptions (singular `description` stays the English-preferred primary)
+	credits: [Credit!]! # full author/artist list (singular `author`/`artist` keep only the first of each)
+	covers: [Cover!]! # F2: full per-volume/per-locale cover set, primary first; `coverUrl` remains the single primary. Populated by enrichment/backfill; empty until then
+}
+
+type LocalizedDescription {
+	lang: String!
+	description: String!
+}
+
+type Credit {
+	role: String! # "author" | "artist"
+	name: String!
+}
+
+type Cover {
+	fileName: String! # covers/{mangadexId}/{fileName} leaf
+	url: String! # proxy-ready full cover URL (client resolves via ImageProvider)
+	thumbnailUrl: String! # proxy-ready 512px thumbnail URL
+	lang: String # cover locale (e.g. "ja")
+	volume: String # volume label (e.g. "1")
+	isPrimary: Boolean! # the main cover mirrored on Series.coverUrl
 }
 
 type RatingSummary {
@@ -362,6 +403,130 @@ type WorkSourceGroup {
 	sources: [WorkSource!]!
 }
 
+# [komika] One source/extension that carries a canonical work — a "translator" in
+# the reader UI. For a suwayomi translator, suwayomiMangaId is the id to pass to
+# chapters(seriesId:) for THIS translator's chapters; for the mangadex canonical
+# spine it is null and chapters come from canonicalChapters(workId).
+type Translator {
+	sourceType: String! # "mangadex" (canonical spine) | "suwayomi" (an installed extension)
+	sourceId: String!
+	sourceName: String # display name; null when the source isn't currently installed
+	lang: String
+	suwayomiMangaId: ID # chapters(seriesId:) key; null for the mangadex spine
+	extensionPkgName: String
+	extensionIconUrl: String # browser-reachable store-hosted PNG
+}
+
+# [komika] One consolidated federated-search hit: a canonical work as a Series,
+# plus the per-source translator list gathered across every installed extension.
+type FederatedSeries {
+	series: Series!
+	translators: [Translator!]!
+}
+
+# [komika] A page of federated multi-extension search results.
+type FederatedSearchPage {
+	items: [FederatedSeries!]!
+	page: Int!
+	hasNextPage: Boolean!
+	sourcesQueried: Int! # how many installed sources were queried in the fan-out
+}
+
+# [komika] Admin catalogue provenance for one Suwayomi series: the canonical work
+# it's linked to (null when uncatalogued) and that work's source mappings.
+type SeriesSourceGroup {
+	seriesId: ID!
+	workId: ID
+	sources: [WorkSource!]!
+}
+
+# [komika] One Keiyoushi/Mihon extension as known to the Suwayomi engine (admin
+# management view, installed or not).
+type ExtensionInfo {
+	pkgName: String!
+	name: String!
+	lang: String!
+	versionName: String!
+	isInstalled: Boolean!
+	hasUpdate: Boolean!
+	isNsfw: Boolean!
+	iconUrl: String
+	repo: String
+}
+
+# [komika] One installed Suwayomi source — the admin picker feeding sourceBrowse.
+type SourceInfo {
+	id: ID!
+	name: String!
+	lang: String!
+	isNsfw: Boolean!
+	iconUrl: String
+	pkgName: String
+}
+
+# [komika] Which listing of a source to browse.
+enum SourceBrowseType {
+	POPULAR
+	LATEST
+	SEARCH
+}
+
+# [komika] One manga returned by browsing a source; suwayomiMangaId is exactly
+# what bulkAddSourceSeries consumes.
+type SourceBrowseEntry {
+	suwayomiMangaId: ID!
+	title: String!
+	thumbnailUrl: String
+	inLibrary: Boolean!
+}
+
+# [komika] A page of source-browse results.
+type SourceBrowsePage {
+	items: [SourceBrowseEntry!]!
+	page: Int!
+	hasNextPage: Boolean!
+}
+
+# [komika] Per-id outcome of bulkAddSourceSeries: MatchResult on success, or the
+# error that made this one id fail (other ids still proceed).
+type BulkAddEntry {
+	suwayomiMangaId: ID!
+	result: MatchResult
+	error: String
+}
+
+# [komika] A background "add all from this source" ingest job (S1): walks a
+# source's listing page by page through the Tier-2 dedup add flow, persisting
+# progress counters. Poll sourceIngestJobs(active:true) for updates.
+type SourceIngestJob {
+	id: ID!
+	sourceId: String!
+	state: String! # running | completed | cancelled | failed
+	pagesDone: Int!
+	itemsSeen: Int!
+	succeeded: Int!
+	failed: Int!
+	newWorks: Int!
+	autoMerged: Int!
+	queuedForReview: Int!
+	alreadyExisting: Int!
+	error: String # set when state = failed
+	startedAt: String!
+	finishedAt: String # set once terminal (completed/cancelled/failed)
+}
+
+# [komika] Result of a bulk catalogue ingest: per-id entries + decision summary.
+type BulkAddResult {
+	entries: [BulkAddEntry!]!
+	total: Int!
+	succeeded: Int!
+	failed: Int!
+	newWorks: Int!
+	autoMerged: Int!
+	queuedForReview: Int!
+	alreadyExisting: Int!
+}
+
 # [komika] A pending mid-confidence match awaiting manual admin review.
 type MergeCandidate {
 	id: String!
@@ -373,4 +538,9 @@ type MergeCandidate {
 	method: String!
 	status: String!
 	createdAt: String!
+}
+
+type MergeWorksResult {
+	targetWorkId: ID! # the surviving (target) work
+	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
 }

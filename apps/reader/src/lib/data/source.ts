@@ -13,8 +13,11 @@ import type {
 	ComicType as DomainComicType,
 	Series,
 	SeriesStatus,
+	Translator,
+	WorkSource,
 } from '@komika/types';
 import { backend, images } from '$lib/context';
+import { getPreferredTranslator } from './translator-pref.svelte';
 import { config } from '$lib/config';
 import * as content from './content';
 import { FLAG, FORMAT_CARDS } from './types';
@@ -40,6 +43,26 @@ async function live<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
 	} catch (err) {
 		console.warn('[komika] backend call failed:', err);
 		return fallback;
+	}
+}
+
+/**
+ * Like {@link live} but tells a genuine backend FAILURE apart from an honest
+ * empty result: returns `{ data, error }` where `error` is true only when the
+ * mapping threw. Screens use this to show an error state (during an outage)
+ * instead of a misleading "not found" / "no results" empty state. Mock mode
+ * (`!LIVE`) is never an error — it's just empty.
+ */
+async function liveResult<T>(
+	fn: () => Promise<T>,
+	empty: T,
+): Promise<{ data: T; error: boolean }> {
+	if (!LIVE) return { data: empty, error: false };
+	try {
+		return { data: await fn(), error: false };
+	} catch (err) {
+		console.warn('[komika] backend call failed:', err);
+		return { data: empty, error: true };
 	}
 }
 
@@ -196,6 +219,298 @@ function shelfFor(read: number, total: number): 'reading' | 'completed' | 'plan'
 	return 'reading';
 }
 
+// ---- translators (per-source "translator" selection, S3) -------------------
+
+/** A selectable translator (source) for a canonical work, in view shape. */
+export interface TranslatorOption {
+	/** Stable selection key (`sourceType:suwayomiMangaId`), persisted per work. */
+	key: string;
+	/** `'mangadex'` (canonical spine) or `'suwayomi'` (an installed extension). */
+	sourceType: string;
+	/** Display name, e.g. "MangaDex" or "MANGA Plus". */
+	name: string;
+	/** Language code (e.g. `en`), or null when N/A. */
+	lang: string | null;
+	/** Store-hosted extension logo, or null → the UI renders an initial. */
+	iconUrl: string | null;
+	/** Suwayomi manga id whose `chapters(seriesId:)` gives this translator's
+	 *  chapters; null → the canonical spine (`canonicalChapters(workId)`). */
+	suwayomiMangaId: string | null;
+	/** How many chapters this translator currently carries. */
+	chapterCount: number;
+}
+
+/** A compact translator tag for cards (logo + label). */
+export interface TranslatorChip {
+	name: string;
+	lang: string | null;
+	iconUrl: string | null;
+}
+
+/** Friendly display names for the common curated extensions; falls back to a
+ *  prettified last package segment (e.g. `…extension.all.foo` → "Foo"). */
+const SOURCE_NAME_BY_PKG: Record<string, string> = {
+	'eu.kanade.tachiyomi.extension.all.mangadex': 'MangaDex',
+	'eu.kanade.tachiyomi.extension.all.mangaplus': 'MANGA Plus',
+	'eu.kanade.tachiyomi.extension.all.comick': 'ComicK',
+	'eu.kanade.tachiyomi.extension.en.webtoons': 'WEBTOON',
+	'eu.kanade.tachiyomi.extension.all.batoto': 'Bato.to',
+};
+
+function prettySourceName(pkg: string | null | undefined): string | null {
+	if (!pkg) return null;
+	if (SOURCE_NAME_BY_PKG[pkg]) return SOURCE_NAME_BY_PKG[pkg];
+	const seg = pkg.split('.').pop() ?? pkg;
+	return seg.charAt(0).toUpperCase() + seg.slice(1);
+}
+
+/** The store-hosted icon URL Keiyoushi publishes for an extension package. */
+function iconForPkg(pkg: string | null | undefined): string | null {
+	return pkg ? `https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/${pkg}.png` : null;
+}
+
+/** A normalized language label, dropping Suwayomi's catch-all "all". */
+function langLabel(lang: string | null | undefined): string | null {
+	return lang && lang !== 'all' ? lang : null;
+}
+
+function translatorKey(sourceType: string, suwayomiMangaId: string | null): string {
+	return `${sourceType}:${suwayomiMangaId ?? 'spine'}`;
+}
+
+/** Federated-search `Translator` → compact card chip. */
+function toTranslatorChip(t: Translator): TranslatorChip {
+	return {
+		name: t.sourceName ?? prettySourceName(t.extensionPkgName) ?? 'Source',
+		lang: langLabel(t.lang),
+		iconUrl: t.extensionIconUrl ?? iconForPkg(t.extensionPkgName),
+	};
+}
+
+/** Dedupe chips by name+lang, preserving first-seen order (a work can carry the
+ *  same source under several manga ids — collapse them for display). */
+function dedupeChips(list: TranslatorChip[]): TranslatorChip[] {
+	const seen = new Set<string>();
+	const out: TranslatorChip[] = [];
+	for (const c of list) {
+		const k = `${c.name}|${c.lang ?? ''}`;
+		if (!seen.has(k)) {
+			seen.add(k);
+			out.push(c);
+		}
+	}
+	return out;
+}
+
+/** A resolved canonical work: its selectable translators, the chosen one, and
+ *  that translator's chapters + series metadata. Null when nothing readable. */
+interface ResolvedWork {
+	translators: TranslatorOption[];
+	selected: TranslatorOption;
+	chapters: Chapter[];
+	meta: Series | null;
+	/** The canonical (MangaDex-mirrored) series for the work when it resolves —
+	 *  carries S2 enrichment (credits + localized descriptions). Null for
+	 *  federation-only works with no MangaDex anchor. */
+	canonSeries: Series | null;
+	/** Whether `chapters` are already server-ordered (the canonical spine). */
+	preserveOrder: boolean;
+}
+
+/**
+ * Resolve a canonical (`w_`) work into its translator list + the selected
+ * translator's chapters/metadata. Fans out over the work's source mappings
+ * (`workSources`) plus the MangaDex canonical spine when present, fetching each
+ * translator's chapters so the picker can show counts and a non-empty default is
+ * chosen. The SAME resolver backs both the series page and the reader, so they
+ * always agree on the default translator. Returns null when the work has no
+ * readable source at all.
+ */
+async function resolveWork(workId: string, preferredKey?: string): Promise<ResolvedWork | null> {
+	// Source mappings (suwayomi translators) + the canonical spine chapters + the
+	// canonical series (S2 enrichment: credits + localized descriptions), in
+	// parallel. Individual rejections are tolerated (canonicalChapters/canonicalSeries
+	// legitimately 404 for a federation-only work), but if ALL THREE reject the
+	// backend is effectively down — rethrow so the caller surfaces an honest error
+	// rather than a false "not found".
+	const [wsRes, spineRes, canonRes] = await Promise.allSettled([
+		backend.workSources ? backend.workSources(workId) : Promise.resolve([] as WorkSource[]),
+		backend.canonicalChapters ? backend.canonicalChapters(workId) : Promise.resolve([] as Chapter[]),
+		backend.canonicalSeries ? backend.canonicalSeries(workId) : Promise.resolve(null),
+	]);
+	if (
+		wsRes.status === 'rejected' &&
+		spineRes.status === 'rejected' &&
+		canonRes.status === 'rejected'
+	) {
+		throw wsRes.reason;
+	}
+	const wsList: WorkSource[] = wsRes.status === 'fulfilled' ? wsRes.value : [];
+	const spineChapters: Chapter[] = spineRes.status === 'fulfilled' ? spineRes.value : [];
+	const canonSeries: Series | null = canonRes.status === 'fulfilled' ? canonRes.value : null;
+
+	// Candidate translators: canonical spine first (when the mirror has chapters),
+	// then each distinct suwayomi source mapping.
+	const candidates: { view: Omit<TranslatorOption, 'chapterCount'>; chapters: Chapter[] }[] = [];
+	if (spineChapters.length) {
+		candidates.push({
+			view: {
+				key: translatorKey('mangadex', null),
+				sourceType: 'mangadex',
+				name: 'MangaDex',
+				lang: null,
+				iconUrl: iconForPkg('eu.kanade.tachiyomi.extension.all.mangadex'),
+				suwayomiMangaId: null,
+			},
+			chapters: spineChapters,
+		});
+	}
+
+	const seenIds = new Set<string>();
+	const suwViews: Omit<TranslatorOption, 'chapterCount'>[] = [];
+	for (const ws of wsList) {
+		if (ws.sourceType === 'mangadex') continue; // spine handled above
+		const id = ws.sourceKey;
+		if (!id || seenIds.has(id)) continue;
+		seenIds.add(id);
+		suwViews.push({
+			key: translatorKey(ws.sourceType, id),
+			sourceType: ws.sourceType,
+			name: prettySourceName(ws.extension?.pkgName) ?? `Source ${ws.sourceId}`,
+			lang: langLabel(ws.lang),
+			iconUrl: iconForPkg(ws.extension?.pkgName),
+			suwayomiMangaId: id,
+		});
+	}
+	// Fetch each suwayomi translator's chapters (bounded — a work has few mappings).
+	const suwChapters = await Promise.all(
+		suwViews.map((v) => backend.chapters(v.suwayomiMangaId as string).catch(() => [] as Chapter[])),
+	);
+	suwViews.forEach((v, i) => candidates.push({ view: v, chapters: suwChapters[i] }));
+
+	if (!candidates.length) return null;
+
+	// Order: spine first, then by chapter count desc so a populated translator
+	// leads. Stable within equal counts (preserves discovery order).
+	const ordered = candidates
+		.map((c, i) => ({ ...c, i }))
+		.sort((a, b) => {
+			const aSpine = a.view.suwayomiMangaId === null ? 1 : 0;
+			const bSpine = b.view.suwayomiMangaId === null ? 1 : 0;
+			if (aSpine !== bSpine) return bSpine - aSpine;
+			if (b.chapters.length !== a.chapters.length) return b.chapters.length - a.chapters.length;
+			return a.i - b.i;
+		});
+
+	const translators: TranslatorOption[] = ordered.map((c) => ({
+		...c.view,
+		chapterCount: c.chapters.length,
+	}));
+
+	// Selection: honour a valid persisted preference, else the first candidate
+	// that actually carries chapters (never default to an empty translator), else
+	// the first candidate.
+	let pick =
+		(preferredKey && ordered.find((c) => c.view.key === preferredKey)) ||
+		ordered.find((c) => c.chapters.length > 0) ||
+		ordered[0];
+
+	const selected = translators.find((t) => t.key === pick.view.key) as TranslatorOption;
+
+	// Metadata for the selected translator: the canonical mirror for the spine
+	// (already fetched), otherwise the source series behind the chosen suwayomi
+	// mapping.
+	let meta: Series | null;
+	if (selected.suwayomiMangaId === null) {
+		meta = canonSeries;
+	} else {
+		meta = await backend.series(selected.suwayomiMangaId).catch(() => null);
+	}
+
+	return {
+		translators,
+		selected,
+		chapters: pick.chapters,
+		meta,
+		canonSeries,
+		preserveOrder: selected.suwayomiMangaId === null,
+	};
+}
+
+/**
+ * The outcome of a catalogue search. The federated (`searchAllSources`) path is
+ * login-gated and per-user rate-limited on the server, so callers need to tell
+ * "no matches" apart from "not authenticated" (fall back to native) and
+ * "rate-limited" (honest transient message) rather than collapsing every case to
+ * an empty grid.
+ */
+export type SearchOutcome =
+	| { kind: 'ok'; rows: FederatedResultView[] }
+	| { kind: 'unauthenticated' }
+	| { kind: 'rateLimited'; retryAfter: number | null }
+	| { kind: 'error' };
+
+/**
+ * Federated multi-extension search: one deduped row per canonical work, each
+ * carrying its per-source translator tags. REQUIRES a signed-in viewer (the
+ * server rejects anonymous callers) — callers should only invoke it when logged
+ * in and fall back to {@link getNativeSearch} otherwise. Never rejects; classifies
+ * the server's auth/rate-limit errors into {@link SearchOutcome}.
+ */
+export async function getFederatedSearch(query: string): Promise<SearchOutcome> {
+	const q = query.trim();
+	if (!q) return { kind: 'ok', rows: [] };
+	if (!LIVE || !backend.searchAllSources) {
+		// Backend without federation — treat as unauthenticated so callers use the
+		// public native path (which carries no translators).
+		return { kind: 'unauthenticated' };
+	}
+	try {
+		const page = await backend.searchAllSources(q);
+		return {
+			kind: 'ok',
+			rows: page.items.map((fs, i) => ({
+				...toCatalogEntryFull(fs.series, i),
+				translators: dedupeChips(fs.translators.map(toTranslatorChip)),
+			})),
+		};
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (/not authenticated/i.test(msg)) return { kind: 'unauthenticated' };
+		if (/too many/i.test(msg)) {
+			const m = msg.match(/(\d+)\s*s/i);
+			return { kind: 'rateLimited', retryAfter: m ? Number(m[1]) : null };
+		}
+		console.warn('[komika] federated search failed:', err);
+		return { kind: 'error' };
+	}
+}
+
+/**
+ * Native (public) catalogue search — the pre-federation path, available to
+ * anonymous viewers. Returns rows without translator tags (a single source).
+ * Never rejects; resolves to an empty list on failure/backend-off.
+ */
+export function getNativeSearch(query: string): Promise<FederatedResultView[]> {
+	const q = query.trim();
+	if (!q) return Promise.resolve([]);
+	return live(async () => {
+		const { items } = await backend.search(q);
+		return items.map((s, i) => ({ ...toCatalogEntryFull(s, i), translators: [] as TranslatorChip[] }));
+	}, []);
+}
+
+/** A federated search row for the Browse grid: a catalog entry + translator tags. */
+export interface FederatedResultView extends CatalogEntry {
+	isNsfw: boolean;
+	translators: TranslatorChip[];
+}
+
+/** Like {@link toCatalogEntry} but keeps the NSFW flag for the federated grid. */
+function toCatalogEntryFull(s: Series, i: number): CatalogEntry & { isNsfw: boolean } {
+	return { ...toCatalogEntry(s, i), isNsfw: s.isNsfw };
+}
+
 // ---- per-screen getters ----------------------------------------------------
 
 export function getHome() {
@@ -232,11 +547,20 @@ export function getHome() {
 	}, fallback);
 }
 
-export function getBrowseCatalog(): Promise<CatalogEntry[]> {
-	return live(async () => {
+/** The native browse catalog plus an honest failure flag (RC4). `error` is true
+ *  only when the backend request threw — the screen then shows an error state
+ *  instead of a misleading "no series" empty. */
+export interface CatalogResult {
+	items: CatalogEntry[];
+	error: boolean;
+}
+
+export async function getBrowseCatalog(): Promise<CatalogResult> {
+	const r = await liveResult(async () => {
 		const { items } = await backend.search('');
 		return items.map(toCatalogEntry);
-	}, []);
+	}, [] as CatalogEntry[]);
+	return { items: r.data, error: r.error };
 }
 
 export function getUpdates() {
@@ -359,6 +683,27 @@ export interface SeriesDetailView {
 	continueCh: number;
 	startChapterId?: string;
 	isMarked: boolean;
+	/** Full author/artist credit list (S2 enrichment); empty → fall back to the
+	 *  single author/artist line. Deduped display is left to the component. */
+	credits: { role: string; name: string }[];
+	/** Every localized description of the work (S2); empty when un-enriched. Lets
+	 *  the page offer other languages beyond the default-picked `synopsis`. */
+	descriptions: { lang: string; description: string }[];
+	/** The language tag of the description shown in `synopsis` (or null). */
+	descLang: string | null;
+	/** The full MangaDex cover set (F2), primary first then volume-ordered; empty
+	 *  for a non-canonical / un-enriched work. The gallery renders only when >1. */
+	covers: CoverView[];
+}
+
+/** One cover in the series-page gallery (F2). URLs are proxy-ready — render via
+ *  the {@link Cover} component / ImageProvider, not as a raw <img src>. */
+export interface CoverView {
+	thumbnailUrl: string;
+	url: string;
+	lang: string | null;
+	volume: string | null;
+	isPrimary: boolean;
 }
 export interface RelatedView {
 	title: string;
@@ -372,6 +717,13 @@ export interface SeriesView {
 	detail: SeriesDetailView;
 	chapters: SeriesChapterView[];
 	related: RelatedView[];
+	/** Available translators (sources) for this work; empty for single-source
+	 *  (numeric Suwayomi) series that have no per-source alternatives. */
+	translators: TranslatorOption[];
+	/** The selected translator's key (matches one of {@link translators}). */
+	selectedTranslatorKey: string | null;
+	/** The canonical `w_` workId to switch translators against; null when N/A. */
+	workId: string | null;
 }
 
 const STATUS_WORD: Record<SeriesStatus, string> = {
@@ -401,13 +753,63 @@ function relatedFor(s: Series, pool: Series[]): RelatedView[] {
 	return picks.map(toRelated);
 }
 
+interface TranslatorMeta {
+	translators: TranslatorOption[];
+	selectedTranslatorKey: string | null;
+	workId: string | null;
+}
+
+const NO_TRANSLATORS: TranslatorMeta = {
+	translators: [],
+	selectedTranslatorKey: null,
+	workId: null,
+};
+
+/** The viewer's/app language tag (lowercased), e.g. `en`, `pt-br`. */
+function appLang(): string {
+	if (typeof navigator !== 'undefined' && navigator.language) return navigator.language.toLowerCase();
+	return 'en';
+}
+
+/**
+ * Pick the localized description best matching the app language from the work's
+ * enrichment: exact tag → base language (`pt` for `pt-br`) → any English → the
+ * work's default description. Returns the chosen text + its language tag.
+ */
+function pickLocalizedDescription(
+	enrich: Series | null,
+	fallback: string,
+): { text: string; lang: string | null } {
+	const list = enrich?.localizedDescriptions ?? [];
+	if (!list.length) return { text: fallback, lang: null };
+	const want = appLang();
+	const base = want.split('-')[0];
+	const exact = list.find((d) => d.lang.toLowerCase() === want);
+	const baseMatch = list.find((d) => d.lang.toLowerCase().split('-')[0] === base);
+	const en = list.find((d) => d.lang.toLowerCase().split('-')[0] === 'en');
+	const chosen = exact ?? baseMatch ?? en ?? null;
+	return chosen ? { text: chosen.description, lang: chosen.lang } : { text: fallback, lang: null };
+}
+
 function mapSeriesView(
 	s: Series,
 	chs: Chapter[],
 	pool: Series[],
 	preserveOrder = false,
+	tmeta: TranslatorMeta = NO_TRANSLATORS,
+	enrich: Series | null = null,
 ): SeriesView {
 	const type = toViewType(s.type);
+	const desc = pickLocalizedDescription(enrich, s.description ?? '');
+	const credits = enrich?.credits ?? [];
+	const descriptions = enrich?.localizedDescriptions ?? [];
+	const covers: CoverView[] = (enrich?.covers ?? []).map((c) => ({
+		thumbnailUrl: c.thumbnailUrl,
+		url: c.url,
+		lang: c.lang,
+		volume: c.volume,
+		isPrimary: c.isPrimary,
+	}));
 	// Canonical chapters are already server-ordered ascending (number-less last); sorting
 	// by number would float a oneshot (wire value 0) ahead of ch. 1 (CR4). The Suwayomi
 	// path keeps its explicit ascending sort.
@@ -427,11 +829,15 @@ function mapSeriesView(
 			author: s.author ?? '',
 			artist: s.artist ?? '',
 			genres: s.genres,
-			synopsis: s.description ?? '',
+			synopsis: desc.text,
 			cover: s.coverUrl,
 			continueCh: firstUnread?.number ?? 1,
 			startChapterId: firstUnread?.id,
 			isMarked: s.isMarked,
+			credits,
+			descriptions,
+			descLang: desc.lang,
+			covers,
 		},
 		chapters: chs.map((c, i) => ({
 			id: c.id,
@@ -442,22 +848,51 @@ function mapSeriesView(
 			read: c.read,
 		})),
 		related: relatedFor(s, pool),
+		translators: tmeta.translators,
+		selectedTranslatorKey: tmeta.selectedTranslatorKey,
+		workId: tmeta.workId,
 	};
 }
 
-export function getSeries(id: string): Promise<SeriesView | null> {
-	return live<SeriesView | null>(async () => {
-		// Canonical (MangaDex-mirrored) works resolve through the canonical path; there
-		// is no genre-related pool for them yet, so related is empty.
-		if (isCanonicalId(id) && backend.canonicalSeries && backend.canonicalChapters) {
-			const [s, chs] = await Promise.all([
-				backend.canonicalSeries(id),
-				backend.canonicalChapters(id),
-			]);
-			return mapSeriesView(s, chs, [], true);
+/** A series-detail view plus an honest failure flag (RC4). `view` is null for a
+ *  genuinely missing series; `error` is true only when the backend request threw
+ *  (outage) — the page then shows an error state, not "series not found". */
+export interface SeriesResult {
+	view: SeriesView | null;
+	error: boolean;
+}
+
+export async function getSeries(id: string): Promise<SeriesResult> {
+	const r = await liveResult<SeriesView | null>(async () => {
+		// Canonical (`w_`) works: resolve the selected translator (persisted
+		// preference or a sensible default) and render ITS chapters + metadata. This
+		// covers both federation-only works (no MangaDex mirror) and true mirrors
+		// (the canonical spine appears as one translator). See {@link resolveWork}.
+		if (isCanonicalId(id)) {
+			const preferred = getPreferredTranslator(id);
+			const resolved = await resolveWork(id, preferred);
+			if (!resolved || !resolved.meta) return null;
+			// The detail id must stay the canonical `w_` workId (even though metadata
+			// comes from the selected translator's source series), so chapter links,
+			// the reader route and library marking all route through the canonical
+			// path — where the persisted translator preference is resolved again.
+			const metaForView: Series = { ...resolved.meta, id };
+			return mapSeriesView(
+				metaForView,
+				resolved.chapters,
+				[],
+				resolved.preserveOrder,
+				{
+					translators: resolved.translators,
+					selectedTranslatorKey: resolved.selected.key,
+					workId: id,
+				},
+				resolved.canonSeries,
+			);
 		}
-		// Fetch a candidate pool (Popular) alongside the series to seed related-by-
-		// genre. A pool failure just yields no related — it never fails the page.
+		// A numeric Suwayomi series is a single source — no translator picker. Fetch a
+		// candidate pool (Popular) alongside it to seed related-by-genre. A pool
+		// failure just yields no related — it never fails the page.
 		const [s, chs, pool] = await Promise.all([
 			backend.series(id),
 			backend.chapters(id),
@@ -468,6 +903,7 @@ export function getSeries(id: string): Promise<SeriesView | null> {
 		]);
 		return mapSeriesView(s, chs, pool);
 	}, null);
+	return { view: r.data, error: r.error };
 }
 
 /**
@@ -532,10 +968,15 @@ export interface ReaderView {
 	chapters: ReaderChapterRef[];
 	prevChapterId?: string;
 	nextChapterId?: string;
+	/** Available translators (sources) for the work; empty for single-source series. */
+	translators: TranslatorOption[];
+	selectedTranslatorKey: string | null;
+	/** Canonical `w_` workId to switch translators against; null for single-source. */
+	workId: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
-function emptyReader(seriesId: string): ReaderView {
+function emptyReader(seriesId: string, tmeta: TranslatorMeta = NO_TRANSLATORS): ReaderView {
 	return {
 		seriesId,
 		seriesTitle: '',
@@ -546,52 +987,104 @@ function emptyReader(seriesId: string): ReaderView {
 		chapters: [],
 		prevChapterId: undefined,
 		nextChapterId: undefined,
+		translators: tmeta.translators,
+		selectedTranslatorKey: tmeta.selectedTranslatorKey,
+		workId: tmeta.workId,
+	};
+}
+
+/** Assemble a ReaderView from a resolved chapter list + target chapter's pages. */
+function buildReaderView(
+	seriesId: string,
+	chs: Chapter[],
+	preserveOrder: boolean,
+	target: Chapter,
+	urls: string[],
+	seriesTitle: string,
+	tmeta: TranslatorMeta,
+): ReaderView {
+	const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
+	const idx = asc.findIndex((c) => c.id === target.id);
+	return {
+		seriesId,
+		seriesTitle: seriesTitle || 'Reader',
+		chapterId: target.id,
+		chNum: target.number,
+		chTitle: target.title || `Chapter ${target.number}`,
+		pages: urls.map((url, index) => ({
+			url,
+			index,
+			ratio: '800 / 1200',
+			label: String(index + 1).padStart(2, '0'),
+			dim: '',
+		})),
+		chapters: asc
+			.slice()
+			.reverse()
+			.map((c) => ({ id: c.id, n: c.number, title: c.title || `Chapter ${c.number}` })),
+		prevChapterId: idx > 0 ? asc[idx - 1].id : undefined,
+		nextChapterId: idx >= 0 && idx < asc.length - 1 ? asc[idx + 1].id : undefined,
+		translators: tmeta.translators,
+		selectedTranslatorKey: tmeta.selectedTranslatorKey,
+		workId: tmeta.workId,
 	};
 }
 
 export function getReaderChapter(seriesId: string, chParam?: string | null): Promise<ReaderView> {
-	const canonical =
-		isCanonicalId(seriesId) && !!backend.canonicalChapters && !!backend.canonicalPages;
 	return live(async () => {
-		const chs = canonical
-			? await backend.canonicalChapters!(seriesId)
-			: await backend.chapters(seriesId);
+		// Canonical (`w_`) works read through the selected translator (persisted
+		// preference or the same default the series page picked — shared resolver).
+		if (isCanonicalId(seriesId)) {
+			const preferred = getPreferredTranslator(seriesId);
+			const resolved = await resolveWork(seriesId, preferred);
+			if (!resolved) return emptyReader(seriesId);
+			const tmeta: TranslatorMeta = {
+				translators: resolved.translators,
+				selectedTranslatorKey: resolved.selected.key,
+				workId: seriesId,
+			};
+			const chs = resolved.chapters;
+			if (!chs.length) {
+				const empty = emptyReader(seriesId, tmeta);
+				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+			}
+			const asc = resolved.preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
+			let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
+			if (!target) target = asc.find((c) => !c.read) ?? asc[0];
+			const spine = resolved.selected.suwayomiMangaId === null;
+			const domainPages =
+				spine && backend.canonicalPages
+					? await backend.canonicalPages(target.id)
+					: await backend.pages(target.id);
+			const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
+			return buildReaderView(
+				seriesId,
+				chs,
+				resolved.preserveOrder,
+				target,
+				urls,
+				resolved.meta?.title ?? 'Reader',
+				tmeta,
+			);
+		}
+		// Numeric Suwayomi series — single source, no translator picker.
+		const chs = await backend.chapters(seriesId);
 		if (!chs.length) return emptyReader(seriesId);
-		// Canonical chapters already arrive server-ordered ascending with number-less/
-		// oneshot rows last; re-sorting by number here would float a oneshot (wire value
-		// 0) to the front, contradicting that order (CR4). Only the Suwayomi path — whose
-		// backend order isn't guaranteed ascending — is sorted.
-		const asc = canonical ? chs : [...chs].sort((a, b) => a.number - b.number);
+		const asc = [...chs].sort((a, b) => a.number - b.number);
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
 		if (!target) target = asc.find((c) => !c.read) ?? asc[0];
-		const domainPages = canonical
-			? await backend.canonicalPages!(target.id)
-			: await backend.pages(target.id);
+		const domainPages = await backend.pages(target.id);
 		const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
-		const idx = asc.findIndex((c) => c.id === target.id);
-		const series = await (
-			canonical ? backend.canonicalSeries!(seriesId) : backend.series(seriesId)
-		).catch(() => null);
-		return {
+		const series = await backend.series(seriesId).catch(() => null);
+		return buildReaderView(
 			seriesId,
-			seriesTitle: series?.title ?? 'Reader',
-			chapterId: target.id,
-			chNum: target.number,
-			chTitle: target.title || `Chapter ${target.number}`,
-			pages: urls.map((url, index) => ({
-				url,
-				index,
-				ratio: '800 / 1200',
-				label: String(index + 1).padStart(2, '0'),
-				dim: '',
-			})),
-			chapters: asc
-				.slice()
-				.reverse()
-				.map((c) => ({ id: c.id, n: c.number, title: c.title || `Chapter ${c.number}` })),
-			prevChapterId: idx > 0 ? asc[idx - 1].id : undefined,
-			nextChapterId: idx >= 0 && idx < asc.length - 1 ? asc[idx + 1].id : undefined,
-		};
+			chs,
+			false,
+			target,
+			urls,
+			series?.title ?? 'Reader',
+			NO_TRANSLATORS,
+		);
 	}, emptyReader(seriesId));
 }
 

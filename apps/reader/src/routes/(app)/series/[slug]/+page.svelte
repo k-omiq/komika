@@ -8,7 +8,8 @@
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 	import { FLAG } from '$lib/data/types';
-	import { setLibraryMark } from '$lib/data/source';
+	import { setLibraryMark, getSeries } from '$lib/data/source';
+	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import {
@@ -23,17 +24,32 @@
 
 	let { data } = $props();
 	// Stream the series detail; the page shows a hero/chapter skeleton until it
-	// resolves. `data.series` never rejects (null on error → not-found state).
+	// resolves. `data.series` never rejects — it resolves to { view, error }: a null
+	// view with error=false is a genuine not-found; error=true is a backend failure
+	// (outage) that gets an honest error state + retry instead of "not found".
 	let view = $state<SeriesView | null>(null);
 	let loading = $state(true);
+	let loadError = $state(false);
 	$effect(() => {
 		loading = true;
 		view = null;
-		data.series.then((v) => {
-			view = v;
+		loadError = false;
+		data.series.then((r) => {
+			view = r.view;
+			loadError = r.error;
 			loading = false;
 		});
 	});
+
+	async function retrySeries(): Promise<void> {
+		loading = true;
+		view = null;
+		loadError = false;
+		const r = await getSeries(data.slug);
+		view = r.view;
+		loadError = r.error;
+		loading = false;
+	}
 
 	const detail = $derived(view?.detail);
 	const seriesDetail = $derived(view?.detail); // alias: template reads seriesDetail.author/artist/votes/…
@@ -118,6 +134,100 @@
 		return sort === 'oldest' ? [...chs].reverse() : chs;
 	});
 
+	// Translators (sources) available for this work, and switching between them.
+	const translators = $derived(view?.translators ?? []);
+	const selectedTranslatorKey = $derived(view?.selectedTranslatorKey ?? null);
+	const workId = $derived(view?.workId ?? null);
+	let switching = $state(false);
+
+	async function selectTranslator(key: string): Promise<void> {
+		if (!workId || switching || key === selectedTranslatorKey) return;
+		setPreferredTranslator(workId, key);
+		switching = true;
+		try {
+			const r = await getSeries(data.slug);
+			if (r.view) view = r.view;
+		} finally {
+			switching = false;
+		}
+	}
+
+	// Credits (S2 enrichment): dedupe by name, collecting roles; fall back to the
+	// single author/artist line when the work carries no structured credits.
+	const ROLE_LABEL: Record<string, string> = { author: 'Story', artist: 'Art' };
+	const creditList = $derived.by(() => {
+		const raw = seriesDetail?.credits ?? [];
+		if (raw.length) {
+			const byName = new Map<string, Set<string>>();
+			for (const c of raw) {
+				if (!byName.has(c.name)) byName.set(c.name, new Set());
+				byName.get(c.name)!.add(c.role);
+			}
+			return [...byName.entries()].map(([name, roles]) => ({
+				name,
+				label:
+					roles.has('author') && roles.has('artist')
+						? 'Story & Art'
+						: [...roles].map((r) => ROLE_LABEL[r] ?? r).join(' · '),
+			}));
+		}
+		const names = [seriesDetail?.author, seriesDetail?.artist].filter(
+			(n): n is string => !!n && n.length > 0,
+		);
+		return [...new Set(names)].map((name) => ({ name, label: '' }));
+	});
+
+	// Localized descriptions (S2): default to the app-language pick; let the reader
+	// switch language when the work carries more than one.
+	const descriptions = $derived(seriesDetail?.descriptions ?? []);
+	let descLangSel = $state<string | null>(null);
+	$effect(() => {
+		seriesId; // reset the language choice when navigating between series
+		untrack(() => (descLangSel = null));
+	});
+	const synopsisText = $derived.by(() => {
+		if (descLangSel) {
+			const d = descriptions.find((x) => x.lang === descLangSel);
+			if (d) return d.description;
+		}
+		return seriesDetail?.synopsis ?? '';
+	});
+	function langName(code: string): string {
+		try {
+			const dn = new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' });
+			return dn.of(code) ?? code.toUpperCase();
+		} catch {
+			return code.toUpperCase();
+		}
+	}
+
+	// Cover gallery (F2): the full MangaDex cover set; the hero keeps the primary.
+	const covers = $derived(seriesDetail?.covers ?? []);
+	let activeCoverIdx = $state<number | null>(null);
+	const activeCover = $derived(activeCoverIdx != null ? (covers[activeCoverIdx] ?? null) : null);
+	function coverLabel(c: { volume: string | null; lang: string | null; isPrimary: boolean }): string {
+		const parts: string[] = [];
+		if (c.volume) parts.push(`Vol. ${c.volume}`);
+		if (c.lang) parts.push(c.lang.toUpperCase());
+		if (c.isPrimary) parts.push('Primary');
+		return parts.length ? parts.join(' · ') : 'Cover';
+	}
+	function openCover(i: number): void {
+		activeCoverIdx = i;
+	}
+	function closeCover(): void {
+		activeCoverIdx = null;
+	}
+	// Close the lightbox on Escape.
+	$effect(() => {
+		if (activeCoverIdx == null) return;
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') closeCover();
+		};
+		window.addEventListener('keydown', onKey);
+		return () => window.removeEventListener('keydown', onKey);
+	});
+
 	const ratingLabel = $derived(
 		needsAuth
 			? 'Sign in to rate this series'
@@ -193,7 +303,16 @@
 					<span class="badge type"><span class="type-flag">{FLAG[type]}</span>{type}</span>
 				</div>
 				<h1>{title}</h1>
-				<div class="creators">{seriesDetail.author} · {seriesDetail.artist}</div>
+				<div class="creators">
+					{#if creditList.length}
+						{#each creditList as c, i (c.name)}
+							{#if i > 0}<span class="cr-sep">·</span>{/if}<span class="cr-name">{c.name}</span
+							>{#if c.label}<span class="cr-role">{c.label}</span>{/if}
+						{/each}
+					{:else}
+						{seriesDetail.author} · {seriesDetail.artist}
+					{/if}
+				</div>
 				<div class="facts">
 					<span class="fact rating"
 						><Icon name="star" size={16} fill="var(--k-star)" />{rating}<span class="votes"
@@ -229,8 +348,45 @@
 				<span class="gchip">{g}</span>
 			{/each}
 		</div>
-		<p class="synopsis">{seriesDetail.synopsis}</p>
+		{#if descriptions.length > 1}
+			<div class="desc-lang">
+				<span class="desc-lang-label">Description language</span>
+				<select bind:value={descLangSel} aria-label="Description language">
+					<option value={null}>Default ({(seriesDetail.descLang ?? 'en').toUpperCase()})</option>
+					{#each descriptions as d (d.lang)}
+						<option value={d.lang}>{langName(d.lang)}</option>
+					{/each}
+				</select>
+			</div>
+		{/if}
+		<p class="synopsis">{synopsisText}</p>
 	</div>
+
+	<!-- covers (F2): additional per-volume/locale covers; hidden for ≤1 cover -->
+	{#if covers.length > 1}
+		<div class="covers k-gutter">
+			<div class="covers-head">
+				<h2>Covers</h2>
+				<span class="covers-count">{covers.length}</span>
+			</div>
+			<div class="covers-strip">
+				{#each covers as c, i (c.url)}
+					<button class="cover-cell" onclick={() => openCover(i)} title={coverLabel(c)}>
+						<div class="cover-thumb">
+							<Cover src={c.thumbnailUrl} alt={coverLabel(c)} loading="lazy" />
+							{#if c.isPrimary}<span class="cover-primary">Primary</span>{/if}
+						</div>
+						{#if c.volume || c.lang}
+							<span class="cover-meta">
+								{#if c.volume}<span class="cover-vol">Vol. {c.volume}</span>{/if}
+								{#if c.lang}<span class="cover-lang">{c.lang.toUpperCase()}</span>{/if}
+							</span>
+						{/if}
+					</button>
+				{/each}
+			</div>
+		</div>
+	{/if}
 
 	<!-- rate -->
 	<div class="rate-wrap k-gutter">
@@ -254,6 +410,55 @@
 			</div>
 		</div>
 	</div>
+
+	<!-- translators (sources) -->
+	{#if translators.length}
+		<div class="translators k-gutter">
+			<div class="tr-head">
+				<span class="tr-label">Translation source</span>
+				<span class="tr-sub"
+					>{translators.length === 1
+						? 'Only one source available'
+						: `${translators.length} sources · pick who you read from`}</span
+				>
+			</div>
+			<div class="tr-list" class:switching>
+				{#each translators as t (t.key)}
+					<button
+						class="tr-opt"
+						class:on={t.key === selectedTranslatorKey}
+						disabled={switching}
+						onclick={() => selectTranslator(t.key)}
+						title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
+					>
+						{#if t.iconUrl}
+							<img
+								class="tr-logo"
+								src={t.iconUrl}
+								alt=""
+								loading="lazy"
+								decoding="async"
+								referrerpolicy="no-referrer"
+							/>
+						{:else}
+							<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
+						{/if}
+						<span class="tr-name">
+							<span class="tr-name-main"
+								>{t.name}{#if t.lang}<span class="tr-lang">{t.lang.toUpperCase()}</span>{/if}</span
+							>
+							<span class="tr-count"
+								>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
+							>
+						</span>
+						{#if t.key === selectedTranslatorKey}
+							<Icon name="check" size={15} strokeWidth={2.6} />
+						{/if}
+					</button>
+				{/each}
+			</div>
+		</div>
+	{/if}
 
 	<!-- chapters -->
 	<div class="chapters k-gutter">
@@ -309,6 +514,17 @@
 			</div>
 		</div>
 	{/if}
+{:else if loadError}
+	<!-- LOAD ERROR (backend outage) — distinct from a genuinely missing series -->
+	<div class="not-found k-gutter">
+		<div class="nf-icon"><Icon name="alert" size={28} /></div>
+		<h1>Couldn’t load this series</h1>
+		<p>Something went wrong reaching the server. Check your connection and try again.</p>
+		<div class="nf-btns">
+			<button class="nf-primary" onclick={retrySeries}>Retry</button>
+			<a class="nf-ghost" href="/browse">Browse series</a>
+		</div>
+	</div>
 {:else}
 	<!-- NOT FOUND -->
 	<div class="not-found k-gutter">
@@ -318,6 +534,30 @@
 		<div class="nf-btns">
 			<a class="nf-primary" href="/browse">Browse series</a>
 			<a class="nf-ghost" href="/">Go home</a>
+		</div>
+	</div>
+{/if}
+
+<!-- cover lightbox (F2) -->
+{#if activeCover}
+	<div
+		class="lightbox"
+		role="dialog"
+		aria-modal="true"
+		aria-label={coverLabel(activeCover)}
+		tabindex="-1"
+	>
+		<button class="lb-scrim" aria-label="Close cover" onclick={closeCover}></button>
+		<div class="lb-inner">
+			<div class="lb-image">
+				<Cover src={activeCover.url} alt={coverLabel(activeCover)} fit="contain" />
+			</div>
+			<div class="lb-bar">
+				<span class="lb-label">{coverLabel(activeCover)}</span>
+				<button class="lb-close" onclick={closeCover} aria-label="Close"
+					><Icon name="x" size={18} /></button
+				>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -584,6 +824,9 @@
 	.nf-primary {
 		background: var(--k-primary);
 		color: var(--k-on-primary);
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
 	}
 	.nf-ghost {
 		background: transparent;
@@ -644,6 +887,52 @@
 		font-size: 15px;
 		color: var(--k-text-dim);
 		margin-bottom: 22px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+	.cr-name {
+		color: var(--k-text-2);
+		font-weight: 600;
+	}
+	.cr-role {
+		font-size: 10.5px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+		background: var(--k-hover-fill);
+		border: 1px solid var(--k-border-3);
+		border-radius: 5px;
+		padding: 1px 6px;
+		margin-left: 5px;
+	}
+	.cr-sep {
+		color: var(--k-text-disabled);
+	}
+	.desc-lang {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.desc-lang-label {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+	}
+	.desc-lang select {
+		height: 34px;
+		padding: 0 10px;
+		border-radius: 8px;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
 	}
 	.facts {
 		display: flex;
@@ -764,6 +1053,158 @@
 		color: var(--k-text-muted);
 		margin: 0;
 	}
+	/* covers (F2) */
+	.covers {
+		padding-top: 44px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+	}
+	.covers-head {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+	}
+	.covers-head h2 {
+		font-size: 21px;
+		margin: 0;
+		color: var(--k-text);
+	}
+	.covers-count {
+		font-size: 13px;
+		color: var(--k-text-faint);
+	}
+	.covers-strip {
+		display: flex;
+		gap: 14px;
+		overflow-x: auto;
+		padding-bottom: 8px;
+		scroll-snap-type: x proximity;
+	}
+	.cover-cell {
+		flex: 0 0 auto;
+		width: 120px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 0;
+		background: none;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		scroll-snap-align: start;
+	}
+	.cover-thumb {
+		position: relative;
+		width: 120px;
+		height: 180px;
+		border-radius: 9px;
+		overflow: hidden;
+		border: 1px solid var(--k-border-2);
+		background: var(--k-surface-2);
+		transition: border-color 0.15s;
+	}
+	.cover-cell:hover .cover-thumb {
+		border-color: var(--k-border-strong);
+	}
+	.cover-primary {
+		position: absolute;
+		top: 7px;
+		left: 7px;
+		z-index: 1;
+		font-size: 9.5px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-on-primary);
+		background: var(--k-primary);
+		border-radius: 5px;
+		padding: 2px 6px;
+	}
+	.cover-meta {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		font-size: 12px;
+	}
+	.cover-vol {
+		font-weight: 700;
+		color: var(--k-text-2);
+	}
+	.cover-lang {
+		font-size: 9.5px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		color: var(--k-text-faint);
+		background: var(--k-hover-fill);
+		border: 1px solid var(--k-border-3);
+		border-radius: 4px;
+		padding: 1px 5px;
+	}
+	/* cover lightbox */
+	.lightbox {
+		position: fixed;
+		inset: 0;
+		z-index: 200;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 40px;
+	}
+	.lb-scrim {
+		position: fixed;
+		inset: 0;
+		border: none;
+		background: rgba(6, 6, 7, 0.86);
+		backdrop-filter: blur(6px);
+		cursor: zoom-out;
+	}
+	.lb-inner {
+		position: relative;
+		z-index: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+		max-width: min(90vw, 560px);
+		max-height: 90vh;
+	}
+	.lb-image {
+		position: relative;
+		width: 100%;
+		flex: 1 1 auto;
+		min-height: 0;
+		aspect-ratio: 2 / 3;
+		border-radius: 12px;
+		overflow: hidden;
+		box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7);
+	}
+	.lb-bar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 14px;
+	}
+	.lb-label {
+		font-size: 14px;
+		font-weight: 700;
+		color: var(--k-text-bright);
+	}
+	.lb-close {
+		width: 40px;
+		height: 40px;
+		flex: 0 0 auto;
+		border-radius: 9px;
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.lb-close:hover {
+		border-color: var(--k-border-strong);
+	}
 	.rate-wrap {
 		padding-top: 40px;
 	}
@@ -834,6 +1275,102 @@
 	}
 	.clear:hover {
 		color: var(--k-text);
+	}
+	.translators {
+		padding-top: 44px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+	}
+	.tr-head {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+	.tr-label {
+		font-size: 21px;
+		font-weight: 700;
+		font-family: var(--k-font-display);
+		color: var(--k-text);
+	}
+	.tr-sub {
+		font-size: 13px;
+		color: var(--k-text-faint);
+	}
+	.tr-list {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+	}
+	.tr-list.switching {
+		opacity: 0.6;
+		pointer-events: none;
+	}
+	.tr-opt {
+		display: inline-flex;
+		align-items: center;
+		gap: 12px;
+		padding: 10px 16px 10px 12px;
+		border-radius: 12px;
+		background: var(--k-surface);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text-2);
+		cursor: pointer;
+		transition: all 0.15s;
+		text-align: left;
+	}
+	.tr-opt:hover {
+		border-color: var(--k-border-strong);
+	}
+	.tr-opt.on {
+		border-color: var(--k-primary);
+		background: rgba(224, 131, 105, 0.1);
+		color: var(--k-text-bright);
+	}
+	.tr-logo {
+		width: 34px;
+		height: 34px;
+		flex: 0 0 auto;
+		border-radius: 8px;
+		object-fit: cover;
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-2);
+	}
+	.tr-initial {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 16px;
+		font-weight: 800;
+		color: var(--k-text-2);
+	}
+	.tr-name {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+	.tr-name-main {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		font-size: 14px;
+		font-weight: 700;
+	}
+	.tr-lang {
+		font-size: 9.5px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		color: var(--k-text-3);
+		background: var(--k-hover-fill);
+		border: 1px solid var(--k-border-3);
+		border-radius: 4px;
+		padding: 1px 5px;
+	}
+	.tr-count {
+		font-size: 12px;
+		color: var(--k-text-faint);
 	}
 	.chapters {
 		padding-top: 48px;

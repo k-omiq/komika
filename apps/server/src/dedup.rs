@@ -214,12 +214,26 @@ fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData)
     }
 }
 
+/// Order-insensitive author-name key: lowercased word tokens, sorted (D1). Folds
+/// "Masashi Kishimoto" and "Kishimoto Masashi" to the same key so a cross-source
+/// name-order variance doesn't defeat author corroboration.
+fn author_key(name: &str) -> Vec<String> {
+    let mut toks: Vec<String> = name
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    toks.sort();
+    toks
+}
+
 fn author_matches(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
-            let na = a.trim().to_lowercase();
-            let nb = b.trim().to_lowercase();
-            !na.is_empty() && na == nb
+            let ka = author_key(a);
+            // Non-empty and equal as a sorted token multiset (order-insensitive).
+            !ka.is_empty() && ka == author_key(b)
         }
         _ => false,
     }
@@ -432,6 +446,91 @@ mod tests {
                 Decision::Review { work_id, .. } => assert_eq!(work_id, expected),
                 other => panic!("expected review, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_via_localized_alt_title_across_extensions() {
+        // S2: the cross-extension dedup payoff. A MangaDex spine entry stores ALL
+        // its localized alt titles (here the romaji `ja-ro`). A series arriving
+        // from another extension under only that localized title — with no shared
+        // description or cover — must still resolve to the same work (via Review,
+        // since title-only lacks corroboration). This is what consolidates the
+        // same series across extensions that each label it differently.
+        let pool = pool().await;
+        let w = seed_slime(&pool).await; // primary "That Time..."; alt "Tensei Shitara Slime Datta Ken"
+        let localized = Candidate {
+            // A different extension only knows the romaji title.
+            title: "Tensei Shitara Slime Datta Ken".into(),
+            ..Default::default()
+        };
+        match resolve(&pool, &localized).await.unwrap() {
+            Decision::Review {
+                work_id, method, ..
+            } => {
+                assert_eq!(work_id, w, "localized title resolves to the spine work");
+                assert_eq!(
+                    method, "title_exact",
+                    "matched via the exact alt-title alias"
+                );
+            }
+            other => panic!("expected review via alt title, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn author_corroboration_is_order_insensitive_lifts_above_mid() {
+        // D1: a federated hit that IS the existing MangaDex-anchored work — same
+        // title, same author but with the name order reversed (the real Naruto
+        // case: "Kishimoto Masashi" vs "Masashi Kishimoto") — must corroborate
+        // above the bare-title MID band so it can consolidate, NOT mint a dup.
+        let pool = pool().await;
+        let existing = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Naruto".into()),
+                author: Some("Kishimoto Masashi".into()),
+                aliases: vec![Alias {
+                    raw: "Naruto".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Reversed author order + a genuinely different (source-specific) blurb.
+        let cand = Candidate {
+            title: "Naruto".into(),
+            author: Some("Masashi Kishimoto".into()),
+            description: Some("A ninja's tale from a different source.".into()),
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
+            Decision::Review { work_id, score, .. } => {
+                assert_eq!(work_id, existing);
+                assert!(
+                    score > MID,
+                    "author corroboration must lift the score above MID ({MID}); got {score}"
+                );
+            }
+            other => panic!("expected a review-band match above MID, got {other:?}"),
+        }
+
+        // But a bare title-only hit with NO author still scores exactly MID (the
+        // C2 guard's floor) — corroboration genuinely absent, no false lift.
+        let bare = Candidate {
+            title: "Naruto".into(),
+            ..Default::default()
+        };
+        match resolve(&pool, &bare).await.unwrap() {
+            Decision::Review { score, .. } => {
+                assert!(
+                    (score - MID).abs() < 1e-9,
+                    "bare title-only must stay at MID; got {score}"
+                );
+            }
+            other => panic!("expected bare-title review at MID, got {other:?}"),
         }
     }
 

@@ -1,10 +1,13 @@
 import type {
 	AdminUser,
+	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
 	Comment,
 	CommentTargetType,
 	DiscoveryFeed,
+	ExtensionInfo,
+	FederatedSearchPage,
 	Id,
 	MatchResult,
 	MergeCandidate,
@@ -13,6 +16,11 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesSourceGroup,
+	SourceBrowsePage,
+	SourceBrowseType,
+	SourceIngestJob,
+	SourceInfo,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -95,6 +103,13 @@ export class GraphQLBackend implements Backend {
 	async search(query: string, page = 1): Promise<Paginated<Series>> {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, { query, page });
 		return d.search;
+	}
+	async searchAllSources(query: string, page = 1): Promise<FederatedSearchPage> {
+		const d = await this.gql<{ searchAllSources: FederatedSearchPage }>(ops.SEARCH_ALL_SOURCES, {
+			query,
+			page,
+		});
+		return d.searchAllSources;
 	}
 	async series(id: Id): Promise<Series> {
 		const d = await this.gql<{ series: Series }>(ops.SERIES, { id });
@@ -209,6 +224,118 @@ export class GraphQLBackend implements Backend {
 			suwayomiMangaId,
 		});
 		return d.addSourceSeries;
+	}
+
+	// --- admin sources & extensions (EXT-1/EXT-2) ---
+	async extensions(refresh = false): Promise<ExtensionInfo[]> {
+		const d = await this.gql<{ extensions: ExtensionInfo[] }>(ops.EXTENSIONS, { refresh });
+		return d.extensions;
+	}
+
+	async sources(): Promise<SourceInfo[]> {
+		const d = await this.gql<{ sources: SourceInfo[] }>(ops.SOURCES);
+		return d.sources;
+	}
+
+	async sourceBrowse(
+		sourceId: Id,
+		type: SourceBrowseType,
+		page = 1,
+		query?: string,
+	): Promise<SourceBrowsePage> {
+		const d = await this.gql<{ sourceBrowse: SourceBrowsePage }>(ops.SOURCE_BROWSE, {
+			sourceId,
+			type,
+			page,
+			query: query ?? null,
+		});
+		return d.sourceBrowse;
+	}
+
+	async addExtensionRepo(indexUrl: string): Promise<number> {
+		const d = await this.gql<{ addExtensionRepo: number }>(ops.ADD_EXTENSION_REPO, { indexUrl });
+		return d.addExtensionRepo;
+	}
+
+	async installExtension(pkgName: string): Promise<ExtensionInfo> {
+		const d = await this.gql<{ installExtension: ExtensionInfo }>(ops.INSTALL_EXTENSION, {
+			pkgName,
+		});
+		return d.installExtension;
+	}
+
+	async uninstallExtension(pkgName: string): Promise<ExtensionInfo> {
+		const d = await this.gql<{ uninstallExtension: ExtensionInfo }>(ops.UNINSTALL_EXTENSION, {
+			pkgName,
+		});
+		return d.uninstallExtension;
+	}
+
+	async updateExtension(pkgName: string): Promise<ExtensionInfo> {
+		const d = await this.gql<{ updateExtension: ExtensionInfo }>(ops.UPDATE_EXTENSION, {
+			pkgName,
+		});
+		return d.updateExtension;
+	}
+
+	async bulkAddSourceSeries(suwayomiMangaIds: Id[]): Promise<BulkAddResult> {
+		const d = await this.gql<{ bulkAddSourceSeries: BulkAddResult }>(ops.BULK_ADD_SOURCE_SERIES, {
+			suwayomiMangaIds,
+		});
+		return d.bulkAddSourceSeries;
+	}
+
+	async seriesSourcesBatch(seriesIds: Id[]): Promise<SeriesSourceGroup[]> {
+		const d = await this.gql<{ seriesSourcesBatch: SeriesSourceGroup[] }>(
+			ops.SERIES_SOURCES_BATCH,
+			{ seriesIds },
+		);
+		return d.seriesSourcesBatch;
+	}
+
+	async setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
+		const d = await this.gql<{ setSeriesPaused: Series }>(ops.SET_SERIES_PAUSED, {
+			seriesId,
+			paused,
+		});
+		return d.setSeriesPaused;
+	}
+
+	async sourceIngestJobs(active = false): Promise<SourceIngestJob[]> {
+		const d = await this.gql<{ sourceIngestJobs: SourceIngestJob[] }>(ops.SOURCE_INGEST_JOBS, {
+			active,
+		});
+		return d.sourceIngestJobs;
+	}
+
+	async startSourceIngest(sourceId: Id): Promise<SourceIngestJob> {
+		const d = await this.gql<{ startSourceIngest: SourceIngestJob }>(ops.START_SOURCE_INGEST, {
+			sourceId,
+		});
+		return d.startSourceIngest;
+	}
+
+	async cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {
+		const d = await this.gql<{ cancelSourceIngest: SourceIngestJob }>(ops.CANCEL_SOURCE_INGEST, {
+			jobId,
+		});
+		return d.cancelSourceIngest;
+	}
+
+	async startExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+		const d = await this.gql<{ startExtensionIngest: SourceIngestJob[] }>(
+			ops.START_EXTENSION_INGEST,
+			{ pkgName },
+		);
+		return d.startExtensionIngest;
+	}
+
+	async cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+		const d = await this.gql<{ cancelExtensionIngest: SourceIngestJob[] }>(
+			ops.CANCEL_EXTENSION_INGEST,
+			{ pkgName },
+		);
+		return d.cancelExtensionIngest;
 	}
 
 	// --- viewer preferences ---
