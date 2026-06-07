@@ -1,11 +1,7 @@
 /**
- * Static site copy for the Donate and Support pages. Editorial content, not
- * catalog data — served through `source.ts` so screens keep a single data seam.
+ * Static site copy for the Support page. Editorial content, not catalog data —
+ * served through `source.ts` so screens keep a single data seam.
  */
-
-// Plain suggested donation amounts. No perks or benefits attached — donations
-// are voluntary support, not a paywall.
-export const donateAmounts = [5, 15, 30, 50, 100];
 
 export const supportCategories = [
 	{

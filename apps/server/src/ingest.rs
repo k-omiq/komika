@@ -29,9 +29,14 @@ use crate::suwayomi::FetchType;
 /// Delay between browse pages — polite throttle toward the upstream source
 /// (every page is one upstream fetch through the engine).
 const PAGE_DELAY_MS: u64 = 750;
-/// Delay between items within a page (each item costs a detail fetch + library
-/// write + cover download through the engine).
-const ITEM_DELAY_MS: u64 = 150;
+/// Max items processed concurrently within a page (S3). Each item is a detail
+/// fetch + library write + cover download through the engine, so a bounded fan-out
+/// (not unbounded) keeps the engine/source from being hammered while still cutting
+/// the per-page wall time by ~this factor vs the old sequential loop.
+const ITEM_CONCURRENCY: usize = 6;
+/// Flush progress to the job row every this many completed items (S3), so the
+/// admin sees live within-page progress instead of only per-page jumps.
+const PROGRESS_FLUSH_EVERY: i64 = 5;
 /// Hard ceiling on pages walked, so a source with a pathological/looping
 /// pagination can't run a job forever (20k+ items at 20/page).
 const MAX_PAGES: i64 = 1_000;
@@ -260,7 +265,7 @@ pub async fn mark_interrupted_jobs(pool: &SqlitePool) -> Result<u64> {
 pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
     tokio::spawn(async move {
         let pool = state.pool.clone();
-        match run_job(&state, &job_id, &source_id).await {
+        match run_job(state.clone(), &job_id, &source_id).await {
             Ok(RunOutcome::Completed) => {
                 if let Err(e) = finish_job(&pool, &job_id, STATE_COMPLETED, None).await {
                     tracing::warn!(job_id, error = %e, "ingest: failed to mark job completed");
@@ -287,40 +292,82 @@ enum RunOutcome {
     Cancelled,
 }
 
-/// The page-walk loop. Per-ITEM errors are counted and skipped; a PAGE fetch
-/// error fails the job (progress is preserved — the admin can restart).
-async fn run_job(state: &AppState, job_id: &str, source_id: &str) -> Result<RunOutcome> {
-    let pool = &state.pool;
+/// The page-walk loop (S3: items within a page are processed CONCURRENTLY, bounded
+/// by `ITEM_CONCURRENCY`, and the next page is PREFETCHED while the current page's
+/// items run). Per-ITEM errors are counted and skipped; a PAGE fetch error fails the
+/// job (progress preserved — the admin can restart). Cancel + progress + the
+/// one-job-per-source guarantees are unchanged (cancel is observed between pages;
+/// progress is folded once per page from the concurrent results).
+async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<RunOutcome> {
+    let pool = state.pool.clone();
     let mut progress = Progress::default();
     let mut page: i64 = 1;
-    loop {
-        // Cancellation check between pages (cheap single-row read).
-        if job_state(pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
-            write_progress(pool, job_id, &progress).await?;
-            return Ok(RunOutcome::Cancelled);
-        }
-        let (has_next, mangas) = state
+    // Prefetch buffer: the browse result for the page we're about to process.
+    let mut pending = Some(
+        state
             .suwayomi
             .browse_source(source_id, FetchType::Popular, page as i32, None)
-            .await?;
+            .await?,
+    );
+    loop {
+        // Cancellation check between pages (cheap single-row read).
+        if job_state(&pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
+            write_progress(&pool, job_id, &progress).await?;
+            return Ok(RunOutcome::Cancelled);
+        }
+        let (has_next, mangas) = pending.take().expect("page buffered");
+
+        // Kick off the NEXT page browse concurrently with processing this page's
+        // items, so browse latency overlaps item work.
+        let prefetch = if has_next && !mangas.is_empty() && page < MAX_PAGES {
+            let st = state.clone();
+            let sid = source_id.to_string();
+            let next = page + 1;
+            Some(tokio::spawn(async move {
+                st.suwayomi
+                    .browse_source(&sid, FetchType::Popular, next as i32, None)
+                    .await
+            }))
+        } else {
+            None
+        };
+
+        // Process this page's items with bounded concurrency.
+        let sem = Arc::new(tokio::sync::Semaphore::new(ITEM_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
         for m in &mangas {
+            let st = state.clone();
+            let sem = sem.clone();
+            let mid = m.id;
+            set.spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                (
+                    mid,
+                    crate::graphql::ingest_source_series(&st, &mid.to_string()).await,
+                )
+            });
+        }
+        while let Some(joined) = set.join_next().await {
             progress.items_seen += 1;
-            match crate::graphql::ingest_source_series(state, &m.id.to_string()).await {
-                Ok(r) => progress.record_decision(&r.decision),
+            match joined {
+                Ok((_, Ok(r))) => progress.record_decision(&r.decision),
+                Ok((mid, Err(e))) => {
+                    progress.record_failure();
+                    tracing::warn!(job_id, manga_id = mid, error = %e, "ingest: item failed");
+                }
                 Err(e) => {
                     progress.record_failure();
-                    tracing::warn!(job_id, manga_id = m.id, error = %e, "ingest: item failed");
+                    tracing::warn!(job_id, error = %e, "ingest: item task panicked");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(ITEM_DELAY_MS)).await;
-            // Also honor cancellation mid-page — a page can hold slow items.
-            if job_state(pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
-                write_progress(pool, job_id, &progress).await?;
-                return Ok(RunOutcome::Cancelled);
+            // Flush progress incrementally (every few items) so the admin sees live
+            // progress within a page, not just per-page jumps.
+            if progress.items_seen % PROGRESS_FLUSH_EVERY == 0 {
+                write_progress(&pool, job_id, &progress).await?;
             }
         }
         progress.pages_done += 1;
-        write_progress(pool, job_id, &progress).await?;
+        write_progress(&pool, job_id, &progress).await?;
         tracing::info!(
             job_id,
             source_id,
@@ -329,14 +376,17 @@ async fn run_job(state: &AppState, job_id: &str, source_id: &str) -> Result<RunO
             succeeded = progress.succeeded,
             "ingest: page done"
         );
-        if !has_next || mangas.is_empty() {
-            return Ok(RunOutcome::Completed);
+
+        // Resolve the prefetched next page (or finish).
+        match prefetch {
+            None => return Ok(RunOutcome::Completed),
+            Some(handle) => match handle.await {
+                Ok(Ok(next)) => pending = Some(next),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(anyhow::anyhow!("prefetch task panicked: {e}")),
+            },
         }
         page += 1;
-        if page > MAX_PAGES {
-            tracing::warn!(job_id, source_id, "ingest: MAX_PAGES reached; stopping");
-            return Ok(RunOutcome::Completed);
-        }
         tokio::time::sleep(std::time::Duration::from_millis(PAGE_DELAY_MS)).await;
     }
 }

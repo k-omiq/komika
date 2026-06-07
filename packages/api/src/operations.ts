@@ -100,14 +100,55 @@ export const UPDATES = /* GraphQL */ `
 
 export const SEARCH = /* GraphQL */ `
 	${SERIES_FIELDS}
-	query Search($query: String!, $page: Int) {
-		search(query: $query, page: $page) {
+	query Search(
+		$query: String!
+		$page: Int
+		$genres: [String!]
+		$minRating: Float
+		$maxRating: Float
+	) {
+		search(
+			query: $query
+			page: $page
+			genres: $genres
+			minRating: $minRating
+			maxRating: $maxRating
+		) {
 			items {
 				...SeriesFields
 			}
 			page
 			hasNextPage
 			total
+		}
+	}
+`;
+
+// The full genre/tag facet set across the persisted catalogue (S4), most-common
+// first with counts — drives the search genre multi-select.
+export const GENRE_FACETS = /* GraphQL */ `
+	query GenreFacets {
+		genreFacets {
+			genre
+			count
+		}
+	}
+`;
+
+// Multi-source aggregated chapters for a work (S2): one row per chapter number
+// across ALL a work's sources, with per-source availability for reading.
+export const AGGREGATED_CHAPTERS = /* GraphQL */ `
+	query AggregatedChapters($workId: ID!) {
+		aggregatedChapters(workId: $workId) {
+			number
+			title
+			sources {
+				sourceType
+				sourceId
+				suwayomiMangaId
+				chapterId
+				scanlator
+			}
 		}
 	}
 `;
@@ -456,6 +497,15 @@ export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	}
 `;
 
+export const MERGE_WORKS = /* GraphQL */ `
+	mutation MergeWorks($sourceWorkId: ID!, $targetWorkId: ID!) {
+		mergeWorks(sourceWorkId: $sourceWorkId, targetWorkId: $targetWorkId) {
+			targetWorkId
+			movedSourceSeries
+		}
+	}
+`;
+
 export const ADD_SOURCE_SERIES = /* GraphQL */ `
 	mutation AddSourceSeries($suwayomiMangaId: ID!) {
 		addSourceSeries(suwayomiMangaId: $suwayomiMangaId) {
@@ -584,6 +634,15 @@ export const BULK_ADD_SOURCE_SERIES = /* GraphQL */ `
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)
+	}
+`;
+
+// Admin maintenance: materialize the whole Suwayomi library into the DB cache
+// (metadata synchronously; chapter lists in a background task). Returns the
+// number of series persisted. Admin-gated server-side (require_admin).
+export const PERSIST_CATALOGUE = /* GraphQL */ `
+	mutation PersistCatalogue {
+		persistCatalogue
 	}
 `;
 

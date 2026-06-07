@@ -105,6 +105,18 @@ export interface MatchResult {
 }
 
 /**
+ * The result of folding one canonical work into another (admin `mergeWorks`):
+ * the source work's mappings + user data re-point to the target and the source
+ * work is deleted. Irreversible.
+ */
+export interface MergeWorksResult {
+	/** The surviving (target) work id. */
+	targetWorkId: Id;
+	/** How many `source_series` mappings were re-pointed onto the target. */
+	movedSourceSeries: number;
+}
+
+/**
  * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
  * work with its most recent stored chapter, served from the `chapter` mirror.
  * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through
@@ -402,6 +414,34 @@ export interface Credit {
 	/** `"author"` or `"artist"`. */
 	role: string;
 	name: string;
+}
+
+/** One genre/tag facet across the persisted catalogue (S4) — for the search
+ *  genre filter. The full set the sources provide, most-common first. */
+export interface GenreFacet {
+	genre: string;
+	count: number;
+}
+
+/** One source that provides a given chapter number of a work (S2 aggregation).
+ *  `suwayomiMangaId` (Suwayomi source) is the id to pass to `chapters(seriesId:)`
+ *  to read this source's copy; null = the MangaDex mirror. `chapterId` is the
+ *  specific chapter to open. */
+export interface ChapterSource {
+	sourceType: string;
+	sourceId: string;
+	suwayomiMangaId: Id | null;
+	chapterId: Id;
+	scanlator: string | null;
+}
+
+/** One aggregated chapter of a work — a chapter NUMBER available across one or
+ *  more sources (S2). Deduped by number; `sources` keeps per-source availability
+ *  so the reader can pick which translator/source to read it from. */
+export interface AggregatedChapter {
+	number: number;
+	title: string | null;
+	sources: ChapterSource[];
 }
 
 export interface Chapter {

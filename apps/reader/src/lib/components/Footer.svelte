@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { config } from '$lib/config';
 	let { links = false }: { links?: boolean } = $props();
 </script>
 
@@ -6,7 +7,9 @@
 	<span>komiq</span>
 	{#if links}
 		<div class="links">
-			<a href="/donate">Donate</a>
+			{#if config.sponsorUrl}
+				<a href={config.sponsorUrl} target="_blank" rel="noopener noreferrer">Sponsor</a>
+			{/if}
 			<a href="/support">Support</a>
 		</div>
 	{/if}

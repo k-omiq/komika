@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use crate::auth::{self, User};
 use crate::catalog;
 use crate::scanner::{scan_series, scan_state};
-use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
+use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
 use types::*;
 
 const PAGE_SIZE: i64 = 20;
@@ -485,6 +485,105 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
     }
 }
 
+/// Apply the S4 search filters to a mapped result set: keep series matching ANY of
+/// `genres` (case-insensitive; empty/None = no genre filter) AND whose aggregate
+/// user rating falls in `[min_rating, max_rating]`. A `min_rating > 0` excludes
+/// unrated series (rating average 0 with 0 reviews). Pure so it's unit-testable.
+fn apply_search_filters(
+    items: Vec<Series>,
+    genres: Option<&[String]>,
+    min_rating: Option<f64>,
+    max_rating: Option<f64>,
+) -> Vec<Series> {
+    let want: Vec<String> = genres
+        .map(|g| {
+            g.iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    items
+        .into_iter()
+        .filter(|s| {
+            if !want.is_empty() {
+                let have: Vec<String> = s.genres.iter().map(|g| g.to_lowercase()).collect();
+                if !want.iter().any(|w| have.iter().any(|h| h == w)) {
+                    return false;
+                }
+            }
+            let avg = s.rating.average;
+            if let Some(min) = min_rating {
+                if avg < min {
+                    return false;
+                }
+            }
+            if let Some(max) = max_rating {
+                if avg > max {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Group raw cross-source chapter rows (S2) into one `AggregatedChapter` per
+/// chapter number, collecting each source that provides it, ascending by number.
+/// Pure so the dedupe/ordering is unit-testable without a DB. A number is bucketed
+/// by `round(number*100)` so "10.5" ≠ "10" but float noise can't split a number.
+fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<AggregatedChapter> {
+    use std::collections::BTreeMap;
+    let mut by_num: BTreeMap<i64, AggregatedChapter> = BTreeMap::new();
+    for r in rows {
+        let key = (r.number * 100.0).round() as i64;
+        let entry = by_num.entry(key).or_insert_with(|| AggregatedChapter {
+            number: r.number,
+            title: r.title.clone(),
+            sources: Vec::new(),
+        });
+        // Keep the first non-empty title we see for the number.
+        if entry.title.as_deref().unwrap_or("").is_empty() {
+            entry.title = r.title.clone();
+        }
+        entry.sources.push(ChapterSource {
+            source_type: r.source_type,
+            source_id: r.source_id,
+            suwayomi_manga_id: r.suwayomi_manga_id.map(ID),
+            chapter_id: ID(r.chapter_id),
+            scanlator: r.scanlator,
+        });
+    }
+    by_num.into_values().collect()
+}
+
+/// S1: resolve one Suwayomi series DB-first — return the cached row when present,
+/// else live-fetch from Suwayomi and populate the cache for next time.
+async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<SuwayomiManga> {
+    if let Some(m) = crate::series_cache::get_series(&st.pool, id).await? {
+        return Ok(m);
+    }
+    let m = st.suwayomi.series(id).await?;
+    let _ = crate::series_cache::put_series(&st.pool, &m).await;
+    Ok(m)
+}
+
+/// S1: resolve one series' chapter list DB-first — cached rows when present, else
+/// live-fetch and cache. An empty cache row is treated as a miss (so a series with
+/// genuinely zero chapters re-checks the source until it's scanned).
+async fn resolve_chapters_cached(
+    st: &AppState,
+    manga_id: i64,
+) -> anyhow::Result<Vec<SuwayomiChapter>> {
+    let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
+    let list = st.suwayomi.chapters(manga_id).await?;
+    let _ = crate::series_cache::put_chapters(&st.pool, manga_id, &list).await;
+    Ok(list)
+}
+
 async fn map_series_list(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series> {
     let mut out = Vec::with_capacity(list.len());
     for m in list {
@@ -534,6 +633,14 @@ async fn map_canonical_series(
                 != 0,
             None => false,
         };
+    // S2: chapterCount is the AGGREGATE across all the work's sources (Suwayomi
+    // caches + MangaDex mirror), deduped by number — so a work whose MangaDex spine
+    // has 0 chapters but whose asurascans source has 201 reports 201, not 0. The
+    // passed `chapter_count` (MangaDex mirror) is a subset, kept as a floor.
+    let aggregate = catalog::aggregate_chapter_count(pool, &work.work_id)
+        .await
+        .unwrap_or(0);
+    let chapter_count = aggregate.max(chapter_count as i64) as i32;
     Series {
         id: ID(work.work_id),
         title,
@@ -846,18 +953,38 @@ impl QueryRoot {
     /// Curated discovery feeds over the federated catalog.
     async fn discovery(&self, ctx: &Context<'_>) -> Result<Vec<DiscoveryFeed>> {
         let st = state(ctx);
-        let popular = st
-            .suwayomi
-            .fetch_source(FetchType::Popular, 1, None)
+        // S1: serve from the DB cache once the catalogue has been persisted (the
+        // admin "save everything" / ingest / scan populate it), so the home page
+        // reads from SQLite instead of a live source browse. Fall back to a live
+        // browse only while the cache is still empty (fresh install), caching what
+        // it fetches so the next load is fast.
+        let (popular, latest) = if crate::series_cache::count(&st.pool)
             .await
             .map_err(gql_err)?
-            .1;
-        let latest = st
-            .suwayomi
-            .fetch_source(FetchType::Latest, 1, None)
-            .await
-            .map(|r| r.1)
-            .unwrap_or_default();
+            > 0
+        {
+            let lib = crate::series_cache::library(&st.pool, PAGE_SIZE)
+                .await
+                .map_err(gql_err)?;
+            (lib, Vec::new())
+        } else {
+            let popular = st
+                .suwayomi
+                .fetch_source(FetchType::Popular, 1, None)
+                .await
+                .map_err(gql_err)?
+                .1;
+            for m in &popular {
+                let _ = crate::series_cache::put_series(&st.pool, m).await;
+            }
+            let latest = st
+                .suwayomi
+                .fetch_source(FetchType::Latest, 1, None)
+                .await
+                .map(|r| r.1)
+                .unwrap_or_default();
+            (popular, latest)
+        };
 
         // Hide NSFW-flagged works unless the viewer opted in (CATALOGUE.md §2).
         let show_nsfw = viewer_show_nsfw(ctx).await;
@@ -938,13 +1065,13 @@ impl QueryRoot {
         .map_err(gql_err)?;
         let has_next = ids.len() as i64 > PAGE_SIZE;
 
-        // Hydrate each id from Suwayomi. A series that has since been removed from
-        // the source is skipped rather than failing the whole feed. NSFW is already
-        // filtered in SQL above, so no post-slice filter is needed here.
+        // Hydrate each id DB-first (S1) — cached row when present, live-fetch on a
+        // miss. A series that has since been removed from the source is skipped
+        // rather than failing the whole feed. NSFW is already filtered in SQL above.
         let mut items = Vec::new();
         for id in ids.into_iter().take(PAGE_SIZE as usize) {
             let Ok(n) = id.parse::<i64>() else { continue };
-            match st.suwayomi.series(n).await {
+            match resolve_series_cached(st, n).await {
                 Ok(m) => items.push(map_series(st, m).await),
                 Err(e) => {
                     tracing::warn!(series_id = id, error = %e, "updates: skipping unresolvable series")
@@ -1063,6 +1190,30 @@ impl QueryRoot {
             .collect())
     }
 
+    /// S2: the aggregated chapter list of a canonical work — every chapter number
+    /// available across ALL its sources (installed Suwayomi sources + the MangaDex
+    /// mirror), deduped by number, each carrying the per-source availability so the
+    /// reader can pick a translator. This is how Solo Leveling shows its asurascans
+    /// chapters even though its MangaDex spine has none. Ascending by number.
+    async fn aggregated_chapters(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+    ) -> Result<Vec<AggregatedChapter>> {
+        let st = state(ctx);
+        let work = catalog::load_canonical_work(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?
+            .ok_or_else(|| Error::new("No such work"))?;
+        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such work"));
+        }
+        let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?;
+        Ok(group_aggregated_chapters(rows))
+    }
+
     /// Ordered page URLs for a mirrored MangaDex chapter, via MangaDex@Home
     /// (CATALOGUE.md §5). `chapterId` is the MangaDex chapter uuid. The URLs are
     /// `*.mangadex.network` hosts the client resolves through the Worker proxy (never
@@ -1122,33 +1273,82 @@ impl QueryRoot {
         Ok(groups)
     }
 
+    /// Catalogue search with optional genre + rating-range filters (S4 — drives the
+    /// refined UI's rating slider + genre chips). An empty query browses the
+    /// persisted catalogue from the DB cache (so filters apply across everything
+    /// materialized); a text query does a live source search. `genres` matches ANY
+    /// of the given genres; `minRating`/`maxRating` filter by the work's aggregate
+    /// user rating (0–10; a `minRating > 0` excludes unrated series). Filters are
+    /// applied to the result set (a text-query page is filtered post-fetch).
     async fn search(
         &self,
         ctx: &Context<'_>,
         query: String,
         #[graphql(default = 1)] page: i32,
+        genres: Option<Vec<String>>,
+        min_rating: Option<f64>,
+        max_rating: Option<f64>,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
         let trimmed = query.trim();
-        let (ty, q) = if trimmed.is_empty() {
-            (FetchType::Popular, None)
-        } else {
-            (FetchType::Search, Some(trimmed))
-        };
-        let (has_next, mangas) = st
-            .suwayomi
-            .fetch_source(ty, page, q)
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        if trimmed.is_empty() {
+            // F2: empty query → the filters are applied in SQL across the ENTIRE
+            // persisted catalogue and paginated, so `search(genres:["Action"])`
+            // returns the full catalogue-wide Action set (paged), not a slice of the
+            // first N. `total` is the filtered catalogue-wide count.
+            let genres_v = genres.unwrap_or_default();
+            let (total, mangas) = crate::series_cache::search_catalogue(
+                &st.pool,
+                &genres_v,
+                min_rating,
+                max_rating,
+                show_nsfw,
+                page.max(1) as i64,
+                PAGE_SIZE,
+            )
             .await
             .map_err(gql_err)?;
+            let items = map_series_list(st, mangas).await;
+            let has_next = (page.max(1) as i64) * PAGE_SIZE < total;
+            return Ok(SeriesPage {
+                items,
+                page,
+                has_next_page: has_next,
+                total: Some(total as i32),
+            });
+        }
+        // Text query → live source search (the source's own text index isn't in our
+        // DB); genre/rating filters are applied to the fetched page.
+        let (has_next, mangas) = st
+            .suwayomi
+            .fetch_source(FetchType::Search, page, Some(trimmed))
+            .await
+            .map_err(gql_err)?;
+        let mapped = filter_nsfw(show_nsfw, map_series_list(st, mangas).await);
+        let items = apply_search_filters(mapped, genres.as_deref(), min_rating, max_rating);
         Ok(SeriesPage {
-            items: filter_nsfw(
-                viewer_show_nsfw(ctx).await,
-                map_series_list(st, mangas).await,
-            ),
+            items,
             page,
             has_next_page: has_next,
             total: None,
         })
+    }
+
+    /// The available genre/tag facets across the persisted catalogue (S4), most
+    /// common first — the full set the sources provide, for the search UI's genre
+    /// filter. Empty until the catalogue has been persisted (ingest/scan/persistCatalogue).
+    async fn genre_facets(&self, ctx: &Context<'_>) -> Result<Vec<GenreFacet>> {
+        let st = state(ctx);
+        Ok(crate::series_cache::genre_facets(&st.pool)
+            .await
+            .map_err(gql_err)?
+            .into_iter()
+            .map(|(genre, count)| GenreFacet {
+                genre,
+                count: count as i32,
+            })
+            .collect())
     }
 
     /// Federated multi-extension catalogue search (S3). Fans the query out to
@@ -1193,7 +1393,8 @@ impl QueryRoot {
         if canonical_is_nsfw(&st.pool, &id.0).await && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such series"));
         }
-        let m = st.suwayomi.series(n).await.map_err(gql_err)?;
+        // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
+        let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
         Ok(map_series(st, m).await)
     }
 
@@ -1204,7 +1405,8 @@ impl QueryRoot {
         if canonical_is_nsfw(&st.pool, &series_id.0).await && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such series"));
         }
-        let list = st.suwayomi.chapters(n).await.map_err(gql_err)?;
+        // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
+        let list = resolve_chapters_cached(st, n).await.map_err(gql_err)?;
         Ok(list.into_iter().map(map_chapter).collect())
     }
 
@@ -1886,10 +2088,39 @@ const WORK_SOURCE_SELECT: &str =
      FROM source_series ss \
      LEFT JOIN source_extension se ON se.source_id = ss.source_id";
 
+/// The AUTHORITATIVE Suwayomi `source_key`s for a work (F1) — one per source_id,
+/// the mapping with the most cached chapters. Used to drop redundant same-source
+/// mappings from `workSources`/translators so they agree with `aggregatedChapters`.
+async fn authoritative_key_set(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(catalog::authoritative_suwayomi_mappings(pool, work_id)
+        .await
+        .map_err(gql_err)?
+        .into_iter()
+        .map(|m| m.source_key)
+        .collect())
+}
+
+/// Keep a work's source mappings, dropping redundant same-source Suwayomi mappings
+/// (F1): a Suwayomi row survives only if its `source_key` is the authoritative one
+/// for its `source_id`. MangaDex / non-Suwayomi rows always survive.
+fn retain_authoritative(
+    sources: Vec<WorkSource>,
+    keys: &std::collections::HashSet<String>,
+) -> Vec<WorkSource> {
+    sources
+        .into_iter()
+        .filter(|s| s.source_type != "suwayomi" || keys.contains(&s.source_key))
+        .collect()
+}
+
 /// Load a canonical work's source mappings, MangaDex-native first then by recency,
-/// dropping NSFW rows for an opted-out viewer. The extension is populated only when the
-/// LEFT JOIN matched (`pkg_name`/`repo_url` non-null); `WorkSource.lang` is the
-/// extension's lang since `source_series` carries no per-source language.
+/// dropping NSFW rows for an opted-out viewer AND redundant same-source Suwayomi
+/// mappings (F1 — only the authoritative, most-complete mapping per source survives,
+/// so translators agree with `aggregatedChapters`). The extension is populated only
+/// when the LEFT JOIN matched; `WorkSource.lang` is the extension's lang.
 async fn load_work_sources(
     pool: &SqlitePool,
     work_id: &str,
@@ -1903,10 +2134,12 @@ async fn load_work_sources(
     .fetch_all(pool)
     .await
     .map_err(gql_err)?;
-    Ok(rows
+    let mapped: Vec<WorkSource> = rows
         .into_iter()
         .filter_map(|r| work_source_from_row(r, show_nsfw))
-        .collect())
+        .collect();
+    let keys = authoritative_key_set(pool, work_id).await?;
+    Ok(retain_authoritative(mapped, &keys))
 }
 
 /// Batched `load_work_sources` (X2): one query for many work ids, returning a map
@@ -1938,6 +2171,13 @@ async fn load_work_sources_batch(
         if let Some(ws) = work_source_from_row(r, show_nsfw) {
             map.entry(wid).or_default().push(ws);
         }
+    }
+    // F1: drop redundant same-source Suwayomi mappings per work (keep the
+    // authoritative, most-complete one), consistent with the single-work loader.
+    for (wid, sources) in map.iter_mut() {
+        let keys = authoritative_key_set(pool, wid).await?;
+        let taken = std::mem::take(sources);
+        *sources = retain_authoritative(taken, &keys);
     }
     Ok(map)
 }
@@ -3127,6 +3367,57 @@ impl MutationRoot {
         enrich_works(st, &ids).await
     }
 
+    /// Admin (S1): "save everything to DB" — materialize the whole Suwayomi library
+    /// into the DB cache so reader loads serve from SQLite. Series METADATA (title,
+    /// cover reference, description, author/artist, genres, status, chapter count)
+    /// is written synchronously from one `library()` call and returned immediately;
+    /// the per-series CHAPTER LISTS are filled by a spawned background task (each is
+    /// one source fetch, so a large library would otherwise block the request past
+    /// client/proxy timeouts). PRODUCTION maintenance action gated ONLY by
+    /// `require_admin` (admin identity is the gate — no separate feature flag).
+    /// Returns how many series were persisted.
+    async fn persist_catalogue(&self, ctx: &Context<'_>) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        let library = st_arc.suwayomi.library().await.map_err(gql_err)?;
+        let mut ids = Vec::with_capacity(library.len());
+        let mut persisted = 0i32;
+        for mut m in library {
+            m.in_library = true;
+            match crate::series_cache::put_series(&st_arc.pool, &m).await {
+                Ok(()) => {
+                    ids.push(m.id);
+                    persisted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(series_id = m.id, error = %e, "persistCatalogue: series write failed")
+                }
+            }
+        }
+        // Fill chapter lists in the background (best-effort, sequential + polite) so
+        // the request returns immediately even for a large library.
+        let st_bg = st_arc.clone();
+        tokio::spawn(async move {
+            for id in ids {
+                match st_bg.suwayomi.chapters(id).await {
+                    Ok(chapters) => {
+                        let _ = crate::series_cache::put_chapters(&st_bg.pool, id, &chapters).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(series_id = id, error = %e, "persistCatalogue(bg): chapter fetch failed")
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            tracing::info!("persistCatalogue: background chapter fill complete");
+        });
+        tracing::info!(
+            persisted,
+            "persistCatalogue: metadata materialized; chapters filling in background"
+        );
+        Ok(persisted)
+    }
+
     /// Admin: start an "add all from this source" background ingest job (S1).
     /// Walks the source's POPULAR listing page by page and runs every entry
     /// through the Tier-2 dedup add flow; progress is persisted on the job row
@@ -3296,8 +3587,13 @@ pub(crate) async fn ingest_source_series(
     let mid: i64 = raw_id
         .parse()
         .map_err(|_| anyhow::anyhow!("suwayomiMangaId must be an integer id"))?;
-    let m = st.suwayomi.series(mid).await?;
+    let mut m = st.suwayomi.series(mid).await?;
     st.suwayomi.set_in_library(mid, true).await?;
+    m.in_library = true;
+    // S1: cache the series METADATA so reader loads serve from the DB. Chapters are
+    // cached by the scanner (which scans the library) and lazily on first read — NOT
+    // fetched here, so a bulk ingest isn't slowed by a chapter fetch per item (S3).
+    let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
         Some(bytes) => crate::phash::dhash(&bytes),
         None => None,
@@ -3443,8 +3739,11 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
     let mid: i64 = raw_id
         .parse()
         .map_err(|_| anyhow::anyhow!("suwayomiMangaId must be an integer id"))?;
-    let m = st.suwayomi.series(mid).await?;
+    let mut m = st.suwayomi.series(mid).await?;
     st.suwayomi.set_in_library(mid, true).await?;
+    m.in_library = true;
+    // S1: cache series METADATA (chapters fill on scan / first read — not per item).
+    let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
         Some(bytes) => crate::phash::dhash(&bytes),
         None => None,
@@ -6052,6 +6351,107 @@ mod tests {
         assert!(ids.contains("pill") && ids.contains("adult"));
         assert!(!ids.contains("0"), "the local source is never fanned out");
         assert_eq!(all.len(), 3, "one source per extension pkg");
+    }
+
+    #[test]
+    fn apply_search_filters_by_genre_and_rating() {
+        let mk = |title: &str, genres: &[&str], avg: f64, count: i32| Series {
+            id: ID(title.into()),
+            title: title.into(),
+            alt_titles: vec![],
+            author: None,
+            artist: None,
+            description: None,
+            genres: genres.iter().map(|g| g.to_string()).collect(),
+            r#type: ComicType::Manga,
+            status: SeriesStatus::Ongoing,
+            cover_url: String::new(),
+            source_id: "s".into(),
+            chapter_count: 0,
+            is_marked: false,
+            is_nsfw: false,
+            rating: RatingSummary {
+                average: avg,
+                count,
+                distribution: vec![0; 10],
+            },
+            scan: ScanPolicy {
+                avg_interval_hours: 0.0,
+                override_interval_hours: None,
+                poll_every_minutes: 30,
+                paused: false,
+                status_override: None,
+                paused_override: None,
+                poll_every_minutes_override: None,
+                last_scanned_at: None,
+                next_scan_at: None,
+            },
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let items = vec![
+            mk("Action8", &["Action", "Comedy"], 8.0, 3),
+            mk("Drama5", &["Drama"], 5.0, 2),
+            mk("Action3", &["Action"], 3.0, 1),
+            mk("Unrated", &["Action"], 0.0, 0),
+        ];
+
+        // Genre filter (case-insensitive, ANY): only Action titles.
+        let out = apply_search_filters(items.clone(), Some(&["action".into()]), None, None);
+        let ids: Vec<&str> = out.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(ids, vec!["Action8", "Action3", "Unrated"]);
+
+        // Rating range [4,10] excludes the 3.0 and the unrated (0.0).
+        let out = apply_search_filters(items.clone(), None, Some(4.0), Some(10.0));
+        let ids: Vec<&str> = out.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(ids, vec!["Action8", "Drama5"]);
+
+        // Combined: Action AND rating >= 4 → only Action8.
+        let out = apply_search_filters(items.clone(), Some(&["Action".into()]), Some(4.0), None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Action8");
+
+        // No filters → unchanged.
+        assert_eq!(
+            apply_search_filters(items.clone(), None, None, None).len(),
+            4
+        );
+    }
+
+    #[test]
+    fn group_aggregated_chapters_dedupes_by_number_keeps_sources() {
+        // S2: one entry per number, ascending, each keeping every source (translator)
+        // that provides it.
+        let row = |num: f64, st: &str, sid: &str, mid: Option<&str>, cid: &str| {
+            crate::catalog::WorkChapterRow {
+                number: num,
+                title: Some(format!("Ch {num}")),
+                source_type: st.into(),
+                source_id: sid.into(),
+                suwayomi_manga_id: mid.map(Into::into),
+                chapter_id: cid.into(),
+                scanlator: None,
+            }
+        };
+        // Number 1 from two sources; 2 from one; 10.5 distinct from 10; out of order.
+        let rows = vec![
+            row(2.0, "suwayomi", "a", Some("333"), "c2"),
+            row(1.0, "suwayomi", "a", Some("333"), "c1"),
+            row(1.0, "mangadex", "mangadex", None, "md-uuid"),
+            row(10.5, "suwayomi", "a", Some("333"), "c105"),
+            row(10.0, "suwayomi", "a", Some("333"), "c10"),
+        ];
+        let out = group_aggregated_chapters(rows);
+        let nums: Vec<f64> = out.iter().map(|c| c.number).collect();
+        assert_eq!(nums, vec![1.0, 2.0, 10.0, 10.5], "deduped + ascending");
+        // Number 1 kept both sources.
+        let first = &out[0];
+        assert_eq!(first.sources.len(), 2);
+        assert!(first.sources.iter().any(|s| s.source_type == "mangadex"));
+        assert!(first
+            .sources
+            .iter()
+            .any(|s| s.suwayomi_manga_id.as_ref().map(|i| i.0.as_str()) == Some("333")));
     }
 
     #[test]

@@ -36,6 +36,13 @@ export const config = {
 	 * transport itself lands later — this flag only selects the composite wrapper.
 	 */
 	nativeEngine: env.PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
+	/**
+	 * External donation link. Donations are framed as sponsoring the open-source
+	 * project (not the hosted catalog), so this points at GitHub Sponsors by
+	 * default. Override with PUBLIC_KOMIKA_SPONSOR_URL, or set it empty to hide
+	 * the Sponsor links entirely.
+	 */
+	sponsorUrl: env.PUBLIC_KOMIKA_SPONSOR_URL ?? 'https://github.com/sponsors/gecallidryas',
 };
 
 /**

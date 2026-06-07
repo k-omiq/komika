@@ -5,6 +5,7 @@
 	import {
 		loadCatalog,
 		loadSeriesSources,
+		mergeWorks,
 		saveSeriesAdmin,
 		setSeriesPaused,
 		triggerScan,
@@ -60,6 +61,75 @@
 			pauseMsg = { ...pauseMsg, [s.id]: err instanceof Error ? err.message : 'Unpause failed.' };
 		} finally {
 			unpausing = null;
+		}
+	}
+
+	// ---- merge duplicate works (admin D1, destructive + irreversible) ----
+	type MergeSide = { seriesId: string; workId: string; title: string; group: SeriesSourceGroup };
+	/** The work chosen to be DELETED (its mappings/data fold into the target). */
+	let mergeSource = $state<MergeSide | null>(null);
+	/** The surviving target; when set, the confirmation dialog is shown. */
+	let mergeTarget = $state<MergeSide | null>(null);
+	let merging = $state(false);
+	let mergeError = $state<string | null>(null);
+	let mergeResult = $state<{ targetTitle: string; movedSourceSeries: number } | null>(null);
+
+	/** The canonical work id for a catalogue row, or null when not catalogued. */
+	function workIdOf(s: Series): string | null {
+		const g = provenance[s.id];
+		return g?.workId ?? null;
+	}
+
+	/** Can this row be a target for the in-progress merge? (catalogued + a different work) */
+	function canBeTarget(s: Series): boolean {
+		if (!mergeSource) return false;
+		const wid = workIdOf(s);
+		return !!wid && wid !== mergeSource.workId;
+	}
+
+	function sideFor(s: Series): MergeSide | null {
+		const g = provenance[s.id];
+		if (!g?.workId) return null;
+		return { seriesId: s.id, workId: g.workId, title: s.title, group: g };
+	}
+
+	function startMerge(s: Series): void {
+		const side = sideFor(s);
+		if (!side) return;
+		mergeSource = side;
+		mergeTarget = null;
+		mergeError = null;
+		mergeResult = null;
+	}
+
+	function pickTarget(s: Series): void {
+		if (!mergeSource || !canBeTarget(s)) return;
+		mergeTarget = sideFor(s);
+		mergeError = null;
+	}
+
+	function cancelMerge(): void {
+		mergeSource = null;
+		mergeTarget = null;
+		mergeError = null;
+	}
+
+	async function confirmMerge(): Promise<void> {
+		if (!mergeSource || !mergeTarget || merging) return;
+		merging = true;
+		mergeError = null;
+		try {
+			const res = await mergeWorks(mergeSource.workId, mergeTarget.workId);
+			mergeResult = { targetTitle: mergeTarget.title, movedSourceSeries: res.movedSourceSeries };
+			mergeSource = null;
+			mergeTarget = null;
+			// Re-fetch provenance so the folded-away work is gone and any re-pointed
+			// rows now show the surviving target work.
+			await loadProvenance(series);
+		} catch (err) {
+			mergeError = err instanceof Error ? err.message : 'Merge failed.';
+		} finally {
+			merging = false;
 		}
 	}
 
@@ -245,6 +315,26 @@
 		<div class="notice error">Source provenance unavailable: {provenanceError}</div>
 	{/if}
 
+	{#if mergeResult}
+		<div class="notice success">
+			Merged into <strong>{mergeResult.targetTitle}</strong> · {mergeResult.movedSourceSeries} source
+			mapping{mergeResult.movedSourceSeries === 1 ? '' : 's'} moved. The duplicate work was deleted.
+			<button class="link-btn" onclick={() => (mergeResult = null)}>Dismiss</button>
+		</div>
+	{/if}
+
+	{#if mergeSource}
+		<div class="notice merge-banner">
+			<span>
+				Merging <strong>{mergeSource.title}</strong>
+				<span class="mono">({mergeSource.workId})</span> — pick the <strong>target</strong> row to
+				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved
+				to the target.
+			</span>
+			<button class="link-btn" onclick={cancelMerge}>Cancel merge</button>
+		</div>
+	{/if}
+
 	<div class="table" class:dim={loading}>
 		<div class="thead">
 			<span class="col-series">Series</span>
@@ -316,11 +406,24 @@
 						{#if pauseMsg[s.id]}<span class="pause-err">{pauseMsg[s.id]}</span>{/if}
 					</span>
 					<span class="col-actions">
-						<button class="edit" onclick={() => openEditor(s)}>Edit</button>
-						<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
-							{addingId === s.id ? 'Adding…' : 'Add'}
-						</button>
-						{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
+						{#if mergeSource}
+							{#if mergeSource.seriesId === s.id}
+								<span class="merge-source-badge">Source · will delete</span>
+							{:else if canBeTarget(s)}
+								<button class="merge-target" onclick={() => pickTarget(s)}>Set as target</button>
+							{:else if workIdOf(s) === mergeSource.workId}
+								<span class="add-msg">same work</span>
+							{/if}
+						{:else}
+							<button class="edit" onclick={() => openEditor(s)}>Edit</button>
+							<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
+								{addingId === s.id ? 'Adding…' : 'Add'}
+							</button>
+							{#if workIdOf(s)}
+								<button class="merge-btn" onclick={() => startMerge(s)} title="Merge this work into another (delete this duplicate)">Merge…</button>
+							{/if}
+							{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
+						{/if}
 					</span>
 				</div>
 			{/each}
@@ -396,6 +499,63 @@
 			<button class="save" onclick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
 		</div>
 	</aside>
+{/if}
+
+{#if mergeSource && mergeTarget}
+	<button class="scrim" aria-label="Cancel merge" onclick={() => (mergeTarget = null)}></button>
+	<div class="modal" role="dialog" aria-modal="true" aria-label="Confirm work merge">
+		<div class="modal-head">
+			<div class="modal-kicker">DESTRUCTIVE · IRREVERSIBLE</div>
+			<h2>Merge duplicate works?</h2>
+		</div>
+		<p class="modal-lede">
+			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its source
+			mappings and all user data (library, reading progress, reviews, comments) move to the
+			<strong>target</strong>, which survives as the canonical entry. Confirm both are the same
+			series.
+		</p>
+
+		<div class="merge-cards">
+			<div class="merge-card danger">
+				<div class="merge-card-tag delete">Source · deleted</div>
+				<div class="merge-card-title">{mergeSource.title}</div>
+				<div class="merge-card-id">{mergeSource.workId}</div>
+				<div class="merge-chips">
+					{#if mergeSource.group.sources.length > 0}
+						{#each mergeSource.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
+						{/each}
+					{:else}
+						<span class="src-none">no source mappings</span>
+					{/if}
+				</div>
+			</div>
+			<div class="merge-arrow" aria-hidden="true">→</div>
+			<div class="merge-card survive">
+				<div class="merge-card-tag keep">Target · survives</div>
+				<div class="merge-card-title">{mergeTarget.title}</div>
+				<div class="merge-card-id">{mergeTarget.workId}</div>
+				<div class="merge-chips">
+					{#if mergeTarget.group.sources.length > 0}
+						{#each mergeTarget.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
+						{/each}
+					{:else}
+						<span class="src-none">no source mappings</span>
+					{/if}
+				</div>
+			</div>
+		</div>
+
+		{#if mergeError}<div class="notice error">{mergeError}</div>{/if}
+
+		<div class="modal-actions">
+			<button class="cancel" onclick={() => (mergeTarget = null)} disabled={merging}>Back</button>
+			<button class="danger-btn" onclick={confirmMerge} disabled={merging}>
+				{merging ? 'Merging…' : 'Merge & delete source'}
+			</button>
+		</div>
+	</div>
 {/if}
 
 <style>
@@ -876,5 +1036,231 @@
 	.save:disabled {
 		opacity: 0.6;
 		cursor: default;
+	}
+
+	/* ---- merge duplicate works ---- */
+	.notice.success {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+		background: rgba(127, 211, 154, 0.1);
+		border: 1px solid rgba(127, 211, 154, 0.35);
+		color: var(--k-ongoing);
+	}
+	.notice.merge-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+		background: rgba(95, 200, 207, 0.08);
+		border: 1px solid rgba(95, 200, 207, 0.35);
+		color: var(--k-text-2);
+	}
+	.notice.merge-banner strong {
+		color: var(--k-text-bright);
+	}
+	.mono {
+		font-family: var(--k-font-mono, monospace);
+		font-size: 12px;
+		color: var(--k-text-faint);
+	}
+	.link-btn {
+		background: none;
+		border: none;
+		color: var(--k-accent-teal);
+		font-family: var(--k-font-sans);
+		font-size: 12.5px;
+		font-weight: 600;
+		cursor: pointer;
+		padding: 0;
+		white-space: nowrap;
+	}
+	.merge-btn {
+		height: 32px;
+		padding: 0 12px;
+		border-radius: var(--k-radius);
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-1);
+		font-family: var(--k-font-sans);
+		font-weight: 600;
+		font-size: 12.5px;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.merge-btn:hover {
+		border-color: rgba(95, 200, 207, 0.5);
+		color: var(--k-accent-teal);
+	}
+	.merge-target {
+		height: 32px;
+		padding: 0 12px;
+		border-radius: var(--k-radius);
+		background: rgba(95, 200, 207, 0.12);
+		border: 1px solid rgba(95, 200, 207, 0.45);
+		color: var(--k-accent-teal);
+		font-family: var(--k-font-sans);
+		font-weight: 700;
+		font-size: 12.5px;
+		cursor: pointer;
+	}
+	.merge-source-badge {
+		font-size: 11px;
+		font-weight: 700;
+		color: var(--k-accent);
+		border: 1px solid rgba(224, 131, 105, 0.4);
+		background: rgba(224, 131, 105, 0.1);
+		border-radius: var(--k-radius-sm);
+		padding: 3px 8px;
+		white-space: nowrap;
+	}
+
+	/* confirm modal */
+	.modal {
+		position: fixed;
+		top: 50%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		z-index: 41;
+		width: 680px;
+		max-width: 94vw;
+		max-height: 90vh;
+		overflow-y: auto;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-lg);
+		box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+		padding: var(--k-space-6);
+		display: flex;
+		flex-direction: column;
+		gap: var(--k-space-4);
+	}
+	.modal-kicker {
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.08em;
+		color: var(--k-accent);
+		margin-bottom: 6px;
+	}
+	.modal-head h2 {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 22px;
+		color: var(--k-text-bright);
+	}
+	.modal-lede {
+		font-size: 13.5px;
+		line-height: 1.5;
+		color: var(--k-text-dim);
+	}
+	.modal-lede strong {
+		color: var(--k-text-1);
+	}
+	.merge-cards {
+		display: grid;
+		grid-template-columns: 1fr auto 1fr;
+		align-items: stretch;
+		gap: 14px;
+	}
+	.merge-card {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 14px;
+		border-radius: var(--k-radius-md);
+		border: 1px solid var(--k-border);
+		background: var(--k-surface);
+		min-width: 0;
+	}
+	.merge-card.danger {
+		border-color: rgba(224, 131, 105, 0.45);
+	}
+	.merge-card.survive {
+		border-color: rgba(127, 211, 154, 0.45);
+	}
+	.merge-card-tag {
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		padding: 2px 7px;
+		border-radius: var(--k-radius-sm);
+		align-self: flex-start;
+	}
+	.merge-card-tag.delete {
+		color: var(--k-accent);
+		background: rgba(224, 131, 105, 0.12);
+	}
+	.merge-card-tag.keep {
+		color: var(--k-ongoing);
+		background: rgba(127, 211, 154, 0.12);
+	}
+	.merge-card-title {
+		font-weight: 700;
+		font-size: 15px;
+		color: var(--k-text-bright);
+		line-height: 1.25;
+	}
+	.merge-card-id {
+		font-family: var(--k-font-mono, monospace);
+		font-size: 11.5px;
+		color: var(--k-text-faint);
+		word-break: break-all;
+	}
+	.merge-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-top: 2px;
+	}
+	.chip {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 3px 8px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-4);
+		color: var(--k-text-2);
+	}
+	.src-none {
+		font-size: 12px;
+		color: var(--k-text-faint);
+	}
+	.merge-arrow {
+		display: grid;
+		place-items: center;
+		font-size: 22px;
+		color: var(--k-text-faint);
+	}
+	.modal-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 10px;
+		margin-top: var(--k-space-2);
+	}
+	.danger-btn {
+		height: 42px;
+		padding: 0 22px;
+		border: none;
+		border-radius: var(--k-radius-md);
+		background: var(--k-accent);
+		color: #1a0d08;
+		font-family: var(--k-font-sans);
+		font-weight: 700;
+		font-size: 13.5px;
+		cursor: pointer;
+	}
+	.danger-btn:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	@media (max-width: 640px) {
+		.merge-cards {
+			grid-template-columns: 1fr;
+		}
+		.merge-arrow {
+			transform: rotate(90deg);
+		}
 	}
 </style>

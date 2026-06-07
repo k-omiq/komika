@@ -4,16 +4,8 @@
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
+	import { FLAG, STATUS_META, type ComicType, type Status } from '$lib/data/types';
 	import {
-		ALL_GENRES,
-		FLAG,
-		STATUS_META,
-		type CatalogEntry,
-		type ComicType,
-		type Status,
-	} from '$lib/data/types';
-	import {
-		getBrowseCatalog,
 		getFederatedSearch,
 		getNativeSearch,
 		type FederatedResultView,
@@ -21,102 +13,24 @@
 	import { auth } from '$lib/auth.svelte';
 
 	let { data } = $props();
-	// Filters stay interactive while the catalog streams in; the results area
-	// shows a skeleton until it resolves. `data.catalog` never rejects.
-	let catalog = $state<CatalogEntry[]>([]);
-	let loading = $state(true);
-	let catalogError = $state(false);
-	$effect(() => {
-		loading = true;
-		catalogError = false;
-		data.catalog.then((r) => {
-			catalog = r.items;
-			catalogError = r.error;
-			loading = false;
-		});
-	});
 
-	async function retryCatalog(): Promise<void> {
-		loading = true;
-		catalogError = false;
-		const r = await getBrowseCatalog();
-		catalog = r.items;
-		catalogError = r.error;
-		loading = false;
-	}
+	// Genre facets (S4): the full genre set across the persisted catalogue, most
+	// common first, driving the genre multi-select. `data.facets` never rejects.
+	let facets = $state<{ genre: string; count: number }[]>([]);
+	$effect(() => {
+		data.facets.then((f) => (facets = f));
+	});
 
 	const params = page.url.searchParams;
 	let query = $state(params.get('q') ?? '');
-
-	// Search: signed-in viewers get FEDERATED search across every installed
-	// extension (deduped works tagged with their sources/"translators"). The
-	// federated query is login-gated + rate-limited on the server, so signed-out
-	// viewers fall back to the public NATIVE catalogue search (no translator tags),
-	// and rate-limit/errors surface an honest notice instead of an empty grid.
-	// Debounced so we don't fan out on every keystroke.
-	let federated = $state<FederatedResultView[]>([]);
-	let fedLoading = $state(false);
-	let searchNotice = $state<string | null>(null);
-	const queryActive = $derived(query.trim().length > 0);
-
-	$effect(() => {
-		const q = query.trim();
-		const loggedIn = !!auth.user; // re-run when sign-in state flips
-		if (!q) {
-			fedLoading = false;
-			federated = [];
-			searchNotice = null;
-			return;
-		}
-		fedLoading = true;
-		let cancelled = false;
-		const t = setTimeout(async () => {
-			try {
-				// Signed-out (or no federation backend): public native search.
-				if (!loggedIn) {
-					const rows = await getNativeSearch(q);
-					if (!cancelled) {
-						federated = rows;
-						searchNotice = null;
-					}
-					return;
-				}
-				const outcome = await getFederatedSearch(q);
-				if (cancelled) return;
-				if (outcome.kind === 'ok') {
-					federated = outcome.rows;
-					searchNotice = null;
-				} else if (outcome.kind === 'rateLimited') {
-					// Keep any prior results visible; show a transient message, not "0 results".
-					searchNotice =
-						outcome.retryAfter != null
-							? `Too many searches — try again in ${outcome.retryAfter}s.`
-							: 'Too many searches — try again in a moment.';
-				} else {
-					// Not authenticated / unexpected error → public native fallback so results
-					// still appear; flag genuine errors distinctly from "no matches".
-					const rows = await getNativeSearch(q);
-					if (cancelled) return;
-					federated = rows;
-					searchNotice =
-						outcome.kind === 'error'
-							? 'Live search had a problem — showing catalogue results.'
-							: null;
-				}
-			} finally {
-				if (!cancelled) fedLoading = false;
-			}
-		}, 280);
-		return () => {
-			cancelled = true;
-			clearTimeout(t);
-		};
-	});
 	let types = $state<ComicType[]>(params.get('type') ? [params.get('type') as ComicType] : []);
-	let genres = $state<string[]>(params.get('genre') ? [params.get('genre')!] : []);
+	let selectedGenres = $state<string[]>(params.get('genre') ? [params.get('genre')!] : []);
 	let status = $state<Status | 'any'>('any');
+	// Rating is a dual-handle range on the 0–10 scale (10 = no upper bound).
 	let minRating = $state(0);
+	let maxRating = $state(10);
 	let sort = $state<'trending' | 'rating' | 'newest' | 'chapters'>('trending');
+	let genreQuery = $state(''); // filters the (long) facet list
 
 	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
 
@@ -124,49 +38,168 @@
 		return arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v];
 	}
 
-	// When a query is active, results come from the federated (all-extensions)
-	// search — already matched server-side, so we don't substring-filter again.
-	// With no query, the native catalog is browsed. The facet filters + sort apply
-	// to both. Federated rows carry `translators`; native rows don't.
-	type ResultRow = CatalogEntry & { translators?: FederatedResultView['translators'] };
+	// The facet list filtered by the genre search box (case-insensitive), always
+	// keeping already-selected genres visible.
+	const shownFacets = $derived.by(() => {
+		const q = genreQuery.trim().toLowerCase();
+		if (!q) return facets;
+		return facets.filter(
+			(f) => f.genre.toLowerCase().includes(q) || selectedGenres.includes(f.genre),
+		);
+	});
+
+	// ---- rows: server-filtered native / client-filtered federated -------------
+	// Signed-in viewers get FEDERATED search across every installed extension
+	// (deduped works tagged with translators); genre/rating filtering there is
+	// client-side (searchAllSources takes no filter args) so a filter change does
+	// NOT re-fan-out (protects the rate limit). Everything else — an empty query
+	// (whole-catalogue browse) or a signed-out text search — goes to the public
+	// NATIVE search with genre/rating applied SERVER-side, re-fetching on change.
+	let rows = $state<FederatedResultView[]>([]);
+	let rowsLoading = $state(true);
+	let rowsError = $state(false);
+	let rowsAreFederated = $state(false);
+	let searchNotice = $state<string | null>(null);
+	let reloadKey = $state(0);
+	const queryActive = $derived(query.trim().length > 0);
+
+	function serverFilters() {
+		return {
+			genres: [...selectedGenres],
+			minRating: minRating > 0 ? minRating : undefined,
+			maxRating: maxRating < 10 ? maxRating : undefined,
+		};
+	}
+
+	$effect(() => {
+		const q = query.trim();
+		const loggedIn = !!auth.user;
+		reloadKey; // manual retry re-runs the fetch
+		const isFederated = !!q && loggedIn;
+		// Reading the filter state HERE (synchronously) only for the native path makes
+		// the effect depend on it → native re-fetches on filter change; the federated
+		// branch skips these reads so it re-fetches only on query/auth change.
+		const nativeFilters = isFederated ? null : serverFilters();
+		rowsLoading = true;
+		let cancelled = false;
+		const t = setTimeout(async () => {
+			try {
+				if (isFederated) {
+					const outcome = await getFederatedSearch(q);
+					if (cancelled) return;
+					if (outcome.kind === 'ok') {
+						rows = outcome.rows;
+						rowsAreFederated = true;
+						rowsError = false;
+						searchNotice = null;
+					} else if (outcome.kind === 'rateLimited') {
+						// Keep prior results; show a transient message, not "0 results".
+						searchNotice =
+							outcome.retryAfter != null
+								? `Too many searches — try again in ${outcome.retryAfter}s.`
+								: 'Too many searches — try again in a moment.';
+					} else {
+						// Not authenticated / error → public native fallback (server-filtered).
+						const r = await getNativeSearch(q, serverFilters());
+						if (cancelled) return;
+						rows = r.items;
+						rowsAreFederated = false;
+						rowsError = r.error;
+						searchNotice =
+							outcome.kind === 'error'
+								? 'Live search had a problem — showing catalogue results.'
+								: null;
+					}
+				} else {
+					const r = await getNativeSearch(q, nativeFilters!);
+					if (cancelled) return;
+					rows = r.items;
+					rowsAreFederated = false;
+					rowsError = r.error;
+					searchNotice = null;
+				}
+			} finally {
+				if (!cancelled) rowsLoading = false;
+			}
+		}, q ? 280 : 160);
+		return () => {
+			cancelled = true;
+			clearTimeout(t);
+		};
+	});
+
+	function retryRows() {
+		reloadKey++;
+	}
+
+	// Client-side facets the server search doesn't cover (type, status), plus
+	// genre/rating for FEDERATED rows (native rows are already server-filtered).
 	const results = $derived.by(() => {
-		const base: ResultRow[] = queryActive ? federated : catalog;
-		const list = base.filter((m) => {
+		const gsel = selectedGenres.map((g) => g.toLowerCase());
+		const list = rows.filter((m) => {
 			if (types.length && !types.includes(m.type)) return false;
-			if (genres.length && !genres.includes(m.genre)) return false;
 			if (status !== 'any' && m.status !== status) return false;
-			if (minRating && m.rating < minRating) return false;
+			if (rowsAreFederated) {
+				if (gsel.length && !m.genres.some((mg) => gsel.includes(mg.toLowerCase()))) return false;
+				if (minRating > 0 && m.rating < minRating) return false;
+				if (maxRating < 10 && m.rating > maxRating) return false;
+			}
 			return true;
 		});
 		const sorters = {
-			trending: (a: ResultRow, b: ResultRow) => b.rating - a.rating || b.ch - a.ch,
-			rating: (a: ResultRow, b: ResultRow) => b.rating - a.rating,
-			newest: (a: ResultRow, b: ResultRow) => a.added - b.added,
-			chapters: (a: ResultRow, b: ResultRow) => b.ch - a.ch,
+			trending: (a: FederatedResultView, b: FederatedResultView) =>
+				b.rating - a.rating || b.ch - a.ch,
+			rating: (a: FederatedResultView, b: FederatedResultView) => b.rating - a.rating,
+			newest: (a: FederatedResultView, b: FederatedResultView) => a.added - b.added,
+			chapters: (a: FederatedResultView, b: FederatedResultView) => b.ch - a.ch,
 		};
 		return [...list].sort(sorters[sort]);
 	});
 
-	// The results area is loading when the relevant source is still resolving.
-	const resultsLoading = $derived(queryActive ? fedLoading : loading);
+	const resultsLoading = $derived(rowsLoading);
+	const catalogError = $derived(rowsError);
 
 	const anyFilter = $derived(
-		types.length > 0 || genres.length > 0 || status !== 'any' || minRating > 0,
+		types.length > 0 ||
+			selectedGenres.length > 0 ||
+			status !== 'any' ||
+			minRating > 0 ||
+			maxRating < 10,
 	);
-	const minRatingLabel = $derived(minRating > 0 ? minRating.toFixed(1) + '+' : 'Any');
+	const ratingLabel = $derived(
+		minRating === 0 && maxRating >= 10
+			? 'Any'
+			: `${minRating.toFixed(1)} – ${maxRating >= 10 ? '10' : maxRating.toFixed(1)}`,
+	);
 
 	const activePills = $derived.by(() => {
 		const pills: { label: string; remove: () => void }[] = [];
 		types.forEach((t) =>
 			pills.push({ label: `${FLAG[t]}  ${t}`, remove: () => (types = toggle(types, t)) }),
 		);
-		genres.forEach((g) => pills.push({ label: g, remove: () => (genres = toggle(genres, g)) }));
+		selectedGenres.forEach((g) =>
+			pills.push({ label: g, remove: () => (selectedGenres = toggle(selectedGenres, g)) }),
+		);
 		if (status !== 'any')
 			pills.push({ label: STATUS_META[status].label, remove: () => (status = 'any') });
-		if (minRating)
-			pills.push({ label: minRating.toFixed(1) + '+ rating', remove: () => (minRating = 0) });
+		if (minRating > 0 || maxRating < 10)
+			pills.push({
+				label: `${ratingLabel} rating`,
+				remove: () => {
+					minRating = 0;
+					maxRating = 10;
+				},
+			});
 		return pills;
 	});
+
+	// Dual-handle rating slider: keep min ≤ max as either thumb is dragged.
+	function onMinRating() {
+		if (minRating > maxRating) minRating = maxRating;
+	}
+	function onMaxRating() {
+		if (maxRating < minRating) maxRating = minRating;
+	}
 
 	const sortChips = [
 		{ key: 'trending', label: 'Trending' },
@@ -175,11 +208,15 @@
 		{ key: 'chapters', label: 'Most ch.' },
 	] as const;
 
+	// Mobile: the filter rail collapses into a bottom sheet toggled by this flag.
+	let filtersOpen = $state(false);
+
 	function resetFilters() {
 		types = [];
-		genres = [];
+		selectedGenres = [];
 		status = 'any';
 		minRating = 0;
+		maxRating = 10;
 	}
 	function resetAll() {
 		query = '';
@@ -218,10 +255,17 @@
 </div>
 
 <div class="body k-gutter">
-	<aside class="rail">
+	{#if filtersOpen}
+		<button class="filter-scrim" aria-label="Close filters" onclick={() => (filtersOpen = false)}
+		></button>
+	{/if}
+	<aside class="rail" class:open={filtersOpen}>
 		<div class="rail-head">
 			<span class="rail-title">Filters</span>
-			{#if anyFilter}<button class="reset" onclick={resetFilters}>Reset</button>{/if}
+			<div class="rail-head-right">
+				{#if anyFilter}<button class="reset" onclick={resetFilters}>Reset</button>{/if}
+				<button class="sheet-done" onclick={() => (filtersOpen = false)}>Done</button>
+			</div>
 		</div>
 
 		<div class="group">
@@ -240,15 +284,44 @@
 		</div>
 
 		<div class="group">
-			<span class="glabel">Genre</span>
-			<div class="chips">
-				{#each ALL_GENRES as g (g)}
-					<button
-						class="chip"
-						class:on={genres.includes(g)}
-						onclick={() => (genres = toggle(genres, g))}>{g}</button
+			<div class="glabel-row">
+				<span class="glabel">Genre</span>
+				{#if selectedGenres.length}<span class="glabel-count">{selectedGenres.length} selected</span
+					>{/if}
+			</div>
+			<div class="genre-search">
+				<Icon name="search" size={15} stroke="#87857f" />
+				<input bind:value={genreQuery} placeholder="Filter genres…" aria-label="Filter genres" />
+				{#if genreQuery}
+					<button class="gs-clear" aria-label="Clear" onclick={() => (genreQuery = '')}
+						><Icon name="x" size={14} /></button
 					>
-				{/each}
+				{/if}
+			</div>
+			<div class="genre-list">
+				{#if facets.length === 0}
+					<span class="genre-empty">Genres load with the catalogue…</span>
+				{:else}
+					{#each shownFacets as f (f.genre)}
+						<button
+							class="genre-opt"
+							class:on={selectedGenres.includes(f.genre)}
+							onclick={() => (selectedGenres = toggle(selectedGenres, f.genre))}
+						>
+							<span class="go-check" aria-hidden="true">
+								{#if selectedGenres.includes(f.genre)}<Icon
+										name="check"
+										size={12}
+										strokeWidth={2.6}
+									/>{/if}
+							</span>
+							<span class="go-name">{f.genre}</span>
+							<span class="go-count">{f.count}</span>
+						</button>
+					{:else}
+						<span class="genre-empty">No genres match “{genreQuery}”.</span>
+					{/each}
+				{/if}
 			</div>
 		</div>
 
@@ -269,28 +342,49 @@
 
 		<div class="group">
 			<div class="rating-head">
-				<span class="glabel">Minimum rating</span>
+				<span class="glabel">Rating</span>
 				<span class="rating-val">
-					{#if minRating > 0}<Icon
+					{#if minRating > 0 || maxRating < 10}<Icon
 							name="star"
 							size={12}
 							fill="var(--k-star)"
-						/>{/if}{minRatingLabel}
+						/>{/if}{ratingLabel}
 				</span>
 			</div>
-			<input
-				type="range"
-				min="0"
-				max="9.5"
-				step="0.5"
-				bind:value={minRating}
-				class="rating-slider"
-			/>
-			<div class="rating-scale"><span>Any</span><span>9.5+</span></div>
+			<div class="range" style="--min:{(minRating / 10) * 100}%;--max:{(maxRating / 10) * 100}%">
+				<div class="range-rail"></div>
+				<div class="range-fill"></div>
+				<input
+					class="range-input"
+					type="range"
+					min="0"
+					max="10"
+					step="0.5"
+					bind:value={minRating}
+					oninput={onMinRating}
+					aria-label="Minimum rating"
+				/>
+				<input
+					class="range-input"
+					type="range"
+					min="0"
+					max="10"
+					step="0.5"
+					bind:value={maxRating}
+					oninput={onMaxRating}
+					aria-label="Maximum rating"
+				/>
+			</div>
+			<div class="rating-scale"><span>0</span><span>10</span></div>
 		</div>
 	</aside>
 
 	<div class="results">
+		<button class="filter-trigger" onclick={() => (filtersOpen = true)}>
+			<Icon name="sliders-h" size={16} />Filters{#if activePills.length}<span class="ft-badge"
+					>{activePills.length}</span
+				>{/if}
+		</button>
 		<div class="results-head">
 			<div class="results-title">
 				<span class="rt">{query.trim() ? `"${query.trim()}"` : 'All series'}</span>
@@ -355,7 +449,7 @@
 				<div class="empty-desc">
 					Something went wrong reaching the server. Check your connection and try again.
 				</div>
-				<button class="empty-btn" onclick={retryCatalog}>Retry</button>
+				<button class="empty-btn" onclick={retryRows}>Retry</button>
 			</div>
 		{:else if !searchNotice}
 			<div class="empty">
@@ -534,10 +628,172 @@
 		font-weight: 700;
 		color: var(--k-text);
 	}
-	.rating-slider {
-		width: 100%;
-		accent-color: var(--k-star);
+	/* genre multi-select (S4) */
+	.glabel-row {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 8px;
+	}
+	.glabel-count {
+		font-size: 11px;
+		font-weight: 700;
+		color: var(--k-primary);
+	}
+	.genre-search {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		height: 36px;
+		padding: 0 8px 0 12px;
+		border-radius: 9px;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-3);
+	}
+	.genre-search:focus-within {
+		border-color: var(--k-border-strong);
+	}
+	.genre-search input {
+		flex: 1;
+		min-width: 0;
+		background: transparent;
+		border: none;
+		outline: none;
+		color: var(--k-text);
+		font-size: 13px;
+	}
+	.gs-clear {
+		width: 26px;
+		height: 26px;
+		border: none;
+		background: transparent;
+		color: var(--k-text-faint);
 		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.genre-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		max-height: 232px;
+		overflow-y: auto;
+		padding-right: 2px;
+	}
+	.genre-opt {
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		padding: 7px 9px;
+		border-radius: 8px;
+		border: 1px solid transparent;
+		background: transparent;
+		color: var(--k-text-3);
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+		text-align: left;
+		transition: background 0.12s;
+	}
+	.genre-opt:hover {
+		background: var(--k-hover-fill);
+	}
+	.genre-opt.on {
+		background: rgba(224, 131, 105, 0.12);
+		border-color: rgba(224, 131, 105, 0.4);
+		color: var(--k-text-bright);
+	}
+	.go-check {
+		width: 18px;
+		height: 18px;
+		flex: 0 0 auto;
+		border-radius: 5px;
+		border: 1px solid var(--k-border-3);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--k-on-primary);
+	}
+	.genre-opt.on .go-check {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+	}
+	.go-name {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.go-count {
+		flex: 0 0 auto;
+		font-size: 11.5px;
+		font-weight: 700;
+		color: var(--k-text-faint);
+	}
+	.genre-empty {
+		font-size: 12.5px;
+		color: var(--k-text-faint);
+		padding: 6px 2px;
+	}
+	/* dual-handle rating range slider */
+	.range {
+		position: relative;
+		height: 24px;
+		--min: 0%;
+		--max: 100%;
+	}
+	.range-rail,
+	.range-fill {
+		position: absolute;
+		top: 50%;
+		height: 4px;
+		border-radius: 4px;
+		transform: translateY(-50%);
+		pointer-events: none;
+	}
+	.range-rail {
+		left: 0;
+		right: 0;
+		background: var(--k-border-4);
+	}
+	.range-fill {
+		left: var(--min);
+		right: calc(100% - var(--max));
+		background: var(--k-star);
+	}
+	/* Two native range inputs stacked; only the thumbs receive pointer events so
+	   both handles stay grabbable. */
+	.range-input {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		margin: 0;
+		background: transparent;
+		-webkit-appearance: none;
+		appearance: none;
+		pointer-events: none;
+	}
+	.range-input::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		appearance: none;
+		width: 18px;
+		height: 18px;
+		border-radius: 50%;
+		background: var(--k-text-bright);
+		border: 2px solid var(--k-star);
+		cursor: pointer;
+		pointer-events: auto;
+	}
+	.range-input::-moz-range-thumb {
+		width: 18px;
+		height: 18px;
+		border-radius: 50%;
+		background: var(--k-text-bright);
+		border: 2px solid var(--k-star);
+		cursor: pointer;
+		pointer-events: auto;
 	}
 	.rating-scale {
 		display: flex;
@@ -680,6 +936,21 @@
 		font-size: 13.5px;
 		cursor: pointer;
 	}
+	/* Mobile filter sheet controls — hidden on desktop/tablet. */
+	.rail-head-right {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+	}
+	.sheet-done {
+		display: none;
+	}
+	.filter-trigger {
+		display: none;
+	}
+	.filter-scrim {
+		display: none;
+	}
 	@media (max-width: 820px) {
 		.body {
 			grid-template-columns: 1fr;
@@ -687,6 +958,86 @@
 		}
 		.rail {
 			position: static;
+		}
+	}
+	@media (max-width: 640px) {
+		/* Rail becomes a bottom sheet; results take the full width with a Filters
+		   trigger. Declared after the 820 block so it wins the shared props. */
+		.filter-trigger {
+			display: inline-flex;
+			align-items: center;
+			gap: 8px;
+			align-self: flex-start;
+			height: 40px;
+			padding: 0 16px;
+			margin-bottom: 4px;
+			border-radius: var(--k-radius-pill);
+			background: var(--k-surface-2);
+			border: 1px solid var(--k-border-3);
+			color: var(--k-text);
+			font-size: 13.5px;
+			font-weight: 700;
+			cursor: pointer;
+		}
+		.ft-badge {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 18px;
+			height: 18px;
+			padding: 0 5px;
+			border-radius: 9px;
+			background: var(--k-primary);
+			color: var(--k-on-primary);
+			font-size: 11px;
+			font-weight: 800;
+		}
+		.filter-scrim {
+			display: block;
+			position: fixed;
+			inset: 0;
+			z-index: 59;
+			border: none;
+			background: rgba(8, 8, 9, 0.55);
+			backdrop-filter: blur(2px);
+		}
+		.rail {
+			position: fixed;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			top: auto;
+			z-index: 60;
+			max-height: 84vh;
+			overflow-y: auto;
+			gap: 22px;
+			padding: 18px 20px calc(24px + env(safe-area-inset-bottom));
+			background: var(--k-surface-3);
+			border: 1px solid var(--k-border-2);
+			border-radius: 18px 18px 0 0;
+			box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.5);
+			transform: translateY(110%);
+			transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+		}
+		.rail.open {
+			transform: translateY(0);
+		}
+		.sheet-done {
+			display: inline-flex;
+			align-items: center;
+			height: 32px;
+			padding: 0 16px;
+			border-radius: var(--k-radius-pill);
+			background: var(--k-primary);
+			border: none;
+			color: var(--k-on-primary);
+			font-size: 13px;
+			font-weight: 700;
+			cursor: pointer;
+		}
+		.grid {
+			grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+			gap: 22px 14px;
 		}
 	}
 </style>

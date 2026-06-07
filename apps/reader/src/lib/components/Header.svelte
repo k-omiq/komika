@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { auth, logout } from '$lib/auth.svelte';
+	import { config } from '$lib/config';
 	import { theme, cycleTheme, resolvedTheme } from '$lib/theme.svelte';
 	import Icon from './Icon.svelte';
 	import Avatar from './Avatar.svelte';
@@ -94,17 +95,20 @@
 		<button class="icon-btn" aria-label="Search" onclick={() => (searchOpen = true)}>
 			<Icon name="search" size={21} />
 		</button>
+		{#if config.sponsorUrl}
+			<a
+				class="icon-btn sponsor"
+				href={config.sponsorUrl}
+				target="_blank"
+				rel="noopener noreferrer"
+				aria-label="Sponsor"
+				title="Sponsor komiq"
+			>
+				<Icon name="heart" size={19} />
+			</a>
+		{/if}
 		<a
-			class="icon-btn donate"
-			class:on={isActive('/donate')}
-			href="/donate"
-			aria-label="Donate"
-			title="Support komiq"
-		>
-			<Icon name="heart" size={19} fill={isActive('/donate') ? 'currentColor' : 'none'} />
-		</a>
-		<a
-			class="icon-btn"
+			class="icon-btn support-btn"
 			class:on={isActive('/support')}
 			href="/support"
 			aria-label="Support"
@@ -218,8 +222,7 @@
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
 	}
-	.icon-btn.donate:hover,
-	.icon-btn.donate.on {
+	.icon-btn.sponsor:hover {
 		border-color: rgba(224, 131, 105, 0.5);
 		color: var(--k-accent);
 	}
@@ -344,11 +347,24 @@
 		color: var(--k-accent);
 	}
 	@media (max-width: 640px) {
-		.left {
-			gap: 20px;
-		}
+		/* Primary nav moves to the bottom tab bar; keep only the brand on the left. */
 		nav {
-			gap: 18px;
+			display: none;
+		}
+		.left {
+			gap: 0;
+		}
+		.right {
+			gap: 8px;
+		}
+		/* Trim secondary icons on mobile: support lives in the footer/menu. Theme,
+		   search and the account control stay reachable. */
+		.support-btn {
+			display: none;
+		}
+		.icon-btn {
+			width: 38px;
+			height: 38px;
 		}
 	}
 </style>

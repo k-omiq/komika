@@ -566,6 +566,37 @@ pub struct FederatedSearchPage {
     pub sources_queried: i32,
 }
 
+/// One genre/tag facet for the search filter UI (S4): a genre name and how many
+/// cached series carry it. The full set the sources provide, not a hardcoded list.
+#[derive(SimpleObject, Clone)]
+pub struct GenreFacet {
+    pub genre: String,
+    pub count: i32,
+}
+
+/// One source that provides a given chapter number of a work (S2 aggregation).
+/// `suwayomiMangaId` (for a Suwayomi source) is the id the reader passes to
+/// `chapters(seriesId:)` to read this source's copy; `chapterId` is the specific
+/// chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid).
+#[derive(SimpleObject, Clone)]
+pub struct ChapterSource {
+    pub source_type: String,
+    pub source_id: String,
+    pub suwayomi_manga_id: Option<ID>,
+    pub chapter_id: ID,
+    pub scanlator: Option<String>,
+}
+
+/// One aggregated chapter of a work — a chapter NUMBER available across one or
+/// more sources (S2). Deduped by number; `sources` keeps per-source availability
+/// so the reader can pick a translator.
+#[derive(SimpleObject, Clone)]
+pub struct AggregatedChapter {
+    pub number: f64,
+    pub title: Option<String>,
+    pub sources: Vec<ChapterSource>,
+}
+
 /// Result of folding one canonical work into another (D1 admin merge).
 #[derive(SimpleObject, Clone)]
 pub struct MergeWorksResult {

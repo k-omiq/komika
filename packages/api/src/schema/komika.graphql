@@ -20,10 +20,12 @@ type Query {
 	# catalog
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
 	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, newest-first
-	search(query: String!, page: Int = 1): SeriesPage! # [suwayomi] source/library search
+	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float): SeriesPage! # [komika] S4: catalogue search. Empty query browses the persisted catalogue from the DB (filterable); text query does a live source search. `genres` matches ANY (case-insensitive); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated)
+	genreFacets: [GenreFacet!]! # [komika] S4: available genre/tag facets across the persisted catalogue (most common first) — drives the search UI's genre filter
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
-	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
+	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId}) — one source's chapter list (served from the DB cache, S1)
+	aggregatedChapters(workId: ID!): [AggregatedChapter!]! # [komika] S2: a canonical work's chapters aggregated across ALL sources (installed Suwayomi sources + MangaDex mirror), deduped by number, each carrying per-source availability so the reader can pick a translator
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
 	canonicalUpdates(page: Int = 1): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed)
 	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
@@ -85,6 +87,7 @@ type Mutation {
 	startExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: start an ingest job for EVERY installed source of an extension (e.g. MangaDex's per-language sources); skips NSFW sources for opted-out admin + sources with a job already running (returns their existing job); errors only if no source matches (requires isAdmin)
 	cancelExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: cancel all running ingest jobs for an extension's sources; returns the cancelled jobs (requires isAdmin)
 	backfillMangadexMetadata(limit: Int = 200): Int! # [komika] S2 enrichment backfill — processes up to `limit` un-enriched MangaDex-anchored works (all-language alt titles/descriptions + full credits); returns count processed; call until it returns 0 to drain (requires isAdmin)
+	persistCatalogue: Int! # [komika] S1 "save everything to DB" — materialize the whole Suwayomi library (metadata + chapter lists) into the DB cache so reader loads serve from SQLite; returns series persisted; prod maintenance action gated by isAdmin (no extra flag)
 }
 
 enum ComicType {
@@ -153,6 +156,11 @@ type RatingSummary {
 	average: Float!
 	count: Int!
 	distribution: [Int!]! # length 10; index 0 => score 1
+}
+
+type GenreFacet { # [komika] S4 search filter facet
+	genre: String!
+	count: Int! # cached series carrying this genre
 }
 
 type ScanPolicy {
@@ -543,4 +551,21 @@ type MergeCandidate {
 type MergeWorksResult {
 	targetWorkId: ID! # the surviving (target) work
 	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
+}
+
+# [komika] S2 cross-source chapter aggregation. `Series.chapterCount` on a canonical
+# work now reflects the AGGREGATE (distinct chapter numbers across all sources), so a
+# work whose MangaDex spine has 0 chapters but whose asurascans source has 201 reports 201.
+type AggregatedChapter {
+	number: Float!
+	title: String
+	sources: [ChapterSource!]! # every source (translator) that provides this chapter number
+}
+
+type ChapterSource {
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceId: String!
+	suwayomiMangaId: ID # for a Suwayomi source: pass to chapters(seriesId:) to read this source's copy; null for the MangaDex mirror
+	chapterId: ID! # the specific chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid)
+	scanlator: String
 }

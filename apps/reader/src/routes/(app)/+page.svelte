@@ -410,11 +410,44 @@
 		border-bottom-color: rgba(255, 255, 255, 0.3);
 	}
 	@media (max-width: 640px) {
-		.hero {
-			height: 460px;
+		.hero,
+		.hero-loading {
+			height: 440px;
+		}
+		.hero-info {
+			bottom: 40px;
+			max-width: none;
+			right: var(--k-gutter);
 		}
 		.hero-info h1 {
-			font-size: 40px;
+			font-size: 36px;
+		}
+		.dots {
+			bottom: 46px;
+		}
+		.sections {
+			gap: 40px;
+			padding-top: 40px;
+			padding-bottom: 56px;
+		}
+		.format-grid {
+			grid-template-columns: 1fr;
+			gap: 14px;
+		}
+		.format-card {
+			padding: 20px 22px;
+		}
+		.block h2 {
+			font-size: 19px;
+		}
+		/* Snappy, touch-friendly horizontal carousels. */
+		.row {
+			gap: 16px;
+			scroll-snap-type: x proximity;
+			-webkit-overflow-scrolling: touch;
+		}
+		.genres {
+			gap: 18px 22px;
 		}
 	}
 </style>

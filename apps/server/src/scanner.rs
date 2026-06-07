@@ -366,6 +366,15 @@ pub async fn scan_series(
     let series_id = m.id.to_string();
     let admin = scan_admin(&state.pool, &series_id).await;
     let chapters = state.suwayomi.chapters(m.id).await?;
+    // S1: persist the series metadata + chapter list to the DB cache so reader
+    // requests serve from SQLite instead of live-fetching. Best-effort — a cache
+    // write must never fail the scan.
+    if let Err(e) = crate::series_cache::put_series(&state.pool, m).await {
+        tracing::warn!(series_id, error = %e, "scan: series cache write failed");
+    }
+    if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, &chapters).await {
+        tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
+    }
     record_scan(&state.pool, &series_id, &m.title, &admin, &chapters, now).await
 }
 

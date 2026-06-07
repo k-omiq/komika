@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	AggregatedChapter,
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
@@ -8,9 +9,11 @@ import type {
 	DiscoveryFeed,
 	ExtensionInfo,
 	FederatedSearchPage,
+	GenreFacet,
 	Id,
 	MatchResult,
 	MergeCandidate,
+	MergeWorksResult,
 	Page,
 	Paginated,
 	Review,
@@ -30,6 +33,7 @@ import type {
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
+	SearchFilters,
 	SeriesAdminInput,
 	Session,
 	UpdateProfileInput,
@@ -100,8 +104,14 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page });
 		return d.updates;
 	}
-	async search(query: string, page = 1): Promise<Paginated<Series>> {
-		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, { query, page });
+	async search(query: string, page = 1, filters?: SearchFilters): Promise<Paginated<Series>> {
+		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, {
+			query,
+			page,
+			genres: filters?.genres && filters.genres.length ? filters.genres : undefined,
+			minRating: filters?.minRating,
+			maxRating: filters?.maxRating,
+		});
 		return d.search;
 	}
 	async searchAllSources(query: string, page = 1): Promise<FederatedSearchPage> {
@@ -111,6 +121,10 @@ export class GraphQLBackend implements Backend {
 		});
 		return d.searchAllSources;
 	}
+	async genreFacets(): Promise<GenreFacet[]> {
+		const d = await this.gql<{ genreFacets: GenreFacet[] }>(ops.GENRE_FACETS);
+		return d.genreFacets;
+	}
 	async series(id: Id): Promise<Series> {
 		const d = await this.gql<{ series: Series }>(ops.SERIES, { id });
 		return d.series;
@@ -118,6 +132,12 @@ export class GraphQLBackend implements Backend {
 	async chapters(seriesId: Id): Promise<Chapter[]> {
 		const d = await this.gql<{ chapters: Chapter[] }>(ops.CHAPTERS, { seriesId });
 		return d.chapters;
+	}
+	async aggregatedChapters(workId: Id): Promise<AggregatedChapter[]> {
+		const d = await this.gql<{ aggregatedChapters: AggregatedChapter[] }>(ops.AGGREGATED_CHAPTERS, {
+			workId,
+		});
+		return d.aggregatedChapters;
 	}
 	async pages(chapterId: Id): Promise<Page[]> {
 		const d = await this.gql<{ pages: Page[] }>(ops.PAGES, { chapterId });
@@ -224,6 +244,14 @@ export class GraphQLBackend implements Backend {
 			suwayomiMangaId,
 		});
 		return d.addSourceSeries;
+	}
+
+	async mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
+		const d = await this.gql<{ mergeWorks: MergeWorksResult }>(ops.MERGE_WORKS, {
+			sourceWorkId,
+			targetWorkId,
+		});
+		return d.mergeWorks;
 	}
 
 	// --- admin sources & extensions (EXT-1/EXT-2) ---
@@ -336,6 +364,12 @@ export class GraphQLBackend implements Backend {
 			{ pkgName },
 		);
 		return d.cancelExtensionIngest;
+	}
+
+	// --- admin maintenance ---
+	async persistCatalogue(): Promise<number> {
+		const d = await this.gql<{ persistCatalogue: number }>(ops.PERSIST_CATALOGUE);
+		return d.persistCatalogue;
 	}
 
 	// --- viewer preferences ---

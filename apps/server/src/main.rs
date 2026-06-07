@@ -9,6 +9,7 @@ mod ingest;
 mod mangadex;
 mod phash;
 mod scanner;
+mod series_cache;
 mod suwayomi;
 
 use std::sync::Arc;

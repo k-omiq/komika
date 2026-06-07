@@ -19,6 +19,7 @@
 		loadExtensions,
 		loadSourceIngestJobs,
 		loadSources,
+		persistCatalogue,
 		startExtensionIngest,
 		startSourceIngest,
 		uninstallExtension,
@@ -31,6 +32,32 @@
 	});
 
 	let tab = $state<'extensions' | 'catalogue'>('extensions');
+
+	// ---- Maintenance: persist whole catalogue to the DB cache -----------------
+	// Materializes the entire Suwayomi library into the DB read-cache that the
+	// reader now reads from (metadata synchronously; chapter lists in a server
+	// background task). Heavy on a large real catalogue, so it's behind a confirm
+	// step. Execution is gated server-side by require_admin — that IS the prod gate.
+	let persistConfirm = $state(false);
+	let persisting = $state(false);
+	let persistError = $state<string | null>(null);
+	/** Series count from the last successful run, for honest reporting. */
+	let persistCount = $state<number | null>(null);
+
+	async function runPersistCatalogue(): Promise<void> {
+		if (persisting) return;
+		persisting = true;
+		persistError = null;
+		persistCount = null;
+		try {
+			persistCount = await persistCatalogue();
+			persistConfirm = false;
+		} catch (err) {
+			persistError = err instanceof Error ? err.message : 'Failed to persist the catalogue.';
+		} finally {
+			persisting = false;
+		}
+	}
 
 	// ---- Extensions tab -------------------------------------------------------
 	let exts = $state<ExtensionInfo[]>([]);
@@ -767,6 +794,51 @@
 		</div>
 	</div>
 
+	<section class="maint" aria-label="Maintenance">
+		<div class="maint-copy">
+			<div class="maint-head">
+				<span class="maint-kicker">Production maintenance</span>
+				<h2>Save everything to the DB</h2>
+			</div>
+			<p class="maint-lede">
+				Materialize the entire source library into the DB read-cache that home, series, updates and
+				chapters read from. Series metadata is saved immediately; chapter lists fill in a background
+				task afterwards. Safe to re-run; heavy on a large catalogue.
+			</p>
+			{#if persistError}
+				<p class="maint-msg error">{persistError}</p>
+			{:else if persistCount !== null}
+				<p class="maint-msg ok">
+					Persisted {persistCount} series to the DB. Chapter lists are filling in the background.
+				</p>
+			{/if}
+		</div>
+		<div class="maint-actions">
+			{#if persistConfirm}
+				<span class="maint-confirm-q">Save the whole catalogue now?</span>
+				<button class="act primary" disabled={persisting} onclick={runPersistCatalogue}>
+					{persisting ? 'Saving…' : 'Confirm save'}
+				</button>
+				<button class="act" disabled={persisting} onclick={() => (persistConfirm = false)}>
+					Cancel
+				</button>
+			{:else}
+				<button
+					class="act primary"
+					disabled={persisting}
+					onclick={() => {
+						persistError = null;
+						persistCount = null;
+						persistConfirm = true;
+					}}
+					title="Materialize the whole Suwayomi library into the DB read-cache"
+				>
+					{persisting ? 'Saving…' : 'Save everything to DB'}
+				</button>
+			{/if}
+		</div>
+	</section>
+
 	{#if tab === 'extensions'}
 		{#if extsError && exts.length === 0}
 			<div class="notice error">{extsError}</div>
@@ -1325,6 +1397,69 @@
 	.tabs button.on {
 		background: var(--k-primary);
 		color: var(--k-on-primary);
+	}
+	.maint {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--k-space-6);
+		flex-wrap: wrap;
+		padding: 16px 20px;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border);
+		border-radius: var(--k-radius-lg);
+	}
+	.maint-copy {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		min-width: 0;
+		flex: 1 1 340px;
+	}
+	.maint-head {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.maint-kicker {
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--k-accent-teal);
+	}
+	.maint-head h2 {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 18px;
+		color: var(--k-text-bright);
+	}
+	.maint-lede {
+		font-size: 13px;
+		color: var(--k-text-dim);
+		max-width: 68ch;
+		line-height: 1.45;
+	}
+	.maint-msg {
+		font-size: 12.5px;
+		font-weight: 600;
+	}
+	.maint-msg.ok {
+		color: var(--k-accent-teal);
+	}
+	.maint-msg.error {
+		color: #f0808a;
+	}
+	.maint-actions {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+	.maint-confirm-q {
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-1);
 	}
 	.notice {
 		padding: 14px 16px;

@@ -10,6 +10,7 @@ import type {
 	Id,
 	MatchResult,
 	MergeCandidate,
+	MergeWorksResult,
 	Paginated,
 	Series,
 	SeriesSourceGroup,
@@ -84,6 +85,19 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
 	if (!backend.resolveMergeCandidate)
 		throw new Error('Dedup review is unavailable on this backend.');
 	return backend.resolveMergeCandidate(id, accept);
+}
+
+/**
+ * Fold one canonical work into another (admin D1): re-point the source work's
+ * source_series mappings + user data to the target, then DELETE the source work.
+ * The target survives as canonical. IRREVERSIBLE.
+ */
+export async function mergeWorks(
+	sourceWorkId: Id,
+	targetWorkId: Id,
+): Promise<MergeWorksResult> {
+	if (!backend.mergeWorks) throw new Error('Work merge is unavailable on this backend.');
+	return backend.mergeWorks(sourceWorkId, targetWorkId);
 }
 
 /**
@@ -245,6 +259,18 @@ export async function cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJo
 	if (!backend.cancelExtensionIngest)
 		throw new Error('Extension ingest is unavailable on this backend.');
 	return backend.cancelExtensionIngest(pkgName);
+}
+
+/**
+ * Maintenance: materialize the whole Suwayomi library into the DB read-cache.
+ * Series metadata is written synchronously (the returned count); per-series
+ * chapter lists fill in a server-side background task. Admin-gated server-side.
+ * Returns how many series were persisted.
+ */
+export async function persistCatalogue(): Promise<number> {
+	if (!backend.persistCatalogue)
+		throw new Error('Catalogue persistence is unavailable on this backend.');
+	return backend.persistCatalogue();
 }
 
 export const STATUS_OPTIONS: SeriesStatus[] = [

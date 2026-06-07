@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	AggregatedChapter,
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
@@ -8,9 +9,11 @@ import type {
 	DiscoveryFeed,
 	ExtensionInfo,
 	FederatedSearchPage,
+	GenreFacet,
 	Id,
 	MatchResult,
 	MergeCandidate,
+	MergeWorksResult,
 	Page,
 	Paginated,
 	Review,
@@ -58,7 +61,13 @@ export interface Backend {
 	 * it with the source "Latest" endpoint.
 	 */
 	updates(page?: number): Promise<Paginated<Series>>;
-	search(query: string, page?: number): Promise<Paginated<Series>>;
+	/**
+	 * Catalogue search. An empty query serves the whole persisted catalogue; a text
+	 * query hits the live source index. `filters` (genres / rating range) are applied
+	 * server-side (genres match ANY, case-insensitive). Both are honoured on the
+	 * unified Komika API. (S4)
+	 */
+	search(query: string, page?: number, filters?: SearchFilters): Promise<Paginated<Series>>;
 	/**
 	 * Federated multi-extension catalogue search (S3): fans the query out to every
 	 * installed source, dedupes to one canonical work per series, and returns each
@@ -67,8 +76,16 @@ export interface Backend {
 	 * unified Komika API implements it.
 	 */
 	searchAllSources?(query: string, page?: number): Promise<FederatedSearchPage>;
+	/** The full genre/tag facet set across the persisted catalogue (S4), most-common
+	 *  first, for the search genre filter. Optional: only the unified Komika API. */
+	genreFacets?(): Promise<GenreFacet[]>;
 	series(id: Id): Promise<Series>;
 	chapters(seriesId: Id): Promise<Chapter[]>;
+	/** Multi-source aggregated chapters for a canonical work (S2): one entry per
+	 *  chapter number across ALL the work's sources, each carrying per-source
+	 *  availability so the reader can pick/​fall-back a source. Optional: only the
+	 *  unified Komika API implements it. `workId` is the `w_`-prefixed canonical id. */
+	aggregatedChapters?(workId: Id): Promise<AggregatedChapter[]>;
 	pages(chapterId: Id): Promise<Page[]>;
 
 	// --- library & progress ---
@@ -171,6 +188,12 @@ export interface Backend {
 	 * work (auto-merge / queue for review / create new), idempotently. Optional:
 	 * only the unified Komika API implements it. */
 	addSourceSeries?(suwayomiMangaId: Id): Promise<MatchResult>;
+	/** Fold one canonical work into another: re-point the source work's
+	 * source_series mappings + user data (library/progress/reviews/comments) +
+	 * aliases/external-ids to the target, then DELETE the source work. The target
+	 * survives as canonical. Irreversible. Optional: only the unified Komika API
+	 * implements it. */
+	mergeWorks?(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult>;
 
 	// --- admin sources & extensions (requires an admin session; EXT-1/EXT-2) ---
 	/** Every Keiyoushi/Mihon extension known to the Suwayomi engine, installed or
@@ -234,6 +257,23 @@ export interface Backend {
 	/** Cancel every running ingest job for an extension's sources; returns the
 	 * cancelled jobs (empty if none were running). Optional. */
 	cancelExtensionIngest?(pkgName: Id): Promise<SourceIngestJob[]>;
+
+	// --- admin maintenance (requires an admin session) ---
+	/** Materialize the whole Suwayomi library into the DB read-cache: series
+	 * metadata is written synchronously and the count returned; per-series chapter
+	 * lists fill in a server-side background task. A production maintenance /
+	 * pre-warm action, gated server-side by `require_admin`. Returns how many
+	 * series were persisted. Optional: only the unified Komika API implements it. */
+	persistCatalogue?(): Promise<number>;
+}
+
+/** Server-side catalogue-search filters (S4). All optional; omit to not filter. */
+export interface SearchFilters {
+	/** Match any of these genres (case-insensitive). */
+	genres?: string[];
+	/** Inclusive rating bounds on the 0–10 scale. */
+	minRating?: number;
+	maxRating?: number;
 }
 
 export interface Session {

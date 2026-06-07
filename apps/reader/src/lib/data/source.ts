@@ -8,6 +8,7 @@
  * the screens render their empty states. No sample content is ever fabricated.
  */
 import type {
+	AggregatedChapter,
 	CanonicalUpdate,
 	Chapter,
 	ComicType as DomainComicType,
@@ -407,12 +408,14 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 		chapterCount: c.chapters.length,
 	}));
 
-	// Selection: honour a valid persisted preference, else the first candidate
-	// that actually carries chapters (never default to an empty translator), else
-	// the first candidate.
+	// Selection: honour a valid persisted preference, else the candidate carrying
+	// the MOST chapters (so a work whose spine has few/none but another source is
+	// complete — e.g. Solo Leveling → Asura — defaults to the readable source),
+	// else the first candidate.
+	const byMostChapters = [...ordered].sort((a, b) => b.chapters.length - a.chapters.length)[0];
 	let pick =
 		(preferredKey && ordered.find((c) => c.view.key === preferredKey)) ||
-		ordered.find((c) => c.chapters.length > 0) ||
+		byMostChapters ||
 		ordered[0];
 
 	const selected = translators.find((t) => t.key === pick.view.key) as TranslatorOption;
@@ -486,29 +489,57 @@ export async function getFederatedSearch(query: string): Promise<SearchOutcome> 
 	}
 }
 
+/** Browse-search filters applied server-side where supported (S4). */
+export interface CatalogFilters {
+	/** Match any of these genres (case-insensitive). Empty → no genre filter. */
+	genres?: string[];
+	/** Inclusive rating bounds on the 0–10 scale. */
+	minRating?: number;
+	maxRating?: number;
+}
+
 /**
  * Native (public) catalogue search — the pre-federation path, available to
- * anonymous viewers. Returns rows without translator tags (a single source).
- * Never rejects; resolves to an empty list on failure/backend-off.
+ * anonymous viewers, and the whole-catalogue browse when `query` is empty. Genre
+ * / rating `filters` are applied server-side (S4). Rows carry no translator tags
+ * (single source). Never rejects; `error` is true only on a genuine backend
+ * failure (an empty query with no error is an honest "no results").
  */
-export function getNativeSearch(query: string): Promise<FederatedResultView[]> {
-	const q = query.trim();
-	if (!q) return Promise.resolve([]);
-	return live(async () => {
-		const { items } = await backend.search(q);
+export async function getNativeSearch(
+	query: string,
+	filters: CatalogFilters = {},
+): Promise<{ items: FederatedResultView[]; error: boolean }> {
+	const r = await liveResult(async () => {
+		const { items } = await backend.search(query.trim(), 1, {
+			genres: filters.genres,
+			minRating: filters.minRating,
+			maxRating: filters.maxRating,
+		});
 		return items.map((s, i) => ({ ...toCatalogEntryFull(s, i), translators: [] as TranslatorChip[] }));
+	}, [] as FederatedResultView[]);
+	return { items: r.data, error: r.error };
+}
+
+/** The full genre facet set for the search filter (S4), most-common first. Never
+ *  rejects; resolves to an empty list on failure/backend-off. */
+export function getGenreFacets(): Promise<{ genre: string; count: number }[]> {
+	return live(async () => {
+		if (!backend.genreFacets) return [];
+		return backend.genreFacets();
 	}, []);
 }
 
-/** A federated search row for the Browse grid: a catalog entry + translator tags. */
+/** A federated search row for the Browse grid: a catalog entry + translator tags
+ *  + the full genre list (for client-side ANY-genre filtering of federated rows). */
 export interface FederatedResultView extends CatalogEntry {
 	isNsfw: boolean;
+	genres: string[];
 	translators: TranslatorChip[];
 }
 
-/** Like {@link toCatalogEntry} but keeps the NSFW flag for the federated grid. */
-function toCatalogEntryFull(s: Series, i: number): CatalogEntry & { isNsfw: boolean } {
-	return { ...toCatalogEntry(s, i), isNsfw: s.isNsfw };
+/** Like {@link toCatalogEntry} but keeps the NSFW flag + full genre list for the grid. */
+function toCatalogEntryFull(s: Series, i: number): CatalogEntry & { isNsfw: boolean; genres: string[] } {
+	return { ...toCatalogEntry(s, i), isNsfw: s.isNsfw, genres: s.genres };
 }
 
 // ---- per-screen getters ----------------------------------------------------
@@ -547,20 +578,17 @@ export function getHome() {
 	}, fallback);
 }
 
-/** The native browse catalog plus an honest failure flag (RC4). `error` is true
- *  only when the backend request threw — the screen then shows an error state
- *  instead of a misleading "no series" empty. */
+/** The browse catalogue rows (with genres/translator shape) plus an honest
+ *  failure flag (RC4). `error` is true only when the backend request threw — the
+ *  screen shows an error state instead of a misleading "no series" empty. Genre /
+ *  rating `filters` are applied server-side (S4). */
 export interface CatalogResult {
-	items: CatalogEntry[];
+	items: FederatedResultView[];
 	error: boolean;
 }
 
-export async function getBrowseCatalog(): Promise<CatalogResult> {
-	const r = await liveResult(async () => {
-		const { items } = await backend.search('');
-		return items.map(toCatalogEntry);
-	}, [] as CatalogEntry[]);
-	return { items: r.data, error: r.error };
+export function getBrowseCatalog(filters: CatalogFilters = {}): Promise<CatalogResult> {
+	return getNativeSearch('', filters);
 }
 
 export function getUpdates() {
@@ -664,6 +692,10 @@ export interface SeriesChapterView {
 	date: string;
 	isNew: boolean;
 	read: boolean;
+	/** The Suwayomi manga id of the source that provides this chapter (S2
+	 *  aggregation), so the reader opens it from the right source; null = the
+	 *  MangaDex mirror; undefined for a single-source (numeric) series. */
+	src?: string | null;
 }
 export interface SeriesDetailView {
 	id: string;
@@ -682,6 +714,9 @@ export interface SeriesDetailView {
 	cover: string;
 	continueCh: number;
 	startChapterId?: string;
+	/** The source (Suwayomi manga id) the Continue/start chapter is read from
+	 *  (S2 aggregation); null = MangaDex mirror; undefined for single-source. */
+	startChapterSrc?: string | null;
 	isMarked: boolean;
 	/** Full author/artist credit list (S2 enrichment); empty → fall back to the
 	 *  single author/artist line. Deduped display is left to the component. */
@@ -854,6 +889,59 @@ function mapSeriesView(
 	};
 }
 
+/**
+ * Build the series-page chapter list from the server's multi-source aggregation
+ * (S2): one row per chapter NUMBER across ALL a work's sources. Each row picks
+ * the source to read from — the work's preferred translator when it carries that
+ * chapter, otherwise the first source that does (per-chapter fallback, so a
+ * chapter the preferred source lacks is still readable). Read-state + dates are
+ * enriched from the preferred translator's own chapters where they line up.
+ */
+function buildAggregatedChapters(
+	agg: AggregatedChapter[],
+	resolved: ResolvedWork,
+): SeriesChapterView[] {
+	const selectedSuw = resolved.selected.suwayomiMangaId ?? null;
+	// The selected translator's OWN chapters are guaranteed readable (they came from
+	// `chapters(selectedSuw)` / the mirror). Index them by number so an aggregated
+	// chapter the translator also carries is read from IT (its real id + date +
+	// read-state), sidestepping any drift between the aggregation and a source's
+	// live `chapters()`.
+	const readable = new Map(resolved.chapters.map((c) => [c.number, c]));
+	// Fallback source for numbers the selected translator lacks: any Suwayomi source
+	// (readable via `chapters()`), else the MangaDex mirror.
+	const pickSource = (sources: AggregatedChapter['sources']) =>
+		sources.find((s) => s.suwayomiMangaId) ?? sources[0];
+	const asc = [...agg].sort((a, b) => a.number - b.number);
+	return asc.map((c, i) => {
+		const own = readable.get(c.number);
+		let id: string | undefined;
+		let src: string | null;
+		let read = false;
+		let date = '';
+		if (own) {
+			id = own.id;
+			src = selectedSuw;
+			read = own.read;
+			date = relTime(own.uploadedAt);
+		} else {
+			const chosen = pickSource(c.sources);
+			id = chosen?.chapterId;
+			src = chosen?.suwayomiMangaId ?? null;
+		}
+		return {
+			id,
+			n: c.number,
+			title: c.title || `Chapter ${c.number}`,
+			date,
+			// "New" = the highest-numbered chapters (shown first when sorted newest).
+			isNew: i >= asc.length - 3,
+			read,
+			src,
+		};
+	});
+}
+
 /** A series-detail view plus an honest failure flag (RC4). `view` is null for a
  *  genuinely missing series; `error` is true only when the backend request threw
  *  (outage) — the page then shows an error state, not "series not found". */
@@ -877,7 +965,7 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			// the reader route and library marking all route through the canonical
 			// path — where the persisted translator preference is resolved again.
 			const metaForView: Series = { ...resolved.meta, id };
-			return mapSeriesView(
+			const view = mapSeriesView(
 				metaForView,
 				resolved.chapters,
 				[],
@@ -889,6 +977,23 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 				},
 				resolved.canonSeries,
 			);
+			// S2: render the UNION of chapters across every source (fixes works whose
+			// spine has 0 chapters but another source has them, e.g. Solo Leveling →
+			// Asura's 201). Falls back to the single-translator list when aggregation
+			// is unavailable/empty.
+			const agg = backend.aggregatedChapters
+				? await backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+				: [];
+			if (agg.length) {
+				const rows = buildAggregatedChapters(agg, resolved);
+				view.chapters = rows;
+				view.detail.totalCh = rows.length;
+				const firstUnread = rows.find((c) => !c.read) ?? rows[0];
+				view.detail.continueCh = firstUnread?.n ?? 1;
+				view.detail.startChapterId = firstUnread?.id;
+				view.detail.startChapterSrc = firstUnread?.src ?? null;
+			}
+			return view;
 		}
 		// A numeric Suwayomi series is a single source — no translator picker. Fetch a
 		// candidate pool (Popular) alongside it to seed related-by-genre. A pool
@@ -973,6 +1078,9 @@ export interface ReaderView {
 	selectedTranslatorKey: string | null;
 	/** Canonical `w_` workId to switch translators against; null for single-source. */
 	workId: string | null;
+	/** The Suwayomi manga id of the source these chapters are read from (S2), so
+	 *  prev/next stay on the same source; null = the MangaDex mirror / default. */
+	readingSrc: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -990,6 +1098,7 @@ function emptyReader(seriesId: string, tmeta: TranslatorMeta = NO_TRANSLATORS): 
 		translators: tmeta.translators,
 		selectedTranslatorKey: tmeta.selectedTranslatorKey,
 		workId: tmeta.workId,
+		readingSrc: null,
 	};
 }
 
@@ -1002,6 +1111,7 @@ function buildReaderView(
 	urls: string[],
 	seriesTitle: string,
 	tmeta: TranslatorMeta,
+	readingSrc: string | null,
 ): ReaderView {
 	const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
 	const idx = asc.findIndex((c) => c.id === target.id);
@@ -1027,10 +1137,15 @@ function buildReaderView(
 		translators: tmeta.translators,
 		selectedTranslatorKey: tmeta.selectedTranslatorKey,
 		workId: tmeta.workId,
+		readingSrc,
 	};
 }
 
-export function getReaderChapter(seriesId: string, chParam?: string | null): Promise<ReaderView> {
+export function getReaderChapter(
+	seriesId: string,
+	chParam?: string | null,
+	srcParam?: string | null,
+): Promise<ReaderView> {
 	return live(async () => {
 		// Canonical (`w_`) works read through the selected translator (persisted
 		// preference or the same default the series page picked — shared resolver).
@@ -1038,33 +1153,53 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 			const preferred = getPreferredTranslator(seriesId);
 			const resolved = await resolveWork(seriesId, preferred);
 			if (!resolved) return emptyReader(seriesId);
+			// S2: a chapter may be provided by a source OTHER than the preferred
+			// translator (per-chapter fallback from the aggregated list). When `src`
+			// names such a source, read from it (and highlight it in the switcher);
+			// otherwise use the preferred translator's already-fetched chapters.
+			const selectedSuw = resolved.selected.suwayomiMangaId ?? null;
+			const readFromSrc = !!srcParam && srcParam !== selectedSuw;
+			const srcTranslator = readFromSrc
+				? resolved.translators.find((t) => t.suwayomiMangaId === srcParam)
+				: undefined;
 			const tmeta: TranslatorMeta = {
 				translators: resolved.translators,
-				selectedTranslatorKey: resolved.selected.key,
+				selectedTranslatorKey: srcTranslator?.key ?? resolved.selected.key,
 				workId: seriesId,
 			};
-			const chs = resolved.chapters;
+			const spine = readFromSrc ? false : resolved.selected.suwayomiMangaId === null;
+			const chs = readFromSrc
+				? await backend.chapters(srcParam as string).catch(() => [] as Chapter[])
+				: resolved.chapters;
 			if (!chs.length) {
 				const empty = emptyReader(seriesId, tmeta);
 				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 			}
-			const asc = resolved.preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
+			const preserveOrder = readFromSrc ? false : resolved.preserveOrder;
+			const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
 			let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
+			// A requested chapter not carried by this source degrades honestly to the
+			// no-pages state (don't silently open a different chapter).
+			if (chParam && !target) {
+				const empty = emptyReader(seriesId, tmeta);
+				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+			}
 			if (!target) target = asc.find((c) => !c.read) ?? asc[0];
-			const spine = resolved.selected.suwayomiMangaId === null;
 			const domainPages =
 				spine && backend.canonicalPages
 					? await backend.canonicalPages(target.id)
 					: await backend.pages(target.id);
 			const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
+			const readingSrc = readFromSrc ? (srcParam as string) : (resolved.selected.suwayomiMangaId ?? null);
 			return buildReaderView(
 				seriesId,
 				chs,
-				resolved.preserveOrder,
+				preserveOrder,
 				target,
 				urls,
 				resolved.meta?.title ?? 'Reader',
 				tmeta,
+				readingSrc,
 			);
 		}
 		// Numeric Suwayomi series — single source, no translator picker.
@@ -1084,6 +1219,7 @@ export function getReaderChapter(seriesId: string, chParam?: string | null): Pro
 			urls,
 			series?.title ?? 'Reader',
 			NO_TRANSLATORS,
+			null,
 		);
 	}, emptyReader(seriesId));
 }
@@ -1231,12 +1367,6 @@ export async function uploadAvatar(file: Blob): Promise<string> {
 		throw new Error('Avatar upload requires the Komiq backend.');
 	}
 	return backend.uploadAvatar(file);
-}
-
-export function getDonate() {
-	return Promise.resolve({
-		donateAmounts: content.donateAmounts,
-	});
 }
 
 export function getSupport() {

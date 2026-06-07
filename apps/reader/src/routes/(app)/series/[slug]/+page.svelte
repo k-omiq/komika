@@ -61,10 +61,15 @@
 	const continueCh = $derived(detail?.continueCh ?? 1);
 	const relatedSeries = $derived(view?.related ?? []);
 
-	function chapterHref(chId?: string) {
-		return `/read/${detail?.id ?? data.slug}${chId ? `?ch=${chId}` : ''}`;
+	// `src` (a Suwayomi manga id) pins which source a chapter is read from when it
+	// comes from a non-preferred source in the aggregated list (S2 per-chapter
+	// fallback); omitted for the preferred/mirror source.
+	function chapterHref(chId?: string, src?: string | null) {
+		const base = `/read/${detail?.id ?? data.slug}`;
+		if (!chId) return base;
+		return `${base}?ch=${chId}${src ? `&src=${src}` : ''}`;
 	}
-	const readHref = $derived(chapterHref(detail?.startChapterId));
+	const readHref = $derived(chapterHref(detail?.startChapterId, detail?.startChapterSrc));
 
 	let inLibrary = $state(false);
 	let marking = $state(false);
@@ -478,7 +483,7 @@
 		</div>
 		<div class="ch-list">
 			{#each chapters as c (c.id ?? c.n)}
-				<a class="ch-row" class:read={c.read} href={chapterHref(c.id)}>
+				<a class="ch-row" class:read={c.read} href={chapterHref(c.id, c.src)}>
 					<span class="ch-num">{c.n}</span>
 					<div class="ch-info">
 						<div class="ch-line">
@@ -1765,15 +1770,66 @@
 		color: var(--k-text);
 	}
 	@media (max-width: 640px) {
+		/* Shorter backdrop + matching hero pull-up so the fold isn't dominated by art. */
+		.backdrop {
+			height: 260px;
+		}
+		.hero {
+			margin-top: -120px;
+		}
+		/* Stack the cover above full-width metadata so badges/title/facts never clip. */
 		.hero-row {
-			gap: 20px;
+			flex-direction: column;
+			align-items: flex-start;
+			gap: 18px;
 		}
 		.poster {
-			width: 140px;
-			height: 206px;
+			width: 132px;
+			height: 194px;
+		}
+		.info {
+			width: 100%;
+			padding-bottom: 0;
+		}
+		.badges {
+			flex-wrap: wrap;
 		}
 		h1 {
-			font-size: 34px;
+			font-size: 30px;
+		}
+		.creators {
+			font-size: 13.5px;
+		}
+		/* CTA row wraps so Continue / Library / Share never overflow; primary grows. */
+		.cta {
+			flex-wrap: wrap;
+		}
+		.read {
+			flex: 1 1 auto;
+			justify-content: center;
+			min-width: 160px;
+		}
+		/* Give the translator picker + chapter rows comfortable one-handed targets. */
+		.tr-opt {
+			flex: 1 1 100%;
+		}
+		.covers-strip {
+			gap: 12px;
+		}
+		.cover-cell,
+		.cover-thumb {
+			width: 104px;
+		}
+		.cover-thumb {
+			height: 156px;
+		}
+		/* Rate panel stacks so the stars aren't cramped beside the score. */
+		.rate {
+			padding: 20px;
+		}
+		.rate-left {
+			flex-wrap: wrap;
+			gap: 16px;
 		}
 	}
 </style>

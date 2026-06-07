@@ -119,7 +119,9 @@
 		if (!id) return;
 		// Persist how far we got in the chapter we're leaving.
 		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
-		goto(`/read/${data.seriesId}?ch=${id}`);
+		// Keep prev/next on the same source (S2) — chapter ids are per-source.
+		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
+		goto(`/read/${data.seriesId}?ch=${id}${src}`);
 		const reduce =
 			typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 		window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
@@ -1261,6 +1263,38 @@
 	@media (max-width: 640px) {
 		.chapter-header h1 {
 			font-size: 24px;
+		}
+		/* Tighten top/bottom chrome padding for narrow screens. */
+		.chrome {
+			padding: 0 14px;
+		}
+		.top-left {
+			gap: 12px;
+		}
+		/* The chapter dropdown must never exceed the viewport width. */
+		.ch-menu {
+			width: min(280px, calc(100vw - 28px));
+		}
+		/* Reader settings become a full-width bottom sheet (thumb-reachable), with
+		   the translator switcher, reading mode, width + chrome-lock all inside. */
+		.settings {
+			top: auto;
+			bottom: 0;
+			left: 0;
+			right: 0;
+			width: auto;
+			max-height: 82vh;
+			overflow-y: auto;
+			border-radius: 18px 18px 0 0;
+			padding: 22px 20px calc(24px + env(safe-area-inset-bottom));
+			box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.6);
+		}
+		/* Larger, one-handed tap targets for the reading-mode + page-width controls. */
+		.mode {
+			height: 46px;
+		}
+		.tr-opt {
+			padding: 10px 12px;
 		}
 	}
 </style>

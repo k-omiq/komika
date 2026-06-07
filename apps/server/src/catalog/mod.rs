@@ -946,6 +946,128 @@ pub async fn merge_works(
     })
 }
 
+/// One raw chapter row from any of a work's sources (S2 aggregation input).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WorkChapterRow {
+    pub number: f64,
+    pub title: Option<String>,
+    pub source_type: String,
+    pub source_id: String,
+    pub suwayomi_manga_id: Option<String>,
+    pub chapter_id: String,
+    pub scanlator: Option<String>,
+}
+
+/// One reconciled Suwayomi mapping for a work (F1): the authoritative
+/// `source_series` per `source_id`.
+#[derive(Debug, Clone)]
+pub struct AuthMapping {
+    pub source_id: String,
+    /// The authoritative Suwayomi manga id (= `source_series.source_key`), the
+    /// mapping with the most cached chapters for its `source_id`.
+    pub source_key: String,
+}
+
+/// The AUTHORITATIVE Suwayomi mapping per `source_id` for a work (F1). The dedup
+/// matcher can consolidate several DISTINCT same-source manga onto one work (e.g.
+/// two "Naruto" entries from the MangaDex extension, one with chapters and one
+/// without), leaving redundant `source_series` rows for the same `source_id`. This
+/// picks, per `source_id`, the mapping with the MOST cached chapters (tiebreak:
+/// most-recent `last_seen`, then lowest `id`), so `aggregatedChapters`,
+/// `workSources`/translators, and live `chapters()` all agree on ONE readable id.
+pub async fn authoritative_suwayomi_mappings(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> Result<Vec<AuthMapping>> {
+    let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+        "SELECT ss.id, ss.source_id, ss.source_key, \
+                (SELECT COUNT(*) FROM suwayomi_chapter sc \
+                 WHERE sc.manga_id = CAST(ss.source_key AS INTEGER)) AS cached \
+         FROM source_series ss \
+         WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' \
+         ORDER BY ss.source_id ASC, cached DESC, ss.last_seen DESC, ss.id ASC",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+    // The ORDER BY puts the winner per source_id first; keep the first per source_id.
+    let mut out: Vec<AuthMapping> = Vec::new();
+    for (_ss_id, source_id, source_key, _cached) in rows {
+        if out.iter().any(|m| m.source_id == source_id) {
+            continue; // already have this source's authoritative mapping
+        }
+        out.push(AuthMapping {
+            source_id,
+            source_key,
+        });
+    }
+    Ok(out)
+}
+
+/// Every chapter across a work's sources (S2/F1): the AUTHORITATIVE Suwayomi source
+/// caches (one mapping per source_id — see `authoritative_suwayomi_mappings`) UNION
+/// the MangaDex mirror. Raw rows — the caller groups them by number. This is what
+/// makes a work whose MangaDex spine has 0 chapters still show an installed source's
+/// chapters, while never surfacing a redundant same-source mapping the reader can't
+/// read from.
+pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Vec<WorkChapterRow>> {
+    let auth = authoritative_suwayomi_mappings(pool, work_id).await?;
+    let mut rows: Vec<WorkChapterRow> = Vec::new();
+    // Suwayomi chapters from the authoritative mapping of each source.
+    for m in &auth {
+        let Ok(manga_id) = m.source_key.parse::<i64>() else {
+            continue;
+        };
+        let chapters = sqlx::query_as::<_, (f64, String, i64, Option<String>)>(
+            "SELECT chapter_number, name, id, scanlator FROM suwayomi_chapter WHERE manga_id = ?",
+        )
+        .bind(manga_id)
+        .fetch_all(pool)
+        .await?;
+        for (number, title, id, scanlator) in chapters {
+            rows.push(WorkChapterRow {
+                number,
+                title: Some(title),
+                source_type: "suwayomi".into(),
+                source_id: m.source_id.clone(),
+                suwayomi_manga_id: Some(m.source_key.clone()),
+                chapter_id: id.to_string(),
+                scanlator,
+            });
+        }
+    }
+    // MangaDex mirror (English).
+    let md = sqlx::query_as::<_, WorkChapterRow>(
+        "SELECT CAST(c.number AS REAL) AS number, c.title AS title, 'mangadex' AS source_type, \
+                ss.source_id AS source_id, NULL AS suwayomi_manga_id, \
+                c.external_id AS chapter_id, NULL AS scanlator \
+         FROM source_series ss \
+         JOIN chapter c ON c.source_series_id = ss.id \
+         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+           AND c.number IS NOT NULL",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+    rows.extend(md);
+    Ok(rows)
+}
+
+/// The aggregate chapter count of a work (S2): the number of DISTINCT chapter
+/// numbers across all its sources. This is the count the reader should see — a
+/// work whose MangaDex spine has 0 chapters but whose asurascans source has 201
+/// reports 201, not 0.
+pub async fn aggregate_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<i64> {
+    let rows = work_source_chapters(pool, work_id).await?;
+    let mut nums: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for r in &rows {
+        // Bucket by number * 100 so "10" and "10.5" are distinct but float noise
+        // doesn't split a number into two buckets.
+        nums.insert((r.number * 100.0).round() as i64);
+    }
+    Ok(nums.len() as i64)
+}
+
 /// Resolve the id of an existing source_series by its natural key.
 pub async fn find_source_series_id(
     pool: &SqlitePool,
@@ -1516,6 +1638,132 @@ mod tests {
             pending, 0,
             "mark_metadata_synced advances a not-returned id"
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_mapping_dedupes_same_source_and_aggregation_agrees() {
+        // F1: a work with TWO mappings for the same source (the dedup matcher
+        // consolidated two distinct manga) — key "366" (0 cached) and key "377"
+        // (42 cached) — plus MangaPlus "357" (3). The authoritative mapping per
+        // source is the one with the most cached chapters, and aggregation +
+        // provenance must reference only those (not the empty 366).
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-naruto",
+            &WorkInput {
+                primary_title: Some("Naruto".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // MangaDex-ext source "2499": two mappings (366 empty, 377 full).
+        upsert_source_series(&pool, &work, "suwayomi", "2499", "366", None, false)
+            .await
+            .unwrap();
+        upsert_source_series(&pool, &work, "suwayomi", "2499", "377", None, false)
+            .await
+            .unwrap();
+        // MangaPlus source "1998": one mapping (357, 3 chapters).
+        upsert_source_series(&pool, &work, "suwayomi", "1998", "357", None, false)
+            .await
+            .unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        // Cache 42 chapters under 377, 3 under 357, 0 under 366.
+        for (manga, count) in [(377, 42), (357, 3)] {
+            for n in 1..=count {
+                sqlx::query(
+                    "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
+                     VALUES (?, ?, ?, ?, 0, ?)",
+                )
+                .bind(manga * 1000 + n)
+                .bind(manga)
+                .bind(format!("Ch {n}"))
+                .bind(n as f64)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let auth = authoritative_suwayomi_mappings(&pool, &work).await.unwrap();
+        // One authoritative per source_id: 377 for 2499, 357 for 1998.
+        assert_eq!(auth.len(), 2);
+        let by_src: std::collections::HashMap<&str, &str> = auth
+            .iter()
+            .map(|m| (m.source_id.as_str(), m.source_key.as_str()))
+            .collect();
+        assert_eq!(
+            by_src["2499"], "377",
+            "the 42-chapter mapping wins over 366"
+        );
+        assert_eq!(by_src["1998"], "357");
+
+        // Aggregation only references authoritative ids (never 366).
+        let rows = work_source_chapters(&pool, &work).await.unwrap();
+        let ids: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter_map(|r| r.suwayomi_manga_id.as_deref())
+            .collect();
+        assert!(ids.contains("377") && ids.contains("357"));
+        assert!(!ids.contains("366"), "redundant empty mapping is excluded");
+        // Aggregate distinct-number count = union(377's 1..42, 357's 1..3) = 42.
+        assert_eq!(aggregate_chapter_count(&pool, &work).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn aggregate_chapters_unions_across_sources() {
+        // S2: a work whose MangaDex spine has 0 chapters but whose Suwayomi source
+        // (asurascans, manga id 333) has chapters must report the aggregate.
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-solo",
+            &WorkInput {
+                primary_title: Some("Solo Leveling".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A Suwayomi source mapping (source_key = the Suwayomi manga id "333").
+        upsert_source_series(&pool, &work, "suwayomi", "asura-src", "333", None, false)
+            .await
+            .unwrap();
+        // Cache three asura chapters (as the scanner would), plus a duplicate number
+        // from a second (hypothetical) source to prove numbers dedupe.
+        upsert_source_series(&pool, &work, "suwayomi", "other-src", "999", None, false)
+            .await
+            .unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        for (id, manga, num) in [(1, 333, 1.0), (2, 333, 2.0), (3, 333, 3.0), (4, 999, 1.0)] {
+            sqlx::query(
+                "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
+                 VALUES (?, ?, ?, ?, 0, ?)",
+            )
+            .bind(id)
+            .bind(manga)
+            .bind(format!("Ch {num}"))
+            .bind(num)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Aggregate count = 3 distinct numbers (1,2,3), not 4 rows.
+        assert_eq!(aggregate_chapter_count(&pool, &work).await.unwrap(), 3);
+        // Raw rows carry per-source availability (number 1 from BOTH sources).
+        let rows = work_source_chapters(&pool, &work).await.unwrap();
+        let n1: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.number == 1.0)
+            .map(|r| r.suwayomi_manga_id.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(n1.len(), 2, "chapter 1 available from two sources");
+        assert!(n1.contains(&"333") && n1.contains(&"999"));
     }
 
     #[tokio::test]
