@@ -22,9 +22,31 @@
 interface Env {
 	ALLOWED_SOURCE_HOSTS?: string;
 	ALLOWED_ORIGINS?: string;
+	// Cloudflare native per-IP rate limiter for the upstream-fetch path (bandwidth
+	// abuse cap). Configured as an [[unsafe.bindings]] ratelimit in wrangler.toml,
+	// so the limit/period live in config — no dashboard step.
+	IMG_RATE_LIMITER: RateLimit;
 }
 
 const IMMUTABLE_CACHE = 'public, max-age=604800, immutable';
+// Image size ceiling, mirroring the native reference (`MAX_IMAGE_BYTES`,
+// src-tauri/src/lib.rs). Enforced both from the upstream Content-Length (fail
+// fast) and while streaming (in case the length is absent or lies).
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024; // 32 MiB
+// Redirect hops we follow manually so the host allowlist is re-checked on every
+// hop (matches native `MAX_REDIRECTS`); a 3xx must never smuggle us to a
+// non-allowlisted host.
+const MAX_REDIRECTS = 4;
+
+/** Error carrying the HTTP status the proxy should surface to its caller. */
+class ProxyError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+	) {
+		super(message);
+	}
+}
 const CORS_HEADERS: Record<string, string> = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
@@ -85,19 +107,29 @@ export default {
 		const cached = await edge.match(cacheKey);
 		if (cached) return withMethod(cached, request.method);
 
+		// --- Rate limit (per client IP) — only reached on a cache MISS. ----------
+		// Hot images served from the edge cache above are never throttled; this caps
+		// the bandwidth-abuse path that actually hits the upstream CDN. Keyed on the
+		// client IP (CF-Connecting-IP); requests without one share the "unknown"
+		// bucket. Kept BEFORE the upstream fetch so throttled requests never hit it.
+		const clientIp = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+		const { success } = await env.IMG_RATE_LIMITER.limit({ key: clientIp });
+		if (!success) return errorResponse(429, 'Too Many Requests');
+
 		// --- 2. Upstream fetch. --------------------------------------------------
+		// Follow redirects MANUALLY (`redirect: 'manual'`), re-running the host
+		// allowlist on every hop. `redirect: 'follow'` would let a 3xx from an
+		// allowlisted host bounce us to an arbitrary internal/attacker host,
+		// bypassing the guard (SSRF / open proxy / cache poisoning). Mirrors the
+		// native reference `fetch_image` (redirect::Policy::none + per-hop revalidation).
 		let originResp: Response;
 		try {
-			originResp = await fetch(upstream.toString(), {
-				headers: {
-					// Some CDNs require a Referer / UA to serve images; be polite.
-					Referer: `${upstream.protocol}//${upstream.host}/`,
-					'User-Agent': 'KomikaImageWorker/1.0 (+https://komika.app)',
-					Accept: 'image/*,*/*;q=0.8',
-				},
-				redirect: 'follow',
-			});
+			originResp = await fetchFollowingRedirects(upstream, env.ALLOWED_SOURCE_HOSTS);
 		} catch (err) {
+			if (err instanceof ProxyError) {
+				console.error(`img proxy: ${err.message} for ${upstream.toString()}`);
+				return errorResponse(err.status, err.message);
+			}
 			console.error(`img proxy: upstream fetch failed for ${upstream.toString()}:`, err);
 			return errorResponse(502, 'Upstream fetch failed');
 		}
@@ -116,6 +148,15 @@ export default {
 			return errorResponse(502, 'Upstream is not an image');
 		}
 
+		// Fail fast on an oversized image before we stream a single byte. The body
+		// is also capped while streaming (finalizeImage) in case this header is
+		// absent or lies.
+		const declaredLen = originResp.headers.get('Content-Length');
+		if (declaredLen && Number(declaredLen) > MAX_IMAGE_BYTES) {
+			console.error(`img proxy: upstream Content-Length ${declaredLen} exceeds cap for ${upstream.toString()}`);
+			return errorResponse(502, 'Upstream image too large');
+		}
+
 		const res = finalizeImage(originResp, contentType);
 		ctx.waitUntil(edge.put(cacheKey, res.clone()));
 		return withMethod(res, request.method);
@@ -124,16 +165,90 @@ export default {
 
 // --- helpers ---------------------------------------------------------------
 
+/**
+ * Fetch `start`, following up to `MAX_REDIRECTS` redirects MANUALLY and
+ * re-validating every hop's resolved host against the allowlist. Relative
+ * `Location`s are resolved against the current URL. Any hop to a
+ * non-allowlisted host (or non-http(s) scheme) rejects — this is what keeps a
+ * 3xx from turning the proxy into an SSRF/open-proxy primitive.
+ */
+async function fetchFollowingRedirects(start: URL, allowRaw: string | undefined): Promise<Response> {
+	let current = start;
+	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+		const resp = await fetch(current.toString(), {
+			headers: {
+				// Some CDNs require a Referer / UA to serve images; be polite.
+				Referer: `${current.protocol}//${current.host}/`,
+				'User-Agent': 'KomikaImageWorker/1.0 (+https://komika.app)',
+				Accept: 'image/*,*/*;q=0.8',
+			},
+			redirect: 'manual',
+		});
+
+		if (!isRedirectStatus(resp.status)) return resp;
+
+		const location = resp.headers.get('Location');
+		if (!location) throw new ProxyError(502, 'Upstream redirect without a Location header');
+
+		let next: URL;
+		try {
+			next = new URL(location, current); // resolves relative Locations
+		} catch {
+			throw new ProxyError(502, 'Upstream redirect to an invalid Location');
+		}
+		if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+			throw new ProxyError(400, 'redirect target must be http(s)');
+		}
+		if (!hostAllowed(next.hostname, allowRaw)) {
+			throw new ProxyError(400, 'redirect host not allowed');
+		}
+		current = next;
+	}
+	throw new ProxyError(502, 'Too many redirects');
+}
+
+/** 3xx statuses that carry a Location we should follow. */
+function isRedirectStatus(status: number): boolean {
+	return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
 /** Build the response we serve + cache: image bytes, CORS, long cache. */
 function finalizeImage(source: Response, contentType: string | null): Response {
 	const headers = new Headers();
 	headers.set('Content-Type', contentType || 'application/octet-stream');
 	headers.set('Cache-Control', IMMUTABLE_CACHE);
+	// Defense in depth against content-sniffing: never let a browser reinterpret
+	// these bytes as anything other than the declared image type, and force an
+	// inline disposition so a mislabeled body can't be treated as a download.
+	headers.set('X-Content-Type-Options', 'nosniff');
+	headers.set('Content-Disposition', 'inline');
 	for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-	// Preserve length when known; streaming responses may omit it.
-	const len = source.headers.get('Content-Length');
-	if (len) headers.set('Content-Length', len);
-	return new Response(source.body, { status: 200, headers });
+	// Do NOT forward the upstream Content-Length: the body is re-streamed through
+	// a size cap (and a stale/incorrect length can truncate or hang the response).
+	// Let the runtime compute the length for the body we actually emit.
+	const body = capStream(source.body as ReadableStream<Uint8Array>, MAX_IMAGE_BYTES);
+	return new Response(body, { status: 200, headers });
+}
+
+/**
+ * Wrap a body stream so it errors out once it exceeds `max` bytes. Guards the
+ * case where the upstream omits (or lies about) Content-Length — mirrors the
+ * streamed byte accounting in the native `read_capped`.
+ */
+function capStream(body: ReadableStream<Uint8Array>, max: number): ReadableStream<Uint8Array> {
+	let total = 0;
+	return body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				total += chunk.byteLength;
+				if (total > max) {
+					controller.error(new Error('image body exceeds size cap'));
+					return;
+				}
+				controller.enqueue(chunk);
+			},
+		}),
+	);
 }
 
 /** HEAD requests get headers only. */
@@ -151,9 +266,16 @@ function errorResponse(status: number, message: string): Response {
 	});
 }
 
-/** True when the (possibly parameterized) Content-Type is an `image/*` type. */
+/**
+ * True when the (possibly parameterized) Content-Type is a raster `image/*`
+ * type. SVG is rejected: it is an active document (can carry `<script>` /
+ * event handlers) and re-serving it under our permissive-CORS origin is a stored
+ * XSS vector, so it must never be laundered through the proxy.
+ */
 function isImageContentType(contentType: string): boolean {
-	return /^image\//i.test(contentType.split(';', 1)[0].trim());
+	const type = contentType.split(';', 1)[0].trim().toLowerCase();
+	if (type === 'image/svg+xml' || type === 'image/svg') return false;
+	return /^image\//i.test(type);
 }
 
 /** Parse a comma-separated allowlist var into a trimmed, non-empty list. */
@@ -183,6 +305,14 @@ function hostAllowed(hostname: string, raw: string | undefined): boolean {
  * Hotlink protection. Requests with no Origin and no Referer (native apps,
  * curl, cache-fill jobs, direct hits) are always allowed. Browser requests are
  * checked against the allowlist; an empty allowlist disables the check.
+ *
+ * SECURITY: an empty `ALLOWED_ORIGINS` disables hotlink protection entirely and
+ * is intended ONLY for local dev. In production `ALLOWED_ORIGINS` MUST be set to
+ * a non-empty value (see wrangler.toml) so browser traffic from other origins is
+ * rejected. This alone is not an abuse control — the host allowlist
+ * (`ALLOWED_SOURCE_HOSTS`) is the primary open-proxy guard. Per-IP bandwidth
+ * abuse is capped separately by the `IMG_RATE_LIMITER` binding (see the fetch
+ * handler and wrangler.toml).
  */
 function originAllowed(request: Request, raw: string | undefined): boolean {
 	const list = parseList(raw);

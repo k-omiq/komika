@@ -2,6 +2,7 @@
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
 	import favicon from '$lib/assets/favicon.svg';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth, initAuth, logout } from '$lib/auth.svelte';
 	import { theme, cycleTheme, initTheme } from '$lib/theme.svelte';
@@ -16,6 +17,13 @@
 	});
 
 	const onLogin = $derived(page.url.pathname === '/login');
+
+	// Centralized route guard: once auth has settled, bounce signed-out visitors to
+	// /login from any protected route (but never off /login itself). Individual pages
+	// no longer duplicate this, which also removes the per-page empty-content flash.
+	$effect(() => {
+		if (auth.ready && !auth.user && !onLogin) goto('/login');
+	});
 	const themeLabel = $derived(
 		theme.pref === 'dark' ? 'Dark' : theme.pref === 'light' ? 'Light' : 'System',
 	);

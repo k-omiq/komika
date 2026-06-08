@@ -40,3 +40,17 @@ export const images = createImageProvider({
 	direct: config.imgDirect,
 });
 export const platform = currentPlatform();
+
+// Restore any persisted session token onto the backend SYNCHRONOUSLY at module
+// load — before the first SvelteKit `load()` runs. Page `load`s (e.g. the library
+// and profile) fetch per-user data immediately, but `initAuth` (which sets the
+// token) runs later in a layout effect; without this, that first fetch would go
+// out unauthenticated and a signed-in user would briefly see an empty library /
+// no profile. `initAuth` still validates the token afterwards and populates
+// `auth.user`; a stale token just yields empty results until it clears.
+try {
+	const token = typeof localStorage !== 'undefined' ? localStorage.getItem('komika-token') : null;
+	if (token) backend.setToken?.(token);
+} catch {
+	/* private mode / no storage — initAuth will still restore it shortly */
+}

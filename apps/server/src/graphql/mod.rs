@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 
 use crate::auth::{self, User};
 use crate::catalog;
-use crate::scanner::{scan_series, scan_state};
+use crate::scanner::scan_series;
 use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
 use types::*;
 
@@ -47,7 +47,9 @@ impl RateLimiter {
     /// new hit — callers that want to count an attempt call `record` explicitly.
     pub fn is_limited(&self, key: &str) -> Option<u64> {
         let now = Instant::now();
-        let mut map = self.hits.lock().unwrap();
+        // Recover from a poisoned lock rather than propagating the panic — a single
+        // panic-while-held must not brick login/register for the process lifetime.
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         // Only inspect an existing entry — never insert on a read, or every
         // distinct client IP would leave a permanent key (unbounded RSS growth).
         let entry = map.get_mut(key)?;
@@ -68,7 +70,7 @@ impl RateLimiter {
     /// Record one attempt against `key` (prunes stale timestamps first).
     pub fn record(&self, key: &str) {
         let now = Instant::now();
-        let mut map = self.hits.lock().unwrap();
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         // Opportunistic sweep: when the map is large, drop keys whose window has
         // fully elapsed so a churn of distinct client IPs can't grow it without
         // bound (there is no background reaper).
@@ -93,6 +95,34 @@ impl RateLimiter {
     }
 }
 
+/// Per-key single-flight locks (S1 TTL refresh). N concurrent misses/refreshes for
+/// the same series/chapter id collapse onto ONE upstream fetch instead of
+/// stampeding Suwayomi: each caller awaits the same per-key `tokio` mutex, and the
+/// losers re-check the cache (now populated) after acquiring it. The outer map is
+/// guarded by a std mutex held only for the O(1) lookup/insert — never across an
+/// `await` — and dead entries are pruned via `Weak` so the map can't grow unbounded.
+#[derive(Default)]
+pub struct KeyedLocks {
+    map: Mutex<HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl KeyedLocks {
+    /// Get (or create) the shared lock for `key`. Holding the returned `Arc`'s guard
+    /// serializes the critical section for that key across tasks.
+    pub fn lock_handle(&self, key: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let arc = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(key, std::sync::Arc::downgrade(&arc));
+        // Opportunistically drop entries whose only reference was the (now-dead)
+        // weak, so a long-lived process doesn't accumulate one entry per id ever seen.
+        map.retain(|_, w| w.strong_count() > 0);
+        arc
+    }
+}
+
 /// Shared, request-independent application state.
 pub struct AppState {
     pub pool: SqlitePool,
@@ -112,6 +142,12 @@ pub struct AppState {
     pub federated_limiter: RateLimiter,
     /// Absolute session lifetime in seconds (see `Config::session_ttl_secs`).
     pub session_ttl_secs: i64,
+    /// Single-flight locks collapsing concurrent Suwayomi series-metadata
+    /// refreshes for the same id (S1 TTL refresh).
+    pub series_inflight: KeyedLocks,
+    /// Single-flight locks collapsing concurrent Suwayomi chapter-list refreshes
+    /// for the same manga id (S1 TTL refresh).
+    pub chapters_inflight: KeyedLocks,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -123,6 +159,14 @@ pub struct RequestAuth(pub Option<String>);
 /// cannot exhaust another account's budget.
 #[derive(Clone, Default)]
 pub struct ClientIp(pub Option<String>);
+
+/// Per-request memoization of the authenticated user. `current_user` is called
+/// once per series in a feed (via `is_marked`/`viewer_show_nsfw`/…), so without a
+/// cache a single `discovery`/`search`/`library` query does one `sessions⋈users`
+/// lookup per item. A fresh `OnceCell` is attached per HTTP request, so the DB
+/// lookup runs at most once regardless of how many resolvers ask.
+#[derive(Clone, Default)]
+pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Option<User>>>);
 
 /// Upper bound on password length accepted by `login`/`register`, enforced
 /// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
@@ -145,6 +189,11 @@ pub type ApiSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 pub fn build_schema(state: std::sync::Arc<AppState>, disable_introspection: bool) -> ApiSchema {
     let mut builder = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .extension(ErrorLogger)
+        // Bound query cost on this public endpoint (H7): cap nesting depth and the
+        // total resolved-field complexity so an unauthenticated client can't fan a
+        // single aliased/nested request out to thousands of per-item DB resolvers.
+        .limit_depth(20)
+        .limit_complexity(1000)
         .data(state);
     if disable_introspection {
         builder = builder.disable_introspection();
@@ -197,6 +246,73 @@ fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
 /// are no rows (those works aren't MangaDex-anchored) and both return empty.
 #[async_graphql::ComplexObject]
 impl Series {
+    /// The all-time / 7-day / 24-hour view counts for this series (the popularity
+    /// signal — see the `views` module). Resolved lazily against the normalised view
+    /// key, so a series read under either identity reports one unified count. Feeds that
+    /// don't select `views` never run this query.
+    async fn views(&self, ctx: &Context<'_>) -> Result<SeriesViews> {
+        let c = crate::views::counts_for(&state(ctx).pool, &self.id.0).await;
+        Ok(SeriesViews {
+            total: c.total as i32,
+            last7d: c.last7d as i32,
+            last24h: c.last24h as i32,
+        })
+    }
+
+    /// Whether the signed-in viewer has this series in THEIR library (`user_library`).
+    /// Per-viewer, resolved dynamically so every feed reflects the caller's own
+    /// library; `false` for anonymous viewers (no made-up membership).
+    async fn is_marked(&self, ctx: &Context<'_>) -> Result<bool> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(false);
+        };
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_library WHERE user_id = ? AND series_id = ?)",
+        )
+        .bind(&user.id)
+        .bind(&self.id.0)
+        .fetch_one(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(exists != 0)
+    }
+
+    /// The shelf the viewer has explicitly filed this series under
+    /// ('reading' | 'completed' | 'onhold' | 'plan'), or null when unset — in which
+    /// case the client derives the shelf from read progress. Per-viewer; null for
+    /// anonymous viewers and series not in the viewer's library.
+    async fn library_status(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(None);
+        };
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT status FROM user_library WHERE user_id = ? AND series_id = ?",
+        )
+        .bind(&user.id)
+        .bind(&self.id.0)
+        .fetch_optional(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.flatten())
+    }
+
+    /// Whether the viewer has favourited this series. Per-viewer; false for
+    /// anonymous viewers and series not in the viewer's library.
+    async fn is_favorite(&self, ctx: &Context<'_>) -> Result<bool> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(false);
+        };
+        let fav: Option<i64> = sqlx::query_scalar(
+            "SELECT is_favorite FROM user_library WHERE user_id = ? AND series_id = ?",
+        )
+        .bind(&user.id)
+        .bind(&self.id.0)
+        .fetch_optional(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(fav.unwrap_or(0) != 0)
+    }
+
     /// Every localized description of this work (all languages MangaDex carries),
     /// newest-language-agnostic, ordered by language tag. Empty for a work with no
     /// enrichment yet (run `backfillMangadexMetadata`) or a non-canonical series.
@@ -278,7 +394,25 @@ fn client_ip(ctx: &Context<'_>) -> String {
 }
 
 /// Resolve the authenticated user, or `None` if the request is anonymous.
+/// Memoized per request via `RequestUserCache` so the `sessions⋈users` lookup
+/// runs at most once even when many resolvers ask (one per feed item).
 async fn current_user(ctx: &Context<'_>) -> Option<User> {
+    if let Some(cache) = ctx.data_opt::<RequestUserCache>() {
+        return cache
+            .0
+            .get_or_init(|| async {
+                match token(ctx) {
+                    Some(tok) => auth::user_for_token(&state(ctx).pool, &tok)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                }
+            })
+            .await
+            .clone();
+    }
+    // Fallback when no cache was attached (e.g. a code path that builds a bare request).
     let tok = token(ctx)?;
     auth::user_for_token(&state(ctx).pool, &tok)
         .await
@@ -302,36 +436,51 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
     Ok(user)
 }
 
+/// Wrap an internal/DB error for return to a GraphQL client. The concrete detail
+/// (sqlx messages carry table/column names and SQL fragments) is logged
+/// server-side only; the client receives a generic message so the API surface
+/// isn't leaked. Deliberately user-facing errors are built with `Error::new(...)`
+/// directly and never routed through here, so they're preserved.
 fn gql_err(e: impl std::fmt::Display) -> Error {
-    Error::new(e.to_string())
+    tracing::error!(error = %e, "internal error");
+    Error::new("Internal error")
 }
 
 /// Aggregate the stored reviews for a series into a `RatingSummary`.
 async fn rating_summary(pool: &SqlitePool, series_id: &str) -> RatingSummary {
-    let scores: Vec<i64> = sqlx::query_scalar("SELECT score FROM reviews WHERE series_id = ?")
-        .bind(series_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-    if scores.is_empty() {
+    // Aggregate in SQL: GROUP BY bounds the result to <=10 rows regardless of how
+    // many reviews a series has, instead of pulling every review row into memory
+    // (the old `SELECT score` loaded the full review set on every feed item).
+    let rows: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT score, COUNT(*) FROM reviews WHERE series_id = ? GROUP BY score")
+            .bind(series_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, series_id, "rating_summary query failed");
+                Vec::new()
+            });
+    if rows.is_empty() {
         return RatingSummary::empty();
     }
     let mut dist = vec![0i32; 10];
     let mut sum = 0i64;
-    for s in &scores {
-        sum += *s;
-        let idx = (*s - 1).clamp(0, 9) as usize;
-        dist[idx] += 1;
+    let mut count = 0i64;
+    for (score, n) in &rows {
+        sum += *score * *n;
+        count += *n;
+        let idx = (*score - 1).clamp(0, 9) as usize;
+        dist[idx] += *n as i32;
     }
     RatingSummary {
-        average: sum as f64 / scores.len() as f64,
-        count: scores.len() as i32,
+        average: sum as f64 / count as f64,
+        count: count as i32,
         distribution: dist,
     }
 }
 
 /// Komika-native per-series admin overrides (from `series_admin`).
-#[derive(Default, sqlx::FromRow)]
+#[derive(Clone, Default, sqlx::FromRow)]
 struct AdminOverrides {
     override_interval_hours: Option<f64>,
     poll_every_minutes: Option<i64>,
@@ -339,41 +488,42 @@ struct AdminOverrides {
     status_override: Option<String>,
 }
 
-/// Alt titles for a federated Suwayomi series from the canonical model (CATALOGUE.md
-/// §6). Once a series has been added to a canonical `work` (Tier-2 add flow, or a
-/// MangaDex spine entry it resolved to), its `work_alias` rows surface here as the
-/// series' alt titles. Empty when the series hasn't been catalogued yet — the reader
-/// then just shows no alt titles, exactly as before this wiring.
-async fn canonical_alt_titles(pool: &SqlitePool, suwayomi_id: &str) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT wa.raw_title \
-         FROM source_series ss \
-         JOIN work_alias wa ON wa.work_id = ss.work_id \
-         WHERE ss.source_type = 'suwayomi' AND ss.source_key = ? \
-         ORDER BY wa.raw_title",
-    )
-    .bind(suwayomi_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default()
-}
-
 /// Whether a federated Suwayomi series is NSFW per the canonical model (CATALOGUE.md
 /// §2). True once it's linked to a `work` flagged NSFW; false when uncatalogued (we
 /// only hide what we positively know is NSFW).
 async fn canonical_is_nsfw(pool: &SqlitePool, suwayomi_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(w.is_nsfw), 0) FROM source_series ss \
+        "SELECT COALESCE(MAX(COALESCE(w.is_nsfw_override, w.is_nsfw)), 0) FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND ss.source_key = ?",
     )
     .bind(suwayomi_id)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-        != 0
+    // Fail CLOSED on a DB error: treat the series as NSFW so a transient failure
+    // can't surface NSFW content to an opted-out viewer (matches the fail-closed
+    // viewer-preference half). A successful query with no row means "not linked to
+    // an NSFW work" → SFW.
+    .map(|row| row.unwrap_or(0) != 0)
+    .unwrap_or(true)
+}
+
+/// The canonical type inputs (admin override + original language) for a federated
+/// Suwayomi series, looked up through its linked `work`. Both `None` when the series
+/// isn't catalogued yet — the caller then falls back to genre/title heuristics. The
+/// Suwayomi source language is deliberately NOT used as the origin language (it is the
+/// translation language and would misclassify every non-Japanese title as Manga).
+/// The admin metadata overrides + type inputs for a federated Suwayomi series,
+/// looked up through its linked `work`. All fields default when the series isn't
+/// catalogued (the caller then falls back to the source values). Deterministic
+/// (`ORDER BY w.id`) if a source_key ever maps to more than one work.
+#[derive(Clone, Default)]
+struct SuwayomiWorkOverrides {
+    work_id: Option<String>,
+    content_type_override: Option<String>,
+    original_language: Option<String>,
+    title_override: Option<String>,
+    description_override: Option<String>,
 }
 
 /// The viewer's NSFW preference (default false, including for anonymous requests).
@@ -405,33 +555,36 @@ fn filter_nsfw(show_nsfw: bool, items: Vec<Series>) -> Vec<Series> {
     items.into_iter().filter(|s| !s.is_nsfw).collect()
 }
 
-async fn admin_overrides(pool: &SqlitePool, series_id: &str) -> AdminOverrides {
-    sqlx::query_as::<_, AdminOverrides>(
-        "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
-         FROM series_admin WHERE series_id = ?",
-    )
-    .bind(series_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default()
+/// Map a single federated Suwayomi manga onto a Komika `Series`. One-off callers
+/// (series detail, mutation return values) route through the batch path with a
+/// list of one, so the assembly logic has a single source of truth and stays
+/// byte-identical between the single and list paths.
+async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
+    map_series_batch(st, vec![m])
+        .await
+        .pop()
+        .expect("map_series_batch returns one Series per input")
 }
 
-/// Map a federated Suwayomi manga onto a Komika `Series`, folding in the
-/// Komika-native rating aggregate + admin overrides. (Both are per-series lookups
-/// — fine for the small result sets here; batch them if list sizes grow.)
-async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
+/// Assemble a `Series` from a manga plus its already-resolved per-series lookups.
+/// Pure (no DB): every value it needs is passed in, so the single- and batch-map
+/// paths share exactly this construction. Mirrors the old inline `map_series` body.
+fn assemble_series(
+    st: &AppState,
+    m: SuwayomiManga,
+    rating: RatingSummary,
+    ov: AdminOverrides,
+    scan: Option<crate::scanner::ScanState>,
+    alt_titles: Vec<String>,
+    is_nsfw: bool,
+    ov_meta: SuwayomiWorkOverrides,
+    genres: Vec<String>,
+) -> Series {
     let id = m.id.to_string();
-    let rating = rating_summary(&st.pool, &id).await;
-    let ov = admin_overrides(&st.pool, &id).await;
-    let scan = scan_state(&st.pool, &id).await;
-    // Canonical alt titles (empty until the series is catalogued); drop any that
-    // equal the primary title so the reader shows only genuine alternatives.
-    let mut alt_titles = canonical_alt_titles(&st.pool, &id).await;
-    alt_titles.retain(|t| t != &m.title);
-    let is_nsfw = canonical_is_nsfw(&st.pool, &id).await;
-
+    // Admin metadata overrides win over the source values (same as map_canonical_series,
+    // so an edit shows on the numeric Suwayomi path too — feeds and the editor's return).
+    let title = ov_meta.title_override.clone().unwrap_or_else(|| m.title.clone());
+    let description = ov_meta.description_override.clone().or(m.description.clone());
     // Status: admin override wins over the source-derived status.
     let status = ov
         .status_override
@@ -463,7 +616,12 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
                 .or_else(|| to_iso(m.last_fetched_at.as_deref())),
             next_scan_at: scan.as_ref().and_then(|s| s.next_scan_at.clone()),
         },
-        r#type: type_from_lang(m.source.as_ref().and_then(|s| s.lang.as_deref())),
+        r#type: resolve_comic_type(
+            ov_meta.content_type_override.as_deref(),
+            ov_meta.original_language.as_deref(),
+            &genres,
+            &m.title,
+        ),
         status,
         created_at: to_iso(m.in_library_at.as_deref()).unwrap_or_default(),
         updated_at: to_iso(m.last_fetched_at.as_deref()).unwrap_or_default(),
@@ -472,17 +630,309 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
             .as_ref()
             .map(|c| c.total_count as i32)
             .unwrap_or(0),
-        is_marked: m.in_library,
         is_nsfw,
         source_id: m.source_id,
-        genres: m.genre,
+        genres,
         author: m.author,
         artist: m.artist,
-        description: m.description,
+        description,
         alt_titles,
-        title: m.title,
+        title,
         id: ID(id),
     }
+}
+
+/// Map a whole list of federated Suwayomi mangas onto `Series` with O(1) grouped
+/// queries per lookup instead of the old ~5·N serial per-series queries: a feed of
+/// ~60 series previously issued ~300 round-trips; this issues ~6. Output is
+/// byte-identical to mapping each item through the old `map_series` (same order,
+/// same field values, same NSFW flag). `work_effective_genres` stays per-item (only
+/// hit for the rare catalogued numeric series) — see the `// TODO batch` below.
+async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series> {
+    if list.is_empty() {
+        return Vec::new();
+    }
+    // Deduped key set for the `IN (…)` lookups. For a Suwayomi series the numeric id
+    // (as text) is both the `series_admin`/scan key and the `source_series.source_key`.
+    let ids: Vec<String> = {
+        let mut set = std::collections::BTreeSet::new();
+        for m in &list {
+            set.insert(m.id.to_string());
+        }
+        set.into_iter().collect()
+    };
+
+    // One grouped query per lookup (was one-per-series, run serially).
+    let ratings = rating_summary_batch(&st.pool, &ids).await;
+    let admins = admin_overrides_batch(&st.pool, &ids).await;
+    let scans = scan_state_batch(&st.pool, &ids).await;
+    let alts = canonical_alt_titles_batch(&st.pool, &ids).await;
+    let nsfw = canonical_is_nsfw_batch(&st.pool, &ids).await;
+    let ov_metas = canonical_overrides_batch(&st.pool, &ids).await;
+
+    let mut out = Vec::with_capacity(list.len());
+    for m in list {
+        let id = m.id.to_string();
+        let rating = ratings.get(&id).cloned().unwrap_or_else(RatingSummary::empty);
+        let ov = admins.get(&id).cloned().unwrap_or_default();
+        let scan = scans.get(&id).cloned();
+        // Drop any alt title equal to the primary so only genuine alternatives show.
+        let mut alt_titles = alts.get(&id).cloned().unwrap_or_default();
+        alt_titles.retain(|t| t != &m.title);
+        // `canonical_is_nsfw_batch` fails CLOSED: after a successful query a missing
+        // key means "not linked to an NSFW work" → SFW (false); a DB error marks every
+        // key NSFW inside the batch fn, so the `unwrap_or(false)` here can't leak it.
+        let is_nsfw = nsfw.get(&id).copied().unwrap_or(false);
+        let ov_meta = ov_metas.get(&id).cloned().unwrap_or_default();
+        // Curated genres (work_tag) when catalogued, else the source genres. Still
+        // per-item because it's only reached for a catalogued numeric series (rare on
+        // this feed) and the source-genre branch needs no query. // TODO batch
+        let genres = match &ov_meta.work_id {
+            Some(wid) => catalog::work_effective_genres(&st.pool, wid).await,
+            None => m.genre.clone(),
+        };
+        out.push(assemble_series(
+            st, m, rating, ov, scan, alt_titles, is_nsfw, ov_meta, genres,
+        ));
+    }
+    out
+}
+
+/// Build the `?,?,…` placeholder list for an `IN (…)` clause of `n` values. Values
+/// are always bound (never interpolated), so this only ever emits placeholders.
+fn in_placeholders(n: usize) -> String {
+    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+}
+
+/// Batched `rating_summary`: one grouped query for all series → per-series summary.
+/// Missing ids (no reviews) are simply absent; the caller defaults them to empty.
+async fn rating_summary_batch(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> HashMap<String, RatingSummary> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let sql = format!(
+        "SELECT series_id, score, COUNT(*) FROM reviews WHERE series_id IN ({}) \
+         GROUP BY series_id, score",
+        in_placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "rating_summary_batch query failed");
+        Vec::new()
+    });
+    // (distribution[10], sum, count) per series — same fold as `rating_summary`.
+    let mut acc: HashMap<String, (Vec<i32>, i64, i64)> = HashMap::new();
+    for (sid, score, n) in rows {
+        let e = acc.entry(sid).or_insert_with(|| (vec![0i32; 10], 0i64, 0i64));
+        e.1 += score * n;
+        e.2 += n;
+        let idx = (score - 1).clamp(0, 9) as usize;
+        e.0[idx] += n as i32;
+    }
+    acc.into_iter()
+        .map(|(sid, (dist, sum, count))| {
+            (
+                sid,
+                RatingSummary {
+                    average: sum as f64 / count as f64,
+                    count: count as i32,
+                    distribution: dist,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Batched `admin_overrides`: one query for all series → per-series overrides.
+async fn admin_overrides_batch(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> HashMap<String, AdminOverrides> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        series_id: String,
+        #[sqlx(flatten)]
+        ov: AdminOverrides,
+    }
+    let sql = format!(
+        "SELECT series_id, override_interval_hours, poll_every_minutes, paused_override, \
+         status_override FROM series_admin WHERE series_id IN ({})",
+        in_placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, Row>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "admin_overrides_batch query failed"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.series_id, r.ov))
+        .collect()
+}
+
+/// Batched `scan_state`: one query for all series → per-series scan state.
+async fn scan_state_batch(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> HashMap<String, crate::scanner::ScanState> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        series_id: String,
+        #[sqlx(flatten)]
+        state: crate::scanner::ScanState,
+    }
+    // Same columns as `scanner::SCAN_STATE_SELECT`, plus the series_id key and IN(…).
+    let sql = format!(
+        "SELECT series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
+         last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, known_chapter_ids \
+         FROM series_scan_state WHERE series_id IN ({})",
+        in_placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, Row>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "scan_state_batch query failed"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.series_id, r.state))
+        .collect()
+}
+
+/// Batched `canonical_alt_titles`: one query for all source keys → per-key alt
+/// titles, each ordered by `raw_title` (identical to the single-key path).
+async fn canonical_alt_titles_batch(
+    pool: &SqlitePool,
+    keys: &[String],
+) -> HashMap<String, Vec<String>> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let sql = format!(
+        "SELECT DISTINCT ss.source_key, wa.raw_title \
+         FROM source_series ss \
+         JOIN work_alias wa ON wa.work_id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
+         ORDER BY ss.source_key, wa.raw_title",
+        in_placeholders(keys.len())
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    for k in keys {
+        q = q.bind(k);
+    }
+    let rows = q.fetch_all(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "canonical_alt_titles_batch query failed");
+        Vec::new()
+    });
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, raw_title) in rows {
+        map.entry(key).or_default().push(raw_title);
+    }
+    map
+}
+
+/// Batched `canonical_is_nsfw`: one grouped query for all source keys. Fails CLOSED
+/// exactly like the single-key path — on a DB error every key is marked NSFW (true)
+/// so a transient failure can't surface NSFW content to an opted-out viewer. On
+/// success, keys absent from the result are unlinked/SFW (the caller defaults them
+/// to false).
+async fn canonical_is_nsfw_batch(pool: &SqlitePool, keys: &[String]) -> HashMap<String, bool> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let sql = format!(
+        "SELECT ss.source_key, COALESCE(MAX(COALESCE(w.is_nsfw_override, w.is_nsfw)), 0) \
+         FROM source_series ss \
+         JOIN work w ON w.id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
+         GROUP BY ss.source_key",
+        in_placeholders(keys.len())
+    );
+    let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+    for k in keys {
+        q = q.bind(k);
+    }
+    match q.fetch_all(pool).await {
+        Ok(rows) => rows.into_iter().map(|(k, v)| (k, v != 0)).collect(),
+        Err(e) => {
+            // Fail closed: mark every key NSFW so nothing leaks on a transient error.
+            tracing::warn!(error = %e, "canonical_is_nsfw_batch query failed; failing closed");
+            keys.iter().map(|k| (k.clone(), true)).collect()
+        }
+    }
+}
+
+/// Batched `canonical_overrides`: one query for all source keys, then keep the first
+/// row per key by `w.id` — byte-identical to the single-key `ORDER BY w.id LIMIT 1`.
+async fn canonical_overrides_batch(
+    pool: &SqlitePool,
+    keys: &[String],
+) -> HashMap<String, SuwayomiWorkOverrides> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        source_key: String,
+        work_id: String,
+        content_type_override: Option<String>,
+        original_language: Option<String>,
+        title_override: Option<String>,
+        description_override: Option<String>,
+    }
+    let sql = format!(
+        "SELECT ss.source_key, w.id AS work_id, w.content_type_override, w.original_language, \
+                w.title_override, w.description_override \
+         FROM source_series ss \
+         JOIN work w ON w.id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
+         ORDER BY ss.source_key, w.id",
+        in_placeholders(keys.len())
+    );
+    let mut q = sqlx::query_as::<_, Row>(&sql);
+    for k in keys {
+        q = q.bind(k);
+    }
+    let rows = q.fetch_all(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "canonical_overrides_batch query failed");
+        Vec::new()
+    });
+    let mut map: HashMap<String, SuwayomiWorkOverrides> = HashMap::new();
+    for r in rows {
+        let Row {
+            source_key,
+            work_id,
+            content_type_override,
+            original_language,
+            title_override,
+            description_override,
+        } = r;
+        // Rows are ordered by (source_key, w.id); keep only the first per key.
+        map.entry(source_key).or_insert_with(|| SuwayomiWorkOverrides {
+            work_id: Some(work_id),
+            content_type_override,
+            original_language,
+            title_override,
+            description_override,
+        });
+    }
+    map
 }
 
 /// Apply the S4 search filters to a mapped result set: keep series matching ANY of
@@ -557,39 +1007,193 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
     by_num.into_values().collect()
 }
 
-/// S1: resolve one Suwayomi series DB-first — return the cached row when present,
-/// else live-fetch from Suwayomi and populate the cache for next time.
-async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<SuwayomiManga> {
-    if let Some(m) = crate::series_cache::get_series(&st.pool, id).await? {
-        return Ok(m);
-    }
-    let m = st.suwayomi.series(id).await?;
-    let _ = crate::series_cache::put_series(&st.pool, &m).await;
-    Ok(m)
+/// S1: resolve one Suwayomi series DB-first — return the cached row when it's still
+/// fresh; on a stale hit or a miss, revalidate upstream under a single-flight lock
+/// (so N concurrent readers of the same id trigger ONE fetch), and fall back to the
+/// stale cached row if the refetch fails (the reader never hard-fails on upstream
+/// trouble).
+/// The aggregate bucket key for a chapter number (matches `group_aggregated_chapters`
+/// and the `chapter_override.chapter_key` column).
+fn chapter_key(number: f64) -> String {
+    ((number * 100.0).round() as i64).to_string()
 }
 
-/// S1: resolve one series' chapter list DB-first — cached rows when present, else
-/// live-fetch and cache. An empty cache row is treated as a miss (so a series with
-/// genuinely zero chapters re-checks the source until it's scanned).
+/// Admin chapter overrides for a work, keyed by aggregate bucket key → (hidden,
+/// title_override). Empty (and best-effort) when the work has none.
+async fn chapter_overrides(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> std::collections::HashMap<String, (bool, Option<String>)> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        chapter_key: String,
+        hidden: i64,
+        title_override: Option<String>,
+    }
+    sqlx::query_as::<_, Row>(
+        "SELECT chapter_key, hidden, title_override FROM chapter_override WHERE work_id = ?",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| (r.chapter_key, (r.hidden != 0, r.title_override)))
+    .collect()
+}
+
+/// Resolve a catalog series id (numeric Suwayomi id or `w_` canonical id) to the
+/// canonical work id its admin overrides live on. `None` when the series isn't
+/// catalogued (numeric id with no `source_series` row, or an unknown `w_` id).
+async fn resolve_work_id(pool: &SqlitePool, series_id: &str) -> Option<String> {
+    if series_id.starts_with("w_") {
+        return sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id = ?")
+            .bind(series_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    }
+    sqlx::query_scalar::<_, String>(
+        "SELECT work_id FROM source_series \
+         WHERE source_type = 'suwayomi' AND source_key = ? ORDER BY work_id LIMIT 1",
+    )
+    .bind(series_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<SuwayomiManga> {
+    // Fast path: a fresh cache hit needs no lock and no upstream call.
+    let stale = match crate::series_cache::get_series_fresh(&st.pool, id).await? {
+        Some((m, true)) => return Ok(m),
+        Some((m, false)) => Some(m), // stale — refresh below, keep as fallback
+        None => None,                // miss
+    };
+
+    // Single-flight: collapse concurrent misses/refreshes for this id.
+    let lock = st.series_inflight.lock_handle(id);
+    let _guard = lock.lock().await;
+
+    // Re-check after acquiring: a task we queued behind may have just refreshed it.
+    if let Some((m, true)) = crate::series_cache::get_series_fresh(&st.pool, id).await? {
+        return Ok(m);
+    }
+
+    match st.suwayomi.series(id).await {
+        Ok(m) => {
+            let _ = crate::series_cache::put_series(&st.pool, &m).await;
+            Ok(m)
+        }
+        // Refetch failed: serve the stale cached row rather than erroring the reader.
+        Err(e) => match stale {
+            Some(m) => Ok(m),
+            None => Err(e),
+        },
+    }
+}
+
+/// S1: resolve one series' chapter list DB-first — cached rows when present AND
+/// fresh, else revalidate upstream under a single-flight lock and cache. An empty
+/// cache is a miss (a series with genuinely zero chapters re-checks the source until
+/// scanned). A refetch failure falls back to the stale cached rows. The returned
+/// rows carry GLOBAL chapter state; the per-viewer `suwayomi_progress` overlay is
+/// applied downstream by the caller and is unaffected by this freshness gate.
 async fn resolve_chapters_cached(
     st: &AppState,
     manga_id: i64,
 ) -> anyhow::Result<Vec<SuwayomiChapter>> {
     let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
     if !cached.is_empty() {
-        return Ok(cached);
+        let last = crate::series_cache::chapters_last_fetched(&st.pool, manga_id).await?;
+        if crate::series_cache::is_fresh(last.as_deref(), crate::series_cache::CHAPTERS_TTL_SECS) {
+            return Ok(cached);
+        }
     }
-    let list = st.suwayomi.chapters(manga_id).await?;
-    let _ = crate::series_cache::put_chapters(&st.pool, manga_id, &list).await;
-    Ok(list)
+
+    // Single-flight: collapse concurrent misses/refreshes for this manga id.
+    let lock = st.chapters_inflight.lock_handle(manga_id);
+    let _guard = lock.lock().await;
+
+    // Re-check after acquiring: a queued-behind task may have just refreshed.
+    let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
+    if !cached.is_empty() {
+        let last = crate::series_cache::chapters_last_fetched(&st.pool, manga_id).await?;
+        if crate::series_cache::is_fresh(last.as_deref(), crate::series_cache::CHAPTERS_TTL_SECS) {
+            return Ok(cached);
+        }
+    }
+
+    match st.suwayomi.chapters(manga_id).await {
+        Ok(list) => {
+            let _ = crate::series_cache::put_chapters(&st.pool, manga_id, &list).await;
+            Ok(list)
+        }
+        // Refetch failed: serve stale cached rows if we have any, else propagate.
+        Err(e) => {
+            if !cached.is_empty() {
+                Ok(cached)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 async fn map_series_list(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series> {
-    let mut out = Vec::with_capacity(list.len());
-    for m in list {
-        out.push(map_series(st, m).await);
+    // Batched: O(1) grouped queries per lookup instead of ~5 per series (see
+    // `map_series_batch`). Output order/values are identical to the old per-item map.
+    map_series_batch(st, list).await
+}
+
+/// Load a batch of series by their (normalised) view keys, preserving order and
+/// dropping any that no longer resolve. Numeric keys resolve to Suwayomi series (DB
+/// cache first, live fetch on a miss); `w_` keys to canonical works. Turns a Trending
+/// ranking (`views::trending_keys`) into displayable series. Bounded (≤ the row size),
+/// so the per-key loads never fan out across the whole catalogue.
+async fn series_by_keys(st: &AppState, keys: &[String]) -> Vec<Series> {
+    let mut out: Vec<Option<Series>> = Vec::with_capacity(keys.len());
+    let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
+    for key in keys {
+        if key.starts_with("w_") {
+            if let Ok(Some(work)) = catalog::load_canonical_work(&st.pool, key).await {
+                let chapters = catalog::load_canonical_chapters(&st.pool, key)
+                    .await
+                    .unwrap_or_default();
+                out.push(Some(
+                    map_canonical_series(
+                        &st.pool,
+                        None,
+                        work,
+                        catalog::main_chapter_count_str(&chapters) as i32,
+                    )
+                    .await,
+                ));
+            } else {
+                out.push(None);
+            }
+        } else if let Ok(n) = key.parse::<i64>() {
+            let m = match crate::series_cache::get_series(&st.pool, n).await.ok().flatten() {
+                Some(m) => Some(m),
+                None => st.suwayomi.series(n).await.ok(),
+            };
+            if let Some(m) = m {
+                pending.push((out.len(), m));
+                out.push(None); // slot filled by the batched map below
+            } else {
+                out.push(None);
+            }
+        } else {
+            out.push(None);
+        }
     }
-    out
+    let (indices, mangas): (Vec<usize>, Vec<SuwayomiManga>) = pending.into_iter().unzip();
+    for (idx, series) in indices.into_iter().zip(map_series_batch(st, mangas).await) {
+        out[idx] = Some(series);
+    }
+    out.into_iter().flatten().collect()
 }
 
 /// Map a canonical `work` (MangaDex-mirrored) onto the shared `Series` shape so the
@@ -601,7 +1205,10 @@ async fn map_series_list(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series>
 /// state) are empty/defaulted; reading is fully functional without them.
 async fn map_canonical_series(
     pool: &SqlitePool,
-    user_id: Option<&str>,
+    // `isMarked` is now resolved per-viewer in the ComplexObject impl, so the
+    // caller's user id is no longer needed here; kept in the signature so the
+    // several call sites don't need to change.
+    _user_id: Option<&str>,
     work: catalog::CanonicalWork,
     chapter_count: i32,
 ) -> Series {
@@ -609,7 +1216,11 @@ async fn map_canonical_series(
         (Some(mid), Some(fname)) => crate::mangadex::cover_thumb_url(mid, fname),
         _ => String::new(),
     };
-    let title = work.primary_title.clone().unwrap_or_default();
+    let title = work
+        .title_override
+        .clone()
+        .or_else(|| work.primary_title.clone())
+        .unwrap_or_default();
     let mut alt_titles = work.alt_titles;
     alt_titles.retain(|t| t != &title);
     let status = work
@@ -618,44 +1229,56 @@ async fn map_canonical_series(
         .and_then(komika_status)
         .unwrap_or(SeriesStatus::Unknown);
     // Rating reuses the string-keyed `reviews` aggregate (a `w_` id round-trips with
-    // no schema change); library membership is per-user (CR6).
+    // no schema change). Library membership (`isMarked`) is resolved per-viewer in
+    // the `#[ComplexObject]` impl against `user_library`, not computed here.
     let rating = rating_summary(pool, &work.work_id).await;
-    let is_marked =
-        match user_id {
-            Some(uid) => sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM canonical_library WHERE user_id = ? AND work_id = ?)",
-            )
-            .bind(uid)
-            .bind(&work.work_id)
-            .fetch_one(pool)
+    // chapterCount is the English reader-list count (deduped to one row per number
+    // by `load_canonical_chapters`) — Komika serves only English chapters, so that is
+    // the number the details page must show. The cross-source aggregate
+    // (`aggregate_chapter_count`) is only a FALLBACK for works whose MangaDex spine has
+    // 0 English chapters but whose Suwayomi source carries some: without the English
+    // spine there is nothing else to count. When the English mirror is non-empty we
+    // never fall back, because the Suwayomi branch of the aggregate is not
+    // language-filtered (`suwayomi_chapter` has no `lang` column) and would inflate the
+    // count with non-English / half / re-numbered chapters (e.g. Tsukimichi: 120 → 151).
+    let chapter_count = if chapter_count > 0 {
+        chapter_count
+    } else {
+        catalog::aggregate_chapter_count(pool, &work.work_id)
             .await
             .unwrap_or(0)
-                != 0,
-            None => false,
-        };
-    // S2: chapterCount is the AGGREGATE across all the work's sources (Suwayomi
-    // caches + MangaDex mirror), deduped by number — so a work whose MangaDex spine
-    // has 0 chapters but whose asurascans source has 201 reports 201, not 0. The
-    // passed `chapter_count` (MangaDex mirror) is a subset, kept as a floor.
-    let aggregate = catalog::aggregate_chapter_count(pool, &work.work_id)
+            .max(0) as i32
+    };
+    // "Last updated" = publish time of the newest English chapter, not the work's
+    // metadata timestamp (which a routine re-sync bumps to now). Fall back to the
+    // metadata timestamp only when no English chapter is mirrored yet. Computed here
+    // (before the struct literal moves `work.work_id`).
+    let updated_at = catalog::latest_english_chapter_at(pool, &work.work_id)
         .await
-        .unwrap_or(0);
-    let chapter_count = aggregate.max(chapter_count as i64) as i32;
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| work.updated_at.clone());
+    let genres = catalog::work_effective_genres(pool, &work.work_id).await;
+    let comic_type = resolve_comic_type(
+        work.content_type_override.as_deref(),
+        work.original_language.as_deref(),
+        &genres,
+        &title,
+    );
     Series {
         id: ID(work.work_id),
         title,
         alt_titles,
         author: work.author,
         artist: work.artist,
-        description: work.description,
-        genres: Vec::new(),
-        r#type: type_from_lang(work.original_language.as_deref()),
+        description: work.description_override.clone().or(work.description),
+        genres,
+        r#type: comic_type,
         status,
         cover_url,
         source_id: "mangadex".to_string(),
         chapter_count,
-        is_marked,
-        is_nsfw: work.is_nsfw,
+        is_nsfw: work.is_nsfw_override.unwrap_or(work.is_nsfw),
         rating,
         scan: ScanPolicy {
             avg_interval_hours: 0.0,
@@ -669,7 +1292,7 @@ async fn map_canonical_series(
             next_scan_at: None,
         },
         created_at: work.created_at,
-        updated_at: work.updated_at,
+        updated_at,
     }
 }
 
@@ -723,9 +1346,42 @@ async fn canonical_progress_map(
     .bind(work_id)
     .fetch_all(pool)
     .await
+    // Log (don't swallow) DB errors; still fall back to an empty map gracefully.
+    .inspect_err(|e| tracing::warn!(error = %e, work_id, "canonical_progress_map query failed"))
     .unwrap_or_default();
     rows.into_iter()
         .map(|(cid, lpr, rd)| (cid, (lpr as i32, rd != 0)))
+        .collect()
+}
+
+/// Per-user read state for every chapter of one numeric Suwayomi series, keyed by the
+/// numeric chapter id. One query per series (mirrors `canonical_progress_map`).
+/// Anonymous viewers get an empty map (all chapters read as unread).
+async fn suwayomi_progress_map(
+    pool: &SqlitePool,
+    user_id: Option<&str>,
+    series_id: i64,
+) -> HashMap<i64, (i32, bool)> {
+    let Some(uid) = user_id else {
+        return HashMap::new();
+    };
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT chapter_id, last_page_read, read FROM suwayomi_progress \
+         WHERE user_id = ? AND series_id = ?",
+    )
+    .bind(uid)
+    .bind(series_id.to_string())
+    .fetch_all(pool)
+    .await
+    // Log (don't swallow) DB errors; still fall back to an empty map gracefully.
+    .inspect_err(|e| tracing::warn!(error = %e, series_id, "suwayomi_progress_map query failed"))
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(cid, lpr, rd)| {
+            cid.parse::<i64>()
+                .ok()
+                .map(|id| (id, (lpr as i32, rd != 0)))
+        })
         .collect()
 }
 
@@ -781,12 +1437,16 @@ struct CommentJoin {
     id: String,
     target_type: String,
     target_id: String,
+    parent_id: Option<String>,
     body: String,
     has_spoiler: i64,
     created_at: String,
     author_id: String,
     author_username: String,
     author_avatar: Option<String>,
+    media_id: Option<String>,
+    media_width: Option<i64>,
+    media_height: Option<i64>,
 }
 
 impl From<CommentJoin> for Comment {
@@ -795,6 +1455,7 @@ impl From<CommentJoin> for Comment {
             id: ID(c.id),
             target_type: c.target_type,
             target_id: ID(c.target_id),
+            parent_id: c.parent_id.map(ID),
             author: UserRef {
                 id: ID(c.author_id),
                 username: c.author_username,
@@ -802,6 +1463,9 @@ impl From<CommentJoin> for Comment {
             },
             body: c.body,
             has_spoiler: c.has_spoiler != 0,
+            media_url: c.media_id.as_deref().map(crate::media::comment_media_url),
+            media_width: c.media_width.map(|n| n as i32),
+            media_height: c.media_height.map(|n| n as i32),
             created_at: c.created_at,
         }
     }
@@ -845,6 +1509,8 @@ async fn user_profile_fields(
     .bind(user_id)
     .fetch_optional(pool)
     .await
+    // Log (don't swallow) DB errors; still fall back to empties gracefully.
+    .inspect_err(|e| tracing::warn!(error = %e, user_id, "user_profile_fields query failed"))
     .ok()
     .flatten()
     .unwrap_or((None, None, String::new()))
@@ -958,7 +1624,9 @@ impl QueryRoot {
         // reads from SQLite instead of a live source browse. Fall back to a live
         // browse only while the cache is still empty (fresh install), caching what
         // it fetches so the next load is fast.
-        let (popular, latest) = if crate::series_cache::count(&st.pool)
+        // `recent` = titles most recently ADDED to our catalogue (ordered by
+        // first-persist time), distinct from `latest` (upstream recently-updated).
+        let (popular, latest, recent) = if crate::series_cache::count(&st.pool)
             .await
             .map_err(gql_err)?
             > 0
@@ -966,7 +1634,10 @@ impl QueryRoot {
             let lib = crate::series_cache::library(&st.pool, PAGE_SIZE)
                 .await
                 .map_err(gql_err)?;
-            (lib, Vec::new())
+            let recent = crate::series_cache::recently_added(&st.pool, PAGE_SIZE)
+                .await
+                .map_err(gql_err)?;
+            (lib, Vec::new(), recent)
         } else {
             let popular = st
                 .suwayomi
@@ -983,13 +1654,44 @@ impl QueryRoot {
                 .await
                 .map(|r| r.1)
                 .unwrap_or_default();
-            (popular, latest)
+            // Pre-cache (fresh install) there's no catalogue-insertion history yet;
+            // the source "Latest" is the best available proxy for "newly added".
+            let recent = latest.clone();
+            (popular, latest, recent)
         };
 
         // Hide NSFW-flagged works unless the viewer opted in (CATALOGUE.md §2).
         let show_nsfw = viewer_show_nsfw(ctx).await;
         let popular = filter_nsfw(show_nsfw, map_series_list(st, popular).await);
         let latest = filter_nsfw(show_nsfw, map_series_list(st, latest).await);
+        let recent = filter_nsfw(show_nsfw, map_series_list(st, recent).await);
+
+        // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
+        // popularity signal from `recordView`, replacing the old "first 6 of Popular").
+        // During cold start — before reads accumulate — this is empty, so pad with
+        // Popular (dedup by id) to keep the row populated; it becomes fully
+        // view-ranked as views come in.
+        let trending = {
+            let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            let mut items = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
+            let mut seen: std::collections::HashSet<String> =
+                items.iter().map(|s| s.id.0.clone()).collect();
+            for s in &popular {
+                if items.len() >= 10 {
+                    break;
+                }
+                if seen.insert(s.id.0.clone()) {
+                    items.push(s.clone());
+                }
+            }
+            items.truncate(10);
+            items
+        };
 
         let mut feeds = vec![
             DiscoveryFeed {
@@ -1002,7 +1704,7 @@ impl QueryRoot {
                 kind: DiscoveryFeedKind::Trending,
                 title: "Trending".into(),
                 genre: None,
-                items: popular.iter().take(6).cloned().collect(),
+                items: trending,
             },
         ];
         if !latest.is_empty() {
@@ -1012,11 +1714,13 @@ impl QueryRoot {
                 genre: None,
                 items: latest.clone(),
             });
+        }
+        if !recent.is_empty() {
             feeds.push(DiscoveryFeed {
                 kind: DiscoveryFeedKind::RecentlyAdded,
                 title: "Latest Added".into(),
                 genre: None,
-                items: latest.iter().take(6).cloned().collect(),
+                items: recent,
             });
         }
         Ok(feeds)
@@ -1068,16 +1772,19 @@ impl QueryRoot {
         // Hydrate each id DB-first (S1) — cached row when present, live-fetch on a
         // miss. A series that has since been removed from the source is skipped
         // rather than failing the whole feed. NSFW is already filtered in SQL above.
-        let mut items = Vec::new();
+        // Collect the resolved mangas first, then map the whole page in ONE batched
+        // pass (O(1) grouped queries per lookup) instead of ~5 queries per series.
+        let mut resolved = Vec::new();
         for id in ids.into_iter().take(PAGE_SIZE as usize) {
             let Ok(n) = id.parse::<i64>() else { continue };
             match resolve_series_cached(st, n).await {
-                Ok(m) => items.push(map_series(st, m).await),
+                Ok(m) => resolved.push(m),
                 Err(e) => {
                     tracing::warn!(series_id = id, error = %e, "updates: skipping unresolvable series")
                 }
             }
         }
+        let items = map_series_batch(st, resolved).await;
         Ok(SeriesPage {
             items,
             page,
@@ -1114,7 +1821,7 @@ impl QueryRoot {
              JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'mangadex' AND c.lang = 'en' AND (? = 1 OR w.is_nsfw = 0) \
              GROUP BY ss.work_id \
-             ORDER BY latest_at DESC \
+             ORDER BY latest_at DESC, ss.work_id DESC \
              LIMIT ? OFFSET ?",
         )
         .bind(show_nsfw as i64)
@@ -1142,7 +1849,7 @@ impl QueryRoot {
         if work.mangadex_id.is_none() {
             return Err(Error::new("No such work"));
         }
-        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such work"));
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
@@ -1153,7 +1860,7 @@ impl QueryRoot {
             &st.pool,
             user.as_ref().map(|u| u.id.as_str()),
             work,
-            chapters.len() as i32,
+            catalog::main_chapter_count_str(&chapters) as i32,
         )
         .await)
     }
@@ -1171,7 +1878,7 @@ impl QueryRoot {
         if work.mangadex_id.is_none() {
             return Err(Error::new("No such work"));
         }
-        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such work"));
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
@@ -1205,13 +1912,111 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?
             .ok_or_else(|| Error::new("No such work"))?;
-        if work.is_nsfw && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
             return Err(Error::new("No such work"));
         }
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
-        Ok(group_aggregated_chapters(rows))
+        // (the NSFW gate above uses the effective flag incl. admin override)
+        let mut chapters = group_aggregated_chapters(rows);
+        // Apply admin chapter overrides: drop soft-hidden chapters and apply renames
+        // (non-destructive — the underlying cached rows are untouched).
+        let ov = chapter_overrides(&st.pool, &work_id.0).await;
+        if !ov.is_empty() {
+            chapters.retain(|c| !matches!(ov.get(&chapter_key(c.number)), Some((true, _))));
+            for c in &mut chapters {
+                if let Some((_, Some(t))) = ov.get(&chapter_key(c.number)) {
+                    c.title = Some(t.clone());
+                }
+            }
+        }
+        Ok(chapters)
+    }
+
+    /// Admin: the raw metadata-override state of a series' canonical work, so the
+    /// series-detail editor can show what is pinned vs derived. `workId` is null when
+    /// the series isn't catalogued yet (nothing can be pinned without a work).
+    async fn series_admin_meta(&self, ctx: &Context<'_>, series_id: ID) -> Result<SeriesAdminMeta> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let Some(work_id) = resolve_work_id(&st.pool, &series_id.0).await else {
+            return Ok(SeriesAdminMeta {
+                work_id: None,
+                title_override: None,
+                description_override: None,
+                content_type_override: None,
+                is_nsfw_override: None,
+                tags: Vec::new(),
+                has_curated_tags: false,
+            });
+        };
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            title_override: Option<String>,
+            description_override: Option<String>,
+            content_type_override: Option<String>,
+            is_nsfw_override: Option<i64>,
+        }
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT title_override, description_override, content_type_override, is_nsfw_override \
+             FROM work WHERE id = ?",
+        )
+        .bind(&work_id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let curated: Vec<String> =
+            sqlx::query_scalar("SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag")
+                .bind(&work_id)
+                .fetch_all(&st.pool)
+                .await
+                .unwrap_or_default();
+        let has_curated_tags = !curated.is_empty();
+        let tags = if has_curated_tags {
+            curated
+        } else {
+            catalog::work_effective_genres(&st.pool, &work_id).await
+        };
+        Ok(SeriesAdminMeta {
+            work_id: Some(ID(work_id)),
+            title_override: row.title_override,
+            description_override: row.description_override,
+            content_type_override: row.content_type_override.as_deref().and_then(comic_type_from_word),
+            is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
+            tags,
+            has_curated_tags,
+        })
+    }
+
+    /// Admin: a work's aggregated chapters WITH their override state (hidden/renamed),
+    /// UNFILTERED — the series-detail editor needs to see and un-hide soft-hidden
+    /// chapters, unlike the reader's `aggregatedChapters`.
+    async fn work_chapters_admin(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<AdminChapter>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?;
+        let aggregated = group_aggregated_chapters(rows);
+        let ov = chapter_overrides(&st.pool, &work_id.0).await;
+        Ok(aggregated
+            .into_iter()
+            .map(|c| {
+                let key = chapter_key(c.number);
+                let (hidden, title_override) = ov.get(&key).cloned().unwrap_or((false, None));
+                let effective_title = title_override.clone().or_else(|| c.title.clone());
+                AdminChapter {
+                    number: c.number,
+                    key,
+                    source_title: c.title,
+                    title_override,
+                    effective_title,
+                    hidden,
+                    source_count: c.sources.len() as i32,
+                }
+            })
+            .collect())
     }
 
     /// Ordered page URLs for a mirrored MangaDex chapter, via MangaDex@Home
@@ -1263,13 +2068,26 @@ impl QueryRoot {
         ctx: &Context<'_>,
         work_ids: Vec<ID>,
     ) -> Result<Vec<WorkSourceGroup>> {
+        // Public endpoint (H5): cap the input so one anonymous request can't fan out
+        // to thousands of serial queries and drain the connection pool.
+        const MAX_WORK_IDS: usize = 200;
+        if work_ids.len() > MAX_WORK_IDS {
+            return Err(Error::new(format!(
+                "Too many work ids (max {MAX_WORK_IDS})"
+            )));
+        }
         let st = state(ctx);
         let show_nsfw = viewer_show_nsfw(ctx).await;
-        let mut groups = Vec::with_capacity(work_ids.len());
-        for work_id in work_ids {
-            let sources = load_work_sources(&st.pool, &work_id.0, show_nsfw).await?;
-            groups.push(WorkSourceGroup { work_id, sources });
-        }
+        // Single IN(...) query instead of a serial per-id loop.
+        let ids: Vec<String> = work_ids.iter().map(|w| w.0.clone()).collect();
+        let mut by_work = load_work_sources_batch(&st.pool, &ids, show_nsfw).await?;
+        let groups = work_ids
+            .into_iter()
+            .map(|work_id| {
+                let sources = by_work.remove(&work_id.0).unwrap_or_default();
+                WorkSourceGroup { work_id, sources }
+            })
+            .collect();
         Ok(groups)
     }
 
@@ -1407,7 +2225,18 @@ impl QueryRoot {
         }
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let list = resolve_chapters_cached(st, n).await.map_err(gql_err)?;
-        Ok(list.into_iter().map(map_chapter).collect())
+        // Overlay the VIEWER's per-user read state (`suwayomi_progress`) — the cached
+        // `suwayomi_chapter` read flags are global and no longer authoritative (CR6).
+        let user = current_user(ctx).await;
+        let progress =
+            suwayomi_progress_map(&st.pool, user.as_ref().map(|u| u.id.as_str()), n).await;
+        Ok(list
+            .into_iter()
+            .map(|c| {
+                let p = progress.get(&c.id).copied();
+                map_chapter(c, p)
+            })
+            .collect())
     }
 
     async fn pages(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Vec<Page>> {
@@ -1439,12 +2268,129 @@ impl QueryRoot {
 
     async fn library(&self, ctx: &Context<'_>) -> Result<Vec<Series>> {
         let st = state(ctx);
-        let list = st.suwayomi.library().await.map_err(gql_err)?;
+        // "Your Library" is PER-USER: only the series the viewer has added
+        // (`user_library`), newest-added first. An anonymous visitor has no library —
+        // return empty rather than the whole catalogue. (This replaced returning
+        // Suwayomi's shared in-library set, which showed every visitor the same
+        // ~571-series "library".)
+        let Some(user) = current_user(ctx).await else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT series_id FROM user_library WHERE user_id = ? ORDER BY created_at DESC",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        // Build the library in the stored (newest-added-first) order. Canonical works
+        // fill their slot immediately; numeric Suwayomi series reserve a slot and are
+        // mapped together in ONE batched pass afterwards (O(1) grouped queries per
+        // lookup instead of ~5 per series), preserving the interleaved order.
+        let mut out: Vec<Option<Series>> = Vec::with_capacity(ids.len());
+        let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
+        for sid in ids {
+            if sid.starts_with("w_") {
+                // Canonical (MangaDex-mirrored) work.
+                if let Some(work) = catalog::load_canonical_work(&st.pool, &sid)
+                    .await
+                    .map_err(gql_err)?
+                {
+                    let chapters = catalog::load_canonical_chapters(&st.pool, &sid)
+                        .await
+                        .map_err(gql_err)?;
+                    out.push(Some(
+                        map_canonical_series(
+                            &st.pool,
+                            Some(user.id.as_str()),
+                            work,
+                            catalog::main_chapter_count_str(&chapters) as i32,
+                        )
+                        .await,
+                    ));
+                }
+            } else if let Ok(n) = sid.parse::<i64>() {
+                // Numeric Suwayomi series — DB cache first, live fetch on a miss.
+                let m = match crate::series_cache::get_series(&st.pool, n)
+                    .await
+                    .map_err(gql_err)?
+                {
+                    Some(m) => Some(m),
+                    None => st.suwayomi.series(n).await.ok(),
+                };
+                if let Some(m) = m {
+                    pending.push((out.len(), m));
+                    out.push(None); // slot filled by the batched map below
+                }
+            }
+        }
+        // Map all numeric Suwayomi series at once, then drop each into its slot.
+        let (indices, mangas): (Vec<usize>, Vec<SuwayomiManga>) = pending.into_iter().unzip();
+        for (idx, series) in indices.into_iter().zip(map_series_batch(st, mangas).await) {
+            out[idx] = Some(series);
+        }
+        let out: Vec<Series> = out.into_iter().flatten().collect();
         // Hide NSFW series from the library too, unless the viewer opted in (N2).
-        Ok(filter_nsfw(
-            viewer_show_nsfw(ctx).await,
-            map_series_list(st, list).await,
-        ))
+        Ok(filter_nsfw(viewer_show_nsfw(ctx).await, out))
+    }
+
+    /// Per-series read progress for the viewer's library, in a couple of grouped
+    /// queries. The Library and Profile screens use this to shelve series by progress
+    /// (reading / completed / plan) without fetching each series' chapter list — the
+    /// N-round-trip fan-out that hung both pages. Empty for anonymous viewers.
+    ///
+    /// Numeric Suwayomi series read counts come from the viewer's per-user
+    /// `suwayomi_progress`; canonical `w_` works from the per-user `canonical_progress`.
+    /// A series with no progress rows is omitted; the client then treats it as unread
+    /// and uses `chapterCount` for the total.
+    async fn library_progress(&self, ctx: &Context<'_>) -> Result<Vec<SeriesProgress>> {
+        let st = state(ctx);
+        let Some(user) = current_user(ctx).await else {
+            return Ok(Vec::new());
+        };
+        // Numeric Suwayomi series in the viewer's library — read count from the viewer's
+        // own `suwayomi_progress` (no longer the shared `suwayomi_chapter.is_read`).
+        // `total` is left 0 so the client falls back to the series' `chapterCount`
+        // (only chapters the viewer has touched have progress rows).
+        let mut out: Vec<SeriesProgress> = sqlx::query_as::<_, (String, i64)>(
+            "SELECT sp.series_id, COALESCE(SUM(sp.read), 0) AS read \
+             FROM suwayomi_progress sp \
+             JOIN user_library ul ON ul.series_id = sp.series_id AND ul.user_id = sp.user_id \
+             WHERE sp.user_id = ? \
+             GROUP BY sp.series_id",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?
+        .into_iter()
+        .map(|(id, read)| SeriesProgress {
+            id: ID(id),
+            read: read as i32,
+            total: 0,
+        })
+        .collect();
+        // Canonical works in the viewer's library — read from per-user progress;
+        // `total` is left 0 so the client falls back to the work's `chapterCount`.
+        let canon = sqlx::query_as::<_, (String, i64)>(
+            "SELECT cp.work_id, COALESCE(SUM(cp.read), 0) AS read \
+             FROM canonical_progress cp \
+             JOIN user_library ul ON ul.series_id = cp.work_id AND ul.user_id = cp.user_id \
+             WHERE cp.user_id = ? \
+             GROUP BY cp.work_id",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        for (work_id, read) in canon {
+            out.push(SeriesProgress {
+                id: ID(work_id),
+                read: read as i32,
+                total: 0,
+            });
+        }
+        Ok(out)
     }
 
     async fn reviews(
@@ -1459,7 +2405,7 @@ impl QueryRoot {
             "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
              u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
              FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id = ? AND u.is_banned = 0 ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
+             WHERE r.series_id = ? AND u.is_banned = 0 ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
         )
         .bind(series_id.0.clone())
         .bind(PAGE_SIZE + 1)
@@ -1526,39 +2472,58 @@ impl QueryRoot {
         let target_type = validate_comment_target(&target_type)?;
         let st = state(ctx);
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // Pagination is over ROOT comments (whole threads); a page returns those
+        // roots plus *all* their descendants (flat, ascending) so the client can
+        // assemble the full reply tree without extra round-trips. Banned authors'
+        // subtrees are pruned at every depth (the recursion re-checks `is_banned`),
+        // so a banned reply never orphans the branch beneath it in the response.
         let rows: Vec<CommentJoin> = sqlx::query_as(
-            "SELECT c.id, c.target_type, c.target_id, c.body, c.has_spoiler, c.created_at, \
-             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
+            "WITH RECURSIVE roots AS ( \
+                 SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id \
+                 WHERE c.target_type = ? AND c.target_id = ? AND c.parent_id IS NULL \
+                   AND u.is_banned = 0 \
+                 ORDER BY c.created_at ASC, c.id ASC LIMIT ? OFFSET ? \
+             ), \
+             thread(id) AS ( \
+                 SELECT id FROM roots \
+                 UNION ALL \
+                 SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id \
+                     JOIN users u ON u.id = c.user_id WHERE u.is_banned = 0 \
+             ) \
+             SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, \
+                    c.created_at, u.id AS author_id, u.username AS author_username, \
+                    u.avatar_url AS author_avatar, \
+                    m.id AS media_id, m.width AS media_width, m.height AS media_height \
              FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0 ORDER BY c.created_at ASC LIMIT ? OFFSET ?",
+             LEFT JOIN comment_media m ON m.comment_id = c.id \
+             WHERE c.id IN (SELECT id FROM thread) \
+             ORDER BY c.created_at ASC",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
-        .bind(PAGE_SIZE + 1)
+        .bind(PAGE_SIZE)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar(
+        // `total` and `has_next_page` count root threads (the paginated unit).
+        let total_roots: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = ? AND c.target_id = ? AND u.is_banned = 0",
+             WHERE c.target_type = ? AND c.target_id = ? AND c.parent_id IS NULL \
+               AND u.is_banned = 0",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
         .fetch_one(&st.pool)
         .await
         .map_err(gql_err)?;
-        let has_next = rows.len() as i64 > PAGE_SIZE;
-        let items = rows
-            .into_iter()
-            .take(PAGE_SIZE as usize)
-            .map(Comment::from)
-            .collect();
+        let has_next = offset + PAGE_SIZE < total_roots;
+        let items = rows.into_iter().map(Comment::from).collect();
         Ok(CommentPage {
             items,
             page,
             has_next_page: has_next,
-            total: Some(total as i32),
+            total: Some(total_roots as i32),
         })
     }
 
@@ -1567,7 +2532,8 @@ impl QueryRoot {
         require_admin(ctx).await?;
         let st = state(ctx);
         let (library_size, overdue_count, last_tick_at) = {
-            let h = st.scan_health.lock().unwrap();
+            // Recover from a poisoned lock rather than propagating the panic.
+            let h = st.scan_health.lock().unwrap_or_else(|e| e.into_inner());
             (
                 h.library_size as i32,
                 h.overdue_count as i32,
@@ -1601,7 +2567,7 @@ impl QueryRoot {
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         let rows: Vec<AdminUserRow> = sqlx::query_as(
             "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
-             FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM users ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(PAGE_SIZE + 1)
         .bind(offset)
@@ -2445,13 +3411,15 @@ async fn federated_search(
             continue;
         };
         // NSFW works are hidden from an opted-out viewer (same gate as feeds).
-        if work.is_nsfw && !show_nsfw {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !show_nsfw {
             continue;
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &wid)
             .await
             .map_err(gql_err)?;
-        let series = map_canonical_series(&st.pool, uid, work, chapters.len() as i32).await;
+        let series =
+            map_canonical_series(&st.pool, uid, work, catalog::main_chapter_count_str(&chapters) as i32)
+                .await;
         let translators = work_sources_to_translators(
             st,
             load_work_sources(&st.pool, &wid, show_nsfw).await?,
@@ -2499,6 +3467,40 @@ impl From<ActivityRow> for Activity {
     }
 }
 
+/// Reload a series (canonical `w_` work or numeric Suwayomi id) as a `Series`
+/// whose per-viewer fields (`isMarked` / `libraryStatus` / `isFavorite`) resolve
+/// against `user_id`. Shared by the library mutations to echo the updated state.
+async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<Series> {
+    if series_id.starts_with("w_") {
+        let work = catalog::load_canonical_work(&st.pool, series_id)
+            .await
+            .map_err(gql_err)?
+            .ok_or_else(|| Error::new("No such work"))?;
+        let chapters = catalog::load_canonical_chapters(&st.pool, series_id)
+            .await
+            .map_err(gql_err)?;
+        return Ok(map_canonical_series(
+            &st.pool,
+            Some(user_id),
+            work,
+            catalog::main_chapter_count_str(&chapters) as i32,
+        )
+        .await);
+    }
+    let n = series_id.parse::<i64>().map_err(gql_err)?;
+    // DB cache first, live source only on a miss — so filing a shelf / favouriting
+    // a numeric series works even when the upstream source (Suwayomi) is offline
+    // (the write has already landed; this only echoes the series back).
+    let m = match crate::series_cache::get_series(&st.pool, n)
+        .await
+        .map_err(gql_err)?
+    {
+        Some(m) => m,
+        None => st.suwayomi.series(n).await.map_err(gql_err)?,
+    };
+    Ok(map_series(st, m).await)
+}
+
 // ---- Mutation --------------------------------------------------------------
 
 pub struct MutationRoot;
@@ -2507,38 +3509,49 @@ pub struct MutationRoot;
 impl MutationRoot {
     async fn mark(&self, ctx: &Context<'_>, series_id: ID, marked: bool) -> Result<Series> {
         let st = state(ctx);
-        // Canonical (MangaDex-mirrored) works keep per-user library membership in
-        // `canonical_library`; numeric Suwayomi ids fall through unchanged (CR6).
-        if series_id.0.starts_with("w_") {
-            let user = require_user(ctx).await?;
-            if marked {
-                let now = Utc::now().to_rfc3339();
-                sqlx::query(
-                    "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES (?, ?, ?) \
-                     ON CONFLICT(user_id, work_id) DO NOTHING",
-                )
+        // "Add to library" is a PER-USER action — it writes the viewer's own
+        // `user_library`, not Suwayomi's shared in-library flag. Requires a session
+        // (an anonymous visitor has no library to add to). Works for both numeric
+        // Suwayomi ids and `w_` canonical ids.
+        let user = require_user(ctx).await?;
+        // Validate the id shape BEFORE writing, so a malformed id (neither a `w_`
+        // canonical id nor a numeric Suwayomi id) can't persist an orphan
+        // `user_library` row that later reads skip silently.
+        if !series_id.0.starts_with("w_") && series_id.0.parse::<i64>().is_err() {
+            return Err(Error::new("Invalid series id"));
+        }
+        if marked {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO user_library (user_id, series_id, created_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(user_id, series_id) DO NOTHING",
+            )
+            .bind(&user.id)
+            .bind(&series_id.0)
+            .bind(&now)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+            log_activity(
+                &st.pool,
+                &user.id,
+                "library_add",
+                Some("series"),
+                Some(&series_id.0),
+            )
+            .await;
+        } else {
+            sqlx::query("DELETE FROM user_library WHERE user_id = ? AND series_id = ?")
                 .bind(&user.id)
                 .bind(&series_id.0)
-                .bind(&now)
                 .execute(&st.pool)
                 .await
                 .map_err(gql_err)?;
-                log_activity(
-                    &st.pool,
-                    &user.id,
-                    "library_add",
-                    Some("series"),
-                    Some(&series_id.0),
-                )
-                .await;
-            } else {
-                sqlx::query("DELETE FROM canonical_library WHERE user_id = ? AND work_id = ?")
-                    .bind(&user.id)
-                    .bind(&series_id.0)
-                    .execute(&st.pool)
-                    .await
-                    .map_err(gql_err)?;
-            }
+        }
+        // Return the series with the (now-updated) per-viewer `isMarked` resolved by
+        // the ComplexObject impl. Canonical `w_` works load from the mirror; numeric
+        // ids load the source series.
+        if series_id.0.starts_with("w_") {
             let work = catalog::load_canonical_work(&st.pool, &series_id.0)
                 .await
                 .map_err(gql_err)?
@@ -2550,17 +3563,81 @@ impl MutationRoot {
                 &st.pool,
                 Some(user.id.as_str()),
                 work,
-                chapters.len() as i32,
+                catalog::main_chapter_count_str(&chapters) as i32,
             )
             .await);
         }
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
-        st.suwayomi
-            .set_in_library(n, marked)
-            .await
-            .map_err(gql_err)?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         Ok(map_series(st, m).await)
+    }
+
+    /// File a series under an explicit shelf for the viewer ('reading' |
+    /// 'completed' | 'onhold' | 'plan'), or clear it (`status: null`) to fall back
+    /// to progress-derived shelving. Adds the series to the viewer's library if it
+    /// isn't already there — filing a shelf implies membership. Per-user.
+    async fn set_library_status(
+        &self,
+        ctx: &Context<'_>,
+        series_id: ID,
+        status: Option<String>,
+    ) -> Result<Series> {
+        let st = state(ctx);
+        let user = require_user(ctx).await?;
+        if let Some(s) = status.as_deref() {
+            if !matches!(s, "reading" | "completed" | "onhold" | "plan") {
+                return Err(Error::new(
+                    "status must be one of: reading, completed, onhold, plan",
+                ));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO user_library (user_id, series_id, created_at, status) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(user_id, series_id) DO UPDATE SET status = excluded.status",
+        )
+        .bind(&user.id)
+        .bind(&series_id.0)
+        .bind(&now)
+        .bind(&status)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        reload_series(st, &user.id, &series_id.0).await
+    }
+
+    /// Toggle whether the viewer has favourited a series. Adds it to the library if
+    /// not already present — favouriting implies membership. Per-user.
+    async fn set_favorite(&self, ctx: &Context<'_>, series_id: ID, favorite: bool) -> Result<Series> {
+        let st = state(ctx);
+        let user = require_user(ctx).await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO user_library (user_id, series_id, created_at, is_favorite) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(user_id, series_id) DO UPDATE SET is_favorite = excluded.is_favorite",
+        )
+        .bind(&user.id)
+        .bind(&series_id.0)
+        .bind(&now)
+        .bind(favorite as i64)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        reload_series(st, &user.id, &series_id.0).await
+    }
+
+    /// Record one view (a chapter open) for a series — the popularity signal behind
+    /// Trending and the series-page view counts. Intentionally NO auth: every reader,
+    /// signed-in or anonymous, counts (the product decision is to count everyone). The
+    /// reader fires this once per chapter open. Best-effort: a counter write must never
+    /// fail the read, so an error is logged and swallowed, and the mutation still
+    /// returns `true`.
+    async fn record_view(&self, ctx: &Context<'_>, series_id: ID) -> Result<bool> {
+        let st = state(ctx);
+        if let Err(e) = crate::views::record(&st.pool, &series_id.0).await {
+            tracing::warn!(series_id = %series_id.0, error = %e, "recordView failed");
+        }
+        Ok(true)
     }
 
     async fn set_progress(
@@ -2611,17 +3688,49 @@ impl MutationRoot {
             .map_err(gql_err)?;
             return Ok(true);
         }
+        // Numeric Suwayomi chapter: per-user progress in `suwayomi_progress` (CR6).
+        // Suwayomi is a content source only now — we no longer push read state to it.
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
-        st.suwayomi
-            .set_progress(n, last_page_read as i64, read)
-            .await
-            .map_err(gql_err)?;
+        let user = require_user(ctx).await?;
+        // The owning series id, for per-series aggregation in `libraryProgress`. If the
+        // chapter isn't cached yet, store with series_id = '' rather than erroring —
+        // the row is per-user private and the read state still round-trips.
+        let series_id: Option<i64> =
+            sqlx::query_scalar("SELECT manga_id FROM suwayomi_chapter WHERE id = ? LIMIT 1")
+                .bind(n)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        let series_id = series_id.map(|s| s.to_string()).unwrap_or_default();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO suwayomi_progress \
+               (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+               last_page_read = excluded.last_page_read, read = excluded.read, \
+               series_id = excluded.series_id, updated_at = excluded.updated_at",
+        )
+        .bind(&user.id)
+        .bind(chapter_id.0.clone())
+        .bind(&series_id)
+        .bind(last_page_read as i64)
+        .bind(read)
+        .bind(&now)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
         Ok(true)
     }
 
     async fn post_review(&self, ctx: &Context<'_>, input: PostReviewInput) -> Result<Review> {
         if !(1..=10).contains(&input.score) {
             return Err(Error::new("score must be between 1 and 10"));
+        }
+        // Cap the written body (mirrors the bio cap in `update_profile`) so a client
+        // can't inflate the DB with multi-megabyte reviews.
+        if input.body.trim().chars().count() > 4000 {
+            return Err(Error::new("review must be at most 4000 characters"));
         }
         // An empty body is allowed: it represents a pure rating (the Series
         // rating widget) with no written review. The body-bearing reviews are
@@ -2674,27 +3783,90 @@ impl MutationRoot {
 
     async fn post_comment(&self, ctx: &Context<'_>, input: PostCommentInput) -> Result<Comment> {
         let target_type = validate_comment_target(&input.target_type)?;
-        if input.body.trim().is_empty() {
-            return Err(Error::new("comment body must not be empty"));
+        let body = input.body.trim().to_string();
+        // A comment must carry text OR an image (an image-only comment is fine).
+        if body.is_empty() && input.media_id.is_none() {
+            return Err(Error::new("comment must have text or an image"));
+        }
+        // Cap the body (mirrors the bio cap in `update_profile`) to bound per-row
+        // size and keep recursive thread reads cheap.
+        if body.chars().count() > 4000 {
+            return Err(Error::new("comment must be at most 4000 characters"));
         }
         let user = require_user(ctx).await?;
         let st = state(ctx);
+
+        // A reply must point at an existing comment on the SAME target — this keeps
+        // a thread's tree self-consistent and blocks cross-thread / cross-series
+        // parent ids. The root of the tree is a NULL parent.
+        if let Some(parent) = input.parent_id.as_ref() {
+            let ok: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM comments WHERE id = ? AND target_type = ? AND target_id = ?",
+            )
+            .bind(&parent.0)
+            .bind(target_type)
+            .bind(input.target_id.0.clone())
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?;
+            if ok.is_none() {
+                return Err(Error::new("reply target not found on this thread"));
+            }
+        }
+
         let now = Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO comments (id, target_type, target_id, user_id, body, has_spoiler, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(target_type)
-        .bind(input.target_id.0.clone())
-        .bind(&user.id)
-        .bind(input.body.trim())
-        .bind(input.has_spoiler)
-        .bind(&now)
-        .execute(&st.pool)
-        .await
-        .map_err(gql_err)?;
+        let parent_id = input.parent_id.as_ref().map(|p| p.0.clone());
+
+        // Insert the comment and (optionally) claim the staged image in one
+        // transaction, so a comment never ends up referencing media it failed to
+        // link (or media stays orphaned after the comment committed).
+        let media: Option<(i64, i64)> = {
+            let mut tx = st.pool.begin().await.map_err(gql_err)?;
+            sqlx::query(
+                "INSERT INTO comments \
+                   (id, target_type, target_id, parent_id, user_id, body, has_spoiler, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(target_type)
+            .bind(input.target_id.0.clone())
+            .bind(&parent_id)
+            .bind(&user.id)
+            .bind(&body)
+            .bind(input.has_spoiler)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(gql_err)?;
+
+            let dims = if let Some(media_id) = input.media_id.as_ref() {
+                // Claim the caller's own, not-yet-linked upload. RETURNING gives us
+                // the stored dimensions for the response in the same statement.
+                let row: Option<(i64, i64)> = sqlx::query_as(
+                    "UPDATE comment_media SET comment_id = ? \
+                     WHERE id = ? AND user_id = ? AND comment_id IS NULL \
+                     RETURNING width, height",
+                )
+                .bind(&id)
+                .bind(&media_id.0)
+                .bind(&user.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+                if row.is_none() {
+                    // Bad/foreign/already-used media id: abort so the comment isn't
+                    // committed with a phantom attachment.
+                    return Err(Error::new("attached image not found"));
+                }
+                row
+            } else {
+                None
+            };
+            tx.commit().await.map_err(gql_err)?;
+            dims
+        };
+
         log_activity(
             &st.pool,
             &user.id,
@@ -2703,17 +3875,25 @@ impl MutationRoot {
             Some(&input.target_id.0),
         )
         .await;
+        let media_url = input
+            .media_id
+            .as_ref()
+            .map(|m| crate::media::comment_media_url(&m.0));
         Ok(Comment {
             id: ID(id),
             target_type: target_type.to_string(),
             target_id: input.target_id,
+            parent_id: input.parent_id,
             author: UserRef {
                 id: ID(user.id),
                 username: user.username,
                 avatar_url: user.avatar_url,
             },
-            body: input.body.trim().to_string(),
+            body,
             has_spoiler: input.has_spoiler,
+            media_url,
+            media_width: media.map(|(w, _)| w as i32),
+            media_height: media.map(|(_, h)| h as i32),
             created_at: now,
         })
     }
@@ -2792,8 +3972,26 @@ impl MutationRoot {
         }
         let username = input.username.trim();
         let email = input.email.trim();
-        if username.len() < 3 {
+        // Count glyphs, not bytes, so a multibyte username can't slip under the
+        // minimum; also cap the maximum and restrict the charset (letters, digits,
+        // and `_ - .`) to keep control chars / whitespace / homoglyph tricks out.
+        let uname_len = username.chars().count();
+        if uname_len < 3 {
             return Err(Error::new("username must be at least 3 characters"));
+        }
+        if uname_len > 32 {
+            return Err(Error::new("username must be at most 32 characters"));
+        }
+        if !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(Error::new(
+                "username may only contain letters, digits, and _ - .",
+            ));
+        }
+        if email.chars().count() > 254 {
+            return Err(Error::new("a valid email is required"));
         }
         if !email.contains('@') {
             return Err(Error::new("a valid email is required"));
@@ -2814,6 +4012,21 @@ impl MutationRoot {
             .any(|u| u.eq_ignore_ascii_case(username))
         {
             return Err(Error::new("This username is reserved."));
+        }
+        // Case-insensitive uniqueness pre-check (L): the DB `UNIQUE` is byte-exact,
+        // so without this `alvee` and `Alvee` register as distinct accounts and one
+        // can impersonate the other. (Residual race: two concurrent registrations of
+        // case-variant names can still both pass this check; the byte-exact UNIQUE
+        // only stops exact-duplicate inserts. A COLLATE NOCASE unique index would
+        // close it fully but needs a migration owned elsewhere.)
+        let taken: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
+                .bind(username)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        if taken.is_some() {
+            return Err(Error::new("username or email already taken"));
         }
         let hash = auth::hash_password(&input.password).map_err(gql_err)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -2857,8 +4070,9 @@ impl MutationRoot {
     async fn logout(&self, ctx: &Context<'_>) -> Result<bool> {
         let st = state(ctx);
         if let Some(tok) = token(ctx) {
+            // Stored column is sha256(token) — hash the presented token to match.
             sqlx::query("DELETE FROM sessions WHERE token = ?")
-                .bind(&tok)
+                .bind(auth::hash_token(&tok))
                 .execute(&st.pool)
                 .await
                 .map_err(gql_err)?;
@@ -3019,6 +4233,262 @@ impl MutationRoot {
         Ok(map_series(st, m).await)
     }
 
+    /// Admin series-detail editor: edit a canonical work's user-facing metadata as an
+    /// override layer — the source-derived fields stay immutable and these overrides
+    /// win at read time (like `series_admin` for scan/status). Each field is
+    /// three-valued: OMITTED => leave unchanged; null => clear the override; a value =>
+    /// set it. `tags` is a whole-list replace of the curated set. Returns the
+    /// recomputed series (in the same id shape the caller passed).
+    async fn update_series_metadata(
+        &self,
+        ctx: &Context<'_>,
+        input: SeriesMetadataInput,
+    ) -> Result<Series> {
+        use async_graphql::MaybeUndefined::{Null, Undefined, Value};
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let work_id = resolve_work_id(&st.pool, &input.series_id.0)
+            .await
+            .ok_or_else(|| {
+                Error::new(
+                    "Series is not catalogued — add it to the catalogue before editing its metadata.",
+                )
+            })?;
+        let now = Utc::now().to_rfc3339();
+
+        // All override writes in ONE transaction so a partial failure can't leave a
+        // half-applied edit. Each singular column follows the three-valued input:
+        // Undefined => leave; Null => clear (NULL); Value => set.
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        match &input.title {
+            Undefined => {}
+            Null | Value(_) => {
+                let v = match &input.title {
+                    Value(v) => Some(v.as_str()),
+                    _ => None,
+                };
+                sqlx::query("UPDATE work SET title_override = ?, updated_at = ? WHERE id = ?")
+                    .bind(v)
+                    .bind(&now)
+                    .bind(&work_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+            }
+        }
+        match &input.description {
+            Undefined => {}
+            Null | Value(_) => {
+                let v = match &input.description {
+                    Value(v) => Some(v.as_str()),
+                    _ => None,
+                };
+                sqlx::query("UPDATE work SET description_override = ?, updated_at = ? WHERE id = ?")
+                    .bind(v)
+                    .bind(&now)
+                    .bind(&work_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+            }
+        }
+        match input.r#type {
+            Undefined => {}
+            Null | Value(_) => {
+                let word = match input.r#type {
+                    Value(t) => Some(content_type_word(t)),
+                    _ => None,
+                };
+                sqlx::query("UPDATE work SET content_type_override = ?, updated_at = ? WHERE id = ?")
+                    .bind(word)
+                    .bind(&now)
+                    .bind(&work_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+            }
+        }
+        match input.is_nsfw {
+            Undefined => {}
+            Null | Value(_) => {
+                let val = match input.is_nsfw {
+                    Value(b) => Some(b as i64),
+                    _ => None,
+                };
+                sqlx::query("UPDATE work SET is_nsfw_override = ?, updated_at = ? WHERE id = ?")
+                    .bind(val)
+                    .bind(&now)
+                    .bind(&work_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+            }
+        }
+        // Tags: `tags: []` and `tags: null` both leave zero curated rows → the work
+        // reverts to source-derived genres (curated-empty is intentionally not
+        // expressible; the console only sends `tags` when the admin edits them).
+        match &input.tags {
+            Undefined => {}
+            Null | Value(_) => {
+                sqlx::query("DELETE FROM work_tag WHERE work_id = ?")
+                    .bind(&work_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+                if let Value(list) = &input.tags {
+                    for (i, tag) in list.iter().enumerate() {
+                        let t = tag.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord) VALUES (?, ?, ?)",
+                        )
+                        .bind(&work_id)
+                        .bind(t)
+                        .bind(i as i64)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(gql_err)?;
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(gql_err)?;
+
+        // Recompute the series in the caller's id shape so the console updates in place.
+        if input.series_id.0.starts_with("w_") {
+            let work = catalog::load_canonical_work(&st.pool, &work_id)
+                .await
+                .map_err(gql_err)?
+                .ok_or_else(|| Error::new("No such work"))?;
+            let chapters = catalog::load_canonical_chapters(&st.pool, &work_id)
+                .await
+                .map_err(gql_err)?;
+            let user = current_user(ctx).await;
+            Ok(map_canonical_series(
+                &st.pool,
+                user.as_ref().map(|u| u.id.as_str()),
+                work,
+                catalog::main_chapter_count_str(&chapters) as i32,
+            )
+            .await)
+        } else {
+            let n = input.series_id.0.parse::<i64>().map_err(gql_err)?;
+            let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
+            Ok(map_series(st, m).await)
+        }
+    }
+
+    /// Admin: force an immediate re-scan of every installed Suwayomi source of a
+    /// canonical work (each source's `source_key` is a Suwayomi manga id). Returns how
+    /// many sources were successfully scanned; unresolvable sources are skipped.
+    async fn rescan_work(&self, ctx: &Context<'_>, work_id: ID) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT source_key FROM source_series \
+             WHERE work_id = ? AND source_type = 'suwayomi'",
+        )
+        .bind(&work_id.0)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let now = Utc::now();
+        let mut scanned = 0;
+        for key in keys {
+            let Ok(n) = key.parse::<i64>() else { continue };
+            match st.suwayomi.series(n).await {
+                Ok(m) => {
+                    if scan_series(st, &m, now).await.is_ok() {
+                        scanned += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(source_key = key, error = %e, "rescanWork: skipping unresolvable source")
+                }
+            }
+        }
+        Ok(scanned)
+    }
+
+    /// Admin series-detail editor: soft-hide (reversible) or rename one chapter of a
+    /// work by aggregate number. Non-destructive — the cached chapter rows are
+    /// untouched, so a re-scan can't resurrect a hidden chapter. Clearing both fields
+    /// removes the override row entirely.
+    async fn set_chapter_override(
+        &self,
+        ctx: &Context<'_>,
+        input: ChapterOverrideInput,
+    ) -> Result<bool> {
+        use async_graphql::MaybeUndefined::{Null, Undefined, Value};
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
+            .bind(&input.work_id.0)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        if exists.is_none() {
+            return Err(Error::new("No such work"));
+        }
+        // Read-modify-write under ONE transaction so two concurrent partial edits (one
+        // toggling `hidden`, one renaming) can't clobber each other's field.
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        let existing = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT hidden, title_override FROM chapter_override WHERE work_id = ? AND chapter_key = ?",
+        )
+        .bind(&input.work_id.0)
+        .bind(&input.chapter_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        let (mut hidden, mut title) = existing.map(|(h, t)| (h != 0, t)).unwrap_or((false, None));
+        match input.hidden {
+            Undefined => {}
+            Null => hidden = false,
+            Value(b) => hidden = b,
+        }
+        match input.title {
+            Undefined => {}
+            Null => title = None,
+            Value(v) => {
+                let v = v.trim().to_string();
+                title = if v.is_empty() { None } else { Some(v) };
+            }
+        }
+        // A no-op override (visible + no rename) is stored as the absence of a row.
+        if !hidden && title.is_none() {
+            sqlx::query("DELETE FROM chapter_override WHERE work_id = ? AND chapter_key = ?")
+                .bind(&input.work_id.0)
+                .bind(&input.chapter_key)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            tx.commit().await.map_err(gql_err)?;
+            return Ok(true);
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO chapter_override (work_id, chapter_key, hidden, title_override, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(work_id, chapter_key) DO UPDATE SET \
+               hidden = excluded.hidden, \
+               title_override = excluded.title_override, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(&input.work_id.0)
+        .bind(&input.chapter_key)
+        .bind(hidden as i64)
+        .bind(&title)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
+        Ok(true)
+    }
+
     /// Admin moderation: suspend or restore a user account. A banned user can't
     /// sign in and their active sessions are revoked immediately. Admins can't
     /// ban themselves or another admin.
@@ -3066,16 +4536,41 @@ impl MutationRoot {
         })
     }
 
-    /// Admin moderation: delete a chapter comment. Returns false if it was
-    /// already gone. (Authors don't self-delete here — this is the mod action.)
+    /// Admin moderation: delete a comment and its entire reply subtree. Returns
+    /// false if it was already gone. (Authors don't self-delete here — this is the
+    /// mod action.) The subtree and its attached images are removed explicitly
+    /// (via a recursive CTE) rather than relying on `ON DELETE CASCADE`, so it
+    /// behaves the same on connections without the foreign_keys pragma.
     async fn delete_comment(&self, ctx: &Context<'_>, comment_id: ID) -> Result<bool> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let res = sqlx::query("DELETE FROM comments WHERE id = ?")
-            .bind(&comment_id.0)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        // Drop the attached images of the whole subtree first (FK-safe ordering).
+        sqlx::query(
+            "WITH RECURSIVE subtree(id) AS ( \
+                 SELECT id FROM comments WHERE id = ? \
+                 UNION ALL \
+                 SELECT c.id FROM comments c JOIN subtree s ON c.parent_id = s.id \
+             ) \
+             DELETE FROM comment_media WHERE comment_id IN (SELECT id FROM subtree)",
+        )
+        .bind(&comment_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        let res = sqlx::query(
+            "WITH RECURSIVE subtree(id) AS ( \
+                 SELECT id FROM comments WHERE id = ? \
+                 UNION ALL \
+                 SELECT c.id FROM comments c JOIN subtree s ON c.parent_id = s.id \
+             ) \
+             DELETE FROM comments WHERE id IN (SELECT id FROM subtree)",
+        )
+        .bind(&comment_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -3358,7 +4853,7 @@ impl MutationRoot {
     async fn backfill_mangadex_metadata(
         &self,
         ctx: &Context<'_>,
-        #[graphql(default = 50)] limit: i32,
+        #[graphql(default = 200)] limit: i32,
     ) -> Result<i32> {
         require_admin(ctx).await?;
         let st = state(ctx);
@@ -3754,13 +5249,18 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
 /// Create a session row and return its opaque token.
 async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<String> {
     let tok = auth::generate_token();
+    // Store only sha256(token) at rest (defense-in-depth): a leaked DB snapshot
+    // never yields a replayable bearer token. The plaintext `tok` is returned to
+    // the caller unchanged and is what the client presents on later requests
+    // (`user_for_token` re-hashes before lookup).
+    let token_hash = auth::hash_token(&tok);
     let now = Utc::now();
     let created = now.to_rfc3339();
     let expires = auth::format_ts(now + chrono::Duration::seconds(ttl_secs));
     sqlx::query(
         "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
     )
-    .bind(&tok)
+    .bind(&token_hash)
     .bind(user_id)
     .bind(&created)
     .bind(&expires)
@@ -3856,7 +5356,12 @@ async fn add_source_series_core_ex(
     };
 
     use crate::dedup::Decision;
-    let (decision_str, matched_work_id, score, method, work_id) = match &decision {
+    // `minted_work` is the work we FRESHLY created in this call (New / provisional
+    // Review). It's the orphan-cleanup target if we lose the concurrent claim below
+    // — AutoMerge / review_consolidated reuse an existing work and must never be
+    // deleted here.
+    let mut minted_work: Option<String> = None;
+    let (mut decision_str, matched_work_id, score, method, mut work_id) = match &decision {
         Decision::AutoMerge {
             work_id,
             score,
@@ -3891,6 +5396,7 @@ async fn add_source_series_core_ex(
             // human. Reached by the admin add flow AND by federated matches that
             // failed the C2 corroboration/length guard — never a silent merge.
             let provisional = crate::catalog::create_work(pool, &make_work()).await?;
+            minted_work = Some(provisional.clone());
             (
                 "review",
                 Some(work_id.clone()),
@@ -3901,6 +5407,7 @@ async fn add_source_series_core_ex(
         }
         Decision::New => {
             let created = crate::catalog::create_work(pool, &make_work()).await?;
+            minted_work = Some(created.clone());
             ("new", None, None, None, created)
         }
     };
@@ -3915,6 +5422,32 @@ async fn add_source_series_core_ex(
         source_nsfw,
     )
     .await?;
+
+    // H6 — post-claim re-check. The natural-key `ON CONFLICT` in
+    // `upsert_source_series` is the atomic claim: exactly one work_id ends up
+    // stored for this (source_type, source_id, source_key). If a concurrent add of
+    // the SAME series won the claim, the stored work_id differs from the one we
+    // just linked. Adopt the authoritative stored linkage and, if WE minted a fresh
+    // work, delete it so it isn't orphaned. This closes the false-split / orphan
+    // race without a cross-helper transaction refactor.
+    // Residual risk: two concurrent *New* decisions for what is genuinely the same
+    // series (both saw no existing work) still mint two works; the claim serializes
+    // them so only one is linked and the loser's work is reclaimed here — but a
+    // concurrent add matching a DIFFERENT existing work than the winner would keep
+    // its own (non-minted) work. That window is narrow and human-reviewable.
+    if let Some((_, stored_work_id)) =
+        crate::catalog::find_source_series(pool, "suwayomi", &m.source_id, &source_key).await?
+    {
+        if stored_work_id != work_id {
+            if minted_work.as_deref() == Some(work_id.as_str()) {
+                crate::catalog::delete_work_cascade(pool, &work_id).await?;
+            }
+            // The concurrent winner already established (and, if applicable, queued
+            // a review for) the canonical linkage — treat this add as idempotent.
+            work_id = stored_work_id;
+            decision_str = "existing";
+        }
+    }
 
     // N4: the source-level NSFW signal must reach `work.is_nsfw` — the only column the
     // gating reads consult. `new`/`review` already mint the work with it via make_work;
@@ -4350,12 +5883,15 @@ mod tests {
         seed_user(&pool, "admin-id", "admin", 1, 0).await;
         seed_user(&pool, "bob-id", "bob", 0, 0).await;
         seed_user(&pool, "banned-id", "carol", 0, 1).await;
+        // Sessions store sha256(token); clients still present the raw token
+        // ("admintok"/"bobtok") in the Authorization header, which `user_for_token`
+        // re-hashes before lookup — so seed the hashed value here.
         for (tok, uid) in [("admintok", "admin-id"), ("bobtok", "bob-id")] {
             sqlx::query(
                 "INSERT INTO sessions (token, user_id, created_at, expires_at) \
                  VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
             )
-            .bind(tok)
+            .bind(auth::hash_token(tok))
             .bind(uid)
             .execute(&pool)
             .await
@@ -4364,8 +5900,9 @@ mod tests {
         // An already-expired session — its token must not resolve (A1).
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES ('expiredtok', 'bob-id', '2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z')",
+             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z')",
         )
+        .bind(auth::hash_token("expiredtok"))
         .execute(&pool)
         .await
         .unwrap();
@@ -4380,6 +5917,8 @@ mod tests {
             auth_limiter: RateLimiter::new(max, 60),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
         });
         (build_schema(state, false), pool)
     }
@@ -4392,7 +5931,8 @@ mod tests {
     ) -> async_graphql::Response {
         let req = async_graphql::Request::new(query)
             .data(RequestAuth(token.map(|t| t.to_string())))
-            .data(ClientIp(Some(ip.to_string())));
+            .data(ClientIp(Some(ip.to_string())))
+            .data(RequestUserCache::default());
         schema.execute(req).await
     }
 
@@ -4401,6 +5941,44 @@ mod tests {
             .first()
             .map(|e| e.message.clone())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn record_view_counts_anonymously_and_surfaces_on_series() {
+        // Views are the popularity signal: `recordView` needs NO auth (anonymous reads
+        // count too), and the count surfaces on `series.views` across all windows. Here
+        // a cached numeric series is viewed three times by an anonymous client (no
+        // token), then read back.
+        let (s, pool) = setup_full(100).await;
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (777, 'Viewed Series', 'ONGOING', 'src', 0, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            let r = exec(&s, r#"mutation { recordView(seriesId: "777") }"#, None, "9.9.9.9").await;
+            assert!(r.errors.is_empty(), "recordView failed: {:?}", r.errors);
+            assert_eq!(
+                r.data.into_json().unwrap()["recordView"],
+                serde_json::json!(true)
+            );
+        }
+
+        let r = exec(
+            &s,
+            r#"{ series(id: "777") { views { total last7d last24h } } }"#,
+            None,
+            "9.9.9.9",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "series query failed: {:?}", r.errors);
+        let v = r.data.into_json().unwrap()["series"]["views"].clone();
+        assert_eq!(v["total"], serde_json::json!(3));
+        assert_eq!(v["last24h"], serde_json::json!(3));
+        assert_eq!(v["last7d"], serde_json::json!(3));
     }
 
     fn data_json(resp: &async_graphql::Response) -> String {
@@ -4574,6 +6152,8 @@ mod tests {
                 auth_limiter: RateLimiter::new(100, 60),
                 federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 30 * 24 * 60 * 60,
+                series_inflight: KeyedLocks::default(),
+                chapters_inflight: KeyedLocks::default(),
             })
         };
         const Q: &str = "{ __schema { queryType { name } } }";
@@ -4678,6 +6258,8 @@ mod tests {
             auth_limiter: RateLimiter::new(100, 60),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
         });
         let s = build_schema(state, false);
         // A configured admin name is reserved (case-insensitive) — open
@@ -4907,6 +6489,76 @@ mod tests {
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "nsfw opt-in failed: {:?}", r.errors);
         assert!(data_json(&r).contains("Spicy Work"));
+    }
+
+    #[tokio::test]
+    async fn nsfw_override_flips_gating_both_directions() {
+        // The admin editor's is_nsfw_override must win over the source flag on EVERY
+        // gate (regression for the half-enforced override: a leak when forced NSFW, a
+        // broken un-gate when forced SFW).
+        let (s, pool) = setup_full(100).await;
+
+        // A source-SFW work an admin force-marks NSFW → hidden from an opted-out viewer.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-forcensfw",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Forced NSFW".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let forced_nsfw: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-forcensfw'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE work SET is_nsfw_override = 1 WHERE id = ?")
+            .bind(&forced_nsfw)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let q = format!(r#"{{ canonicalSeries(workId: "{forced_nsfw}") {{ title }} }}"#);
+        assert_eq!(
+            first_error(&exec(&s, &q, Some("bobtok"), "1.1.1.1").await),
+            "No such work",
+            "force-NSFW must hide canonicalSeries"
+        );
+        let qa = format!(r#"{{ aggregatedChapters(workId: "{forced_nsfw}") {{ number }} }}"#);
+        assert_eq!(
+            first_error(&exec(&s, &qa, Some("bobtok"), "1.1.1.1").await),
+            "No such work",
+            "force-NSFW must hide aggregatedChapters"
+        );
+
+        // A source-NSFW work an admin force-marks SFW → visible to an opted-out viewer.
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-forcesfw",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Forced SFW".into()),
+                is_nsfw: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let forced_sfw: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-forcesfw'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE work SET is_nsfw_override = 0 WHERE id = ?")
+            .bind(&forced_sfw)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let q = format!(r#"{{ canonicalSeries(workId: "{forced_sfw}") {{ title }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "force-SFW must un-gate: {:?}", r.errors);
+        assert!(data_json(&r).contains("Forced SFW"));
     }
 
     #[tokio::test]
@@ -5187,7 +6839,7 @@ mod tests {
         assert!(r.errors.is_empty(), "mark failed: {:?}", r.errors);
         assert!(data_json(&r).contains("\"isMarked\":true"));
         let rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM canonical_library WHERE user_id = 'bob-id' AND work_id = ?",
+            "SELECT COUNT(*) FROM user_library WHERE user_id = 'bob-id' AND series_id = ?",
         )
         .bind(&work_id)
         .fetch_one(&pool)
@@ -5204,7 +6856,7 @@ mod tests {
         let r = exec(&s, &mark_q(false), Some("bobtok"), "1.1.1.1").await;
         assert!(data_json(&r).contains("\"isMarked\":false"));
         let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_library WHERE user_id = 'bob-id'")
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_library WHERE user_id = 'bob-id'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -5295,6 +6947,125 @@ mod tests {
             data["canonicalSeries"]["rating"]["count"],
             serde_json::json!(1)
         );
+    }
+
+    #[tokio::test]
+    async fn suwayomi_progress_is_per_user() {
+        // CR6: numeric Suwayomi series get per-user read state + resume, mirroring the
+        // canonical path — two signed-in users are independent, anonymous is all-unread
+        // and cannot persist, and library_progress counts only the viewer's own reads.
+        let (s, pool) = setup_full(100).await;
+        // Seed a cached numeric series (id 500) with two chapters so `chapters()` reads
+        // from the cache (no live source fetch) and `setProgress` can resolve series_id.
+        for (cid, num) in [(9001_i64, 1.0_f64), (9002, 2.0)] {
+            sqlx::query(
+                "INSERT INTO suwayomi_chapter \
+                   (id, manga_id, name, chapter_number, is_read, last_page_read, page_count, updated_at) \
+                 VALUES (?, 500, ?, ?, 1, 99, 20, '2020-01-01T00:00:00Z')",
+            )
+            .bind(cid)
+            .bind(format!("Chapter {num}"))
+            .bind(num)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Both users add series 500 to their library.
+        for uid in ["bob-id", "admin-id"] {
+            sqlx::query(
+                "INSERT INTO user_library (user_id, series_id, created_at) \
+                 VALUES (?, '500', '2020-01-01T00:00:00Z')",
+            )
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Anonymous cannot persist progress.
+        let prog_q = r#"mutation { setProgress(chapterId: "9001", lastPageRead: 12, read: true) }"#;
+        let r = exec(&s, prog_q, None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Not authenticated");
+
+        // Bob reads chapter 9001; admin reads nothing.
+        let r = exec(&s, prog_q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "setProgress failed: {:?}", r.errors);
+        // series_id was resolved from the chapter's cached manga_id.
+        let stored: (String, i64, i64) = sqlx::query_as(
+            "SELECT series_id, last_page_read, read FROM suwayomi_progress \
+             WHERE user_id = 'bob-id' AND chapter_id = '9001'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ("500".into(), 12, 1));
+
+        // chapters() overlays only the VIEWER's state — despite the cached global
+        // is_read=1/last_page_read=99, bob sees his own values and admin sees unread.
+        let chapters_q = r#"{ chapters(seriesId: "500") { id read lastPageRead } }"#;
+        let read_state = |r: async_graphql::Response, id: &str| {
+            r.data.into_json().unwrap()["chapters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let bob = read_state(
+            exec(&s, chapters_q, Some("bobtok"), "1.1.1.1").await,
+            "9001",
+        );
+        assert_eq!(bob["read"], serde_json::json!(true));
+        assert_eq!(bob["lastPageRead"], serde_json::json!(12));
+        let admin = read_state(
+            exec(&s, chapters_q, Some("admintok"), "1.1.1.1").await,
+            "9001",
+        );
+        assert_eq!(admin["read"], serde_json::json!(false), "admin independent");
+        assert_eq!(admin["lastPageRead"], serde_json::json!(0));
+        // Anonymous also sees everything unread (cached global flag ignored).
+        let anon = read_state(exec(&s, chapters_q, None, "1.1.1.1").await, "9001");
+        assert_eq!(anon["read"], serde_json::json!(false));
+        assert_eq!(anon["lastPageRead"], serde_json::json!(0));
+
+        // libraryProgress reflects each viewer's own read count; total is 0 (client
+        // falls back to chapterCount).
+        let lib_q = r#"{ libraryProgress { id read total } }"#;
+        let bob_lib = exec(&s, lib_q, Some("bobtok"), "1.1.1.1").await;
+        let lp = bob_lib.data.into_json().unwrap()["libraryProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "500")
+            .unwrap()
+            .clone();
+        assert_eq!(lp["read"], serde_json::json!(1));
+        assert_eq!(lp["total"], serde_json::json!(0));
+        // Admin has no progress rows → series omitted entirely.
+        let admin_lib = exec(&s, lib_q, Some("admintok"), "1.1.1.1").await;
+        assert!(admin_lib.data.into_json().unwrap()["libraryProgress"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // A second write updates in place — no duplicate row.
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId: "9001", lastPageRead: 5, read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let (cnt, lpr, rd): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(last_page_read), MAX(read) FROM suwayomi_progress \
+             WHERE user_id = 'bob-id' AND chapter_id = '9001'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((cnt, lpr, rd), (1, 5, 0), "upsert in place");
     }
 
     #[tokio::test]
@@ -5757,6 +7528,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn threaded_replies_nest_and_paginate_by_root() {
+        let s = setup().await;
+        // Root comment on the series thread.
+        let root = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"root", hasSpoiler:false }) { id parentId } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            root.errors.is_empty(),
+            "root post failed: {:?}",
+            root.errors
+        );
+        let root_json = root.data.into_json().unwrap();
+        assert_eq!(
+            root_json["postComment"]["parentId"],
+            serde_json::json!(null)
+        );
+        let root_id = root_json["postComment"]["id"].as_str().unwrap().to_string();
+
+        // Reply to the root, and a nested reply to that reply (arbitrary depth).
+        let reply = exec(
+            &s,
+            &format!(
+                r#"mutation {{ postComment(input:{{ targetType:"series", targetId:"s1", parentId:"{root_id}", body:"reply", hasSpoiler:false }}) {{ id parentId }} }}"#
+            ),
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(reply.errors.is_empty(), "reply failed: {:?}", reply.errors);
+        let reply_json = reply.data.into_json().unwrap();
+        assert_eq!(
+            reply_json["postComment"]["parentId"],
+            serde_json::json!(root_id)
+        );
+        let reply_id = reply_json["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let nested = exec(
+            &s,
+            &format!(
+                r#"mutation {{ postComment(input:{{ targetType:"series", targetId:"s1", parentId:"{reply_id}", body:"nested", hasSpoiler:false }}) {{ id }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            nested.errors.is_empty(),
+            "nested failed: {:?}",
+            nested.errors
+        );
+
+        // The thread query returns all three (flat, ascending) but counts ONE root.
+        let list = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id parentId body } total hasNextPage } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let lj = list.data.into_json().unwrap();
+        assert_eq!(lj["comments"]["items"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            lj["comments"]["total"],
+            serde_json::json!(1),
+            "one root thread"
+        );
+        assert_eq!(lj["comments"]["hasNextPage"], serde_json::json!(false));
+
+        // A reply whose parent lives on a different target is rejected.
+        let cross = exec(
+            &s,
+            &format!(
+                r#"mutation {{ postComment(input:{{ targetType:"series", targetId:"s2", parentId:"{root_id}", body:"x", hasSpoiler:false }}) {{ id }} }}"#
+            ),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&cross), "reply target not found on this thread");
+
+        // Deleting the root removes the whole subtree (admin moderation).
+        let del = exec(
+            &s,
+            &format!(r#"mutation {{ deleteComment(commentId:"{root_id}") }}"#),
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(del.errors.is_empty(), "delete failed: {:?}", del.errors);
+        assert_eq!(
+            del.data.into_json().unwrap()["deleteComment"],
+            serde_json::json!(true)
+        );
+        let after = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let aj = after.data.into_json().unwrap();
+        assert!(
+            aj["comments"]["items"].as_array().unwrap().is_empty(),
+            "subtree gone"
+        );
+        assert_eq!(aj["comments"]["total"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn comment_media_links_once_and_rejects_bad_ids() {
+        let (s, pool) = setup_full(100).await;
+        // Stage an uploaded image row for bob (as POST /comment-media would).
+        sqlx::query(
+            "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
+             VALUES ('m1', NULL, 'bob-id', X'00', 800, 600, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Empty body AND no media → rejected.
+        let empty = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"   ", hasSpoiler:false }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&empty), "comment must have text or an image");
+
+        // Someone else's / unlinked media id owned by bob: another user can't claim it.
+        let steal = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"mine now", hasSpoiler:false, mediaId:"m1" }) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&steal), "attached image not found");
+
+        // Bob attaches his image (image-only comment, empty body allowed).
+        let posted = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"", hasSpoiler:false, mediaId:"m1" }) { id mediaUrl mediaWidth mediaHeight } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            posted.errors.is_empty(),
+            "attach failed: {:?}",
+            posted.errors
+        );
+        let pj = posted.data.into_json().unwrap();
+        assert_eq!(
+            pj["postComment"]["mediaUrl"],
+            serde_json::json!("/comment-media/m1.webp")
+        );
+        assert_eq!(pj["postComment"]["mediaWidth"], serde_json::json!(800));
+        assert_eq!(pj["postComment"]["mediaHeight"], serde_json::json!(600));
+
+        // The image is now linked, so it can't be attached again.
+        let reuse = exec(
+            &s,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"again", hasSpoiler:false, mediaId:"m1" }) { id } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&reuse), "attached image not found");
+
+        // The thread query surfaces the media on the stored comment.
+        let list = exec(
+            &s,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { mediaUrl mediaWidth } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let lj = list.data.into_json().unwrap();
+        assert_eq!(
+            lj["comments"]["items"][0]["mediaUrl"],
+            serde_json::json!("/comment-media/m1.webp")
+        );
+        assert_eq!(
+            lj["comments"]["items"][0]["mediaWidth"],
+            serde_json::json!(800)
+        );
+    }
+
+    #[tokio::test]
     async fn my_review_survives_pagination_and_is_null_when_signed_out() {
         let (s, pool) = setup_full(100).await;
         // Bob reviews s1 early (created_at = now, e.g. 2026).
@@ -5922,6 +7891,8 @@ mod tests {
             auth_limiter: RateLimiter::new(100, 60),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
         });
         let s = build_schema(state, false);
         let r = exec(
@@ -5992,6 +7963,8 @@ mod tests {
             auth_limiter: RateLimiter::new(100, 60),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
         })
     }
 
@@ -6368,7 +8341,6 @@ mod tests {
             cover_url: String::new(),
             source_id: "s".into(),
             chapter_count: 0,
-            is_marked: false,
             is_nsfw: false,
             rating: RatingSummary {
                 average: avg,

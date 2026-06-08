@@ -40,6 +40,7 @@ type Query {
 	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
+	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
 	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out)
@@ -56,11 +57,16 @@ type Query {
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
 	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
 	sourceIngestJobs(active: Boolean = false): [SourceIngestJob!]! # [komika] "add all from source" ingest jobs, newest first; active:true for only running ones — poll for progress (requires isAdmin)
+	seriesAdminMeta(seriesId: ID!): SeriesAdminMeta! # [komika] raw metadata-override state of a series' canonical work (pinned title/description/type/NSFW + curated tags) for the series-detail editor (requires isAdmin)
+	workChaptersAdmin(workId: ID!): [AdminChapter!]! # [komika] a work's aggregated chapters WITH override state (hidden/renamed), unfiltered, for the series-detail editor (requires isAdmin)
 }
 
 type Mutation {
 	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
+	setLibraryStatus(seriesId: ID!, status: String): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent
+	setFavorite(seriesId: ID!, favorite: Boolean!): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
+	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth, counts everyone; the popularity signal behind Trending
 	postReview(input: PostReviewInput!): Review! # [komika]
 	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
 	login(username: String!, password: String!): Session! # [komika]
@@ -88,6 +94,9 @@ type Mutation {
 	cancelExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: cancel all running ingest jobs for an extension's sources; returns the cancelled jobs (requires isAdmin)
 	backfillMangadexMetadata(limit: Int = 200): Int! # [komika] S2 enrichment backfill — processes up to `limit` un-enriched MangaDex-anchored works (all-language alt titles/descriptions + full credits); returns count processed; call until it returns 0 to drain (requires isAdmin)
 	persistCatalogue: Int! # [komika] S1 "save everything to DB" — materialize the whole Suwayomi library (metadata + chapter lists) into the DB cache so reader loads serve from SQLite; returns series persisted; prod maintenance action gated by isAdmin (no extra flag)
+	updateSeriesMetadata(input: SeriesMetadataInput!): Series! # [komika] admin series-detail editor — edit a work's title/description/type/NSFW/tags as an override layer (source data stays immutable); returns the recomputed series (requires isAdmin)
+	rescanWork(workId: ID!): Int! # [komika] admin — force an immediate re-scan of EVERY installed Suwayomi source of a canonical work; returns how many sources were scanned (requires isAdmin)
+	setChapterOverride(input: ChapterOverrideInput!): Boolean! # [komika] admin series-detail editor — soft-hide (reversible) or rename one chapter of a work by aggregate number; non-destructive (requires isAdmin)
 }
 
 enum ComicType {
@@ -122,15 +131,24 @@ type Series {
 	sourceId: String!
 	chapterCount: Int!
 	isMarked: Boolean! # [suwayomi] inLibrary
+	libraryStatus: String # [komika] per-viewer explicit shelf (reading|completed|onhold|plan); null = auto-derive from progress
+	isFavorite: Boolean! # [komika] per-viewer favourite flag
 	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
 	rating: RatingSummary! # [komika]
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
 	updatedAt: String!
+	views: SeriesViews! # [komika] per-series view (chapter-read) counts — the popularity signal; resolver field, selected only by the series-detail queries
 	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
 	localizedDescriptions: [LocalizedDescription!]! # every-language MangaDex descriptions (singular `description` stays the English-preferred primary)
 	credits: [Credit!]! # full author/artist list (singular `author`/`artist` keep only the first of each)
 	covers: [Cover!]! # F2: full per-volume/per-locale cover set, primary first; `coverUrl` remains the single primary. Populated by enrichment/backfill; empty until then
+}
+
+type SeriesViews {
+	total: Int! # all-time views
+	last7d: Int! # views in the last 7 days
+	last24h: Int! # views in the last 24 hours
 }
 
 type LocalizedDescription {
@@ -193,6 +211,16 @@ type Chapter {
 	isDownloaded: Boolean!
 }
 
+# Per-series read progress for the whole library, returned by `libraryProgress`
+# in one batched query. read/total are counted from the cached chapter state
+# (the same source `chapters(seriesId)` reads), so they match. Series with no
+# cached chapters are omitted; the client treats those as unread (read = 0).
+type SeriesProgress {
+	id: ID! # [suwayomi] series id (matches Series.id)
+	read: Int!
+	total: Int!
+}
+
 # Upstream image URL; never used directly as <img src> — the client's
 # ImageProvider proxies it via the Cloudflare Worker (web) or fetches it in
 # Rust (native).
@@ -241,9 +269,13 @@ type Comment {
 	id: ID!
 	targetType: String! # "chapter" | "series"
 	targetId: ID!
+	parentId: ID # [komika] reply parent; null = top-level comment (arbitrary-depth trees)
 	author: UserRef!
 	body: String!
 	hasSpoiler: Boolean!
+	mediaUrl: String # [komika] attached image path (/comment-media/<id>.webp), if any
+	mediaWidth: Int # [komika] attached image dimensions (reserve layout space)
+	mediaHeight: Int
 	createdAt: String!
 }
 
@@ -303,8 +335,10 @@ input PostReviewInput {
 input PostCommentInput {
 	targetType: String! # "chapter" | "series"
 	targetId: ID!
+	parentId: ID # [komika] reply target; must be a comment on the same target. Omit for top-level.
 	body: String!
 	hasSpoiler: Boolean!
+	mediaId: ID # [komika] a previously-uploaded comment-media id to attach (owned + unlinked)
 }
 
 input RegisterInput {
@@ -328,6 +362,51 @@ input SeriesAdminInput {
 	pollEveryMinutes: Int # null => default (30)
 	paused: Boolean # null => auto-pause by status
 	status: SeriesStatus # null => use source status
+}
+
+# [komika] Admin edits to a canonical work's user-facing metadata (series-detail
+# editor). Each optional field is three-valued: OMITTED => leave unchanged; null =>
+# clear the override (use the derived/source value); a value => set the override.
+input SeriesMetadataInput {
+	seriesId: ID! # numeric Suwayomi id or w_ canonical id — both resolve to the work
+	title: String
+	description: String
+	type: ComicType
+	isNsfw: Boolean
+	tags: [String!] # full curated tag set (whole-list replace); null clears it
+}
+
+# [komika] Raw override state of a work for the series-detail editor (parallels how
+# ScanPolicy exposes its raw overrides), so the console shows pinned vs derived.
+type SeriesAdminMeta {
+	workId: ID # null when the series isn't catalogued yet (nothing to pin)
+	titleOverride: String
+	descriptionOverride: String
+	contentTypeOverride: ComicType
+	isNsfwOverride: Boolean
+	tags: [String!]! # effective genres (curated set if any, else source-derived)
+	hasCuratedTags: Boolean! # true => `tags` is an admin-curated set
+}
+
+# [komika] One chapter of a work in the admin editor: aggregate identity + override
+# state (hidden / renamed).
+type AdminChapter {
+	number: Float!
+	key: String! # aggregate bucket key (the override key)
+	sourceTitle: String
+	titleOverride: String
+	effectiveTitle: String
+	hidden: Boolean!
+	sourceCount: Int! # how many sources provide this chapter number
+}
+
+# [komika] Admin edit to one chapter of a work (soft-hide / rename). Fields are
+# three-valued (OMITTED => unchanged) so toggling one doesn't clobber the other.
+input ChapterOverrideInput {
+	workId: ID!
+	chapterKey: String! # from AdminChapter.key
+	hidden: Boolean
+	title: String
 }
 
 # [komika] Aggregate health of the adaptive scan scheduler (admin console).

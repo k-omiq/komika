@@ -4,13 +4,16 @@ mod catalog;
 mod config;
 mod db;
 mod dedup;
+mod gc;
 mod graphql;
 mod ingest;
 mod mangadex;
+mod media;
 mod phash;
 mod scanner;
 mod series_cache;
 mod suwayomi;
+mod views;
 
 use std::sync::Arc;
 
@@ -34,7 +37,10 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use config::Config;
-use graphql::{build_schema, ApiSchema, AppState, ClientIp, RateLimiter, RequestAuth, ScanHealth};
+use graphql::{
+    build_schema, ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth,
+    RequestUserCache, ScanHealth,
+};
 use suwayomi::SuwayomiClient;
 
 /// Extract a bearer token from the `Authorization` header.
@@ -145,6 +151,10 @@ struct RouterState {
     schema: ApiSchema,
     pool: sqlx::SqlitePool,
     trusted_proxies: Arc<Vec<Cidr>>,
+    /// Per-user sliding-window limiter for the CPU-bound upload routes
+    /// (`/avatar`, `/comment-media`), so a single account can't flood the
+    /// decode/resize/encode blocking pool.
+    upload_limiter: Arc<RateLimiter>,
 }
 impl FromRef<RouterState> for ApiSchema {
     fn from_ref(s: &RouterState) -> Self {
@@ -161,6 +171,11 @@ impl FromRef<RouterState> for Arc<Vec<Cidr>> {
         s.trusted_proxies.clone()
     }
 }
+impl FromRef<RouterState> for Arc<RateLimiter> {
+    fn from_ref(s: &RouterState) -> Self {
+        s.upload_limiter.clone()
+    }
+}
 
 async fn graphql_handler(
     State(schema): State<ApiSchema>,
@@ -171,8 +186,11 @@ async fn graphql_handler(
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
+    // Fresh per-request cache so `current_user` does at most one session lookup
+    // even when many resolvers ask (one per feed item).
+    let user_cache = RequestUserCache::default();
     schema
-        .execute(req.into_inner().data(auth).data(ip))
+        .execute(req.into_inner().data(auth).data(ip).data(user_cache))
         .await
         .into()
 }
@@ -193,6 +211,7 @@ fn avatar_error(status: StatusCode, message: &str) -> axum::response::Response {
 /// row. Returns `{ "avatarUrl": "/avatars/<id>.webp?v=<ts>" }`.
 async fn upload_avatar(
     State(pool): State<sqlx::SqlitePool>,
+    State(limiter): State<Arc<RateLimiter>>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
@@ -207,6 +226,12 @@ async fn upload_avatar(
             return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
+    if limiter.check(&format!("upload:{}", user.id)).is_err() {
+        return avatar_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many uploads — please slow down",
+        );
+    }
 
     // Take the first file part (the reader sends a single `avatar` field).
     let mut data: Option<Vec<u8>> = None;
@@ -247,7 +272,9 @@ async fn upload_avatar(
         }
     };
 
-    let version = chrono::Utc::now().timestamp();
+    // Millisecond granularity so two uploads within the same second still produce
+    // distinct `?v=` values (the served avatar is immutable/1-year-cached).
+    let version = chrono::Utc::now().timestamp_millis();
     let now = chrono::Utc::now().to_rfc3339();
     let url = avatar::avatar_url(&user.id, version);
     // Upsert the BLOB and repoint the user row in one transaction so the stored
@@ -300,6 +327,155 @@ async fn serve_avatar(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "avatar read failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    match webp {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `POST /comment-media` — authenticated multipart upload of one image to attach to
+/// a comment. The bytes are decoded, downscaled (aspect-preserving) and re-encoded
+/// as budgeted lossless WebP (`media::process_comment_image`), then stored as a
+/// staged BLOB in `comment_media` (with `comment_id` NULL, owned by the uploader).
+/// Returns `{ "mediaId", "url", "width", "height" }`; the client passes `mediaId`
+/// to `postComment`, which links the row to the new comment. Unlinked rows are
+/// drafts the user never posted.
+async fn upload_comment_media(
+    State(pool): State<sqlx::SqlitePool>,
+    State(limiter): State<Arc<RateLimiter>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    let Some(tok) = bearer(&headers) else {
+        return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    let user = match auth::user_for_token(&pool, &tok).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
+        Err(e) => {
+            tracing::warn!(error = %e, "comment media upload: token lookup failed");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    if limiter.check(&format!("upload:{}", user.id)).is_err() {
+        return avatar_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many uploads — please slow down",
+        );
+    }
+    // Cap the number of staged (unattached) uploads a user can accumulate, so the
+    // GC-eligible backlog can't be inflated faster than it's swept. 20 pending
+    // drafts is far more than any real compose flow needs.
+    let staged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM comment_media WHERE user_id = ? AND comment_id IS NULL")
+            .bind(&user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+    if staged >= 20 {
+        return avatar_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pending image uploads — post or discard some first",
+        );
+    }
+
+    // Take the first file part (the reader sends a single `image` field).
+    let mut data: Option<Vec<u8>> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let is_file = field.name() == Some("image") || field.file_name().is_some();
+                if is_file {
+                    match field.bytes().await {
+                        Ok(b) => {
+                            data = Some(b.to_vec());
+                            break;
+                        }
+                        Err(_) => {
+                            return avatar_error(
+                                StatusCode::BAD_REQUEST,
+                                "Upload too large or could not be read",
+                            )
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return avatar_error(StatusCode::BAD_REQUEST, "Malformed upload"),
+        }
+    }
+    let Some(bytes) = data else {
+        return avatar_error(StatusCode::BAD_REQUEST, "No image file provided");
+    };
+
+    // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
+    let processed =
+        match tokio::task::spawn_blocking(move || media::process_comment_image(&bytes)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
+            Err(e) => {
+                tracing::error!(error = %e, "comment media processing task panicked");
+                return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not process image");
+            }
+        };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let stored = sqlx::query(
+        "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
+         VALUES (?, NULL, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&user.id)
+    .bind(&processed.webp)
+    .bind(processed.width as i64)
+    .bind(processed.height as i64)
+    .bind(&now)
+    .execute(&pool)
+    .await;
+    if let Err(e) = stored {
+        tracing::error!(error = %e, "comment media save failed");
+        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save image");
+    }
+    Json(serde_json::json!({
+        "mediaId": id,
+        "url": media::comment_media_url(&id),
+        "width": processed.width,
+        "height": processed.height,
+    }))
+    .into_response()
+}
+
+/// `GET /comment-media/{file}` — serve a stored comment image from `comment_media`.
+/// Immutable + long-cache: the id is a random uuid, so the bytes never change.
+/// `{file}` is `<id>.webp`; the id is looked up as a bind param (no injection
+/// surface), returning 404 for a bad shape or unknown id.
+async fn serve_comment_media(
+    State(pool): State<sqlx::SqlitePool>,
+    UrlPath(file): UrlPath<String>,
+) -> axum::response::Response {
+    let Some(id) = file.strip_suffix(".webp") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let webp: Option<Vec<u8>> =
+        match sqlx::query_scalar("SELECT webp FROM comment_media WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "comment media read failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
@@ -390,6 +566,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.federated_rate_limit_window_secs,
         ),
         session_ttl_secs: cfg.session_ttl_secs,
+        series_inflight: KeyedLocks::default(),
+        chapters_inflight: KeyedLocks::default(),
     });
 
     // Startup recovery: an ingest job still `running` was interrupted by the
@@ -404,6 +582,10 @@ async fn main() -> anyhow::Result<()> {
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
+
+    // Hourly garbage collection of orphaned staged comment-media uploads (rows the
+    // uploader never attached to a comment), so the BLOB store can't grow unbounded.
+    gc::spawn(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
@@ -474,6 +656,15 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route("/avatars/{file}", get(serve_avatar))
+        // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
+        // model as avatars. The upload route raises the body limit above the raw
+        // image cap enforced in `media::process_comment_image`.
+        .route(
+            "/comment-media",
+            post(upload_comment_media)
+                .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
+        )
+        .route("/comment-media/{file}", get(serve_comment_media))
         // Request-id + access-log span. SetRequestId runs first (generates an
         // x-request-id when the client didn't send one), TraceLayer's span picks
         // it up, and PropagateRequestId echoes it back on the response.
@@ -525,6 +716,8 @@ async fn main() -> anyhow::Result<()> {
             schema,
             pool,
             trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
+            // ~20 uploads/min per user across the avatar + comment-media routes.
+            upload_limiter: Arc::new(RateLimiter::new(20, 60)),
         });
 
     let addr = format!("0.0.0.0:{}", cfg.port);

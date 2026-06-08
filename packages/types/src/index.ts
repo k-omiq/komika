@@ -343,6 +343,13 @@ export interface RatingSummary {
 	distribution: number[];
 }
 
+/**
+ * The shelf a viewer can explicitly file a library series under. Distinct from the
+ * progress-derived shelf: an explicit value overrides derivation, `null` restores
+ * it. `onhold` has no derived equivalent — it only exists when set by hand.
+ */
+export type LibraryStatus = 'reading' | 'completed' | 'onhold' | 'plan';
+
 export interface Series {
 	id: Id;
 	title: string;
@@ -362,6 +369,14 @@ export interface Series {
 	/** True if the current user marked it (raises scanning priority). */
 	isMarked: boolean;
 	/**
+	 * The shelf the viewer explicitly filed this series under, or null to derive
+	 * it from read progress. Per-viewer; only selected by library/series-detail
+	 * queries (feeds omit it), so it may be `undefined` on a Series from a feed.
+	 */
+	libraryStatus?: LibraryStatus | null;
+	/** Whether the viewer favourited this series. Per-viewer; see `libraryStatus`. */
+	isFavorite?: boolean;
+	/**
 	 * NSFW per the canonical model (CATALOGUE.md §2); false until the series is
 	 * catalogued. Discovery/search/updates already filter by the viewer's
 	 * `showNsfw` preference server-side — this lets the UI badge/flag it too.
@@ -370,6 +385,12 @@ export interface Series {
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;
+	/**
+	 * Per-series view (chapter-read) counts — the popularity signal. Resolved lazily
+	 * server-side and selected only by the series-detail queries, so it's `undefined`
+	 * on series that come from feeds/search (which don't request it).
+	 */
+	views?: SeriesViews;
 	/**
 	 * Opt-in enrichment (S2), populated only when selected AND the series id is a
 	 * canonical `w_` work id — MangaDex's per-language descriptions and the full
@@ -385,6 +406,16 @@ export interface Series {
 	 * non-canonical/un-enriched work.
 	 */
 	covers?: Cover[];
+}
+
+/** Per-series view counts across the three windows (the popularity signal). */
+export interface SeriesViews {
+	/** All-time total views. */
+	total: number;
+	/** Views in the last 7 days. */
+	last7d: number;
+	/** Views in the last 24 hours. */
+	last24h: number;
 }
 
 /** One MangaDex-sourced description in a specific language (S2 enrichment). */
@@ -421,6 +452,16 @@ export interface Credit {
 export interface GenreFacet {
 	genre: string;
 	count: number;
+}
+
+/** Per-series read progress for the whole library (see `Backend.libraryProgress`).
+ *  `read`/`total` are counted from the cached chapter state — the same source
+ *  `chapters(seriesId)` reads — so they match. Series with no cached chapters are
+ *  omitted from the list; callers treat those as unread. */
+export interface SeriesProgress {
+	id: Id;
+	read: number;
+	total: number;
 }
 
 /** One source that provides a given chapter number of a work (S2 aggregation).
@@ -504,9 +545,17 @@ export interface Comment {
 	id: Id;
 	targetType: CommentTargetType;
 	targetId: Id;
+	/** The comment this replies to, or `null` for a top-level comment. Comments
+	 *  form arbitrary-depth reply trees via this field. */
+	parentId: Id | null;
 	author: UserRef;
 	body: string;
 	hasSpoiler: boolean;
+	/** Path to the attached image (`/comment-media/<id>.webp`), or `null`. */
+	mediaUrl: string | null;
+	/** Attached image pixel dimensions, so the client can reserve layout space. */
+	mediaWidth: number | null;
+	mediaHeight: number | null;
 	createdAt: string;
 }
 

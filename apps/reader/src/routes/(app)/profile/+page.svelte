@@ -1,10 +1,10 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import Footer from '$lib/components/Footer.svelte';
+	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import { slug } from '$lib/data/types';
 	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
-	import { auth } from '$lib/auth.svelte';
+	import { auth, revalidateSession } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 
 	let { data } = $props();
@@ -33,16 +33,41 @@
 	// result (null when signed out / backend off) until then.
 	let liveProfile = $state<ProfileView | null>(null);
 	const profile = $derived(liveProfile ?? data.profile);
-	function refreshProfile(): void {
-		getProfile().then((p) => {
-			liveProfile = p;
-		});
+	// Signed-out is decided by AUTH — the source of truth — not by `profile` being
+	// null. The `load` runs before `initAuth` restores the token, so `getProfile()`
+	// there returns null for a signed-in user until the effect re-fetches; keying
+	// the CTA off `profile` would flash (or, on a hiccup, stick on) "Sign in" for
+	// someone who is actually signed in. A signed-in user only ever sees the profile
+	// or the loading skeleton.
+	const signedOut = $derived(auth.ready && !auth.user);
+	// `profileLoaded` distinguishes "fetch still in flight" from "fetch settled on
+	// null" — without it, a signed-in user whose `getProfile()` resolves null (an
+	// expired/desynced session or a transient backend error) would be trapped on
+	// the loading skeleton forever, since `!profile` alone can't tell the two apart.
+	let profileLoaded = $state(false);
+	let loadFailed = $state(false);
+	const loadingProfile = $derived(!signedOut && !profile && !profileLoaded);
+	async function refreshProfile(): Promise<void> {
+		loadFailed = false;
+		const p = await getProfile();
+		liveProfile = p;
+		profileLoaded = true;
+		// Signed-in per auth but nothing came back: re-validate the session so a
+		// genuinely expired/revoked login clears `auth.user` and falls through to the
+		// sign-in CTA. A transient backend error keeps the user signed in and leaves
+		// `loadFailed` set, so the page shows a retry state instead of hanging.
+		if (!p && auth.user) {
+			loadFailed = true;
+			await revalidateSession();
+		}
 	}
 	$effect(() => {
 		void auth.ready;
 		void auth.user?.id;
 		if (!auth.ready) return;
-		refreshProfile();
+		// Signed out: the sign-in CTA renders; there's nothing to fetch.
+		if (!auth.user) return;
+		void refreshProfile();
 	});
 
 	// --- Edit profile (display name + bio) + avatar upload ------------------
@@ -107,7 +132,7 @@
 	const counts = $derived({
 		reading: (profile?.shelves ?? []).filter((c) => c.shelf === 'reading').length,
 		completed: (profile?.shelves ?? []).filter((c) => c.shelf === 'completed').length,
-		favorites: (profile?.shelves ?? []).filter((c) => c.shelf === 'favorites').length,
+		favorites: (profile?.shelves ?? []).filter((c) => c.favorite).length,
 	});
 
 	const tabDefs = [
@@ -118,7 +143,7 @@
 
 	const shelfItems = $derived(
 		(profile?.shelves ?? [])
-			.filter((c) => c.shelf === tab)
+			.filter((c) => (tab === 'favorites' ? c.favorite : c.shelf === tab))
 			.map((c) => ({
 				...c,
 				sub: c.shelf === 'reading' ? `Ch. ${c.ch} / ${c.total}` : `${c.genre} · ${c.total} ch`,
@@ -126,200 +151,296 @@
 	);
 </script>
 
-{#if !profile}
-	<!-- Signed out (or the backend is unavailable) — no sample profile is shown. -->
+{#if loadingProfile}
+	<!-- Auth restoring or the profile fetch is in flight — show a skeleton, never
+	     the sign-in CTA (which would misrepresent a signed-in user as signed out). -->
+	<div class="head k-gutter">
+		<div class="identity">
+			<div class="k-skeleton sk-avatar"></div>
+			<div class="who">
+				<div class="k-skeleton sk-line sk-name"></div>
+				<div class="k-skeleton sk-line sk-handle"></div>
+				<div class="k-skeleton sk-line sk-bio"></div>
+			</div>
+		</div>
+		<div class="stats">
+			{#each Array(4) as _, i (i)}
+				<div class="stat">
+					<div class="k-skeleton sk-line sk-stat-value"></div>
+					<div class="k-skeleton sk-line sk-stat-label"></div>
+				</div>
+			{/each}
+		</div>
+	</div>
+	<div class="body k-gutter">
+		<div class="left">
+			<div class="section">
+				<div class="k-skeleton sk-line sk-section"></div>
+				<CardGridSkeleton count={8} min={120} />
+			</div>
+		</div>
+		<div class="right">
+			<div class="k-skeleton sk-card"></div>
+			<div class="k-skeleton sk-card"></div>
+		</div>
+	</div>
+{:else if signedOut}
+	<!-- Genuinely signed out (auth resolved, no user) — no sample profile is shown. -->
 	<div class="signed-out k-gutter">
 		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
 		<h1>Your profile</h1>
 		<p>Sign in to track your reading, shelves, and activity.</p>
 		<a class="so-btn" href="/login?redirect=%2Fprofile">Sign in</a>
 	</div>
-{:else}
-<div class="head k-gutter">
-	<div class="identity">
-		<div class="avatar-wrap">
-			<Avatar
-				url={profile.avatarUrl}
-				name={profile.name}
-				colorKey={profile.id || profile.name}
-				size={104}
-			/>
-			{#if canEdit}
-				<button
-					class="avatar-edit"
-					aria-label="Change profile photo"
-					title="Change profile photo"
-					disabled={uploadingAvatar}
-					onclick={() => fileInput?.click()}
-				>
-					{#if uploadingAvatar}<span class="spin"></span>{:else}<span class="cam" aria-hidden="true">📷</span>{/if}
-				</button>
-				<input
-					bind:this={fileInput}
-					type="file"
-					accept="image/png,image/jpeg,image/webp"
-					class="visually-hidden"
-					onchange={onAvatarPicked}
+{:else if profile}
+	<div class="head k-gutter">
+		<div class="identity">
+			<div class="avatar-wrap">
+				<Avatar
+					url={profile.avatarUrl}
+					name={profile.name}
+					colorKey={profile.id || profile.name}
+					size={104}
 				/>
+				{#if canEdit}
+					<button
+						class="avatar-edit"
+						aria-label="Change profile photo"
+						title="Change profile photo"
+						disabled={uploadingAvatar}
+						onclick={() => fileInput?.click()}
+					>
+						{#if uploadingAvatar}<span class="spin"></span>{:else}<span
+								class="cam"
+								aria-hidden="true">📷</span
+							>{/if}
+					</button>
+					<input
+						bind:this={fileInput}
+						type="file"
+						accept="image/png,image/jpeg,image/webp"
+						class="visually-hidden"
+						onchange={onAvatarPicked}
+					/>
+				{/if}
+			</div>
+			<div class="who">
+				<div class="name-row">
+					<h1>{profile.name}</h1>
+					<span class="pro">{profile.badge}</span>
+				</div>
+				<div class="handle">{profile.handle} · {profile.since}</div>
+				<p class="bio">{profile.bio}</p>
+				{#if avatarError}<p class="setting-error">{avatarError}</p>{/if}
+			</div>
+			{#if canEdit}
+				<div class="actions">
+					<button class="edit" onclick={openEditor}>Edit profile</button>
+					<button class="gear" aria-label="Settings"><Icon name="gear" size={18} /></button>
+				</div>
 			{/if}
 		</div>
-		<div class="who">
-			<div class="name-row">
-				<h1>{profile.name}</h1>
-				<span class="pro">{profile.badge}</span>
-			</div>
-			<div class="handle">{profile.handle} · {profile.since}</div>
-			<p class="bio">{profile.bio}</p>
-			{#if avatarError}<p class="setting-error">{avatarError}</p>{/if}
-		</div>
-		{#if canEdit}
-			<div class="actions">
-				<button class="edit" onclick={openEditor}>Edit profile</button>
-				<button class="gear" aria-label="Settings"><Icon name="gear" size={18} /></button>
-			</div>
-		{/if}
-	</div>
 
-	{#if editing}
-		<div class="editor">
-			<label class="field">
-				<span>Display name</span>
-				<input type="text" bind:value={editName} maxlength="50" placeholder={auth.user?.username} />
-			</label>
-			<label class="field">
-				<span>Bio</span>
-				<textarea bind:value={editBio} maxlength="500" rows="3" placeholder="Tell readers about yourself…"
-				></textarea>
-			</label>
-			{#if profileError}<p class="setting-error">{profileError}</p>{/if}
-			<div class="editor-actions">
-				<button class="cancel" onclick={() => (editing = false)} disabled={savingProfile}>Cancel</button>
-				<button class="save" onclick={saveProfile} disabled={savingProfile}>
-					{savingProfile ? 'Saving…' : 'Save changes'}
-				</button>
-			</div>
-		</div>
-	{/if}
-
-	<div class="stats">
-		{#each profile.stats as s (s.label)}
-			<div class="stat">
-				<span class="stat-value">{s.value}</span>
-				<span class="stat-label">{s.label}</span>
-			</div>
-		{/each}
-	</div>
-</div>
-
-<div class="body k-gutter">
-	<div class="left">
-		<div class="section">
-			<h2 class="section-label">Currently Reading</h2>
-			<div class="reading-list">
-				{#each profile.reading as r (r.title)}
-					{@const pct = Math.round((r.ch / r.total) * 100)}
-					<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
-						<div class="mini-cover k-cover"></div>
-						<div class="reading-info">
-							<div class="reading-top">
-								<span class="reading-title">{r.title}</span>
-								<span class="reading-ch">{r.ch} / {r.total}</span>
-							</div>
-							<div class="reading-genre">{r.genre}</div>
-							<div class="reading-bar"><div class="fill" style="width:{pct}%"></div></div>
-						</div>
-					</a>
-				{/each}
-			</div>
-		</div>
-
-		<div class="section">
-			<div class="tabs">
-				{#each tabDefs as t (t.key)}
-					<button class="tab" class:on={tab === t.key} onclick={() => (tab = t.key)}>
-						{t.label}<span class="count">{counts[t.key]}</span>
-					</button>
-				{/each}
-			</div>
-			<div class="shelf-grid">
-				{#each shelfItems as item (item.title + item.shelf)}
-					<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
-						<div class="cover k-cover">
-							<span class="rating"
-								><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
-							>
-						</div>
-						<div class="shelf-title">{item.title}</div>
-						<div class="shelf-sub">{item.sub}</div>
-					</a>
-				{/each}
-			</div>
-		</div>
-	</div>
-
-	<div class="right">
-		{#if auth.user}
-			<div class="card">
-				<h3 class="card-title">Content Settings</h3>
-				<div class="setting-row">
-					<div class="setting-text">
-						<span class="setting-label">Show NSFW content</span>
-						<span class="setting-desc">
-							Include adult-rated series in browse, search, and updates.
-						</span>
-					</div>
-					<button
-						type="button"
-						class="switch"
-						class:on={showNsfw}
-						role="switch"
-						aria-checked={showNsfw}
-						aria-label="Show NSFW content"
-						disabled={savingNsfw}
-						onclick={toggleNsfw}
+		{#if editing}
+			<div class="editor">
+				<label class="field">
+					<span>Display name</span>
+					<input
+						type="text"
+						bind:value={editName}
+						maxlength="50"
+						placeholder={auth.user?.username}
+					/>
+				</label>
+				<label class="field">
+					<span>Bio</span>
+					<textarea
+						bind:value={editBio}
+						maxlength="500"
+						rows="3"
+						placeholder="Tell readers about yourself…"
+					></textarea>
+				</label>
+				{#if profileError}<p class="setting-error">{profileError}</p>{/if}
+				<div class="editor-actions">
+					<button class="cancel" onclick={() => (editing = false)} disabled={savingProfile}
+						>Cancel</button
 					>
-						<span class="knob"></span>
+					<button class="save" onclick={saveProfile} disabled={savingProfile}>
+						{savingProfile ? 'Saving…' : 'Save changes'}
 					</button>
 				</div>
-				{#if nsfwError}<p class="setting-error">{nsfwError}</p>{/if}
 			</div>
 		{/if}
 
-		<div class="card">
-			<h3 class="card-title">Favorite Genres</h3>
-			<div class="genres">
-				{#each profile.favGenres as g (g.name)}
-					<div class="genre">
-						<div class="genre-top">
-							<span class="gname">{g.name}</span><span class="gpct">{g.pct}%</span>
-						</div>
-						<div class="genre-bar"><div class="fill" style="width:{g.pct}%"></div></div>
-					</div>
-				{/each}
+		<div class="stats">
+			{#each profile.stats as s (s.label)}
+				<div class="stat">
+					<span class="stat-value">{s.value}</span>
+					<span class="stat-label">{s.label}</span>
+				</div>
+			{/each}
+		</div>
+	</div>
+
+	<div class="body k-gutter">
+		<div class="left">
+			<div class="section">
+				<h2 class="section-label">Currently Reading</h2>
+				<div class="reading-list">
+					{#each profile.reading as r (r.id ?? r.title)}
+						{@const pct = Math.round((r.ch / r.total) * 100)}
+						<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
+							<div class="mini-cover k-cover"></div>
+							<div class="reading-info">
+								<div class="reading-top">
+									<span class="reading-title">{r.title}</span>
+									<span class="reading-ch">{r.ch} / {r.total}</span>
+								</div>
+								<div class="reading-genre">{r.genre}</div>
+								<div class="reading-bar"><div class="fill" style="width:{pct}%"></div></div>
+							</div>
+						</a>
+					{/each}
+				</div>
+			</div>
+
+			<div class="section">
+				<div class="tabs">
+					{#each tabDefs as t (t.key)}
+						<button class="tab" class:on={tab === t.key} onclick={() => (tab = t.key)}>
+							{t.label}<span class="count">{counts[t.key]}</span>
+						</button>
+					{/each}
+				</div>
+				<div class="shelf-grid">
+					{#each shelfItems as item (item.id ?? item.title + item.shelf)}
+						<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
+							<div class="cover k-cover">
+								<span class="rating"
+									><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
+								>
+							</div>
+							<div class="shelf-title">{item.title}</div>
+							<div class="shelf-sub">{item.sub}</div>
+						</a>
+					{/each}
+				</div>
 			</div>
 		</div>
 
-		<div class="section">
-			<h3 class="section-label">Recent Activity</h3>
-			<div class="activity">
-				{#each profile.activity as a (a.text)}
-					<div class="act-row">
-						<div class="act-icon" style="background:{a.iconBg}">{a.icon}</div>
-						<div class="act-body">
-							<div class="act-text">{a.text}</div>
-							<div class="act-time">{a.time}</div>
+		<div class="right">
+			{#if auth.user}
+				<div class="card">
+					<h3 class="card-title">Content Settings</h3>
+					<div class="setting-row">
+						<div class="setting-text">
+							<span class="setting-label">Show NSFW content</span>
+							<span class="setting-desc">
+								Include adult-rated series in browse, search, and updates.
+							</span>
 						</div>
+						<button
+							type="button"
+							class="switch"
+							class:on={showNsfw}
+							role="switch"
+							aria-checked={showNsfw}
+							aria-label="Show NSFW content"
+							disabled={savingNsfw}
+							onclick={toggleNsfw}
+						>
+							<span class="knob"></span>
+						</button>
 					</div>
-				{/each}
+					{#if nsfwError}<p class="setting-error">{nsfwError}</p>{/if}
+				</div>
+			{/if}
+
+			<div class="card">
+				<h3 class="card-title">Favorite Genres</h3>
+				<div class="genres">
+					{#each profile.favGenres as g (g.name)}
+						<div class="genre">
+							<div class="genre-top">
+								<span class="gname">{g.name}</span><span class="gpct">{g.pct}%</span>
+							</div>
+							<div class="genre-bar"><div class="fill" style="width:{g.pct}%"></div></div>
+						</div>
+					{/each}
+				</div>
+			</div>
+
+			<div class="section">
+				<h3 class="section-label">Recent Activity</h3>
+				<div class="activity">
+					{#each profile.activity as a (a.id)}
+						<div class="act-row">
+							<div class="act-icon" style="background:{a.iconBg}">{a.icon}</div>
+							<div class="act-body">
+								<div class="act-text">{a.text}</div>
+								<div class="act-time">{a.time}</div>
+							</div>
+						</div>
+					{/each}
+				</div>
 			</div>
 		</div>
 	</div>
-</div>
+{:else if loadFailed}
+	<!-- Signed-in per auth, but the profile fetch settled empty and the session is
+	     still valid (transient backend error) — offer a retry rather than hang. -->
+	<div class="signed-out k-gutter">
+		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
+		<h1>Couldn't load your profile</h1>
+		<p>Something went wrong reaching the server. Check your connection and try again.</p>
+		<button class="so-btn" onclick={() => refreshProfile()}>Retry</button>
+	</div>
 {/if}
 
-<Footer />
-
 <style>
+	/* Loading skeleton (mirrors the profile header + body layout). */
+	.sk-avatar {
+		flex: 0 0 auto;
+		width: 104px;
+		height: 104px;
+		border-radius: 50%;
+	}
+	.sk-line {
+		height: 12px;
+		border-radius: 5px;
+	}
+	.sk-name {
+		width: 220px;
+		height: 30px;
+		margin-bottom: 14px;
+	}
+	.sk-handle {
+		width: 260px;
+		height: 13px;
+		margin-bottom: 18px;
+	}
+	.sk-bio {
+		width: min(460px, 90%);
+		height: 14px;
+	}
+	.sk-stat-value {
+		width: 60px;
+		height: 24px;
+		margin-bottom: 8px;
+	}
+	.sk-stat-label {
+		width: 84px;
+		height: 11px;
+	}
+	.sk-section {
+		width: 180px;
+		height: 14px;
+	}
+	.sk-card {
+		height: 180px;
+		border-radius: 12px;
+	}
 	.signed-out {
 		display: flex;
 		flex-direction: column;
@@ -363,6 +484,9 @@
 		font-weight: 700;
 		font-size: 13.5px;
 		text-decoration: none;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
 	}
 	.head {
 		padding-top: 52px;

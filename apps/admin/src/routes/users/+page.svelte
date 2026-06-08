@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type { AdminUser } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadUsers, setUserBanned, setUserAdmin } from '$lib/data';
@@ -13,15 +12,21 @@
 	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // id currently being mutated
 
-	// Redirect out if we're not an admin.
-	$effect(() => {
-		if (auth.ready && !auth.user) goto('/login');
-	});
+	// Auth redirect is centralized in +layout.svelte.
 
 	$effect(() => {
 		if (!auth.user) return;
 		void refresh(page);
 	});
+
+	// The load effect above is the single fetch driver: pager buttons only move `page`
+	// and the effect re-fires exactly once. `refresh` no longer reassigns `page` (which
+	// previously caused a second fetch per navigation).
+	function go(delta: number): void {
+		const next = Math.max(1, page + delta);
+		if (next === page) return;
+		page = next;
+	}
 
 	async function refresh(p: number): Promise<void> {
 		loading = true;
@@ -31,7 +36,6 @@
 			users = res.items;
 			hasNext = res.hasNextPage;
 			total = res.total;
-			page = res.page;
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load users.';
 			users = [];
@@ -137,13 +141,9 @@
 		</div>
 
 		<div class="pager">
-			<button class="pg" disabled={page <= 1 || loading} onclick={() => refresh(page - 1)}
-				>← Prev</button
-			>
+			<button class="pg" disabled={page <= 1 || loading} onclick={() => go(-1)}>← Prev</button>
 			<span class="pg-num">Page {page}</span>
-			<button class="pg" disabled={!hasNext || loading} onclick={() => refresh(page + 1)}
-				>Next →</button
-			>
+			<button class="pg" disabled={!hasNext || loading} onclick={() => go(1)}>Next →</button>
 		</div>
 	{/if}
 </div>

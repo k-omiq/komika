@@ -143,6 +143,25 @@ impl FetchType {
     }
 }
 
+/// Parse a JSON array element-by-element, skipping (and counting) records that
+/// don't deserialize, so one malformed node (e.g. a manga with a null title, or a
+/// chapter with a null name) doesn't fail the whole page/list. Mirrors the
+/// per-record parse in `mangadex::list_manga`.
+fn parse_records<T: DeserializeOwned>(raw: Vec<Value>, what: &str) -> Vec<T> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipped = 0usize;
+    for v in raw {
+        match serde_json::from_value::<T>(v) {
+            Ok(x) => out.push(x),
+            Err(_) => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, kind = what, "suwayomi: skipped unparseable records");
+    }
+    out
+}
+
 pub struct SuwayomiClient {
     base_url: String,
     /// Public base used when building image URLs (covers/pages) handed to the
@@ -164,10 +183,20 @@ impl SuwayomiClient {
         let image_base_url = public_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| base_url.clone());
+        // Bound every request so a hung/slow upstream (Suwayomi proxies to source
+        // sites, often via FlareSolverr, which routinely stalls) can't freeze the
+        // scan scheduler or a reader cache-miss path forever. Mirrors
+        // `MangaDexClient::new`. Falls back to the default client if the builder
+        // somehow fails, so construction stays infallible.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url,
             image_base_url,
-            http: reqwest::Client::new(),
+            http,
             source_id: Mutex::new(configured_source.clone()),
             configured_source,
         }
@@ -238,14 +267,22 @@ impl SuwayomiClient {
     }
 
     /// Resolve (and cache) a source id to browse: configured → English → first real.
+    ///
+    /// Double-checked locking: the network resolve (`sources` query) runs WITHOUT the
+    /// cache lock held, so concurrent first-callers don't serialize behind a single
+    /// round-trip. A benign race may resolve twice, but the stored value is stable
+    /// (it's process-lifetime; the first writer wins and later writers store the same
+    /// deterministic pick), so the extra query is harmless.
     async fn resolve_source(&self) -> Result<String> {
-        let mut guard = self.source_id.lock().await;
-        if let Some(id) = guard.as_ref() {
+        // Fast path: already cached.
+        if let Some(id) = self.source_id.lock().await.as_ref() {
             return Ok(id.clone());
         }
+        // A configured source needs no network round-trip; cache and return.
         if let Some(id) = &self.configured_source {
-            *guard = Some(id.clone());
-            return Ok(id.clone());
+            let mut guard = self.source_id.lock().await;
+            let id = guard.get_or_insert_with(|| id.clone()).clone();
+            return Ok(id);
         }
         #[derive(Deserialize)]
         struct Src {
@@ -260,6 +297,7 @@ impl SuwayomiClient {
         struct Data {
             sources: Nodes,
         }
+        // Resolve over the network with NO lock held.
         let data: Data = self
             .gql("query Sources { sources { nodes { id lang } } }", json!({}))
             .await?;
@@ -274,8 +312,10 @@ impl SuwayomiClient {
             .find(|s| s.lang.as_deref() == Some("en"))
             .or_else(|| real.first())
             .ok_or_else(|| anyhow!("No Suwayomi source installed — add one first"))?;
-        *guard = Some(chosen.id.clone());
-        Ok(chosen.id.clone())
+        // Re-acquire and store. If another caller won the race, keep their value.
+        let mut guard = self.source_id.lock().await;
+        let id = guard.get_or_insert_with(|| chosen.id.clone()).clone();
+        Ok(id)
     }
 
     pub async fn fetch_source(
@@ -310,7 +350,7 @@ impl SuwayomiClient {
         #[serde(rename_all = "camelCase")]
         struct Payload {
             has_next_page: bool,
-            mangas: Vec<SuwayomiManga>,
+            mangas: Vec<Value>,
         }
         #[derive(Deserialize)]
         struct Data {
@@ -325,7 +365,7 @@ impl SuwayomiClient {
             .await?;
         Ok((
             data.fetch_source_manga.has_next_page,
-            data.fetch_source_manga.mangas,
+            parse_records::<SuwayomiManga>(data.fetch_source_manga.mangas, "browse_manga"),
         ))
     }
 
@@ -368,7 +408,7 @@ impl SuwayomiClient {
         );
         #[derive(Deserialize)]
         struct FetchPayload {
-            chapters: Option<Vec<SuwayomiChapter>>,
+            chapters: Option<Vec<Value>>,
         }
         #[derive(Deserialize)]
         struct FetchData {
@@ -379,7 +419,10 @@ impl SuwayomiClient {
             .gql::<FetchData>(&fetch, json!({ "id": series_id }))
             .await
         {
-            Ok(d) => Ok(d.f.chapters.unwrap_or_default()),
+            Ok(d) => Ok(parse_records::<SuwayomiChapter>(
+                d.f.chapters.unwrap_or_default(),
+                "chapters",
+            )),
             Err(e) => {
                 if e.to_string().contains("No chapters") {
                     return Ok(vec![]);
@@ -390,14 +433,14 @@ impl SuwayomiClient {
                 );
                 #[derive(Deserialize)]
                 struct Nodes {
-                    nodes: Vec<SuwayomiChapter>,
+                    nodes: Vec<Value>,
                 }
                 #[derive(Deserialize)]
                 struct Data {
                     chapters: Nodes,
                 }
                 let d: Data = self.gql(&doc, json!({ "id": series_id })).await?;
-                Ok(d.chapters.nodes)
+                Ok(parse_records::<SuwayomiChapter>(d.chapters.nodes, "chapters"))
             }
         }
     }
@@ -452,14 +495,14 @@ impl SuwayomiClient {
         );
         #[derive(Deserialize)]
         struct Nodes {
-            nodes: Vec<SuwayomiManga>,
+            nodes: Vec<Value>,
         }
         #[derive(Deserialize)]
         struct Data {
             mangas: Nodes,
         }
         let d: Data = self.gql(&doc, json!({})).await?;
-        Ok(d.mangas.nodes)
+        Ok(parse_records::<SuwayomiManga>(d.mangas.nodes, "library"))
     }
 
     /// List the installed extensions and their coordinates (§2.1), so the catalogue
@@ -739,14 +782,7 @@ impl SuwayomiClient {
         Ok(())
     }
 
-    pub async fn set_progress(&self, id: i64, last_page_read: i64, is_read: bool) -> Result<()> {
-        let doc = "mutation U($id: Int!, $lastPageRead: Int!, $isRead: Boolean!) { updateChapter(input: { id: $id, patch: { lastPageRead: $lastPageRead, isRead: $isRead } }) { chapter { id } } }";
-        let _: Value = self
-            .gql(
-                doc,
-                json!({ "id": id, "lastPageRead": last_page_read, "isRead": is_read }),
-            )
-            .await?;
-        Ok(())
-    }
+    // NOTE: reading progress is no longer pushed back to Suwayomi — it is per-user and
+    // lives in `suwayomi_progress` (see the `set_progress` GraphQL mutation). Suwayomi
+    // is a content source only, so the old `updateChapter` progress mutation was removed.
 }

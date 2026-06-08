@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type {
 		BulkAddResult,
 		ExtensionInfo,
@@ -26,10 +25,7 @@
 		updateExtension,
 	} from '$lib/data';
 
-	// Redirect out if we're not an admin.
-	$effect(() => {
-		if (auth.ready && !auth.user) goto('/login');
-	});
+	// Auth redirect is centralized in +layout.svelte.
 
 	let tab = $state<'extensions' | 'catalogue'>('extensions');
 
@@ -124,6 +120,14 @@
 		verb: 'install' | 'uninstall' | 'update',
 	): Promise<void> {
 		if (busyPkg) return;
+		// Uninstalling drops a source and invalidates the catalogue picker (reversible
+		// only by reinstall + re-ingest), so gate it behind a confirm like other
+		// consequential actions.
+		if (
+			verb === 'uninstall' &&
+			!confirm(`Uninstall ${e.name}? This removes the source and its catalogue picker entry until you reinstall it.`)
+		)
+			return;
 		busyPkg = e.pkgName;
 		const { [e.pkgName]: _drop, ...rest } = rowMsg;
 		rowMsg = rest;

@@ -158,6 +158,13 @@ export const SERIES = /* GraphQL */ `
 	query Series($id: ID!) {
 		series(id: $id) {
 			...SeriesFields
+			libraryStatus
+			isFavorite
+			views {
+				total
+				last7d
+				last24h
+			}
 		}
 	}
 `;
@@ -217,6 +224,20 @@ export const LIBRARY = /* GraphQL */ `
 	query Library {
 		library {
 			...SeriesFields
+			libraryStatus
+			isFavorite
+		}
+	}
+`;
+
+// Batched per-series read progress for the whole library (one query instead of a
+// `chapters()` fan-out per series) — shelves the Library/Profile screens fast.
+export const LIBRARY_PROGRESS = /* GraphQL */ `
+	query LibraryProgress {
+		libraryProgress {
+			id
+			read
+			total
 		}
 	}
 `;
@@ -226,6 +247,30 @@ export const MARK = /* GraphQL */ `
 	mutation Mark($seriesId: ID!, $marked: Boolean!) {
 		mark(seriesId: $seriesId, marked: $marked) {
 			...SeriesFields
+			libraryStatus
+			isFavorite
+		}
+	}
+`;
+
+export const SET_LIBRARY_STATUS = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation SetLibraryStatus($seriesId: ID!, $status: String) {
+		setLibraryStatus(seriesId: $seriesId, status: $status) {
+			...SeriesFields
+			libraryStatus
+			isFavorite
+		}
+	}
+`;
+
+export const SET_FAVORITE = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation SetFavorite($seriesId: ID!, $favorite: Boolean!) {
+		setFavorite(seriesId: $seriesId, favorite: $favorite) {
+			...SeriesFields
+			libraryStatus
+			isFavorite
 		}
 	}
 `;
@@ -233,6 +278,14 @@ export const MARK = /* GraphQL */ `
 export const SET_PROGRESS = /* GraphQL */ `
 	mutation SetProgress($chapterId: ID!, $lastPageRead: Int!, $read: Boolean!) {
 		setProgress(chapterId: $chapterId, lastPageRead: $lastPageRead, read: $read)
+	}
+`;
+
+// Popularity signal: fire once per chapter open (see `views` module server-side). No
+// auth — anonymous reads count too — so it never carries user identity.
+export const RECORD_VIEW = /* GraphQL */ `
+	mutation RecordView($seriesId: ID!) {
+		recordView(seriesId: $seriesId)
 	}
 `;
 
@@ -305,11 +358,15 @@ export const COMMENTS = /* GraphQL */ `
 				id
 				targetType
 				targetId
+				parentId
 				author {
 					...UserRefFields
 				}
 				body
 				hasSpoiler
+				mediaUrl
+				mediaWidth
+				mediaHeight
 				createdAt
 			}
 			page
@@ -326,11 +383,15 @@ export const POST_COMMENT = /* GraphQL */ `
 			id
 			targetType
 			targetId
+			parentId
 			author {
 				...UserRefFields
 			}
 			body
 			hasSpoiler
+			mediaUrl
+			mediaWidth
+			mediaHeight
 			createdAt
 		}
 	}
@@ -694,6 +755,13 @@ export const CANONICAL_SERIES = /* GraphQL */ `
 	query CanonicalSeries($workId: ID!) {
 		canonicalSeries(workId: $workId) {
 			...SeriesFields
+			libraryStatus
+			isFavorite
+			views {
+				total
+				last7d
+				last24h
+			}
 			localizedDescriptions {
 				lang
 				description
@@ -862,5 +930,56 @@ export const SET_SERIES_PAUSED = /* GraphQL */ `
 		setSeriesPaused(seriesId: $seriesId, paused: $paused) {
 			...SeriesFields
 		}
+	}
+`;
+
+// ---- admin series-detail editor (metadata + chapter overrides + rescan) ------
+
+export const SERIES_ADMIN_META = /* GraphQL */ `
+	query SeriesAdminMeta($seriesId: ID!) {
+		seriesAdminMeta(seriesId: $seriesId) {
+			workId
+			titleOverride
+			descriptionOverride
+			contentTypeOverride
+			isNsfwOverride
+			tags
+			hasCuratedTags
+		}
+	}
+`;
+
+export const UPDATE_SERIES_METADATA = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation UpdateSeriesMetadata($input: SeriesMetadataInput!) {
+		updateSeriesMetadata(input: $input) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const WORK_CHAPTERS_ADMIN = /* GraphQL */ `
+	query WorkChaptersAdmin($workId: ID!) {
+		workChaptersAdmin(workId: $workId) {
+			number
+			key
+			sourceTitle
+			titleOverride
+			effectiveTitle
+			hidden
+			sourceCount
+		}
+	}
+`;
+
+export const SET_CHAPTER_OVERRIDE = /* GraphQL */ `
+	mutation SetChapterOverride($input: ChapterOverrideInput!) {
+		setChapterOverride(input: $input)
+	}
+`;
+
+export const RESCAN_WORK = /* GraphQL */ `
+	mutation RescanWork($workId: ID!) {
+		rescanWork(workId: $workId)
 	}
 `;

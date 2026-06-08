@@ -13,8 +13,50 @@
 	let q = $state('');
 	let inputEl = $state<HTMLInputElement | undefined>();
 
+	// Advanced-filter selection. Genre is multi-select; the rest are single-select.
+	let selGenres = $state<string[]>([]);
+	let selStatus = $state<string | null>(null);
+	let selSort = $state<string | null>(null);
+	let selMinRating = $state<string | null>(null);
+
+	// Map the human-readable panel labels onto the query params /browse consumes.
+	const SORT_MAP: Record<string, string> = {
+		Trending: 'trending',
+		Newest: 'newest',
+		'Top Rated': 'rating',
+		'Most Chapters': 'chapters',
+	};
+
+	function isSelected(label: string, opt: string): boolean {
+		if (label === 'Genre') return selGenres.includes(opt);
+		if (label === 'Status') return selStatus === opt;
+		if (label === 'Sort by') return selSort === opt;
+		if (label === 'Minimum rating') return selMinRating === opt;
+		return false;
+	}
+	function toggleChip(label: string, opt: string): void {
+		if (label === 'Genre') {
+			selGenres = selGenres.includes(opt) ? selGenres.filter((g) => g !== opt) : [...selGenres, opt];
+		} else if (label === 'Status') {
+			selStatus = selStatus === opt ? null : opt;
+		} else if (label === 'Sort by') {
+			selSort = selSort === opt ? null : opt;
+		} else if (label === 'Minimum rating') {
+			selMinRating = selMinRating === opt ? null : opt;
+		}
+	}
+	function resetFilters(): void {
+		selGenres = [];
+		selStatus = null;
+		selSort = null;
+		selMinRating = null;
+	}
+
 	$effect(() => {
-		if (open && inputEl) setTimeout(() => inputEl?.focus(), 30);
+		if (open && inputEl) {
+			const t = setTimeout(() => inputEl?.focus(), 30);
+			return () => clearTimeout(t);
+		}
 	});
 
 	function close() {
@@ -22,9 +64,20 @@
 		advancedOpen = false;
 	}
 	function submit() {
+		const params = new URLSearchParams();
 		const term = q.trim();
+		if (term) params.set('q', term);
+		for (const g of selGenres) params.append('genre', g);
+		if (selStatus) params.set('status', selStatus.toLowerCase());
+		const sortKey = selSort ? SORT_MAP[selSort] : undefined;
+		if (sortKey) params.set('sort', sortKey);
+		if (selMinRating) {
+			const n = parseFloat(selMinRating);
+			if (!Number.isNaN(n)) params.set('minRating', String(n));
+		}
 		close();
-		goto(term ? `/browse?q=${encodeURIComponent(term)}` : '/browse');
+		const qs = params.toString();
+		goto(qs ? `/browse?${qs}` : '/browse');
 	}
 	function onkey(e: KeyboardEvent) {
 		if (e.key === 'Escape') close();
@@ -63,13 +116,19 @@
 						<span class="sec-label">{sec.label}</span>
 						<div class="chips">
 							{#each sec.options as opt (opt)}
-								<span class="chip">{opt}</span>
+								<button
+									type="button"
+									class="chip"
+									class:on={isSelected(sec.label, opt)}
+									aria-pressed={isSelected(sec.label, opt)}
+									onclick={() => toggleChip(sec.label, opt)}>{opt}</button
+								>
 							{/each}
 						</div>
 					</div>
 				{/each}
 				<div class="adv-foot">
-					<button class="ghost">Reset</button>
+					<button class="ghost" onclick={resetFilters}>Reset</button>
 					<button class="primary" onclick={submit}>Search</button>
 				</div>
 			</div>
@@ -206,6 +265,11 @@
 		border-color: rgba(255, 255, 255, 0.36);
 		color: var(--k-text);
 		background: var(--k-hover-fill);
+	}
+	.chip.on {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+		color: var(--k-on-primary);
 	}
 	.adv-foot {
 		display: flex;

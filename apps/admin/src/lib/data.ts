@@ -19,25 +19,27 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	WorkSource,
 } from '@komika/types';
-import type { SeriesAdminInput } from '@komika/api';
+import type {
+	AdminChapter,
+	ChapterOverrideInput,
+	SeriesAdminInput,
+	SeriesAdminMeta,
+	SeriesMetadataInput,
+} from '@komika/api';
 import { backend } from './context';
 
 /**
- * The catalog the console manages: a search when a query is given, otherwise the
- * curated library (falling back to popular so the console isn't empty on a fresh
- * install).
+ * The catalog the console manages, ONE server page at a time. A text query hits the
+ * live source index; an empty query serves the whole persisted catalogue — both
+ * paginated SERVER-SIDE by {@link backend.search} (page/pageSize), so the console
+ * never pulls the unbounded full library into memory. Returns the paginated envelope
+ * (`items` + `page` + `hasNextPage` + `total`) so the caller can drive its pager off
+ * the server's own paging metadata.
  */
-export async function loadCatalog(query: string): Promise<Series[]> {
-	const q = query.trim();
-	if (q) {
-		const { items } = await backend.search(q);
-		return items;
-	}
-	const lib = await backend.library();
-	if (lib.length) return lib;
-	const { items } = await backend.search('');
-	return items;
+export async function loadCatalog(query: string, page = 1): Promise<Paginated<Series>> {
+	return backend.search(query.trim(), page);
 }
 
 /** Persist per-series overrides (whole-state) and return the recomputed series. */
@@ -272,6 +274,62 @@ export async function persistCatalogue(): Promise<number> {
 		throw new Error('Catalogue persistence is unavailable on this backend.');
 	return backend.persistCatalogue();
 }
+
+// ---- Series-detail editor (metadata + chapters + rescan) --------------------
+
+/**
+ * Load one series for the detail page. A `w_` id routes to the canonical path
+ * (`canonicalSeries`, an optional method — guarded with a readable error); a numeric
+ * Suwayomi id routes to `series`.
+ */
+export async function loadSeriesDetail(seriesId: string): Promise<Series> {
+	if (seriesId.startsWith('w_')) {
+		if (!backend.canonicalSeries)
+			throw new Error('Canonical series lookup is unavailable on this backend.');
+		return backend.canonicalSeries(seriesId);
+	}
+	return backend.series(seriesId);
+}
+
+/** Raw metadata-override state of a series' canonical work (pinned vs derived). */
+export async function loadSeriesAdminMeta(seriesId: string): Promise<SeriesAdminMeta> {
+	if (!backend.seriesAdminMeta)
+		throw new Error('Series metadata editing is unavailable on this backend.');
+	return backend.seriesAdminMeta(seriesId);
+}
+
+/** Save metadata overrides (title/description/type/nsfw/tags); returns the series. */
+export async function saveSeriesMetadata(input: SeriesMetadataInput): Promise<Series> {
+	if (!backend.updateSeriesMetadata)
+		throw new Error('Series metadata editing is unavailable on this backend.');
+	return backend.updateSeriesMetadata(input);
+}
+
+/** The source mappings for one canonical work (per-source rescan + provenance). */
+export async function loadWorkSources(workId: string): Promise<WorkSource[]> {
+	if (!backend.workSources) throw new Error('Work sources are unavailable on this backend.');
+	return backend.workSources(workId);
+}
+
+/** A work's aggregated chapters WITH override state (hidden/renamed), unfiltered. */
+export async function loadWorkChaptersAdmin(workId: string): Promise<AdminChapter[]> {
+	if (!backend.workChaptersAdmin) throw new Error('Chapter editing is unavailable on this backend.');
+	return backend.workChaptersAdmin(workId);
+}
+
+/** Soft-hide (reversible) or rename one chapter of a work. */
+export async function setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
+	if (!backend.setChapterOverride) throw new Error('Chapter editing is unavailable on this backend.');
+	return backend.setChapterOverride(input);
+}
+
+/** Force an immediate re-scan of every Suwayomi source of a work; returns count. */
+export async function rescanWork(workId: string): Promise<number> {
+	if (!backend.rescanWork) throw new Error('Rescan is unavailable on this backend.');
+	return backend.rescanWork(workId);
+}
+
+export const COMIC_TYPE_OPTIONS = ['MANGA', 'MANHWA', 'MANHUA', 'WEBTOON', 'COMIC'] as const;
 
 export const STATUS_OPTIONS: SeriesStatus[] = [
 	'ONGOING',

@@ -1,39 +1,40 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
-	import Footer from '$lib/components/Footer.svelte';
-	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
+	import Cover from '$lib/components/Cover.svelte';
+	import StatusMenu from '$lib/components/StatusMenu.svelte';
+	import { setLibraryStatus, setFavorite, type LibraryRowView } from '$lib/data/source';
 	import { SHELF_META, slug, type Shelf } from '$lib/data/types';
 
-	type LibraryData = Awaited<ReturnType<typeof import('$lib/data/source').getLibrary>>;
-
 	let { data } = $props();
-	// Stream the library in; show a skeleton until it resolves. Never rejects.
-	let libraryCatalog = $state<LibraryData['libraryCatalog']>([]);
-	let continueRow = $state<LibraryData['continueRow']>([]);
-	let loading = $state(true);
+	// `data.library` is resolved in `load` (this is a static SPA — streamed promises
+	// don't resolve in the component, which is what left the page stuck loading), so
+	// it's a ready value here. Copy the catalogue into local state so shelf/favourite
+	// edits reflect immediately (optimistic), re-syncing whenever `load` re-runs.
+	let rows = $state<LibraryRowView[]>([]);
 	$effect(() => {
-		loading = true;
-		data.library.then((lib) => {
-			libraryCatalog = lib.libraryCatalog;
-			continueRow = lib.continueRow;
-			loading = false;
-		});
+		rows = data.library.libraryCatalog.map((r) => ({ ...r }));
 	});
+	const continueRow = $derived(data.library.continueRow);
 
-	let shelf = $state<'all' | Shelf>('all');
+	let shelf = $state<'all' | Shelf | 'favorites'>('all');
 	let sort = $state<'recent' | 'alpha'>('recent');
 
 	const counts = $derived({
-		all: libraryCatalog.length,
-		reading: libraryCatalog.filter((c) => c.shelf === 'reading').length,
-		completed: libraryCatalog.filter((c) => c.shelf === 'completed').length,
-		onhold: libraryCatalog.filter((c) => c.shelf === 'onhold').length,
-		plan: libraryCatalog.filter((c) => c.shelf === 'plan').length,
+		all: rows.length,
+		reading: rows.filter((c) => c.shelf === 'reading').length,
+		completed: rows.filter((c) => c.shelf === 'completed').length,
+		onhold: rows.filter((c) => c.shelf === 'onhold').length,
+		plan: rows.filter((c) => c.shelf === 'plan').length,
+		favorites: rows.filter((c) => c.favorite).length,
 	});
 
 	const items = $derived.by(() => {
 		let list =
-			shelf === 'all' ? [...libraryCatalog] : libraryCatalog.filter((c) => c.shelf === shelf);
+			shelf === 'all'
+				? [...rows]
+				: shelf === 'favorites'
+					? rows.filter((c) => c.favorite)
+					: rows.filter((c) => c.shelf === shelf);
 		if (sort === 'alpha') list = [...list].sort((a, b) => a.title.localeCompare(b.title));
 		return list.map((c) => {
 			const m = SHELF_META[c.shelf];
@@ -58,7 +59,27 @@
 		{ key: 'completed', label: 'Completed' },
 		{ key: 'onhold', label: 'On Hold' },
 		{ key: 'plan', label: 'Plan to Read' },
+		{ key: 'favorites', label: 'Favorites' },
 	] as const;
+
+	// Optimistically re-shelve / (un)favourite, persisting via the backend. On a
+	// persisted failure the source layer resolves to the optimistic value, so the
+	// UI stays consistent; a genuine desync corrects on the next load.
+	async function changeShelf(id: string | undefined, next: Shelf): Promise<void> {
+		if (!id) return;
+		const row = rows.find((r) => r.id === id);
+		if (!row || row.shelf === next) return;
+		row.shelf = next;
+		const result = await setLibraryStatus(id, next);
+		if (result) row.shelf = result;
+	}
+	async function toggleFavorite(id: string | undefined, current: boolean): Promise<void> {
+		if (!id) return;
+		const row = rows.find((r) => r.id === id);
+		if (!row) return;
+		row.favorite = !current;
+		row.favorite = await setFavorite(id, !current);
+	}
 </script>
 
 <div class="head k-gutter">
@@ -68,24 +89,27 @@
 	</div>
 </div>
 
-<section class="continue k-gutter">
-	<h2 class="section-label">Continue Reading</h2>
-	<div class="continue-row">
-		{#each continueRow as item (item.title)}
-			<a class="continue-card" href={`/series/${item.id ?? slug(item.title)}`}>
-				<div class="landscape k-cover">
-					<span class="resume"><Icon name="play" size={9} fill="currentColor" />Resume</span>
-					<div class="bar"><div class="fill" style="width:{item.progress}%"></div></div>
-				</div>
-				<div class="continue-meta">
-					<span class="ctitle">{item.title}</span>
-					<span class="cch">{item.ch}</span>
-				</div>
-				<div class="csub">{item.progress}% · {item.genre}</div>
-			</a>
-		{/each}
-	</div>
-</section>
+{#if continueRow.length}
+	<section class="continue k-gutter">
+		<h2 class="section-label">Continue Reading</h2>
+		<div class="continue-row">
+			{#each continueRow as item (item.id ?? item.title)}
+				<a class="continue-card" href={`/series/${item.id ?? slug(item.title)}`}>
+					<div class="landscape k-cover">
+						<Cover src={item.cover} alt={item.title} loading="lazy" />
+						<span class="resume"><Icon name="play" size={9} fill="currentColor" />Resume</span>
+						<div class="bar"><div class="fill" style="width:{item.progress}%"></div></div>
+					</div>
+					<div class="continue-meta">
+						<span class="ctitle">{item.title}</span>
+						<span class="cch">{item.ch}</span>
+					</div>
+					<div class="csub">{item.progress}% · {item.genre}</div>
+				</a>
+			{/each}
+		</div>
+	</section>
+{/if}
 
 <div class="shelfbar k-gutter">
 	<div class="shelf-tabs">
@@ -111,13 +135,14 @@
 </div>
 
 <div class="grid-wrap k-gutter">
-	{#if loading}
-		<CardGridSkeleton count={10} min={160} />
-	{:else if items.length}
+	{#if items.length}
 		<div class="grid">
-			{#each items as item (item.title + item.shelf)}
-				<a class="lib-card" href={`/series/${item.id ?? slug(item.title)}`}>
+			{#each items as item (item.id ?? item.title + item.shelf)}
+				{@const href = `/series/${item.id ?? slug(item.title)}`}
+				<div class="lib-card">
 					<div class="cover k-cover">
+						<Cover src={item.cover} alt={item.title} loading="lazy" />
+						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span
 							class="badge"
 							style="color:{item.meta.color};background:{item.meta.bg};border-color:{item.meta
@@ -126,13 +151,26 @@
 						<span class="rating"
 							><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
 						>
+						<button
+							class="fav-chip"
+							class:on={item.favorite}
+							aria-pressed={item.favorite}
+							aria-label={item.favorite ? 'Remove from favourites' : 'Add to favourites'}
+							title={item.favorite ? 'Favourited' : 'Add to favourites'}
+							onclick={() => toggleFavorite(item.id, item.favorite)}
+						>
+							<Icon name="heart" size={14} fill={item.favorite ? 'currentColor' : 'none'} />
+						</button>
+						<div class="status-slot">
+							<StatusMenu status={item.shelf} onchange={(s) => changeShelf(item.id, s)} />
+						</div>
 						{#if item.showBar}
 							<div class="progressbar"><div class="fill" style="width:{item.progress}%"></div></div>
 						{/if}
 					</div>
-					<div class="lib-title">{item.title}</div>
+					<a class="lib-title" {href}>{item.title}</a>
 					<div class="lib-sub">{item.sub}</div>
-				</a>
+				</div>
 			{/each}
 		</div>
 	{:else}
@@ -151,7 +189,6 @@
 	{/if}
 </div>
 
-<Footer />
 
 <style>
 	.head {
@@ -203,6 +240,16 @@
 		height: 168px;
 		border-radius: 10px;
 		transition: border-color 0.2s;
+	}
+	/* Round the cover art to match its container without `overflow:hidden`, which
+	   would clip the StatusMenu dropdown that escapes below the grid cover box. */
+	.landscape :global(.cover-img),
+	.landscape :global(.cover-ph) {
+		border-radius: 10px;
+	}
+	.cover :global(.cover-img),
+	.cover :global(.cover-ph) {
+		border-radius: 8px;
 	}
 	.continue-card:hover .landscape {
 		border-color: rgba(255, 255, 255, 0.2);
@@ -382,7 +429,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
-		text-decoration: none;
 	}
 	.cover {
 		position: relative;
@@ -391,11 +437,55 @@
 		border-radius: 8px;
 		transition: opacity 0.15s;
 	}
-	.lib-card:hover .cover {
-		opacity: 0.82;
+	/* Stretched navigation target — fills the cover, sits under the controls. */
+	.cover-link {
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		border-radius: 8px;
+	}
+	.lib-card:hover .cover-link {
+		background: rgba(12, 12, 13, 0.12);
+	}
+	.fav-chip {
+		position: absolute;
+		z-index: 2;
+		left: 9px;
+		bottom: 9px;
+		width: 28px;
+		height: 28px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 7px;
+		cursor: pointer;
+		color: var(--k-text);
+		background: rgba(12, 12, 13, 0.72);
+		border: 1px solid var(--k-border-3);
+		backdrop-filter: blur(3px);
+		transition: all 0.12s;
+	}
+	.fav-chip:hover {
+		color: #e96e6e;
+		border-color: rgba(233, 110, 110, 0.5);
+	}
+	.fav-chip.on {
+		color: #e96e6e;
+		background: rgba(233, 110, 110, 0.2);
+		border-color: rgba(233, 110, 110, 0.55);
+	}
+	.status-slot {
+		position: absolute;
+		z-index: 2;
+		right: 9px;
+		bottom: 9px;
+	}
+	.lib-title {
+		text-decoration: none;
 	}
 	.badge {
 		position: absolute;
+		z-index: 2;
 		top: 9px;
 		left: 9px;
 		font-size: 10px;
@@ -407,6 +497,7 @@
 	}
 	.rating {
 		position: absolute;
+		z-index: 2;
 		top: 9px;
 		right: 9px;
 		display: inline-flex;

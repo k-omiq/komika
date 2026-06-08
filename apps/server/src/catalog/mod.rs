@@ -133,9 +133,17 @@ pub async fn find_works_by_alias(pool: &SqlitePool, normalized: &str) -> Result<
     Ok(ids)
 }
 
-/// Fuzzy blocking (step 3): distinct work ids whose alias index contains `token`
-/// as a substring, capped at `limit`. `token` should be the longest word of the
-/// candidate's normalized title, so the block is selective.
+/// Fuzzy blocking (step 3): distinct work ids whose alias index contains `token` as
+/// a whole word, capped at `limit`. `token` is a whole word of the candidate's
+/// normalized title (the fuzzy block keys on the top-N longest words), so the block
+/// is selective.
+///
+/// H9: this is an index-usable EXACT-TOKEN lookup against the `work_alias_token`
+/// inverted index (one row per work+word), replacing the old leading-wildcard
+/// `normalized_title LIKE '%token%'` full-scan of `work_alias`. Word-level recall is
+/// preserved because the block always feeds whole normalized words (never substrings)
+/// and every alias word is indexed — so a distinctive mid/end-title word like "slime"
+/// in "...as a Slime" still matches, now via the index instead of a scan.
 pub async fn candidate_work_ids_by_token(
     pool: &SqlitePool,
     token: &str,
@@ -144,15 +152,42 @@ pub async fn candidate_work_ids_by_token(
     if token.len() < 2 {
         return Ok(Vec::new());
     }
-    let pattern = format!("%{}%", token.replace(['%', '_'], ""));
     let ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT work_id FROM work_alias WHERE normalized_title LIKE ? LIMIT ?",
+        "SELECT DISTINCT work_id FROM work_alias_token WHERE token = ? LIMIT ?",
     )
-    .bind(pattern)
+    .bind(token)
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(ids)
+}
+
+/// Split a normalized title into its indexable word tokens (whitespace-separated,
+/// byte-length ≥ 2 to mirror the lookup's `token.len() < 2` guard). The
+/// `work_alias_token` inverted index is populated from these on every alias write.
+fn alias_word_tokens(normalized_title: &str) -> Vec<&str> {
+    normalized_title
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect()
+}
+
+/// Upsert the word tokens of one normalized alias into the `work_alias_token`
+/// inverted index (H9). Idempotent via `INSERT OR IGNORE` on the UNIQUE(work_id,
+/// token) key. Runs inside the caller's alias-write transaction.
+async fn insert_alias_tokens(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work_id: &str,
+    normalized_title: &str,
+) -> Result<()> {
+    for token in alias_word_tokens(normalized_title) {
+        sqlx::query("INSERT OR IGNORE INTO work_alias_token (work_id, token) VALUES (?, ?)")
+            .bind(work_id)
+            .bind(token)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Load the corroboration fields + normalized aliases for one work.
@@ -210,6 +245,12 @@ pub struct CanonicalWork {
     pub author: Option<String>,
     pub artist: Option<String>,
     pub is_nsfw: bool,
+    /// Admin-pinned comic type (`content_type_override`); NULL => derive on read.
+    pub content_type_override: Option<String>,
+    /// Admin metadata overrides (NULL => use the derived/source value).
+    pub title_override: Option<String>,
+    pub description_override: Option<String>,
+    pub is_nsfw_override: Option<bool>,
     pub cover_file_name: Option<String>,
     pub alt_titles: Vec<String>,
     pub created_at: String,
@@ -231,6 +272,45 @@ pub struct CanonicalChapter {
     pub published_at: Option<String>,
 }
 
+/// The effective genre/tag list for a canonical work: the admin-curated `work_tag`
+/// set when present, else the distinct genres of its linked Suwayomi source series
+/// (parsed from the cached JSON `genre` arrays). Empty when neither exists. Best-effort
+/// — any query/parse failure just contributes nothing.
+pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<String> {
+    let curated = sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if !curated.is_empty() {
+        return curated;
+    }
+    let jsons = sqlx::query_scalar::<_, String>(
+        "SELECT sw.genre FROM source_series ss \
+         JOIN suwayomi_series sw ON CAST(sw.id AS TEXT) = ss.source_key \
+         WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for j in jsons {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&j) {
+            for g in list {
+                let g = g.trim().to_string();
+                if !g.is_empty() && seen.insert(g.clone()) {
+                    out.push(g);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
 /// the reader's canonical series path. `None` if the work id is unknown.
 pub async fn load_canonical_work(
@@ -247,13 +327,18 @@ pub async fn load_canonical_work(
         author: Option<String>,
         artist: Option<String>,
         is_nsfw: i64,
+        content_type_override: Option<String>,
+        title_override: Option<String>,
+        description_override: Option<String>,
+        is_nsfw_override: Option<i64>,
         cover_file_name: Option<String>,
         created_at: String,
         updated_at: String,
     }
     let row = sqlx::query_as::<_, Row>(
         "SELECT primary_title, description, year, original_language, status, author, artist, \
-                is_nsfw, cover_file_name, created_at, updated_at \
+                is_nsfw, content_type_override, title_override, description_override, \
+                is_nsfw_override, cover_file_name, created_at, updated_at \
          FROM work WHERE id = ?",
     )
     .bind(work_id)
@@ -262,9 +347,14 @@ pub async fn load_canonical_work(
     let Some(row) = row else { return Ok(None) };
 
     // The MangaDex source_series (its source_key is the MangaDex manga uuid).
+    // A merge can fold two mangadex works together, leaving >1 mangadex source_series
+    // on the target. Order deterministically (oldest first, id as final tiebreak) so
+    // the cover/page anchor is stable across loads instead of whatever the planner
+    // happens to return first.
     let mangadex_id = sqlx::query_scalar::<_, String>(
         "SELECT source_key FROM source_series \
-         WHERE work_id = ? AND source_type = 'mangadex' LIMIT 1",
+         WHERE work_id = ? AND source_type = 'mangadex' \
+         ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .bind(work_id)
     .fetch_optional(pool)
@@ -288,6 +378,10 @@ pub async fn load_canonical_work(
         author: row.author,
         artist: row.artist,
         is_nsfw: row.is_nsfw != 0,
+        content_type_override: row.content_type_override,
+        title_override: row.title_override,
+        description_override: row.description_override,
+        is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
         cover_file_name: row.cover_file_name,
         alt_titles,
         created_at: row.created_at,
@@ -316,11 +410,33 @@ pub async fn load_canonical_chapters(
     Ok(select_reader_chapters(rows))
 }
 
+/// The publish time of the work's most recent **English** MangaDex chapter — the
+/// real "last updated" for a series' details page. `None` when the work has no English
+/// chapters mirrored yet (caller falls back to the work-metadata timestamp).
+///
+/// This is deliberately NOT `work.updated_at`: that column is bumped on every routine
+/// metadata re-sync (`Utc::now()` in `upsert_work`), so it reflects "last metadata
+/// touch", not "last new chapter" — a work synced 4h ago but last updated 32 days ago
+/// would wrongly read "4 hours ago". `published_at` falls back to `created_at` per row
+/// only when a chapter has no publish date (mirrors `canonical_updates`).
+pub async fn latest_english_chapter_at(pool: &SqlitePool, work_id: &str) -> Result<Option<String>> {
+    let at = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(COALESCE(c.published_at, c.created_at)) \
+         FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
+    )
+    .bind(work_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(at)
+}
+
 /// NSFW flag of the work owning a mirrored MangaDex chapter (by chapter uuid), for
 /// gating `canonicalPages`. `None` if the chapter isn't in the mirror.
 pub async fn chapter_owner_is_nsfw(pool: &SqlitePool, external_id: &str) -> Result<Option<bool>> {
     let v = sqlx::query_scalar::<_, i64>(
-        "SELECT w.is_nsfw FROM chapter c \
+        "SELECT COALESCE(w.is_nsfw_override, w.is_nsfw) FROM chapter c \
          JOIN source_series ss ON ss.id = c.source_series_id \
          JOIN work w ON w.id = ss.work_id \
          WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
@@ -542,6 +658,42 @@ pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String>
     Ok(work_id)
 }
 
+/// Delete a work and its child rows. Intended to reclaim a freshly-minted work
+/// that lost a concurrent dedup claim (H6) — such a work has no `source_series`,
+/// `reviews`, or `user_library` rows yet, only the child metadata `create_work`
+/// wrote. Explicit child deletes make this correct regardless of the connection's
+/// `foreign_keys` pragma (mirrors the `merge_works` cleanup).
+pub async fn delete_work_cascade(pool: &SqlitePool, work_id: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for table in [
+        "work_alias",
+        "work_alias_token",
+        "work_external_id",
+        "work_description",
+        "work_credit",
+        "work_cover",
+        "work_tag",
+        "chapter_override",
+        "merge_candidate",
+    ] {
+        let col = if table == "merge_candidate" {
+            "candidate_work_id"
+        } else {
+            "work_id"
+        };
+        sqlx::query(&format!("DELETE FROM {table} WHERE {col} = ?"))
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM work WHERE id = ?")
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Upsert the localized descriptions + credit rows (S2). Idempotent: a
 /// re-sync overwrites each `(work, lang)` description in place and `INSERT OR
 /// IGNORE`s credits (names never mutate, they only accumulate).
@@ -639,6 +791,8 @@ async fn insert_aliases(
         .bind(&a.lang)
         .execute(&mut **tx)
         .await?;
+        // H9: keep the token inverted index in lockstep with the alias write.
+        insert_alias_tokens(tx, work_id, &norm).await?;
     }
     Ok(())
 }
@@ -854,6 +1008,8 @@ pub async fn merge_works(
         .bind(&lang)
         .execute(&mut *tx)
         .await?;
+        // H9: fold the alias's word tokens into the target's inverted index too.
+        insert_alias_tokens(&mut tx, target_work, &norm).await?;
     }
     // Fold external ids.
     sqlx::query(
@@ -890,7 +1046,9 @@ pub async fn merge_works(
 
     for (table, col) in [
         ("merge_candidate", "candidate_work_id"),
-        ("canonical_library", "work_id"),
+        // Per-user library membership for canonical works lives in `user_library`
+        // (series_id = the `w_` work id); repoint it when folding works.
+        ("user_library", "series_id"),
         ("reviews", "series_id"),
     ] {
         sqlx::query(&format!(
@@ -900,6 +1058,17 @@ pub async fn merge_works(
         .bind(source_work)
         .execute(&mut *tx)
         .await?;
+    }
+    // `reviews`/`user_library` have a unique key on (series_id, user_id) /
+    // (user_id, series_id), so a user with a row on BOTH merged works had their
+    // source row SKIPPED by the `UPDATE OR IGNORE` above (the target's row wins).
+    // Delete those losing leftovers so the imminent `work` delete can't orphan a
+    // row pointing at a nonexistent work (phantom library entry / stray review).
+    for table in ["reviews", "user_library"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE series_id = ?"))
+            .bind(source_work)
+            .execute(&mut *tx)
+            .await?;
     }
     // canonical_progress.work_id isn't part of any unique key → plain repoint.
     sqlx::query("UPDATE canonical_progress SET work_id = ? WHERE work_id = ?")
@@ -919,12 +1088,18 @@ pub async fn merge_works(
     // Explicitly remove the source's remaining child rows before deleting it.
     // Production has ON DELETE CASCADE, but being explicit makes the merge correct
     // regardless of the connection's `foreign_keys` pragma (and testable in-memory).
+    // work_tag / chapter_override are admin edits on the SOURCE work; the merge folds
+    // the source into the target, so drop them with the other source-scoped child rows
+    // (the target keeps its own). Explicit so the merge is correct with FKs off too.
     for table in [
         "work_alias",
+        "work_alias_token",
         "work_external_id",
         "work_description",
         "work_credit",
         "work_cover",
+        "work_tag",
+        "chapter_override",
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE work_id = ?"))
             .bind(source_work)
@@ -1037,6 +1212,9 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
         }
     }
     // MangaDex mirror (English).
+    // `CAST(c.number AS REAL)` yields 0.0 for a non-numeric number string ("Extra",
+    // "Oneshot", …), which would masquerade as a real chapter 0. Require at least one
+    // digit so those non-numeric labels are excluded rather than folded onto 0.
     let md = sqlx::query_as::<_, WorkChapterRow>(
         "SELECT CAST(c.number AS REAL) AS number, c.title AS title, 'mangadex' AS source_type, \
                 ss.source_id AS source_id, NULL AS suwayomi_manga_id, \
@@ -1044,7 +1222,7 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
          FROM source_series ss \
          JOIN chapter c ON c.source_series_id = ss.id \
          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
-           AND c.number IS NOT NULL",
+           AND c.number IS NOT NULL AND c.number GLOB '*[0-9]*'",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -1053,19 +1231,58 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
     Ok(rows)
 }
 
-/// The aggregate chapter count of a work (S2): the number of DISTINCT chapter
-/// numbers across all its sources. This is the count the reader should see — a
+/// The count of "main" chapters to display for a series: the number of DISTINCT
+/// chapter numbers after grouping by their integer part (the floor). Grouping folds
+/// three kinds of noise into one count that matches what external catalogues headline:
+///   - per-scanlator / per-language duplicate rows of the same number collapse;
+///   - a sparse ".5" bonus/omake (7.5, 14.5, …) folds into its base chapter (7, 14);
+///   - split-part numbering (9.1, 9.2 or 10.1, 10.2 …) folds each real chapter into a
+///     single count instead of one-per-part.
+///
+/// So Tsukimichi — 117 whole chapters carried as 151 scanlator-duplicated rows plus 4
+/// ".5" extras — reports 117, while a split-numbered series like "Villainess Level 99"
+/// (…9.1, 9.2, 10.1…) still reports its ~22 real chapters rather than the 12 whole
+/// numbers that happen to appear. Numbers below 1 (a "chapter 0" prologue, a 0.5 teaser)
+/// and non-finite sentinels aren't main chapters; a source with no such numbers at all
+/// falls back to its raw row count so it never collapses to zero.
+pub fn main_chapter_count<I: IntoIterator<Item = f64>>(numbers: I) -> i64 {
+    use std::collections::HashSet;
+    let mut groups: HashSet<i64> = HashSet::new();
+    let mut total: i64 = 0;
+    for n in numbers {
+        total += 1;
+        // Non-finite/sentinel rows and sub-1 prologue/teaser numbers aren't main
+        // chapters (but still count toward the raw-row fallback below).
+        if !n.is_finite() || n < 1.0 {
+            continue;
+        }
+        groups.insert(n.floor() as i64);
+    }
+    if groups.is_empty() {
+        total
+    } else {
+        groups.len() as i64
+    }
+}
+
+/// `main_chapter_count` over reader chapters whose numbers are `Option<String>` (the
+/// MangaDex mirror shape). Number-less rows only feed the raw-row fallback.
+pub fn main_chapter_count_str(chapters: &[CanonicalChapter]) -> i64 {
+    main_chapter_count(chapters.iter().map(|c| {
+        c.number
+            .as_deref()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(f64::NAN)
+    }))
+}
+
+/// The aggregate chapter count of a work (S2): the number of main chapters across all
+/// its sources (see `main_chapter_count`). This is the count the reader should see — a
 /// work whose MangaDex spine has 0 chapters but whose asurascans source has 201
 /// reports 201, not 0.
 pub async fn aggregate_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<i64> {
     let rows = work_source_chapters(pool, work_id).await?;
-    let mut nums: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for r in &rows {
-        // Bucket by number * 100 so "10" and "10.5" are distinct but float noise
-        // doesn't split a number into two buckets.
-        nums.insert((r.number * 100.0).round() as i64);
-    }
-    Ok(nums.len() as i64)
+    Ok(main_chapter_count(rows.iter().map(|r| r.number)))
 }
 
 /// Resolve the id of an existing source_series by its natural key.
@@ -1521,6 +1738,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_english_chapter_at_ignores_non_english_and_missing() {
+        let pool = pool().await;
+        let w = upsert_work_from_mangadex(&pool, "md-latest", &slime_input())
+            .await
+            .unwrap();
+        // No English chapter yet → None (caller falls back to work metadata time).
+        assert_eq!(latest_english_chapter_at(&pool, &w).await.unwrap(), None);
+
+        let ssid = find_source_series_id(&pool, "mangadex", "mangadex", "md-latest")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, num, lang, pub_at) in [
+            ("en1", "1", "en", Some("2026-01-01T00:00:00Z")),
+            ("en2", "2", "en", Some("2026-02-01T00:00:00Z")), // newest English
+            ("es3", "3", "es", Some("2026-06-01T00:00:00Z")), // newer, but Spanish → ignored
+        ] {
+            upsert_chapter(
+                &pool,
+                &ssid,
+                &ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some(lang.into()),
+                    published_at: pub_at.map(Into::into),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // The Spanish 2026-06 row is ignored; the latest English publish wins.
+        assert_eq!(
+            latest_english_chapter_at(&pool, &w)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-02-01T00:00:00Z"),
+        );
+    }
+
+    #[tokio::test]
     async fn source_extension_upsert_is_idempotent_on_source_id() {
         // §2.1: the source_id is the PK, so a re-scan updates the same row in place
         // (e.g. a bumped version_code) rather than inserting a duplicate.
@@ -1766,6 +2025,34 @@ mod tests {
         assert!(n1.contains(&"333") && n1.contains(&"999"));
     }
 
+    #[test]
+    fn main_chapter_count_groups_by_chapter_number() {
+        // The Tsukimichi shape: 117 whole chapters (1..=117), 4 ".5" bonus chapters
+        // (which fold into their base chapter), and 30 numbers each duplicated by a
+        // second scanlator → 151 source rows. The displayed count must be 117, NOT 121
+        // (counting the .5s) and NOT 151 (raw rows).
+        let mut nums: Vec<f64> = (1..=117).map(|n| n as f64).collect();
+        nums.extend([7.5, 14.5, 21.5, 28.5]);
+        for n in 1..=30 {
+            nums.push(n as f64); // a duplicate row for chapters 1..30 (second scanlator)
+        }
+        assert_eq!(nums.len(), 151, "the raw row count is the inflated 151");
+        assert_eq!(main_chapter_count(nums), 117);
+
+        // Split-part numbering (chapter 9 = 9.1 + 9.2, chapter 10 = 10.1 + 10.2 …): each
+        // real chapter must count once, NOT collapse to the few whole numbers present.
+        // Here chapters 1,2, then 3.1/3.2, 4.1/4.2 → 4 chapters (1,2,3,4), not 2.
+        assert_eq!(main_chapter_count([1.0, 2.0, 3.1, 3.2, 4.1, 4.2]), 4);
+
+        // Sub-1 prologue/teaser (0, 0.5) and non-finite sentinels aren't main chapters.
+        assert_eq!(main_chapter_count([0.0, 0.5, 1.0, 2.0, f64::NAN]), 2);
+
+        // Fallback: no main-chapter numbers at all → raw row count (never zero-out a
+        // series that genuinely has chapters).
+        assert_eq!(main_chapter_count([f64::NAN, f64::NAN, f64::NAN]), 3);
+        assert_eq!(main_chapter_count([0.5, 0.9]), 2);
+    }
+
     #[tokio::test]
     async fn merge_works_folds_source_into_target() {
         // D1: fold a federation-only duplicate into the MangaDex-anchored work.
@@ -1988,5 +2275,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec![w]);
+    }
+
+    #[tokio::test]
+    async fn token_index_backs_block_and_survives_merge_and_delete() {
+        // H9: the exact-token block reads `work_alias_token`; folding/deleting a work
+        // must fold/clean its token rows (no orphans, no lost recall).
+        let pool = pool().await;
+        let target = upsert_work_from_mangadex(
+            &pool,
+            "md-target",
+            &WorkInput {
+                primary_title: Some("Solo Leveling".into()),
+                aliases: vec![Alias {
+                    raw: "Solo Leveling".into(),
+                    lang: Some("en".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A distinctive alias word ("npodamun") only the source carries.
+        let source = create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Na Honjaman Level Up".into()),
+                aliases: vec![Alias {
+                    raw: "Nodamun Level".into(),
+                    lang: Some("en".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Exact-token block finds each work by a whole normalized word.
+        assert_eq!(
+            candidate_work_ids_by_token(&pool, "leveling", 10)
+                .await
+                .unwrap(),
+            vec![target.clone()]
+        );
+        assert_eq!(
+            candidate_work_ids_by_token(&pool, "nodamun", 10)
+                .await
+                .unwrap(),
+            vec![source.clone()]
+        );
+        // Too-short tokens return empty.
+        assert!(candidate_work_ids_by_token(&pool, "a", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Merge folds the source's tokens into the target and leaves no orphans.
+        merge_works(&pool, &source, &target).await.unwrap();
+        assert_eq!(
+            candidate_work_ids_by_token(&pool, "nodamun", 10)
+                .await
+                .unwrap(),
+            vec![target.clone()],
+            "source's distinctive token now blocks to the target"
+        );
+        let orphan: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_alias_token WHERE work_id = ?")
+                .bind(&source)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan, 0, "no token rows left for the deleted source work");
+
+        // Deleting the target cascades its token rows away entirely.
+        delete_work_cascade(&pool, &target).await.unwrap();
+        assert!(candidate_work_ids_by_token(&pool, "leveling", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

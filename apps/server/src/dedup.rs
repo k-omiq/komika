@@ -64,7 +64,24 @@ const FUZZY_BLOCK_TOKENS: usize = 3;
 /// Minimum cover-pHash similarity that counts as corroboration for a title-driven
 /// auto-merge (DD3). A shared normalized title plus mere description overlap must
 /// not auto-merge on its own — without a corroborating cover it lands in Review.
-const PHASH_CORROBORATION: f64 = 0.8;
+/// Set to 0.90 on the 64-bit dHash → at most ~6 differing bits, tight enough that
+/// two genuinely different covers don't corroborate a merge (was 0.8 = up to 12
+/// bits, which let flat/letterboxed covers false-merge distinct series).
+const PHASH_CORROBORATION: f64 = 0.90;
+/// A near-uniform dHash (almost-all-0 or almost-all-1 bits) carries little signal —
+/// flat/letterboxed/dark covers collapse to such hashes, so two DIFFERENT series
+/// can share one. Only accept a cover as corroborating when its own hash's popcount
+/// sits away from both extremes (12..=52 of 64 bits).
+fn is_discriminative_phash(hex: &str) -> bool {
+    let Ok(bytes) = hex::decode(hex) else {
+        return false;
+    };
+    if bytes.len() != 8 {
+        return false;
+    }
+    let ones: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+    (12..=52).contains(&ones)
+}
 
 /// Resolve `cand` against the canonical works in `pool`.
 pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
@@ -150,10 +167,17 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
     // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
     // finer description/cover distinction isn't surfaced separately (DD6).
     let method = if exact_hit { "title_exact" } else { "fuzzy" };
+    // Require both a tight pHash match AND that the candidate's own cover hash is
+    // discriminative — a near-uniform hash must not corroborate an auto-merge.
     let cover_corroborated = scored
         .phash_sim
         .map(|p| p >= PHASH_CORROBORATION)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && cand
+            .cover_phash
+            .as_deref()
+            .map(is_discriminative_phash)
+            .unwrap_or(false);
     Ok(if score >= HIGH && cover_corroborated {
         Decision::AutoMerge {
             work_id,

@@ -20,7 +20,7 @@
  */
 import type { Comment, CommentTargetType, Review } from '@komika/types';
 import { backend } from '$lib/context';
-import { config } from '$lib/config';
+import { config, apiAssetSrc } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
 import * as local from './social';
 import type { ReaderComment, SeriesComment } from './types';
@@ -52,6 +52,8 @@ export interface ReviewView {
 export interface CommentView {
 	id: string;
 	authorId: string;
+	/** Parent comment id, or null for a top-level comment. Drives the reply tree. */
+	parentId: string | null;
 	name: string;
 	initial: string;
 	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
@@ -61,11 +63,28 @@ export interface CommentView {
 	body: string;
 	time: string;
 	hasSpoiler: boolean;
+	/** Attached image (resolved, loadable URL) + its dimensions, if any. */
+	mediaUrl?: string | null;
+	mediaWidth?: number | null;
+	mediaHeight?: number | null;
 	isOp: boolean;
 	mine: boolean;
 	likes: number;
 	liked: boolean;
 }
+
+/** Result of staging a comment image, ready to attach to the next posted comment. */
+export interface PendingMedia {
+	mediaId: string;
+	/** Loadable preview URL (already resolved against the API origin). */
+	url: string;
+	width: number;
+	height: number;
+}
+
+/** Max raw upload accepted client-side before hitting the server (mirrors the
+ *  server's `media::MAX_UPLOAD_BYTES`); rejected early with a friendly message. */
+export const MAX_COMMENT_IMAGE_BYTES = 8 * 1024 * 1024;
 
 export interface SeriesSocial {
 	myScore: number;
@@ -130,6 +149,7 @@ function commentToView(c: Comment): CommentView {
 	return {
 		id: c.id,
 		authorId: c.author.id,
+		parentId: c.parentId ?? null,
 		name: c.author.username,
 		initial: initialOf(c.author.username),
 		avatarUrl: c.author.avatarUrl,
@@ -138,6 +158,9 @@ function commentToView(c: Comment): CommentView {
 		body: c.body,
 		time: relTime(c.createdAt),
 		hasSpoiler: c.hasSpoiler,
+		mediaUrl: apiAssetSrc(c.mediaUrl),
+		mediaWidth: c.mediaWidth,
+		mediaHeight: c.mediaHeight,
 		isOp: false,
 		mine: !!auth.user && c.author.id === auth.user.id,
 		likes: 0,
@@ -276,14 +299,17 @@ async function loadComments(
 ): Promise<CommentView[]> {
 	if (socialLive()) {
 		const { items } = await backend.comments(targetType, targetId);
-		// Server returns oldest→newest; the UI shows newest first.
-		return items.map(commentToView).reverse();
+		// Server returns each root's subtree flat and ascending; keep that order so
+		// the CommentThread component can assemble the reply tree (parentId → child
+		// order is chronological, and it displays root threads newest-first).
+		return items.map(commentToView);
 	}
 	// No seeded thread — honest empty state; offline user comments persist locally.
 	const seeded = local.getComments(bucket, key, [] as ReaderComment[]);
 	return seeded.map((c) => ({
 		id: c.id,
 		authorId: '',
+		parentId: null,
 		name: c.name,
 		initial: c.initial,
 		bg: c.bg,
@@ -298,6 +324,14 @@ async function loadComments(
 	}));
 }
 
+/** Reply/attachment options for {@link submitComment}. */
+export interface CommentOpts {
+	/** Reply target; omit/null for a top-level comment. */
+	parentId?: string | null;
+	/** A staged image to attach (from {@link uploadCommentMedia}). */
+	media?: PendingMedia | null;
+}
+
 async function submitComment(
 	targetType: CommentTargetType,
 	targetId: string,
@@ -306,19 +340,33 @@ async function submitComment(
 	body: string,
 	hasSpoiler: boolean,
 	currentComments: CommentView[],
+	opts: CommentOpts = {},
 ): Promise<CommentView[]> {
+	const parentId = opts.parentId ?? null;
 	if (socialLive()) {
 		// Defense-in-depth: don't post a comment unauthenticated even if the UI
 		// gate is bypassed.
 		if (!auth.user) throw new Error('You must be signed in to comment.');
-		const c = await backend.postComment({ targetType, targetId, body, hasSpoiler });
-		return [commentToView(c), ...currentComments];
+		const c = await backend.postComment({
+			targetType,
+			targetId,
+			parentId,
+			body,
+			hasSpoiler,
+			mediaId: opts.media?.mediaId ?? null,
+		});
+		// Append (newest last): the CommentThread component orders root threads and
+		// nests replies from the flat list, so position within the array only needs
+		// to be chronological.
+		return [...currentComments, commentToView(c)];
 	}
 	const me = auth.user?.username ?? 'You';
 	const next: CommentView[] = [
+		...currentComments,
 		{
 			id: 'local-' + Date.now(),
 			authorId: auth.user?.id ?? '',
+			parentId,
 			name: me,
 			initial: initialOf(me),
 			bg: '#f2f1ee',
@@ -326,33 +374,62 @@ async function submitComment(
 			body,
 			time: 'just now',
 			hasSpoiler,
+			mediaUrl: opts.media?.url ?? null,
+			mediaWidth: opts.media?.width ?? null,
+			mediaHeight: opts.media?.height ?? null,
 			isOp: false,
 			mine: true,
 			likes: 0,
 			liked: false,
 		},
-		...currentComments,
 	];
+	// The localStorage fallback shape is flat and doesn't model replies/media;
+	// persist the top-level rows only so offline mode still shows the discussion.
 	local.saveComments(
 		bucket,
 		key,
-		next.map((c) => ({
-			id: c.id,
-			name: c.name,
-			initial: c.initial,
-			bg: c.bg,
-			fg: c.fg,
-			ts: 999,
-			time: c.time,
-			isOp: c.isOp,
-			hasSpoiler: c.hasSpoiler,
-			likes: c.likes,
-			liked: c.liked,
-			replies: 0,
-			body: c.body,
-		})),
+		next
+			.filter((c) => c.parentId == null)
+			.map((c) => ({
+				id: c.id,
+				name: c.name,
+				initial: c.initial,
+				bg: c.bg,
+				fg: c.fg,
+				ts: 999,
+				time: c.time,
+				isOp: c.isOp,
+				hasSpoiler: c.hasSpoiler,
+				likes: c.likes,
+				liked: c.liked,
+				replies: 0,
+				body: c.body,
+			})),
 	);
 	return next;
+}
+
+/**
+ * Stage an image for the next comment: validate it client-side, then upload it to
+ * the server, which downscales + re-encodes it as budgeted WebP and returns a
+ * staged {@link PendingMedia}. Pass the result to a submit call to attach it.
+ */
+export async function uploadCommentMedia(file: File): Promise<PendingMedia> {
+	if (!socialLive() || !backend.uploadCommentMedia) {
+		throw new Error('Image upload requires the Komiq backend.');
+	}
+	if (!auth.user) throw new Error('You must be signed in to attach an image.');
+	if (!file.type.startsWith('image/')) throw new Error('That file is not an image.');
+	if (file.size > MAX_COMMENT_IMAGE_BYTES) {
+		throw new Error(`Image is too large (max ${MAX_COMMENT_IMAGE_BYTES / (1024 * 1024)} MB).`);
+	}
+	const r = await backend.uploadCommentMedia(file);
+	return {
+		mediaId: r.mediaId,
+		url: apiAssetSrc(r.url) ?? r.url,
+		width: r.width,
+		height: r.height,
+	};
 }
 
 // Per-chapter thread (reader page).
@@ -365,8 +442,18 @@ export function submitChapterComment(
 	body: string,
 	hasSpoiler: boolean,
 	currentComments: CommentView[],
+	opts: CommentOpts = {},
 ): Promise<CommentView[]> {
-	return submitComment('chapter', chapterId, 'chapter', key, body, hasSpoiler, currentComments);
+	return submitComment(
+		'chapter',
+		chapterId,
+		'chapter',
+		key,
+		body,
+		hasSpoiler,
+		currentComments,
+		opts,
+	);
 }
 
 // Series-level discussion (comic detail page) — distinct from Reviews.
@@ -379,8 +466,18 @@ export function submitSeriesComment(
 	body: string,
 	hasSpoiler: boolean,
 	currentComments: CommentView[],
+	opts: CommentOpts = {},
 ): Promise<CommentView[]> {
-	return submitComment('series', seriesId, 'seriesThread', key, body, hasSpoiler, currentComments);
+	return submitComment(
+		'series',
+		seriesId,
+		'seriesThread',
+		key,
+		body,
+		hasSpoiler,
+		currentComments,
+		opts,
+	);
 }
 
 // ---- admin moderation ------------------------------------------------------
@@ -394,7 +491,7 @@ export function canModerate(): boolean {
  * Delete a comment (admin moderation) and return the list without it. In live
  * mode this removes it server-side; the local fallback just drops it from view.
  */
-export async function deleteChapterComment(
+export async function deleteComment(
 	commentId: string,
 	current: CommentView[],
 ): Promise<CommentView[]> {
@@ -403,7 +500,20 @@ export async function deleteChapterComment(
 		if (!backend.deleteComment) throw new Error('Moderation is unavailable on this backend.');
 		await backend.deleteComment(commentId);
 	}
-	return current.filter((c) => c.id !== commentId);
+	// The server deletes the whole reply subtree; mirror that locally so replies of
+	// a removed comment don't linger as orphans until the next reload.
+	const doomed = new Set<string>([commentId]);
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const c of current) {
+			if (c.parentId && doomed.has(c.parentId) && !doomed.has(c.id)) {
+				doomed.add(c.id);
+				grew = true;
+			}
+		}
+	}
+	return current.filter((c) => !doomed.has(c.id));
 }
 
 /**

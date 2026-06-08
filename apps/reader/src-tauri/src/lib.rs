@@ -33,23 +33,36 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Redirect hops we'll follow manually (each one re-validated).
 const MAX_REDIRECTS: usize = 5;
+/// Max concurrent native image fetches. Bounds peak native heap at roughly
+/// N × MAX_IMAGE_BYTES so a burst of page prefetches (or a malicious source
+/// serving large images) can't OOM/jetsam the app — critical on iOS, where the
+/// in-process JVM already runs under `-Xmx256m` in a jetsam-limited process.
+const MAX_CONCURRENT_IMAGE_FETCHES: usize = 6;
 
-/// Shared client: one connection pool, a request timeout, and NO automatic
+/// Global permit pool gating every native image command (`fetch_image` here and
+/// the loopback `suwayomi_image` proxies in the `suwayomi` module). Shared so the
+/// cap is a true process-wide bound on concurrent 32 MiB buffers, not per-command.
+pub(crate) fn image_fetch_semaphore() -> &'static tokio::sync::Semaphore {
+  static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+  SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_IMAGE_FETCHES))
+}
+
+/// Base config for a native image-fetch client: a request timeout and NO automatic
 /// redirect following — we follow manually so every hop's host is re-validated
 /// (a 3xx to `http://169.254.169.254/…` must not slip past the host guard).
-fn image_client() -> &'static reqwest::Client {
-  static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-  CLIENT.get_or_init(|| {
-    reqwest::Client::builder()
-      .timeout(FETCH_TIMEOUT)
-      .redirect(reqwest::redirect::Policy::none())
-      // Some CDNs (MangaDex among them) gate on a UA/Referer and 403 requests
-      // without them; the Worker sets both, so the native path must match to avoid
-      // a web/native divergence on exactly those hosts (I4).
-      .user_agent("Komika/0.1 (+https://komika.app)")
-      .build()
-      .expect("build image http client")
-  })
+///
+/// Callers add a per-host `.resolve(host, addr)` pin before `.build()`, so we hand
+/// back a fresh builder rather than a shared client: the connection then dials
+/// exactly the IP that passed `is_blocked_ip`, closing the DNS-rebinding TOCTOU
+/// where reqwest would otherwise re-resolve to a second, unchecked address.
+fn image_client_builder() -> reqwest::ClientBuilder {
+  reqwest::Client::builder()
+    .timeout(FETCH_TIMEOUT)
+    .redirect(reqwest::redirect::Policy::none())
+    // Some CDNs (MangaDex among them) gate on a UA/Referer and 403 requests
+    // without them; the Worker sets both, so the native path must match to avoid
+    // a web/native divergence on exactly those hosts (I4).
+    .user_agent("Komika/0.1 (+https://komika.app)")
 }
 
 /// Same-origin Referer for the target (mirrors the Worker's `scheme://host[:port]/`).
@@ -75,10 +88,24 @@ fn referer_for(url: &reqwest::Url) -> String {
 /// manually with re-validation, and the body is bounded by a timeout + size cap.
 #[tauri::command]
 async fn fetch_image(url: String) -> Result<tauri::ipc::Response, String> {
-  let client = image_client();
+  // Gate concurrency: one permit, held across the whole redirect chain, so the
+  // in-flight 32 MiB buffers can't stack up past MAX_CONCURRENT_IMAGE_FETCHES.
+  let _permit = image_fetch_semaphore()
+    .acquire()
+    .await
+    .map_err(|_| "image fetch pool closed".to_string())?;
   let mut next = url;
   for _ in 0..=MAX_REDIRECTS {
-    let target = validate_image_url(&next).await?;
+    let (target, addr) = validate_image_url(&next).await?;
+    // Pin the connection to the validated IP. Without this, reqwest resolves DNS
+    // a SECOND time at connect, so a short-TTL/round-robin rebind could swap in a
+    // blocked address (LAN / 169.254.169.254) after the check passed. `.resolve`
+    // dials exactly the vetted IP while host/SNI/cert stay the original hostname.
+    let host = target.host_str().unwrap_or("").to_string();
+    let client = image_client_builder()
+      .resolve(&host, addr)
+      .build()
+      .map_err(|e| e.to_string())?;
     let resp = client
       .get(target.clone())
       .header(reqwest::header::REFERER, referer_for(&target))
@@ -109,8 +136,10 @@ async fn fetch_image(url: String) -> Result<tauri::ipc::Response, String> {
 }
 
 /// Parse `raw`, require http(s), and reject any host that resolves to a
-/// non-public address — the pre-fetch SSRF guard. Returns the parsed URL.
-async fn validate_image_url(raw: &str) -> Result<reqwest::Url, String> {
+/// non-public address — the pre-fetch SSRF guard. Returns the parsed URL together
+/// with the vetted `SocketAddr` the caller must pin the connection to (so reqwest
+/// cannot re-resolve to a different, unchecked address).
+async fn validate_image_url(raw: &str) -> Result<(reqwest::Url, std::net::SocketAddr), String> {
   let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid url: {e}"))?;
   match url.scheme() {
     "http" | "https" => {}
@@ -130,7 +159,9 @@ async fn validate_image_url(raw: &str) -> Result<reqwest::Url, String> {
   if let Some(addr) = addrs.iter().find(|a| is_blocked_ip(&a.ip())) {
     return Err(format!("host resolves to a non-public address: {}", addr.ip()));
   }
-  Ok(url)
+  // Every resolved address passed the guard; pin the connection to the first so
+  // the dialed IP is exactly one we validated (defeats the DNS-rebinding TOCTOU).
+  Ok((url, addrs[0]))
 }
 
 /// True for addresses a source image must never point at: loopback, private,
@@ -139,26 +170,48 @@ async fn validate_image_url(raw: &str) -> Result<reqwest::Url, String> {
 fn is_blocked_ip(ip: &IpAddr) -> bool {
   match ip {
     IpAddr::V4(v4) => {
+      let o = v4.octets();
       v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_broadcast()
         || v4.is_documentation()
         || v4.is_unspecified()
-        || v4.octets()[0] == 0
+        || o[0] == 0
         // Carrier-grade NAT 100.64.0.0/10.
-        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+        // Class E / reserved 240.0.0.0/4 (255.255.255.255 is is_broadcast).
+        || o[0] >= 240
+        // Benchmarking 198.18.0.0/15.
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        // IETF protocol assignments 192.0.0.0/24.
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
     }
     IpAddr::V6(v6) => {
       if let Some(mapped) = v6.to_ipv4_mapped() {
         return is_blocked_ip(&IpAddr::V4(mapped));
       }
+      let seg = v6.segments();
+      // Deprecated IPv4-compatible address ::a.b.c.d (::/96), excluding :: and
+      // ::1 (handled below): fold to the embedded v4 so ::169.254.169.254 etc.
+      // can't tunnel past the guard the way only ::ffff: forms did before.
+      if seg[..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && seg[7] <= 1) {
+        let v4 = std::net::Ipv4Addr::new(
+          (seg[6] >> 8) as u8,
+          seg[6] as u8,
+          (seg[7] >> 8) as u8,
+          seg[7] as u8,
+        );
+        return is_blocked_ip(&IpAddr::V4(v4));
+      }
       v6.is_loopback()
         || v6.is_unspecified()
         // Unique-local fc00::/7.
-        || (v6.segments()[0] & 0xfe00) == 0xfc00
+        || (seg[0] & 0xfe00) == 0xfc00
         // Link-local fe80::/10.
-        || (v6.segments()[0] & 0xffc0) == 0xfe80
+        || (seg[0] & 0xffc0) == 0xfe80
+        // Documentation 2001:db8::/32.
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8)
     }
   }
 }
@@ -242,6 +295,10 @@ mod tests {
       "100.64.0.1",      // CGNAT
       "0.0.0.0",
       "255.255.255.255",
+      "240.0.0.1",       // class E / reserved 240.0.0.0/4
+      "198.18.0.1",      // benchmarking 198.18.0.0/15
+      "198.19.255.255",  // benchmarking (upper half)
+      "192.0.0.1",       // IETF protocol assignments 192.0.0.0/24
     ] {
       assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} must be blocked");
     }
@@ -256,7 +313,16 @@ mod tests {
 
   #[test]
   fn blocks_non_public_ipv6() {
-    for ip in ["::1", "::", "fe80::1", "fc00::1", "::ffff:127.0.0.1"] {
+    for ip in [
+      "::1",
+      "::",
+      "fe80::1",
+      "fc00::1",
+      "::ffff:127.0.0.1",
+      "2001:db8::1",     // documentation 2001:db8::/32
+      "::192.168.1.1",   // deprecated IPv4-compatible folding to a private v4
+      "::169.254.169.254", // IPv4-compatible folding to link-local metadata
+    ] {
       assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} must be blocked");
     }
   }

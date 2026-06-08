@@ -126,6 +126,12 @@ pub struct ScanState {
     /// When the current overdue-awaiting streak began (SC1). `None` = not awaiting
     /// (a chapter is on schedule). Bounds how long the accelerated poll runs.
     pub awaiting_since: Option<String>,
+    /// Snapshot of the chapter identity set at the last scan (sorted, comma-joined
+    /// chapter ids). Drives set-difference new-chapter detection so a removal that
+    /// offsets an insertion at/below the current max is still flagged. `None` =
+    /// not yet captured (pre-migration row / first observation), which seeds a
+    /// baseline without flagging.
+    pub known_chapter_ids: Option<String>,
 }
 
 /// The column list for a `ScanState` row, shared by `scan_state` (pooled read)
@@ -133,7 +139,7 @@ pub struct ScanState {
 /// with the struct.
 const SCAN_STATE_SELECT: &str =
     "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, \
-     last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since \
+     last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, known_chapter_ids \
      FROM series_scan_state WHERE series_id = ?";
 
 /// Read the persisted scan state for a series, if any.
@@ -220,9 +226,36 @@ fn latest_number(chapters: &[SuwayomiChapter]) -> Option<f64> {
         .fold(None, |acc, n| Some(acc.map_or(n, |a: f64| a.max(n))))
 }
 
-/// Two chapter numbers within this tolerance are treated as equal, so float
-/// round-trips through SQLite don't spuriously read as "a higher chapter."
-const CHAPTER_NUMBER_EPS: f64 = 1e-6;
+/// The highest *real* chapter number in the current list, dropping obvious
+/// sentinels/outliers — Suwayomi's `-1.0` "unnumbered" marker, NaN, and absurdly
+/// large values. Unlike a monotonic all-time high-water mark, this is derived
+/// from the CURRENT list, so `known_max_chapter` self-heals once a garbage number
+/// disappears upstream instead of being pinned forever (SC4).
+fn robust_max_number(chapters: &[SuwayomiChapter]) -> Option<f64> {
+    chapters
+        .iter()
+        .map(|c| c.chapter_number)
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n < 100_000.0)
+        .fold(None, |acc, n| Some(acc.map_or(n, |a: f64| a.max(n))))
+}
+
+/// Encode a set of chapter ids as a stable, sorted, comma-joined string for the
+/// `known_chapter_ids` snapshot (SC set-diff detection).
+fn encode_id_set(ids: &std::collections::HashSet<i64>) -> String {
+    let mut v: Vec<i64> = ids.iter().copied().collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse a `known_chapter_ids` snapshot back into a set.
+fn parse_id_set(s: &str) -> std::collections::HashSet<i64> {
+    s.split(',')
+        .filter_map(|t| t.trim().parse::<i64>().ok())
+        .collect()
+}
 
 fn parse_iso(v: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(v?)
@@ -412,25 +445,30 @@ async fn record_scan(
 
     let count = chapters.len() as i64;
     let computed_avg = avg_interval_hours(chapters).unwrap_or(prior.avg_interval_hours);
-    let latest = latest_number(chapters);
-    // A higher chapter number than we've seen means a new chapter even when the
-    // *count* is unchanged — upstream can drop one chapter and add another within
-    // an interval, leaving count flat but the max number advanced (SC4). Only
-    // compares when a prior max exists, so pre-`0012`/first-observation rows just
-    // seed a baseline rather than firing on the jump from "unknown".
-    let advanced_number = match (latest, prior.known_max_chapter) {
-        (Some(l), Some(prev)) => l > prev + CHAPTER_NUMBER_EPS,
-        _ => false,
-    };
-    // On first observation we only record the baseline; a series is never "new"
-    // the first time we see it (SC3).
-    let new_found = !first_observation && (count > prior.known_chapter_count || advanced_number);
-    // Highest number seen is a high-water mark: never regress it just because
-    // upstream removed the top chapter, so a later re-add doesn't re-flag.
-    let known_max = match latest {
-        Some(l) => Some(prior.known_max_chapter.map_or(l, |p| p.max(l))),
-        None => prior.known_max_chapter,
-    };
+    // `known_max` is derived from the CURRENT list (sentinels dropped) so it heals
+    // downward once garbage disappears upstream, instead of being pinned forever by
+    // a single bad number. Falls back to the prior value only when the current list
+    // has no real numbers at all (SC4).
+    let latest = robust_max_number(chapters);
+    let known_max = latest.or(prior.known_max_chapter);
+
+    // New-chapter detection is a set-difference of chapter identities against the
+    // prior snapshot: a chapter present now but absent before is new — even when
+    // upstream simultaneously removed one (count stays flat) or the new chapter is
+    // numbered at/below the current max. A missing prior snapshot (pre-migration
+    // row, or first observation) seeds a baseline WITHOUT flagging, so neither an
+    // upgrade nor a fresh series floods the `updates` feed (SC3).
+    let current_ids: std::collections::HashSet<i64> = chapters.iter().map(|c| c.id).collect();
+    let prior_ids = prior
+        .known_chapter_ids
+        .as_deref()
+        .map(parse_id_set)
+        .unwrap_or_default();
+    let have_prior_snapshot = prior.known_chapter_ids.is_some();
+    let new_found = !first_observation
+        && have_prior_snapshot
+        && current_ids.iter().any(|id| !prior_ids.contains(id));
+    let known_chapter_ids = encode_id_set(&current_ids);
     // A shrinking count means upstream removed chapters; surface it (the count is
     // still overwritten downward, but it's no longer silent) (SC4).
     if !first_observation && count < prior.known_chapter_count {
@@ -508,8 +546,9 @@ async fn record_scan(
     sqlx::query(
         "INSERT INTO series_scan_state \
            (series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
-            last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, \
+            known_chapter_ids, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(series_id) DO UPDATE SET \
            avg_interval_hours = excluded.avg_interval_hours, \
            known_chapter_count = excluded.known_chapter_count, \
@@ -518,6 +557,7 @@ async fn record_scan(
            next_scan_at = excluded.next_scan_at, \
            last_new_chapter_at = excluded.last_new_chapter_at, \
            awaiting_since = excluded.awaiting_since, \
+           known_chapter_ids = excluded.known_chapter_ids, \
            updated_at = excluded.updated_at",
     )
     .bind(series_id)
@@ -528,6 +568,7 @@ async fn record_scan(
     .bind(&next_scan_at)
     .bind(&last_new_chapter_at)
     .bind(&awaiting_since)
+    .bind(&known_chapter_ids)
     .bind(&now_iso)
     .execute(&mut *tx)
     .await?;
@@ -540,34 +581,65 @@ async fn record_scan(
 pub fn spawn(
     state: Arc<AppState>,
     tick_seconds: u64,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Supervisor: run the tick loop in a child task and, if it panics, restart it
+    // after a short backoff so a single panic doesn't permanently kill the scan
+    // scheduler (leaving a silently-stale catalogue). A clean (shutdown) exit ends
+    // supervision.
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(tick_seconds));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        tracing::info!(tick_seconds, "scan scheduler started");
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let started = Utc::now();
-                    let (size, overdue) = tick(&state).await;
-                    {
-                        let mut h = state.scan_health.lock().unwrap();
-                        h.library_size = size;
-                        h.overdue_count = overdue;
-                        h.last_tick_at = Some(started.to_rfc3339());
-                    }
-                    tracing::info!(library_size = size, overdue = overdue, "scan tick complete");
-                }
-                _ = shutdown.changed() => {
+            let handle = tokio::spawn(run_loop(state.clone(), tick_seconds, shutdown.clone()));
+            match handle.await {
+                Ok(()) => break,
+                Err(e) if e.is_panic() => {
                     if *shutdown.borrow() {
-                        tracing::info!("scan scheduler stopping");
+                        break;
+                    }
+                    tracing::error!("scan scheduler loop panicked; restarting in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if *shutdown.borrow() {
                         break;
                     }
                 }
+                Err(_) => break, // cancelled
             }
         }
     });
+}
+
+async fn run_loop(
+    state: Arc<AppState>,
+    tick_seconds: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = interval(Duration::from_secs(tick_seconds));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tracing::info!(tick_seconds, "scan scheduler started");
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let started = Utc::now();
+                let (size, overdue) = tick(&state).await;
+                {
+                    // Recover from a poisoned lock rather than propagating the panic
+                    // (which would kill the scheduler task) — a stale health snapshot
+                    // is harmless compared with a dead scan loop.
+                    let mut h = state.scan_health.lock().unwrap_or_else(|e| e.into_inner());
+                    h.library_size = size;
+                    h.overdue_count = overdue;
+                    h.last_tick_at = Some(started.to_rfc3339());
+                }
+                tracing::info!(library_size = size, overdue = overdue, "scan tick complete");
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("scan scheduler stopping");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -789,9 +861,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_chapter_is_a_high_water_mark() {
-        // Removing the top chapter must not regress the stored max (else a later
-        // re-add would spuriously re-flag), and no new chapter is reported.
+    async fn max_chapter_heals_on_shrink_without_flagging() {
+        // Removing the top chapter is not a new chapter (set-difference: no id
+        // present now was absent before). Unlike the old monotonic high-water mark,
+        // known_max now HEALS down to the current list's real max (SC4), so a
+        // transient garbage number can't pin it forever.
         let pool = migrated_pool().await;
         let admin = ScanAdmin::default();
         let full = vec![
@@ -822,8 +896,75 @@ mod tests {
         );
         assert_eq!(
             row.known_max_chapter,
-            Some(3.0),
-            "max stays at the high-water mark"
+            Some(2.0),
+            "max heals to the current list's real max"
+        );
+    }
+
+    #[tokio::test]
+    async fn sentinel_number_does_not_pin_known_max() {
+        // A garbage/sentinel chapter number (Suwayomi's -1.0, or an absurd value)
+        // must not become the stored known_max — otherwise number-derived state is
+        // pinned forever. The robust max ignores it and uses the real top chapter.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        let with_sentinel = vec![
+            chap_n(1, 1.0, None),
+            chap_n(2, 2.0, None),
+            chap_n(3, -1.0, None),
+            chap_n(4, 999_999.0, None),
+        ];
+        record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &with_sentinel,
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted(&pool, "1").await.known_max_chapter,
+            Some(2.0),
+            "sentinels are excluded from known_max"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_offsetting_insertion_is_flagged() {
+        // A removal that offsets an insertion at/below the current max (count flat,
+        // max unchanged) is still a new chapter via set-difference of identities.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin::default();
+        // ids {10,11,12}, numbers 1,2,3.
+        let base = vec![
+            chap_n(10, 1.0, None),
+            chap_n(11, 2.0, None),
+            chap_n(12, 3.0, None),
+        ];
+        // Drop id 11 (number 2), add id 13 renumbered 2 — count flat (3), max flat.
+        let churned = vec![
+            chap_n(10, 1.0, None),
+            chap_n(13, 2.0, None),
+            chap_n(12, 3.0, None),
+        ];
+        record_scan(&pool, "1", "S", &admin, &base, at("2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let new_found = record_scan(
+            &pool,
+            "1",
+            "S",
+            &admin,
+            &churned,
+            at("2026-01-02T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            new_found,
+            "a new chapter identity must be flagged even with flat count and max"
         );
     }
 

@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type { MergeCandidate } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadMergeQueue, resolveMergeCandidate } from '$lib/data';
@@ -10,10 +9,7 @@
 	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // candidate id currently being resolved
 
-	// Redirect out if we're not an admin.
-	$effect(() => {
-		if (auth.ready && !auth.user) goto('/login');
-	});
+	// Auth redirect is centralized in +layout.svelte.
 
 	$effect(() => {
 		if (!auth.user) return;
@@ -55,8 +51,15 @@
 		busy = c.id;
 		actionError = null;
 		try {
-			await resolveMergeCandidate(c.id, accept);
-			queue = queue.filter((x) => x.id !== c.id);
+			const closed = await resolveMergeCandidate(c.id, accept);
+			if (closed) {
+				queue = queue.filter((x) => x.id !== c.id);
+			} else {
+				// Another admin already resolved this candidate — don't fake a local
+				// removal; surface it and pull the authoritative queue.
+				actionError = 'Already resolved by another admin — refreshing…';
+				await refresh();
+			}
 		} catch (err) {
 			actionError = err instanceof Error ? err.message : 'Action failed.';
 		} finally {

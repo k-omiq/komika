@@ -40,7 +40,7 @@ pub fn process_avatar(bytes: &[u8]) -> Result<Vec<u8>> {
             MAX_UPLOAD_BYTES / (1024 * 1024)
         );
     }
-    let img = image::load_from_memory(bytes).context("unsupported or corrupt image")?;
+    let img = decode_limited(bytes)?;
     let square = to_square(&img);
 
     let mut smallest: Option<Vec<u8>> = None;
@@ -53,6 +53,23 @@ pub fn process_avatar(bytes: &[u8]) -> Result<Vec<u8>> {
         smallest = Some(encoded); // keep the last (smallest edge) as the fallback
     }
     smallest.ok_or_else(|| anyhow!("no candidate size produced"))
+}
+
+/// Decode uploaded image bytes with hard decoder limits so a decompression bomb
+/// (a tiny, highly-compressible file that expands to gigabytes of RGBA — the
+/// `MAX_UPLOAD_BYTES` cap only bounds the *compressed* input) can't OOM the
+/// process before we ever downscale. Caps pixel dimensions and the decode
+/// allocation; an over-limit image is rejected as a client error, not decoded.
+fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("unsupported or corrupt image")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(10_000);
+    limits.max_image_height = Some(10_000);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().context("image too large or unsupported")
 }
 
 /// Center-crop to the largest centered square, as an owned RGBA buffer.

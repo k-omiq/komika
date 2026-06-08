@@ -2,7 +2,6 @@
 	import { page } from '$app/state';
 	import Icon from '$lib/components/Icon.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
-	import Footer from '$lib/components/Footer.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import { FLAG, STATUS_META, type ComicType, type Status } from '$lib/data/types';
 	import {
@@ -33,6 +32,27 @@
 	let genreQuery = $state(''); // filters the (long) facet list
 
 	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
+	const VALID_STATUS = ['ongoing', 'completed', 'hiatus'];
+	const VALID_SORT = ['trending', 'rating', 'newest', 'chapters'];
+
+	// Re-sync inputs/filters from the URL on same-route client navigation (home
+	// genre links, the search overlay's advanced filters). Only reads page.url, so
+	// writing this state can't feed back into the effect — user edits made via the
+	// rail (which don't touch the URL) are preserved until the next navigation.
+	$effect(() => {
+		const sp = page.url.searchParams;
+		query = sp.get('q') ?? '';
+		const tp = sp.get('type');
+		types = tp && TYPES.includes(tp as ComicType) ? [tp as ComicType] : [];
+		selectedGenres = sp.getAll('genre');
+		const st = sp.get('status');
+		status = st && VALID_STATUS.includes(st) ? (st as Status) : 'any';
+		const so = sp.get('sort');
+		sort = so && VALID_SORT.includes(so) ? (so as typeof sort) : 'trending';
+		const mr = sp.get('minRating');
+		const mrn = mr ? parseFloat(mr) : NaN;
+		minRating = Number.isNaN(mrn) ? 0 : Math.min(10, Math.max(0, mrn));
+	});
 
 	function toggle<T>(arr: T[], v: T): T[] {
 		return arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v];
@@ -150,7 +170,7 @@
 			trending: (a: FederatedResultView, b: FederatedResultView) =>
 				b.rating - a.rating || b.ch - a.ch,
 			rating: (a: FederatedResultView, b: FederatedResultView) => b.rating - a.rating,
-			newest: (a: FederatedResultView, b: FederatedResultView) => a.added - b.added,
+			newest: (a: FederatedResultView, b: FederatedResultView) => b.addedAt - a.addedAt,
 			chapters: (a: FederatedResultView, b: FederatedResultView) => b.ch - a.ch,
 		};
 		return [...list].sort(sorters[sort]);
@@ -462,7 +482,6 @@
 	</div>
 </div>
 
-<Footer links />
 
 <style>
 	.head {

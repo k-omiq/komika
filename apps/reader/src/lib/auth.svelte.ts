@@ -54,6 +54,8 @@ export async function initAuth(): Promise<void> {
 			// validation result.
 			if (readToken() === token) {
 				auth.user = session?.user ?? null;
+				// Bind the offline write-queue to this identity (C1) once validated.
+				backend.setCurrentUser?.(auth.user?.id ?? null);
 				if (!session) persist(null); // token was stale/revoked
 			}
 		} catch {
@@ -65,16 +67,47 @@ export async function initAuth(): Promise<void> {
 	auth.ready = true;
 }
 
+/**
+ * Re-validate the persisted session against the server. Clears the local user
+ * when the server reports NO session (token expired/revoked) so gated screens
+ * fall through to their signed-out state; leaves `auth.user` intact on a network
+ * error so a transient outage doesn't spuriously sign the user out. Returns the
+ * resolved user (or null). Cheap to call opportunistically (e.g. when a
+ * per-user fetch comes back empty for a supposedly signed-in viewer).
+ */
+export async function revalidateSession(): Promise<User | null> {
+	const token = readToken();
+	if (!token) {
+		auth.user = null;
+		return null;
+	}
+	try {
+		const session = await backend.session();
+		// A concurrent login/logout may have swapped the token mid-flight; don't
+		// clobber that newer state with this stale validation result.
+		if (readToken() !== token) return auth.user;
+		auth.user = session?.user ?? null;
+		backend.setCurrentUser?.(auth.user?.id ?? null); // (C1) re-bind offline queue
+		if (!session) persist(null); // token was stale/revoked
+		return auth.user;
+	} catch {
+		return auth.user; // backend unreachable — keep the current state
+	}
+}
+
 export async function login(username: string, password: string): Promise<void> {
 	const session = await backend.login(username, password);
 	persist(session.token);
 	auth.user = session.user;
+	// Bind the offline write-queue to this identity (C1) before any write can enqueue.
+	backend.setCurrentUser?.(session.user.id);
 }
 
 export async function register(input: RegisterInput): Promise<void> {
 	const session = await backend.register(input);
 	persist(session.token);
 	auth.user = session.user;
+	backend.setCurrentUser?.(session.user.id); // (C1) bind offline queue
 }
 
 export async function logout(): Promise<void> {
@@ -83,6 +116,9 @@ export async function logout(): Promise<void> {
 	} catch {
 		/* even if the server call fails, drop the local session */
 	}
+	// Clear/scope the offline write-queue for this identity BEFORE the token is
+	// dropped (C1), so a queued write can never replay under the next account.
+	backend.setCurrentUser?.(null);
 	persist(null);
 	auth.user = null;
 }

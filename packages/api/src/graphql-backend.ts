@@ -11,6 +11,7 @@ import type {
 	FederatedSearchPage,
 	GenreFacet,
 	Id,
+	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
 	MergeWorksResult,
@@ -19,6 +20,7 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesProgress,
 	SeriesSourceGroup,
 	SourceBrowsePage,
 	SourceBrowseType,
@@ -29,12 +31,17 @@ import type {
 } from '@komika/types';
 import type {
 	Activity,
+	AdminChapter,
 	Backend,
+	ChapterOverrideInput,
+	CommentMediaUpload,
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
 	SearchFilters,
 	SeriesAdminInput,
+	SeriesAdminMeta,
+	SeriesMetadataInput,
 	Session,
 	UpdateProfileInput,
 } from './backend.js';
@@ -149,12 +156,31 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ mark: Series }>(ops.MARK, { seriesId, marked });
 		return d.mark;
 	}
+	async setLibraryStatus(seriesId: Id, status: LibraryStatus | null): Promise<Series> {
+		const d = await this.gql<{ setLibraryStatus: Series }>(ops.SET_LIBRARY_STATUS, {
+			seriesId,
+			status,
+		});
+		return d.setLibraryStatus;
+	}
+	async setFavorite(seriesId: Id, favorite: boolean): Promise<Series> {
+		const d = await this.gql<{ setFavorite: Series }>(ops.SET_FAVORITE, { seriesId, favorite });
+		return d.setFavorite;
+	}
 	async library(): Promise<Series[]> {
 		const d = await this.gql<{ library: Series[] }>(ops.LIBRARY);
 		return d.library;
 	}
+	async libraryProgress(): Promise<SeriesProgress[]> {
+		const d = await this.gql<{ libraryProgress: SeriesProgress[] }>(ops.LIBRARY_PROGRESS);
+		return d.libraryProgress;
+	}
 	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
 		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, { chapterId, lastPageRead, read });
+	}
+
+	async recordView(seriesId: Id): Promise<void> {
+		await this.gql<{ recordView: boolean }>(ops.RECORD_VIEW, { seriesId });
 	}
 
 	// --- social ---
@@ -182,6 +208,28 @@ export class GraphQLBackend implements Backend {
 		});
 		return d.comments;
 	}
+	async uploadCommentMedia(file: Blob): Promise<CommentMediaUpload> {
+		const doFetch = this.config.fetch ?? fetch;
+		const url = this.config.endpoint.replace(/\/graphql\/?$/, '') + '/comment-media';
+		const form = new FormData();
+		form.append('image', file);
+		const res = await doFetch(url, {
+			method: 'POST',
+			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			body: form,
+		});
+		const json = (await res.json().catch(() => null)) as
+			(Partial<CommentMediaUpload> & { message?: string }) | null;
+		if (!res.ok) throw new Error(json?.message ?? `Upload failed (${res.status})`);
+		if (!json?.mediaId || !json.url) throw new Error('Upload returned no media id');
+		return {
+			mediaId: json.mediaId,
+			url: json.url,
+			width: json.width ?? 0,
+			height: json.height ?? 0,
+		};
+	}
+
 	async postComment(input: PostCommentInput): Promise<Comment> {
 		const d = await this.gql<{ postComment: Comment }>(ops.POST_COMMENT, { input });
 		return d.postComment;
@@ -201,6 +249,38 @@ export class GraphQLBackend implements Backend {
 	async triggerScan(seriesId: Id): Promise<Series> {
 		const d = await this.gql<{ triggerScan: Series }>(ops.TRIGGER_SCAN, { seriesId });
 		return d.triggerScan;
+	}
+
+	// --- admin series-detail editor ---
+	async seriesAdminMeta(seriesId: Id): Promise<SeriesAdminMeta> {
+		const d = await this.gql<{ seriesAdminMeta: SeriesAdminMeta }>(ops.SERIES_ADMIN_META, {
+			seriesId,
+		});
+		return d.seriesAdminMeta;
+	}
+
+	async updateSeriesMetadata(input: SeriesMetadataInput): Promise<Series> {
+		const d = await this.gql<{ updateSeriesMetadata: Series }>(ops.UPDATE_SERIES_METADATA, {
+			input,
+		});
+		return d.updateSeriesMetadata;
+	}
+
+	async workChaptersAdmin(workId: Id): Promise<AdminChapter[]> {
+		const d = await this.gql<{ workChaptersAdmin: AdminChapter[] }>(ops.WORK_CHAPTERS_ADMIN, {
+			workId,
+		});
+		return d.workChaptersAdmin;
+	}
+
+	async setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
+		const d = await this.gql<{ setChapterOverride: boolean }>(ops.SET_CHAPTER_OVERRIDE, { input });
+		return d.setChapterOverride;
+	}
+
+	async rescanWork(workId: Id): Promise<number> {
+		const d = await this.gql<{ rescanWork: number }>(ops.RESCAN_WORK, { workId });
+		return d.rescanWork;
 	}
 
 	// --- admin moderation ---
@@ -403,7 +483,10 @@ export class GraphQLBackend implements Backend {
 			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
 			body: form,
 		});
-		const json = (await res.json().catch(() => null)) as { avatarUrl?: string; message?: string } | null;
+		const json = (await res.json().catch(() => null)) as {
+			avatarUrl?: string;
+			message?: string;
+		} | null;
 		if (!res.ok) throw new Error(json?.message ?? `Upload failed (${res.status})`);
 		if (!json?.avatarUrl) throw new Error('Upload returned no avatar URL');
 		return json.avatarUrl;

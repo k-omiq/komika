@@ -87,7 +87,10 @@ impl Progress {
         match decision {
             "new" => self.new_works += 1,
             "auto_merge" => self.auto_merged += 1,
-            "review" => self.queued_for_review += 1,
+            // Both the bare review path and the consolidated-review path (a candidate
+            // corroborated onto an existing work but held for a human) land in the
+            // review bucket, so the category totals reconcile with `succeeded`.
+            "review" | "review_consolidated" => self.queued_for_review += 1,
             "existing" => self.already_existing += 1,
             _ => {}
         }
@@ -568,15 +571,28 @@ mod tests {
     #[test]
     fn progress_records_decisions() {
         let mut p = Progress::default();
-        for d in ["new", "auto_merge", "review", "existing", "new"] {
+        for d in [
+            "new",
+            "auto_merge",
+            "review",
+            "existing",
+            "new",
+            "review_consolidated",
+        ] {
             p.record_decision(d);
         }
         p.record_failure();
-        assert_eq!(p.succeeded, 5);
+        assert_eq!(p.succeeded, 6);
         assert_eq!(p.new_works, 2);
         assert_eq!(p.auto_merged, 1);
-        assert_eq!(p.queued_for_review, 1);
+        // "review" + "review_consolidated" both land in the review bucket.
+        assert_eq!(p.queued_for_review, 2);
         assert_eq!(p.already_existing, 1);
         assert_eq!(p.failed, 1);
+        // Categories must reconcile with the success total (no uncounted decisions).
+        assert_eq!(
+            p.new_works + p.auto_merged + p.queued_for_review + p.already_existing,
+            p.succeeded
+        );
     }
 }

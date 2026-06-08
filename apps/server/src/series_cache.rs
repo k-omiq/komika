@@ -8,10 +8,31 @@
 //! REFERENCE is stored (Worker-proxied) — never cover bytes (memory posture).
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
 use crate::suwayomi::{ChapterCount, SuwayomiChapter, SuwayomiManga, SuwayomiSourceLang};
+
+/// TTL for cached series METADATA before a cache hit revalidates upstream. Series
+/// metadata (title/status/description/cover) changes slowly, so a generous window.
+pub const SERIES_TTL_SECS: i64 = 6 * 60 * 60; // 6h
+/// TTL for a cached chapter list before a cache hit revalidates upstream. Chapters
+/// arrive more often than metadata changes, so a tighter window.
+pub const CHAPTERS_TTL_SECS: i64 = 90 * 60; // 90m
+
+/// Whether a cached row's last-fetch timestamp is still within `ttl_secs` of now.
+/// A missing or unparseable timestamp is treated as STALE (forces a revalidation),
+/// never as fresh — the safe direction for a freshness gate.
+pub fn is_fresh(fetched_at: Option<&str>, ttl_secs: i64) -> bool {
+    let Some(ts) = fetched_at else { return false };
+    let Ok(t) = DateTime::parse_from_rfc3339(ts) else {
+        return false;
+    };
+    Utc::now()
+        .signed_duration_since(t.with_timezone(&Utc))
+        .num_seconds()
+        < ttl_secs
+}
 
 /// Upsert one series' display metadata into the cache. `chapter_count` prefers the
 /// manga's own count, else keeps whatever is already stored (so a detail fetch
@@ -21,11 +42,15 @@ pub async fn put_series(pool: &SqlitePool, m: &SuwayomiManga) -> Result<()> {
     let genre = serde_json::to_string(&m.genre).unwrap_or_else(|_| "[]".to_string());
     let lang = m.source.as_ref().and_then(|s| s.lang.clone());
     let count = m.chapters.as_ref().map(|c| c.total_count);
+    // `series_fetched_at` records ONLY a metadata fetch (this call) — distinct from
+    // `updated_at`, which `put_chapters` also bumps — so the reader's series-metadata
+    // TTL revalidates on the right event.
     sqlx::query(
         "INSERT INTO suwayomi_series \
            (id, title, thumbnail_url, author, artist, description, genre, status, \
-            in_library, in_library_at, last_fetched_at, source_id, lang, chapter_count, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?) \
+            in_library, in_library_at, last_fetched_at, source_id, lang, chapter_count, \
+            updated_at, created_at, series_fetched_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?, ?) \
          ON CONFLICT(id) DO UPDATE SET \
            title = excluded.title, thumbnail_url = excluded.thumbnail_url, \
            author = excluded.author, artist = excluded.artist, description = excluded.description, \
@@ -33,7 +58,9 @@ pub async fn put_series(pool: &SqlitePool, m: &SuwayomiManga) -> Result<()> {
            in_library_at = excluded.in_library_at, last_fetched_at = excluded.last_fetched_at, \
            source_id = excluded.source_id, lang = excluded.lang, \
            chapter_count = COALESCE(?, suwayomi_series.chapter_count), \
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at, \
+           created_at = COALESCE(suwayomi_series.created_at, excluded.created_at), \
+           series_fetched_at = excluded.series_fetched_at",
     )
     .bind(m.id)
     .bind(&m.title)
@@ -49,6 +76,8 @@ pub async fn put_series(pool: &SqlitePool, m: &SuwayomiManga) -> Result<()> {
     .bind(&m.source_id)
     .bind(&lang)
     .bind(count)
+    .bind(&now)
+    .bind(&now)
     .bind(&now)
     .bind(count)
     .execute(pool)
@@ -91,8 +120,12 @@ pub async fn put_chapters(
         .execute(&mut *tx)
         .await?;
     }
+    // Store the deduped "main" chapter count (distinct whole numbers), NOT the raw row
+    // count — a source lists one row per (chapter_number, scanlator) plus ".5" extras,
+    // so `chapters.len()` inflates the total (e.g. Tsukimichi: 117 real → 151 rows).
+    let count = crate::catalog::main_chapter_count(chapters.iter().map(|c| c.chapter_number));
     sqlx::query("UPDATE suwayomi_series SET chapter_count = ?, updated_at = ? WHERE id = ?")
-        .bind(chapters.len() as i64)
+        .bind(count)
         .bind(&now)
         .bind(manga_id)
         .execute(&mut *tx)
@@ -161,6 +194,40 @@ pub async fn get_series(pool: &SqlitePool, id: i64) -> Result<Option<SuwayomiMan
     Ok(row.map(Into::into))
 }
 
+/// Load one cached series together with whether its METADATA is still fresh (fetched
+/// within `SERIES_TTL_SECS`). `None` on a cache miss. The reader uses the flag to
+/// decide whether to revalidate upstream on a cache hit.
+pub async fn get_series_fresh(pool: &SqlitePool, id: i64) -> Result<Option<(SuwayomiManga, bool)>> {
+    let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let fetched: Option<String> =
+        sqlx::query_scalar("SELECT series_fetched_at FROM suwayomi_series WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let fresh = is_fresh(fetched.as_deref(), SERIES_TTL_SECS);
+    Ok(Some((row.into(), fresh)))
+}
+
+/// When this manga's cached chapter list was last fetched (the max per-row
+/// `updated_at` written by `put_chapters`), or `None` if no chapters are cached.
+/// `put_series` never touches chapter rows, so this cleanly tracks chapter fetches.
+pub async fn chapters_last_fetched(pool: &SqlitePool, manga_id: i64) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
+        )
+        .bind(manga_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten(),
+    )
+}
+
 /// Load the cached chapter list for a manga (source order: newest first by number).
 pub async fn get_chapters(pool: &SqlitePool, manga_id: i64) -> Result<Vec<SuwayomiChapter>> {
     let rows = sqlx::query_as::<_, ChapterRow>(
@@ -220,6 +287,22 @@ pub async fn library(pool: &SqlitePool, limit: i64) -> Result<Vec<SuwayomiManga>
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Cached catalogue series ordered by when they were FIRST added to our cache
+/// (`created_at` desc) — powers the home "Latest Added" row. Distinct from
+/// {@link library} (most-recently-updated) and the source "Latest" endpoint
+/// (recently-updated upstream): this is "what the catalogue gained most recently".
+/// `limit` caps the result.
+pub async fn recently_added(pool: &SqlitePool, limit: i64) -> Result<Vec<SuwayomiManga>> {
+    let rows = sqlx::query_as::<_, SeriesRow>(&format!(
+        "{SERIES_SELECT} WHERE in_library = 1 \
+         ORDER BY COALESCE(created_at, updated_at) DESC, id DESC LIMIT ?"
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Catalogue-wide search over the persisted cache with genre + rating filters,
 /// applied in SQL and paginated (F2) — so `search(genres:["Action"])` returns the
 /// FULL Action set (paged), not a slice of the first N. Returns `(total, page)`.
@@ -255,10 +338,19 @@ pub async fn search_catalogue(
         .iter()
         .map(|g| g.trim())
         .filter(|g| !g.is_empty())
-        .map(|g| format!("%\"{g}\"%"))
+        // Escape LIKE metacharacters in the (source-controlled) genre name so a
+        // genre containing `%`/`_` matches literally, not as a wildcard. The
+        // matching clause uses `ESCAPE '\'`.
+        .map(|g| {
+            let esc = g
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%\"{esc}\"%")
+        })
         .collect();
     if !genre_patterns.is_empty() {
-        let ors = std::iter::repeat_n("s.genre LIKE ?", genre_patterns.len())
+        let ors = std::iter::repeat_n("s.genre LIKE ? ESCAPE '\\'", genre_patterns.len())
             .collect::<Vec<_>>()
             .join(" OR ");
         where_sql.push_str(&format!(" AND ({ors})"));
@@ -501,6 +593,54 @@ mod tests {
         assert_eq!(facets[0], ("Action".to_string(), 2));
         assert!(facets.contains(&("Comedy".to_string(), 1)));
         assert!(facets.contains(&("Drama".to_string(), 1)));
+    }
+
+    #[tokio::test]
+    async fn recently_added_orders_by_first_add_and_preserves_it() {
+        let pool = pool().await;
+        for i in 1..=3 {
+            put_series(&pool, &manga(i, &format!("S{i}")))
+                .await
+                .unwrap();
+        }
+        // A non-library series is excluded from the catalogue "Latest Added" row.
+        let mut out = manga(4, "Excluded");
+        out.in_library = false;
+        put_series(&pool, &out).await.unwrap();
+
+        // Pin distinct first-add times so ordering is deterministic (1 oldest, 3 newest).
+        for (id, ts) in [
+            (1, "2026-01-01T00:00:00Z"),
+            (2, "2026-02-01T00:00:00Z"),
+            (3, "2026-03-01T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE suwayomi_series SET created_at = ? WHERE id = ?")
+                .bind(ts)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let recent = recently_added(&pool, 10).await.unwrap();
+        assert_eq!(
+            recent.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "newest-added first, in-library only"
+        );
+
+        // Re-upserting an existing series must NOT reset its first-add time.
+        put_series(&pool, &manga(1, "S1 refreshed")).await.unwrap();
+        let kept: Option<String> =
+            sqlx::query_scalar("SELECT created_at FROM suwayomi_series WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "created_at preserved on upsert"
+        );
     }
 
     #[tokio::test]

@@ -59,6 +59,15 @@ export const apiOrigin = config.apiEndpoint.replace(/\/graphql\/?$/, '');
  * stays null (the UI then renders an initial).
  */
 export function avatarSrc(url: string | null | undefined): string | null {
+	return apiAssetSrc(url);
+}
+
+/**
+ * Resolve any stored API-origin asset path (`/avatars/...`, `/comment-media/...`)
+ * to a loadable URL: relative paths are prefixed with the API origin, absolute
+ * URLs pass through, and null/empty stays null.
+ */
+export function apiAssetSrc(url: string | null | undefined): string | null {
 	if (!url) return null;
 	if (/^https?:\/\//.test(url)) return url;
 	return apiOrigin + (url.startsWith('/') ? '' : '/') + url;

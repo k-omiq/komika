@@ -1,6 +1,5 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
-	import Footer from '$lib/components/Footer.svelte';
 	import { type ComicType } from '$lib/data/types';
 
 	let { data } = $props();
@@ -101,7 +100,6 @@
 	</div>
 </section>
 
-<Footer links />
 
 <style>
 	.hero {

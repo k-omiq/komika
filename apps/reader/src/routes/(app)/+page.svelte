@@ -1,6 +1,5 @@
 <script lang="ts">
 	import MangaCard from '$lib/components/MangaCard.svelte';
-	import Footer from '$lib/components/Footer.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import { slug } from '$lib/data/types';
@@ -9,9 +8,16 @@
 	let { data } = $props();
 
 	let heroIndex = $state(0);
+	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
+	let heroPicked = $state(false);
 	// Featured slides, populated once the home feeds resolve. Kept as its own
 	// state so the auto-rotate effect can depend on its length.
 	let featured = $state<FeaturedView[]>([]);
+
+	function pickHero(i: number): void {
+		heroIndex = i;
+		heroPicked = true;
+	}
 
 	function seriesHref(f: FeaturedView): string {
 		return `/series/${f.id ?? slug(f.title)}`;
@@ -28,6 +34,7 @@
 
 	// Auto-rotate the hero, unless the user prefers reduced motion.
 	$effect(() => {
+		if (heroPicked) return;
 		if (featured.length < 2) return;
 		const reduce =
 			typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -76,12 +83,12 @@
 				<div class="hero-sub">{current.genre} — Ch. {current.ch}</div>
 				<div class="hero-cta">
 					<a class="btn-read" href={seriesHref(current)}>Read</a>
-					<a class="btn-plus" href={seriesHref(current)} aria-label="Add to library">+</a>
+					<a class="btn-plus" href={seriesHref(current)} aria-label={`Open ${current.title}`}>+</a>
 				</div>
 			</div>
 			<div class="dots">
 				{#each home.featured as _f, i (i)}
-					<button class="dot" aria-label={`Slide ${i + 1}`} onclick={() => (heroIndex = i)}>
+					<button class="dot" aria-label={`Slide ${i + 1}`} onclick={() => pickHero(i)}>
 						<span class="bar" class:active={i === heroIndex}></span>
 					</button>
 				{/each}
@@ -180,7 +187,6 @@
 	</div>
 {/await}
 
-<Footer />
 
 <style>
 	.hero {

@@ -163,13 +163,39 @@ impl MangaDexClient {
         label: &str,
     ) -> Result<reqwest::Response> {
         const MAX_RETRIES: u32 = 4;
+        const MAX_TRANSPORT_RETRIES: u32 = 2;
         let mut attempt: u32 = 0;
+        let mut transport_attempt: u32 = 0;
         loop {
             if athome {
                 self.athome_limiter.acquire().await;
             }
             self.limiter.acquire().await;
-            let res = self.http.get(url).query(params).send().await?;
+            let res = match self.http.get(url).query(params).send().await {
+                Ok(res) => res,
+                Err(e) => {
+                    // Transport-level failures (connection reset, DNS blip, timeout)
+                    // never surface as an HTTP status but are just as transient as a
+                    // 5xx. Retry a bounded number of times with the existing backoff
+                    // before giving up, so a single connection reset doesn't fail a
+                    // reader-facing at-home page load. Non-transient errors (e.g. a
+                    // bad URL / decode) abort immediately, as before.
+                    let transient = e.is_connect() || e.is_timeout();
+                    if !transient || transport_attempt >= MAX_TRANSPORT_RETRIES {
+                        return Err(anyhow!("MangaDex {label} request failed: {e}"));
+                    }
+                    let wait = backoff(transport_attempt);
+                    transport_attempt += 1;
+                    tracing::warn!(
+                        error = %e,
+                        attempt = transport_attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        "mangadex {label}: retrying after transport error",
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
             let status = res.status();
             if status.is_success() {
                 return Ok(res);
@@ -240,27 +266,32 @@ impl MangaDexClient {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut params: Vec<(String, String)> = vec![
-            ("limit".into(), (ids.len().min(100)).to_string()),
-            ("includes[]".into(), "cover_art".into()),
-            ("includes[]".into(), "author".into()),
-            ("includes[]".into(), "artist".into()),
-            ("contentRating[]".into(), "safe".into()),
-            ("contentRating[]".into(), "suggestive".into()),
-            ("contentRating[]".into(), "erotica".into()),
-            ("contentRating[]".into(), "pornographic".into()),
-        ];
-        for id in ids.iter().take(100) {
-            params.push(("ids[]".into(), id.clone()));
-        }
-        let res = self
-            .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga?ids")
-            .await?;
-        let body: RawList = res.json().await?;
-        let mut mangas = Vec::with_capacity(body.data.len());
-        for raw in body.data {
-            if let Ok(m) = serde_json::from_value::<MdManga>(raw) {
-                mangas.push(m);
+        // The `ids[]` filter is capped at 100 per call; chunk and concatenate so a
+        // caller passing >100 (backfill/S2) fetches ALL of them instead of silently
+        // dropping everything past the 100th.
+        let mut mangas = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(100) {
+            let mut params: Vec<(String, String)> = vec![
+                ("limit".into(), chunk.len().to_string()),
+                ("includes[]".into(), "cover_art".into()),
+                ("includes[]".into(), "author".into()),
+                ("includes[]".into(), "artist".into()),
+                ("contentRating[]".into(), "safe".into()),
+                ("contentRating[]".into(), "suggestive".into()),
+                ("contentRating[]".into(), "erotica".into()),
+                ("contentRating[]".into(), "pornographic".into()),
+            ];
+            for id in chunk {
+                params.push(("ids[]".into(), id.clone()));
+            }
+            let res = self
+                .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga?ids")
+                .await?;
+            let body: RawList = res.json().await?;
+            for raw in body.data {
+                if let Ok(m) = serde_json::from_value::<MdManga>(raw) {
+                    mangas.push(m);
+                }
             }
         }
         Ok(mangas)
@@ -729,6 +760,16 @@ pub fn to_since(ts: &str) -> Option<String> {
     Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
+/// The `since` cursor one second AFTER `ts`. Used to step past a boundary second
+/// that holds more than `WINDOW_OFFSET_CAP` records (the window can't advance
+/// otherwise): stepping loses only the tail of that single tied second instead of
+/// stalling the whole sweep on it forever.
+pub fn to_since_next_second(ts: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let stepped = dt + chrono::Duration::seconds(1);
+    Some(stepped.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
 // ---- Sync loops ------------------------------------------------------------
 
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
@@ -794,18 +835,32 @@ pub async fn sync_catalogue(
         let next_since = last_created.as_deref().and_then(to_since);
         if next_since.is_none() || next_since == since {
             // The window can't advance because >9,900 records share this boundary
-            // second (createdAt has 1s resolution). We stop to avoid an infinite
-            // loop, which silently drops everything past offset 9,900 in that
-            // second. Recovering would need a secondary tiebreaker (e.g. paging by
-            // id within the tied second); log at error so it's visible if it trips.
-            tracing::error!(
-                since = since.as_deref().unwrap_or("<none>"),
-                "mangadex: catalogue window stuck on a boundary second (>9900 records \
-                 share it) — records past offset 9900 in this second are dropped"
-            );
-            break;
+            // second (createdAt has 1s resolution). Rather than stop the whole sweep
+            // here (which stalls the seed on this second every cycle), step the cursor
+            // to the NEXT second: this loses only the tail of records past offset
+            // 9,900 in the tied second and lets the sweep continue past it.
+            match last_created.as_deref().and_then(to_since_next_second) {
+                Some(stepped) if Some(&stepped) != since.as_ref() => {
+                    tracing::warn!(
+                        since = since.as_deref().unwrap_or("<none>"),
+                        resume = %stepped,
+                        "mangadex: >9900 records share a catalogue boundary second — \
+                         skipping the tail past offset 9900 and resuming at the next second"
+                    );
+                    since = Some(stepped);
+                }
+                _ => {
+                    tracing::error!(
+                        since = since.as_deref().unwrap_or("<none>"),
+                        "mangadex: catalogue window stuck on a boundary second and the \
+                         cursor cannot be stepped — records past offset 9900 are dropped"
+                    );
+                    break;
+                }
+            }
+        } else {
+            since = next_since;
         }
-        since = next_since;
         // Checkpoint the seed's progress so an abort resumes from this window
         // rather than restarting at createdAt=0 (M6). Only during the createdAt
         // seed; incremental cursors are written once, at cycle end.
@@ -899,17 +954,32 @@ pub async fn sync_chapters(
         }
         let next_since = last_created.as_deref().and_then(to_since);
         if next_since.is_none() || next_since == since {
-            // As in the catalogue sweep: >9,900 chapters sharing one boundary
-            // second stalls the window; stopping drops the overflow. More likely on
-            // the high-volume /chapter firehose. Log at error (see M7).
-            tracing::error!(
-                since = since.as_deref().unwrap_or("<none>"),
-                "mangadex: chapter window stuck on a boundary second (>9900 records \
-                 share it) — records past offset 9900 in this second are dropped"
-            );
-            break;
+            // As in the catalogue sweep: >9,900 chapters sharing one boundary second
+            // stalls the window (more likely on the high-volume /chapter firehose).
+            // Step to the next second so only that tied second's tail past offset
+            // 9,900 is lost and the sweep continues, instead of stalling here (M7).
+            match last_created.as_deref().and_then(to_since_next_second) {
+                Some(stepped) if Some(&stepped) != since.as_ref() => {
+                    tracing::warn!(
+                        since = since.as_deref().unwrap_or("<none>"),
+                        resume = %stepped,
+                        "mangadex: >9900 records share a chapter boundary second — \
+                         skipping the tail past offset 9900 and resuming at the next second"
+                    );
+                    since = Some(stepped);
+                }
+                _ => {
+                    tracing::error!(
+                        since = since.as_deref().unwrap_or("<none>"),
+                        "mangadex: chapter window stuck on a boundary second and the \
+                         cursor cannot be stepped — records past offset 9900 are dropped"
+                    );
+                    break;
+                }
+            }
+        } else {
+            since = next_since;
         }
-        since = next_since;
         // Checkpoint the chapter seed's progress so an abort resumes here (M6).
         if window == SyncWindow::Created {
             if let Some(ref s) = since {
@@ -1035,30 +1105,65 @@ pub fn spawn_recurring(
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     interval_secs: u64,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Supervisor: run the loop in a child task and, if it panics, restart it after
+    // a short backoff so a single panic doesn't silently kill catalogue sync for
+    // the process lifetime. A clean (shutdown) exit ends supervision.
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(
-            interval_secs,
-            cover_phash,
-            "mangadex: recurring catalogue sync started"
-        );
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    sync_cycle(&pool, &client, cover_phash).await;
-                }
-                _ = shutdown.changed() => {
+            let handle = tokio::spawn(run_recurring(
+                pool.clone(),
+                client.clone(),
+                cover_phash,
+                interval_secs,
+                shutdown.clone(),
+            ));
+            match handle.await {
+                Ok(()) => break,
+                Err(e) if e.is_panic() => {
                     if *shutdown.borrow() {
-                        tracing::info!("mangadex: catalogue sync stopping");
+                        break;
+                    }
+                    tracing::error!("mangadex: catalogue sync loop panicked; restarting in 30s");
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    if *shutdown.borrow() {
                         break;
                     }
                 }
+                Err(_) => break, // cancelled
             }
         }
     });
+}
+
+async fn run_recurring(
+    pool: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    cover_phash: bool,
+    interval_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tracing::info!(
+        interval_secs,
+        cover_phash,
+        "mangadex: recurring catalogue sync started"
+    );
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                sync_cycle(&pool, &client, cover_phash).await;
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("mangadex: catalogue sync stopping");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

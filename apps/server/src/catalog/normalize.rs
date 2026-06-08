@@ -37,6 +37,10 @@ pub fn normalize_title(raw: &str) -> String {
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let mut tokens: Vec<&str> = spaced.split_whitespace().collect();
+    // The folded-but-not-yet-stripped form. Stripping noise must never reduce a
+    // non-empty title to "" (e.g. "The Mix" -> strip "mix" (a valid numeral by form)
+    // -> strip "the" -> ""); fall back to this pre-strip form if that happens.
+    let pre_strip: Vec<&str> = tokens.clone();
 
     // Strip trailing noise tokens, plus a trailing bare number that trails a noise
     // word ("season 2" -> both go). Iterate from the end until nothing more strips.
@@ -66,13 +70,79 @@ pub fn normalize_title(raw: &str) -> String {
         }
     }
 
+    // Never let noise-stripping erase a real title.
+    if tokens.is_empty() && !pre_strip.is_empty() {
+        return pre_strip.join(" ");
+    }
     tokens.join(" ")
 }
 
+/// True when `s` is a genuinely, canonically formed Roman numeral (e.g. "ii", "iv",
+/// "xiii"). The old implementation accepted any string over {i,v,x,l,c,d,m}, so
+/// ordinary words like "did" or "civic" were mistaken for numerals and stripped.
+/// Requiring the canonical additive/subtractive form rejects those. A few real words
+/// (e.g. "mix" = 1009) are still valid numerals *by form*; the empty-result guard in
+/// `normalize_title` keeps such a word from erasing a title like "The Mix".
 fn is_roman_numeral(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+    if s.is_empty() {
+        return false;
+    }
+    // Match the canonical grammar greedily, lowercased, over the whole string:
+    //   M{0,3} (CM|CD|D?C{0,3}) (XC|XL|L?X{0,3}) (IX|IV|V?I{0,3})
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    // thousands: M{0,3}
+    let mut m = 0;
+    while i < b.len() && b[i] == b'm' && m < 3 {
+        i += 1;
+        m += 1;
+    }
+    // hundreds: CM | CD | D?C{0,3}
+    if i + 1 < b.len() && b[i] == b'c' && b[i + 1] == b'm' {
+        i += 2;
+    } else if i + 1 < b.len() && b[i] == b'c' && b[i + 1] == b'd' {
+        i += 2;
+    } else {
+        if i < b.len() && b[i] == b'd' {
+            i += 1;
+        }
+        let mut c = 0;
+        while i < b.len() && b[i] == b'c' && c < 3 {
+            i += 1;
+            c += 1;
+        }
+    }
+    // tens: XC | XL | L?X{0,3}
+    if i + 1 < b.len() && b[i] == b'x' && b[i + 1] == b'c' {
+        i += 2;
+    } else if i + 1 < b.len() && b[i] == b'x' && b[i + 1] == b'l' {
+        i += 2;
+    } else {
+        if i < b.len() && b[i] == b'l' {
+            i += 1;
+        }
+        let mut x = 0;
+        while i < b.len() && b[i] == b'x' && x < 3 {
+            i += 1;
+            x += 1;
+        }
+    }
+    // units: IX | IV | V?I{0,3}
+    if i + 1 < b.len() && b[i] == b'i' && b[i + 1] == b'x' {
+        i += 2;
+    } else if i + 1 < b.len() && b[i] == b'i' && b[i + 1] == b'v' {
+        i += 2;
+    } else {
+        if i < b.len() && b[i] == b'v' {
+            i += 1;
+        }
+        let mut ones = 0;
+        while i < b.len() && b[i] == b'i' && ones < 3 {
+            i += 1;
+            ones += 1;
+        }
+    }
+    i == b.len()
 }
 
 #[cfg(test)]
@@ -108,6 +178,28 @@ mod tests {
     #[test]
     fn empty_for_symbol_only() {
         assert_eq!(normalize_title("!!!"), "");
+    }
+
+    #[test]
+    fn ordinary_words_are_not_roman_numerals() {
+        // These are words, not numerals — the canonical validator must reject them.
+        assert!(!is_roman_numeral("did"));
+        assert!(!is_roman_numeral("civic"));
+        assert!(!is_roman_numeral("dic"));
+        // Genuine numerals still validate.
+        assert!(is_roman_numeral("iii"));
+        assert!(is_roman_numeral("iv"));
+        assert!(is_roman_numeral("xiii"));
+    }
+
+    #[test]
+    fn never_normalizes_a_real_title_to_empty() {
+        // "the" is noise and "mix" is a valid numeral *by form* (1009), so naive
+        // stripping empties this; the guard must fall back to the pre-strip form.
+        assert_eq!(normalize_title("The Mix"), "the mix");
+        // "civic" is no longer misread as a numeral, so nothing is stripped here
+        // ("the" is only noise when trailing).
+        assert_eq!(normalize_title("The Civic"), "the civic");
     }
 
     #[test]

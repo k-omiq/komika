@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
-	import { untrack } from 'svelte';
+	import { goto, beforeNavigate } from '$app/navigation';
+	import { untrack, onDestroy } from 'svelte';
 	import { getRating, setRating } from '$lib/data/social';
-	import { saveProgress } from '$lib/data/source';
+	import { saveProgress, recordView } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -49,6 +49,18 @@
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
 
+	// Popularity: count ONE view per chapter open — for every reader, signed-in or
+	// anonymous (the product decision is to count everyone). Keyed on the chapter so
+	// opening a new chapter counts again but re-renders of the same one don't. A page
+	// reload legitimately re-counts (no per-session dedup, by design).
+	let lastViewedChapter = '';
+	$effect(() => {
+		const key = chKey;
+		if (!data.seriesId || key === lastViewedChapter) return;
+		lastViewedChapter = key;
+		void recordView(data.seriesId);
+	});
+
 	// Per-chapter rating (1–5) stays local — the backend has no chapter-rating field.
 	$effect(() => {
 		const k = chKey;
@@ -75,7 +87,27 @@
 			scrolledPage = 1;
 			readMarked = false;
 			pageAspect = {};
+			pageError = {};
 		});
+	});
+
+	// The native image provider hands back `blob:` object URLs for pages; those pin
+	// memory until explicitly revoked, so a long reading session (chapter after
+	// chapter) leaks. Track the current chapter's page URLs and revoke the blob
+	// ones when the chapter changes (this effect's cleanup runs before it re-runs
+	// with the next chapter's pages) and on teardown. Web/proxy pages are plain
+	// http(s) strings — the `blob:` guard leaves those untouched. Because `pages`
+	// is derived from the loaded chapter, the URLs captured here are only revoked
+	// once the DOM has moved on to a different chapter, so nothing in view breaks.
+	$effect(() => {
+		const current = pages;
+		return () => {
+			for (const p of current) {
+				if (typeof p.url === 'string' && p.url.startsWith('blob:')) {
+					URL.revokeObjectURL(p.url);
+				}
+			}
+		};
 	});
 
 	// The current 0-indexed page, however the chapter is being read.
@@ -92,6 +124,24 @@
 			void saveProgress(data.chapterId, Math.max(0, total - 1), true);
 		}
 	}
+
+	// Persist the current reading position. Reading otherwise only saves on in-app
+	// Prev/Next and at ≥98%, so a browser-back or header-link exit would drop a
+	// mid-chapter position. Save on navigation away, on tab-hide, and on unmount.
+	// saveProgress is idempotent latest-wins, so overlapping triggers are harmless.
+	function saveCurrentProgress(): void {
+		if (!data.chapterId) return;
+		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
+	}
+	beforeNavigate(() => saveCurrentProgress());
+	$effect(() => {
+		const onVis = () => {
+			if (document.visibilityState === 'hidden') saveCurrentProgress();
+		};
+		document.addEventListener('visibilitychange', onVis);
+		return () => document.removeEventListener('visibilitychange', onVis);
+	});
+	onDestroy(() => saveCurrentProgress());
 
 	const isStrip = $derived(mode === 'strip');
 	const chromeHidden = $derived(!chromeVisible && !lockChrome);
@@ -168,7 +218,12 @@
 			requestAnimationFrame(update);
 		};
 		window.addEventListener('scroll', onScroll, { passive: true });
-		update();
+		// The priming call reads `total`/`lockChrome` (and, via maybeMarkRead, more
+		// reactive state). Without untrack those become deps of THIS effect, so every
+		// chrome-lock toggle / chapter change would tear down and re-add the scroll
+		// listener. The listener only needs binding once for the component's life;
+		// scroll-time invocations of `update` run outside any tracking scope already.
+		untrack(() => update());
 		return () => window.removeEventListener('scroll', onScroll);
 	});
 
@@ -183,12 +238,24 @@
 	let pageAspect = $state<Record<number, string>>({});
 	// A neutral manga default (~2:3) used only until a page's real ratio is known.
 	const DEFAULT_ASPECT = '800 / 1200';
+	// Per-page load failures — a failed <img> otherwise leaves a permanent
+	// full-height gap with the browser's broken-image glyph and no way to retry.
+	let pageError = $state<Record<number, boolean>>({});
 
 	function onImgLoad(e: Event, index: number): void {
 		const img = e.currentTarget as HTMLImageElement;
 		if (img.naturalWidth > 0 && img.naturalHeight > 0) {
 			pageAspect = { ...pageAspect, [index]: `${img.naturalWidth} / ${img.naturalHeight}` };
 		}
+	}
+	function onImgError(index: number): void {
+		pageError = { ...pageError, [index]: true };
+	}
+	// Clearing the flag remounts a fresh <img> for that page, re-fetching the URL.
+	function retryImage(index: number): void {
+		const next = { ...pageError };
+		delete next[index];
+		pageError = next;
 	}
 
 	const chapterMenu = $derived(
@@ -417,7 +484,7 @@
 					class="strip-cell"
 					style="aspect-ratio:{pageAspect[p.index] ?? DEFAULT_ASPECT};max-width:{width}px"
 				>
-					{#if p.url}
+					{#if p.url && !pageError[p.index]}
 						<img
 							class="strip-img"
 							src={p.url}
@@ -425,7 +492,15 @@
 							loading="lazy"
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}
+							onerror={() => onImgError(p.index)}
 						/>
+					{:else if p.url && pageError[p.index]}
+						<button class="strip-ph strip-err k-cover" onclick={() => retryImage(p.index)}>
+							<span class="err-msg">
+								<Icon name="alert" size={18} />
+								<span>Page {p.label} failed — tap to retry</span>
+							</span>
+						</button>
 					{:else}
 						<div class="strip-ph k-cover">
 							<span class="page-tag">PAGE {p.label} · {p.dim}</span>
@@ -441,13 +516,21 @@
 				class="paged-view"
 				style={currentPage?.url ? 'height:74vh' : `height:74vh;aspect-ratio:${currentPage?.ratio}`}
 			>
-				{#if currentPage?.url}
+				{#if currentPage?.url && !pageError[currentPage.index]}
 					<img
 						class="paged-img"
 						src={currentPage.url}
 						alt={`Page ${currentPage.label}`}
 						decoding="async"
+						onerror={() => onImgError(currentPage.index)}
 					/>
+				{:else if currentPage?.url && pageError[currentPage.index]}
+					<button class="paged-ph strip-err k-cover" onclick={() => retryImage(currentPage.index)}>
+						<span class="err-msg">
+							<Icon name="alert" size={18} />
+							<span>Page {currentPage.label} failed — tap to retry</span>
+						</span>
+					</button>
 				{:else}
 					<div class="paged-ph k-cover">
 						<span class="page-tag">PAGE {currentPage?.label} · {currentPage?.dim}</span>
@@ -1020,6 +1103,27 @@
 		width: 100%;
 		height: 100%;
 		object-fit: contain;
+	}
+	/* Failed-page retry target (strip + paged share the look). */
+	.strip-err {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		color: var(--k-text-dim);
+	}
+	.err-msg {
+		display: inline-flex;
+		align-items: center;
+		gap: 10px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--k-hiatus);
+		padding: 0 16px;
+		text-align: center;
+	}
+	.strip-err:hover .err-msg {
+		color: var(--k-text);
 	}
 	.page-tag {
 		position: absolute;

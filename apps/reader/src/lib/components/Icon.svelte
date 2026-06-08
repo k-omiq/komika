@@ -19,13 +19,15 @@
 		| 'arrow-right'
 		| 'comment'
 		| 'reply'
+		| 'image'
 		| 'alert'
 		| 'gear'
 		| 'x'
 		| 'card'
 		| 'mail'
 		| 'bookmark'
-		| 'flame';
+		| 'flame'
+		| 'eye';
 
 	const FILLED = new Set<IconName>(['star', 'play', 'flame']);
 </script>
@@ -120,6 +122,10 @@
 		<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
 	{:else if name === 'reply'}
 		<polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+	{:else if name === 'image'}
+		<rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path
+			d="M21 15l-5-5L5 21"
+		/>
 	{:else if name === 'alert'}
 		<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><line
 			x1="12"
@@ -143,5 +149,8 @@
 		<path
 			d="M12.5 2c.3 2.4-.7 4-1.9 5.4C9.3 8.9 8 10.3 8 12.6c0 .9.3 1.7.8 2.3-1.8-.4-3.1-1.9-3.4-3.8-.1-.5-.7-.7-1-.3C3.5 12 3 13.6 3 15.2 3 19 6.1 22 10 22c4.4 0 8-3.4 8-7.8 0-3.2-1.7-5.4-3.3-7.1C13.2 5.6 12 4.2 12.5 2z"
 		/>
+	{:else if name === 'eye'}
+		<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+		<circle cx="12" cy="12" r="3" />
 	{/if}
 </svg>

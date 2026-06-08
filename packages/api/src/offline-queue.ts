@@ -35,6 +35,13 @@ export interface ProgressOp {
 	ts: number;
 	/** How many failed flush attempts this op has survived (poison-drop guard). */
 	tries: number;
+	/**
+	 * The user this write belongs to (C1): stamped at enqueue so a drain NEVER
+	 * replays it under a different signed-in account. `null` = enqueued while
+	 * anonymous (never replayed). `undefined` on ops persisted before this field
+	 * existed — treated as foreign and dropped rather than mis-attributed.
+	 */
+	userId?: string | null;
 }
 
 /** A pending on-device library-membership write, reconciled by canonical `seriesId`. */
@@ -46,6 +53,8 @@ export interface MarkOp {
 	ts: number;
 	/** How many failed flush attempts this op has survived (poison-drop guard). */
 	tries: number;
+	/** See {@link ProgressOp.userId} (C1). */
+	userId?: string | null;
 }
 
 /** The queued write union. Discriminated by `kind`. */
@@ -57,8 +66,23 @@ export type WriteOp = ProgressOp | MarkOp;
  * (the composite can pass one) or omitted (the queue stamps `Date.now()`).
  */
 export type EnqueueOp =
-	| { kind: 'progress'; chapterId: string; lastPageRead: number; read: boolean; ts?: number }
-	| { kind: 'mark'; seriesId: string; marked: boolean; ts?: number };
+	| {
+			kind: 'progress';
+			chapterId: string;
+			lastPageRead: number;
+			read: boolean;
+			ts?: number;
+			/** Owning user id (C1); pass `null` when anonymous. */
+			userId?: string | null;
+	  }
+	| {
+			kind: 'mark';
+			seriesId: string;
+			marked: boolean;
+			ts?: number;
+			/** Owning user id (C1); pass `null` when anonymous. */
+			userId?: string | null;
+	  };
 
 /** Drop an op after this many failed flush attempts so a permanently-rejected
  * write can't wedge the queue forever. */
@@ -144,6 +168,7 @@ export class OfflineWriteQueue {
 	 */
 	enqueue(op: EnqueueOp): void {
 		const ts = op.ts ?? Date.now();
+		const userId = op.userId ?? null;
 		const full: WriteOp =
 			op.kind === 'progress'
 				? {
@@ -153,8 +178,9 @@ export class OfflineWriteQueue {
 						read: op.read,
 						ts,
 						tries: 0,
+						userId,
 					}
-				: { kind: 'mark', seriesId: op.seriesId, marked: op.marked, ts, tries: 0 };
+				: { kind: 'mark', seriesId: op.seriesId, marked: op.marked, ts, tries: 0, userId };
 		this.ops = this.ops.filter((existing) => !sameTarget(existing, full));
 		this.ops.push(full);
 		this.persist();
@@ -171,14 +197,45 @@ export class OfflineWriteQueue {
 	}
 
 	/**
+	 * Drop every op that does NOT belong to `userId` (C1). Called on
+	 * login/logout/identity-change so a queued write can never survive into a
+	 * different session and replay under the wrong account. A `null` userId
+	 * (logout / anonymous) clears the queue entirely — nothing is retained across a
+	 * sign-out. No-op when nothing changes.
+	 */
+	dropForeign(userId: string | null): void {
+		const before = this.ops.length;
+		this.ops = userId == null ? [] : this.ops.filter((op) => op.userId === userId);
+		if (this.ops.length !== before) this.persist();
+	}
+
+	/**
 	 * Replay pending ops oldest-first through `flush`. On success the op is
 	 * removed; on failure its `tries` is incremented and draining STOPS (order is
 	 * preserved and the next drain retries from the same head). An op that has
 	 * failed {@link MAX_TRIES} times is dropped (logged) so a permanently-rejected
 	 * write can't wedge the queue forever. Persists after every mutation. Never
 	 * throws: a rejecting `flush` is caught and ends the drain.
+	 *
+	 * `currentUserId` scopes the drain to a single account (C1): if it is `null`
+	 * the identity isn't known yet and the drain DEFERS entirely (dropping here
+	 * would lose the rightful owner's writes). Otherwise any op not stamped with
+	 * `currentUserId` is purged up front — a foreign op can never be replayed under
+	 * this session — before the oldest-first flush of the remaining owned ops.
 	 */
-	async drain(flush: (op: WriteOp) => Promise<void>): Promise<void> {
+	async drain(
+		flush: (op: WriteOp) => Promise<void>,
+		currentUserId: string | null,
+	): Promise<void> {
+		// Identity unknown (e.g. token restored but session not yet validated): defer.
+		// Never drop here — the owner may still sign in and reclaim these ops.
+		if (currentUserId == null) return;
+		// Cross-user safety net: purge anything not owned by the current user before
+		// replaying. Redundant with `dropForeign` on identity-change, but guarantees a
+		// foreign op is impossible to replay even if an identity transition was missed.
+		const before = this.ops.length;
+		this.ops = this.ops.filter((op) => op.userId === currentUserId);
+		if (this.ops.length !== before) this.persist();
 		while (this.ops.length > 0) {
 			const op = this.ops[0];
 			try {

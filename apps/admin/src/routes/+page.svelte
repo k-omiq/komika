@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type { MatchResult, Series, SeriesSourceGroup, SeriesStatus, WorkSource } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import {
@@ -14,21 +13,42 @@
 	} from '$lib/data';
 
 	let query = $state('');
+	// `series` holds ONLY the current SERVER page (≤ the server's page size, itself far
+	// under the 200-id provenance cap) — never the whole catalogue. loadCatalog() pulls
+	// exactly one page from backend.search(query, page); the pager below requests the
+	// next/previous server page. So the console's memory footprint is one page, not the
+	// full library.
 	let series = $state<Series[]>([]);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
+
+	// Server-driven pagination. `page` is the SERVER page number; `total`/`hasNextPage`
+	// come straight from the search envelope. An empty-query (catalogue) search reports
+	// a real `total`; a live text search reports `total: null`, so we fall back to
+	// driving the Next button off `hasNextPage` alone.
+	let page = $state(1);
+	let total = $state<number | null>(null);
+	let hasNextPage = $state(false);
+	// The server's page size, learned from a full page (when more pages follow, the page
+	// is full), so the range/​page-count math never hardcodes the server's constant.
+	let pageSize = $state(0);
+	const totalPages = $derived(
+		total != null && pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : null,
+	);
+	const rangeStart = $derived(series.length === 0 ? 0 : (page - 1) * pageSize + 1);
+	const rangeEnd = $derived(series.length === 0 ? 0 : (page - 1) * pageSize + series.length);
 
 	// ---- source/extension provenance (seriesSourcesBatch) ----
 	let provenance = $state<Record<string, SeriesSourceGroup>>({});
 	let provenanceError = $state<string | null>(null);
 
-	/** Fetch provenance for the loaded page in one batched call (≤200 ids). */
+	/** Fetch provenance for just the current server page (its size ≤ the 200-id cap). */
 	async function loadProvenance(list: Series[]): Promise<void> {
 		provenanceError = null;
 		provenance = {};
 		if (list.length === 0) return;
 		try {
-			const groups = await loadSeriesSources(list.slice(0, 200).map((s) => s.id));
+			const groups = await loadSeriesSources(list.map((s) => s.id));
 			const map: Record<string, SeriesSourceGroup> = {};
 			for (const g of groups) map[String(g.seriesId)] = g;
 			provenance = map;
@@ -123,9 +143,10 @@
 			mergeResult = { targetTitle: mergeTarget.title, movedSourceSeries: res.movedSourceSeries };
 			mergeSource = null;
 			mergeTarget = null;
-			// Re-fetch provenance so the folded-away work is gone and any re-pointed
-			// rows now show the surviving target work.
-			await loadProvenance(series);
+			// Re-fetch the current server page so the deleted work's phantom row is gone
+			// and provenance is re-fetched (the series effect handles provenance once the
+			// series array is replaced).
+			await refresh(query, page);
 		} catch (err) {
 			mergeError = err instanceof Error ? err.message : 'Merge failed.';
 		} finally {
@@ -133,27 +154,42 @@
 		}
 	}
 
-	// Redirect out if we're not an admin.
-	$effect(() => {
-		if (auth.ready && !auth.user) goto('/login');
-	});
+	// Auth redirect is centralized in +layout.svelte.
 
 	// Initial load once authed.
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh('');
+		void refresh('', 1);
 	});
 
-	async function refresh(q: string): Promise<void> {
+	// Fetch provenance for only the rows on the current server page (≤ the 200-id batch
+	// cap), so no rendered row ever silently shows "—" from a batch-size truncation.
+	// Re-fires whenever the page's series array is replaced (fresh result / page change).
+	$effect(() => {
+		void loadProvenance(series);
+	});
+
+	/** Fetch ONE server page of the catalog (default page 1 on a fresh query). */
+	async function refresh(q: string, toPage = 1): Promise<void> {
 		loading = true;
 		loadError = null;
 		try {
-			series = await loadCatalog(q);
-			void loadProvenance(series);
+			const res = await loadCatalog(q, toPage);
+			series = res.items;
+			page = res.page;
+			total = res.total;
+			hasNextPage = res.hasNextPage;
+			// Learn the server's page size from any full page (a page with more to
+			// follow is full); keep the last known size otherwise.
+			if (res.hasNextPage && res.items.length > 0) pageSize = res.items.length;
+			else if (pageSize === 0) pageSize = res.items.length;
+			// Provenance for the new page is fetched by the series effect.
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load catalog.';
 			series = [];
 			provenance = {};
+			total = null;
+			hasNextPage = false;
 		} finally {
 			loading = false;
 		}
@@ -161,7 +197,17 @@
 
 	function onSearch(e: SubmitEvent): void {
 		e.preventDefault();
-		void refresh(query);
+		void refresh(query, 1);
+	}
+
+	/** Move by ±1 SERVER page, refetching that page from the server. */
+	function goPage(delta: number): void {
+		if (loading) return;
+		const next = page + delta;
+		if (next < 1) return;
+		if (delta > 0 && !hasNextPage) return;
+		if (totalPages != null && next > totalPages) return;
+		void refresh(query, next);
 	}
 
 	// ---- add to canonical catalogue (Tier-2 dedup add flow) ----
@@ -184,6 +230,7 @@
 	}
 
 	async function onAdd(s: Series): Promise<void> {
+		if (addingId) return;
 		addingId = s.id;
 		try {
 			const r = await addSourceSeries(s.id);
@@ -288,8 +335,9 @@
 		<div>
 			<h1>Catalog</h1>
 			<p class="lede">
-				{query.trim() ? 'Search results' : 'Library'} · {series.length} series · manage scan cadence and
-				status
+				{query.trim() ? 'Search results' : 'Library'} · {total != null
+					? `${total} series`
+					: `${series.length}${hasNextPage ? '+' : ''} series`} · manage scan cadence and status
 			</p>
 		</div>
 		<form class="search" onsubmit={onSearch}>
@@ -365,7 +413,7 @@
 							<div class="cover placeholder"></div>
 						{/if}
 						<div class="titles">
-							<span class="title">{s.title}</span>
+							<a class="title" href="/series/{s.id}">{s.title}</a>
 							<span class="meta">#{s.id}{s.author ? ` · ${s.author}` : ''}</span>
 						</div>
 					</div>
@@ -429,6 +477,22 @@
 			{/each}
 		{/if}
 	</div>
+
+		{#if page > 1 || hasNextPage}
+			<div class="pager">
+				<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
+				<span class="page-num">
+					{#if totalPages != null}
+						Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
+							? ` of ${total}`
+							: ''}
+					{:else}
+						Page {page} · showing {rangeStart}–{rangeEnd}
+					{/if}
+				</span>
+				<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
+			</div>
+		{/if}
 </div>
 
 {#if editing}
@@ -696,6 +760,11 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+		text-decoration: none;
+		display: block;
+	}
+	.title:hover {
+		text-decoration: underline;
 	}
 	.meta {
 		font-size: 12px;
@@ -862,6 +931,32 @@
 		text-align: center;
 		color: var(--k-text-faint);
 		font-size: 14px;
+	}
+	.pager {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 16px;
+	}
+	.pager .pg {
+		height: 36px;
+		padding: 0 16px;
+		border-radius: var(--k-radius-md);
+		background: var(--k-surface);
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-2);
+		font-family: var(--k-font-sans);
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.pager .pg:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
+	.page-num {
+		font-size: 13px;
+		color: var(--k-text-dim);
 	}
 
 	/* drawer */

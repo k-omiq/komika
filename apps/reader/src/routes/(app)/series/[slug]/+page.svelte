@@ -4,21 +4,14 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
-	import Footer from '$lib/components/Footer.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
-	import { FLAG } from '$lib/data/types';
-	import { setLibraryMark, getSeries } from '$lib/data/source';
+	import StatusMenu from '$lib/components/StatusMenu.svelte';
+	import { FLAG, type Shelf } from '$lib/data/types';
+	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
-	import Avatar from '$lib/components/Avatar.svelte';
-	import {
-		socialLive,
-		loadSeriesSocial,
-		saveSeriesRating,
-		submitSeriesReview,
-		type ReviewView,
-	} from '$lib/data/social-repo';
+	import { socialLive, loadSeriesSocial, saveSeriesRating } from '$lib/data/social-repo';
 
 	import type { SeriesView } from '$lib/data/source';
 
@@ -34,18 +27,28 @@
 		loading = true;
 		view = null;
 		loadError = false;
+		// Guard against a slow A→B navigation letting A's response overwrite B
+		// (mirrors the social-load effect below).
+		let cancelled = false;
 		data.series.then((r) => {
+			if (cancelled) return;
 			view = r.view;
 			loadError = r.error;
 			loading = false;
 		});
+		return () => {
+			cancelled = true;
+		};
 	});
 
 	async function retrySeries(): Promise<void> {
 		loading = true;
 		view = null;
 		loadError = false;
-		const r = await getSeries(data.slug);
+		// Pin the slug we're retrying so a mid-flight navigation can't be clobbered.
+		const slug = data.slug;
+		const r = await getSeries(slug);
+		if (data.slug !== slug) return;
 		view = r.view;
 		loadError = r.error;
 		loading = false;
@@ -59,6 +62,14 @@
 	const totalCh = $derived(detail?.totalCh ?? 0);
 	const statusLabel = $derived(detail?.statusLabel ?? '');
 	const continueCh = $derived(detail?.continueCh ?? 1);
+	// All-time views, compactly formatted (1.2K / 3.4M). Only shown once a series has
+	// any recorded reads, so a brand-new/untracked series doesn't display "0 views".
+	const viewsTotal = $derived(detail?.viewsTotal ?? 0);
+	const viewsLabel = $derived(
+		new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(
+			viewsTotal,
+		),
+	);
 	const relatedSeries = $derived(view?.related ?? []);
 
 	// `src` (a Suwayomi manga id) pins which source a chapter is read from when it
@@ -73,15 +84,17 @@
 
 	let inLibrary = $state(false);
 	let marking = $state(false);
+	// Favourite + explicit shelf, reflected from the backend on load then toggled
+	// optimistically. Setting either implies library membership (server adds it).
+	let isFavorite = $state(false);
+	let favBusy = $state(false);
+	let libStatus = $state<Shelf | null>(null);
+	// The star rating (community score) is kept; the old bespoke review-comment list
+	// was retired in favour of the unified CommentThread discussion below. `myBody`
+	// is preserved so a rating upsert doesn't wipe any review body already on record.
 	let userRating = $state(0);
 	let myBody = $state('');
 	let sort = $state<'newest' | 'oldest'>('newest');
-	let reviews = $state<ReviewView[]>([]);
-	let draft = $state('');
-	let spoiler = $state(false);
-	let posting = $state(false);
-	let postError = $state<string | null>(null);
-	let revealed = $state<Record<string, boolean>>({});
 
 	const seriesId = $derived(detail?.id ?? '');
 	const socialKey = $derived(data.slug ?? page.params.slug ?? '');
@@ -90,8 +103,23 @@
 	// Reflect the backend's library state on load (resets when navigating series).
 	$effect(() => {
 		const marked = detail?.isMarked ?? false;
-		untrack(() => (inLibrary = marked));
+		const fav = detail?.isFavorite ?? false;
+		const status = detail?.libraryStatus ?? null;
+		untrack(() => {
+			inLibrary = marked;
+			isFavorite = fav;
+			libStatus = status;
+		});
 	});
+
+	// The shelf the picker shows: the explicit choice, else derived from progress
+	// (mirrors the library/profile derivation — completed when fully read, plan when
+	// untouched, otherwise reading).
+	const readCount = $derived((view?.chapters ?? []).filter((c) => c.read).length);
+	const effectiveShelf = $derived<Shelf>(
+		libStatus ??
+			(totalCh > 0 && readCount >= totalCh ? 'completed' : readCount === 0 ? 'plan' : 'reading'),
+	);
 
 	async function toggleLibrary(): Promise<void> {
 		if (marking) return;
@@ -100,9 +128,36 @@
 		marking = true;
 		try {
 			inLibrary = await setLibraryMark(seriesId, next);
+			// Removing from the library also drops its shelf/favourite server-side (the
+			// row is deleted) — reflect that so the controls don't show stale state.
+			if (!inLibrary) {
+				libStatus = null;
+				isFavorite = false;
+			}
 		} finally {
 			marking = false;
 		}
+	}
+
+	async function toggleFavorite(): Promise<void> {
+		if (favBusy) return;
+		const next = !isFavorite;
+		isFavorite = next; // optimistic
+		if (next) inLibrary = true; // favouriting implies membership
+		favBusy = true;
+		try {
+			isFavorite = await setFavorite(seriesId, next);
+		} finally {
+			favBusy = false;
+		}
+	}
+
+	async function chooseStatus(s: Shelf): Promise<void> {
+		const prev = libStatus;
+		libStatus = s; // optimistic
+		inLibrary = true; // filing a shelf implies membership
+		const result = await setLibraryStatus(seriesId, s);
+		libStatus = result ?? prev;
 	}
 
 	// Load ratings + reviews for this series (re-runs on navigation and sign-in).
@@ -117,14 +172,40 @@
 				if (cancelled) return;
 				userRating = s.myScore;
 				myBody = s.myBody;
-				reviews = s.reviews;
-				revealed = {};
 			})
 			.catch(() => {});
 		return () => {
 			cancelled = true;
 		};
 	});
+
+	// Share the current series via the Web Share API, falling back to copying the
+	// link to the clipboard when the native sheet isn't available.
+	let shareCopied = $state(false);
+	async function shareSeries(): Promise<void> {
+		if (typeof window === 'undefined') return;
+		const url = window.location.href;
+		const shareData = {
+			title: title || 'komiq',
+			text: title ? `Check out ${title} on komiq` : 'Check out this series on komiq',
+			url,
+		};
+		if (navigator.share) {
+			try {
+				await navigator.share(shareData);
+				return;
+			} catch {
+				return; // user dismissed the share sheet
+			}
+		}
+		try {
+			await navigator.clipboard?.writeText(url);
+			shareCopied = true;
+			setTimeout(() => (shareCopied = false), 2000);
+		} catch {
+			/* clipboard unavailable — nothing more we can do */
+		}
+	}
 
 	function onRate(v: number): void {
 		if (needsAuth) return;
@@ -210,7 +291,11 @@
 	const covers = $derived(seriesDetail?.covers ?? []);
 	let activeCoverIdx = $state<number | null>(null);
 	const activeCover = $derived(activeCoverIdx != null ? (covers[activeCoverIdx] ?? null) : null);
-	function coverLabel(c: { volume: string | null; lang: string | null; isPrimary: boolean }): string {
+	function coverLabel(c: {
+		volume: string | null;
+		lang: string | null;
+		isPrimary: boolean;
+	}): string {
 		const parts: string[] = [];
 		if (c.volume) parts.push(`Vol. ${c.volume}`);
 		if (c.lang) parts.push(c.lang.toUpperCase());
@@ -240,35 +325,6 @@
 				? `You rated ${userRating} / 10 · tap a star to update`
 				: 'Tap a star to rate — out of 10',
 	);
-
-	const postDisabled = $derived(
-		posting || draft.trim().length === 0 || (socialLive() && userRating === 0),
-	);
-
-	async function postReview(): Promise<void> {
-		const body = draft.trim();
-		if (!body || postDisabled) return;
-		posting = true;
-		postError = null;
-		try {
-			reviews = await submitSeriesReview(seriesId, socialKey, userRating, body, spoiler, reviews);
-			myBody = body;
-			draft = '';
-			spoiler = false;
-		} catch (err) {
-			postError = err instanceof Error ? err.message : 'Could not post your review.';
-		} finally {
-			posting = false;
-		}
-	}
-	function toggleLike(id: string): void {
-		reviews = reviews.map((c) =>
-			c.id === id ? { ...c, liked: !c.liked, likes: c.likes + (c.liked ? -1 : 1) } : c,
-		);
-	}
-	function reveal(id: string): void {
-		revealed = { ...revealed, [id]: true };
-	}
 </script>
 
 {#if loading}
@@ -326,6 +382,10 @@
 					>
 					<span class="sep"></span>
 					<span class="fact">{totalCh} chapters</span>
+					{#if viewsTotal > 0}
+						<span class="sep"></span>
+						<span class="fact"><Icon name="eye" size={15} />{viewsLabel} views</span>
+					{/if}
 					<span class="sep"></span>
 					<span class="fact">Updated {seriesDetail.updated}</span>
 				</div>
@@ -340,7 +400,32 @@
 							<Icon name="plus" size={16} strokeWidth={2.2} />Add to Library
 						{/if}
 					</button>
-					<button class="share" aria-label="Share"><Icon name="share" size={18} /></button>
+					{#if inLibrary}
+						<StatusMenu
+							status={effectiveShelf}
+							onchange={chooseStatus}
+							disabled={marking}
+							variant="button"
+						/>
+					{/if}
+					<button
+						class="fav"
+						class:on={isFavorite}
+						disabled={favBusy}
+						aria-pressed={isFavorite}
+						aria-label={isFavorite ? 'Remove from favourites' : 'Add to favourites'}
+						title={isFavorite ? 'Favourited' : 'Add to favourites'}
+						onclick={toggleFavorite}
+					>
+						<Icon name="heart" size={18} fill={isFavorite ? 'currentColor' : 'none'} />
+					</button>
+					<button
+						class="share"
+						class:copied={shareCopied}
+						aria-label={shareCopied ? 'Link copied' : 'Share'}
+						title={shareCopied ? 'Link copied' : 'Share'}
+						onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={18} /></button
+					>
 				</div>
 			</div>
 		</div>
@@ -506,7 +591,7 @@
 		<div class="related k-gutter">
 			<h2>Readers Also Enjoyed</h2>
 			<div class="related-row">
-				{#each relatedSeries as item (item.title)}
+				{#each relatedSeries as item (item.id ?? item.title)}
 					<MangaCard
 						title={item.title}
 						sub={`${item.genre} · ${item.ch} ch`}
@@ -567,94 +652,9 @@
 	</div>
 {/if}
 
-<!-- reviews -->
-<div class="comments k-gutter">
-	<div class="c-head">
-		<h2>Reviews</h2>
-		<span class="c-count">{reviews.length}</span>
-	</div>
-
-	{#if needsAuth}
-		<div class="signin-prompt">
-			<span>Sign in to rate this series and post a review.</span>
-			<a class="signin-link" href={`/login?redirect=${encodeURIComponent(page.url.pathname)}`}
-				>Sign in</a
-			>
-		</div>
-	{:else}
-		<div class="composer">
-			<div class="avatar">
-				<Avatar
-					url={auth.user?.avatarUrl}
-					name={auth.user?.username ?? 'You'}
-					colorKey={auth.user?.id}
-					size={40}
-				/>
-			</div>
-			<div class="composer-body">
-				<textarea
-					bind:value={draft}
-					placeholder={socialLive() && userRating === 0
-						? 'Rate the series above, then share your review…'
-						: 'Share your thoughts on this series…'}
-					rows="3"
-				></textarea>
-				{#if postError}<p class="post-error">{postError}</p>{/if}
-				<div class="composer-actions">
-					<label class="spoiler-toggle">
-						<input type="checkbox" bind:checked={spoiler} />
-						<span>Contains spoilers</span>
-					</label>
-					<button class="post" onclick={postReview} disabled={postDisabled}>
-						{posting ? 'Posting…' : 'Post review'}
-					</button>
-				</div>
-			</div>
-		</div>
-	{/if}
-
-	<div class="c-list">
-		{#each reviews as c (c.id)}
-			<div class="comment">
-				<div class="avatar sm">
-					<Avatar url={c.avatarUrl} name={c.name} colorKey={c.authorId} size={40} />
-				</div>
-				<div class="c-body">
-					<div class="c-meta">
-						<span class="c-name">{c.name}</span>
-						{#if c.score > 0}
-							<span class="c-score"
-								><Icon name="star" size={12} fill="var(--k-star)" />{c.score}</span
-							>
-						{/if}
-						{#if c.mine}<span class="c-mine">You</span>{/if}
-						<span class="c-time">· {c.time}</span>
-					</div>
-					{#if c.hasSpoiler && !revealed[c.id]}
-						<button class="spoiler-veil" onclick={() => reveal(c.id)}>
-							<Icon name="alert" size={14} />Spoiler — tap to reveal
-						</button>
-					{:else}
-						<p class="c-text">{c.body}</p>
-					{/if}
-					<div class="c-actions">
-						<button class="like" class:on={c.liked} onclick={() => toggleLike(c.id)}>
-							<Icon
-								name="heart"
-								size={15}
-								fill={c.liked ? 'currentColor' : 'none'}
-								strokeWidth={2}
-							/>{c.likes}
-						</button>
-						<button class="reply">Reply</button>
-					</div>
-				</div>
-			</div>
-		{/each}
-	</div>
-</div>
-
-<!-- discussion (series-level comments; distinct from Reviews above) -->
+<!-- discussion — the single unified comment engine (replies + image attachments).
+     The old bespoke "Reviews" comment list was removed; the star rating above is
+     the series' score, and all written discussion lives in this one thread. -->
 <div class="discussion k-gutter">
 	<h2 class="discussion-title">Discussion</h2>
 	{#if seriesId}
@@ -667,7 +667,6 @@
 	{/if}
 </div>
 
-<Footer />
 
 <style>
 	.discussion {
@@ -1031,6 +1030,37 @@
 	.share:hover {
 		border-color: rgba(255, 255, 255, 0.34);
 		color: var(--k-text);
+	}
+	.share.copied {
+		border-color: rgba(95, 191, 126, 0.5);
+		color: #7fd39a;
+	}
+	.fav {
+		width: 50px;
+		height: 50px;
+		flex: 0 0 auto;
+		border-radius: 8px;
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-3);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: all 0.15s;
+	}
+	.fav:hover:not(:disabled) {
+		border-color: rgba(233, 110, 110, 0.5);
+		color: #e96e6e;
+	}
+	.fav.on {
+		background: rgba(233, 110, 110, 0.12);
+		border-color: rgba(233, 110, 110, 0.5);
+		color: #e96e6e;
+	}
+	.fav:disabled {
+		opacity: 0.6;
+		cursor: default;
 	}
 	.genres-syn {
 		padding-top: 44px;
@@ -1513,261 +1543,6 @@
 		gap: 22px;
 		overflow-x: auto;
 		padding-bottom: 4px;
-	}
-	.comments {
-		display: flex;
-		flex-direction: column;
-		gap: 22px;
-		padding-top: 56px;
-		padding-bottom: 80px;
-		margin-top: 56px;
-		border-top: 1px solid var(--k-border);
-	}
-	.c-head {
-		display: flex;
-		align-items: baseline;
-		gap: 12px;
-	}
-	.c-head h2 {
-		font-size: 21px;
-		margin: 0;
-		color: var(--k-text);
-	}
-	.c-count {
-		font-size: 13px;
-		color: var(--k-text-faint);
-	}
-	.composer {
-		display: flex;
-		gap: 14px;
-		align-items: flex-start;
-		max-width: 820px;
-	}
-	.avatar {
-		flex: 0 0 auto;
-		width: 40px;
-		height: 40px;
-		border-radius: 50%;
-		background: var(--k-avatar);
-		border: 1px solid var(--k-border-2);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-weight: 700;
-		font-size: 14px;
-		color: var(--k-text-3);
-	}
-	.avatar.sm {
-		background: var(--k-surface-5);
-	}
-	.composer-body {
-		flex: 1;
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-	}
-	textarea {
-		width: 100%;
-		resize: vertical;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-2);
-		border-radius: 10px;
-		padding: 14px 16px;
-		color: var(--k-text);
-		font-family: var(--k-font-sans);
-		font-size: 14.5px;
-		line-height: 1.55;
-		outline: none;
-		transition: border-color 0.15s;
-	}
-	textarea:focus {
-		border-color: var(--k-border-strong);
-	}
-	.composer-actions {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-	}
-	.spoiler-toggle {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 12.5px;
-		font-weight: 600;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-		user-select: none;
-	}
-	.spoiler-toggle input {
-		width: 15px;
-		height: 15px;
-		accent-color: var(--k-accent);
-		cursor: pointer;
-	}
-	.post-error {
-		margin: 0;
-		font-size: 12.5px;
-		color: var(--k-accent);
-	}
-	.post {
-		height: 42px;
-		padding: 0 22px;
-		border: none;
-		border-radius: 8px;
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-weight: 700;
-		font-size: 14px;
-		cursor: pointer;
-		transition: opacity 0.15s;
-	}
-	.post:disabled {
-		opacity: 0.45;
-		cursor: default;
-	}
-	.signin-prompt {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		flex-wrap: wrap;
-		max-width: 820px;
-		padding: 18px 22px;
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-1);
-		border-radius: 12px;
-		font-size: 14px;
-		color: var(--k-text-dim);
-	}
-	.signin-link {
-		flex: 0 0 auto;
-		height: 38px;
-		padding: 0 20px;
-		display: inline-flex;
-		align-items: center;
-		border-radius: var(--k-radius-pill);
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-size: 13px;
-		font-weight: 700;
-		text-decoration: none;
-	}
-	.signin-link:hover {
-		background: var(--k-primary-hover);
-	}
-	.c-score {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		font-size: 11.5px;
-		font-weight: 800;
-		color: var(--k-star);
-		background: rgba(246, 183, 60, 0.12);
-		border: 1px solid rgba(246, 183, 60, 0.3);
-		border-radius: 5px;
-		padding: 1px 7px 1px 5px;
-	}
-	.c-mine {
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		color: var(--k-on-primary);
-		background: var(--k-primary);
-		border-radius: 5px;
-		padding: 2px 6px;
-	}
-	.spoiler-veil {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		margin: 9px 0 12px;
-		padding: 10px 14px;
-		background: var(--k-surface-3);
-		border: 1px dashed var(--k-border-3);
-		border-radius: 8px;
-		color: var(--k-text-dim);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.spoiler-veil:hover {
-		color: var(--k-text);
-		border-color: var(--k-border-strong);
-	}
-	.c-list {
-		display: flex;
-		flex-direction: column;
-		max-width: 820px;
-	}
-	.comment {
-		display: flex;
-		gap: 14px;
-		align-items: flex-start;
-		padding: 22px 0;
-		border-top: 1px solid var(--k-border);
-	}
-	.c-body {
-		flex: 1;
-		min-width: 0;
-	}
-	.c-meta {
-		display: flex;
-		align-items: center;
-		gap: 9px;
-		flex-wrap: wrap;
-	}
-	.c-name {
-		font-weight: 700;
-		font-size: 14px;
-		color: var(--k-text-1);
-	}
-	.c-time {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-	}
-	.c-text {
-		font-size: 14px;
-		line-height: 1.65;
-		color: var(--k-text-muted);
-		margin: 9px 0 12px;
-	}
-	.c-actions {
-		display: flex;
-		align-items: center;
-		gap: 22px;
-	}
-	.like {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		background: none;
-		border: none;
-		padding: 0;
-		font-size: 12.5px;
-		font-weight: 700;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-		transition: color 0.15s;
-	}
-	.like:hover {
-		color: var(--k-text);
-	}
-	.like.on {
-		color: var(--k-star);
-	}
-	.reply {
-		background: none;
-		border: none;
-		font-size: 12.5px;
-		font-weight: 700;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-	}
-	.reply:hover {
-		color: var(--k-text);
 	}
 	@media (max-width: 640px) {
 		/* Shorter backdrop + matching hero pull-up so the fold isn't dominated by art. */

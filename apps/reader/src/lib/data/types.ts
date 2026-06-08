@@ -33,7 +33,17 @@ export interface CatalogEntry {
 	ch: number;
 	rating: number;
 	status: Status;
+	/**
+	 * Positional index in the backend-returned order — NOT a recency signal. Kept
+	 * for back-compat; sort "Newest" on {@link addedAt} instead (a real timestamp).
+	 */
 	added: number;
+	/**
+	 * When the series entered the catalogue (epoch ms, from `Series.createdAt`), or
+	 * 0 when unknown. This is the real recency key: Browse "Newest" should sort by
+	 * `b.addedAt - a.addedAt` (descending). See source.ts `toCatalogEntry`.
+	 */
+	addedAt: number;
 	type: ComicType;
 	cover?: string;
 	id?: string;

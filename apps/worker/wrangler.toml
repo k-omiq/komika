@@ -28,9 +28,28 @@ ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network"
 # Referer header) whose origin is not in this list are rejected with 403.
 # Requests with no Origin AND no Referer (native apps, curl, direct hits,
 # cache-fill jobs) are always allowed. Leave empty ("") to disable hotlink
-# protection entirely (dev). Example value:
+# protection entirely — dev ONLY.
+#
+# PRODUCTION: this MUST be set to a non-empty value. An empty list disables
+# hotlink protection, letting any site embed images through the proxy (bandwidth
+# theft / cache abuse). Set it to your real front-end origins, e.g.:
 #   "https://komika.app,https://read.komika.app,http://localhost:5173"
+# NOTE: this is a hotlink deterrent, not an abuse cap — the per-IP abuse cap is
+# the IMG_RATE_LIMITER binding below.
 ALLOWED_ORIGINS = ""
+
+# ---------------------------------------------------------------------------
+# Native per-IP rate limiter (Cloudflare Rate Limiting binding). Caps bandwidth
+# abuse on the upstream-fetch path: the Worker only calls `.limit()` on a cache
+# MISS (see src/index.ts), so hot edge-cached images are never throttled. Keyed
+# on the client IP. `limit` requests are allowed per `period` SECONDS per key
+# (Cloudflare supports period = 10 or 60); a burst beyond that gets a 429.
+# The limit/period live here, so no dashboard/API step is required.
+[[unsafe.bindings]]
+name = "IMG_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 200, period = 60 }
 
 # ---------------------------------------------------------------------------
 # The Worker needs no secrets: it proxies + edge-caches only. There is no

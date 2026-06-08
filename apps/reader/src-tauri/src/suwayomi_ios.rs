@@ -69,6 +69,19 @@ const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Native stack for the thread that owns the VM and runs Java `main` — the Zero
 /// interpreter burns C stack per Java frame, so give it far more than `-Xss`.
 const JVM_THREAD_STACK: usize = 16 * 1024 * 1024;
+/// Bounded pre-VM boot attempts. iOS can create a JVM exactly once per process
+/// (`JNI_CreateJavaVM` is irreversible), so EVERYTHING that can fail before it —
+/// port broker, port re-verification, `server.conf` write — is wrapped in this
+/// retry: a transient port steal or filesystem hiccup becomes a retry with a fresh
+/// port instead of a permanent `degraded` for the whole app session.
+const MAX_BOOT_ATTEMPTS: u32 = 5;
+/// Short backoff between pre-VM boot attempts (worst case ≈ 4 × this ≈ 0.6 s, only
+/// on the rare retry path — startup is otherwise unaffected).
+const BOOT_RETRY_BACKOFF: Duration = Duration::from_millis(150);
+/// Appended to every TERMINAL degrade reason surfaced to the UI. Once the VM has
+/// been created a second boot is impossible in-process (JNI limitation), so the only
+/// recovery is an app relaunch — say so, rather than leaving a silent dead engine.
+const RESTART_HINT: &str = " — restart the app to retry.";
 
 /// Lifecycle state, surfaced to JS as a lowercase string via `suwayomi_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,7 +149,7 @@ impl SuwayomiSupervisor {
   }
 
   fn set_ready(&self, port: u16, version: String) {
-    let mut g = self.inner.lock().unwrap();
+    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     g.port = Some(port);
     g.state = EngineState::Ready;
     g.version = Some(version);
@@ -144,7 +157,7 @@ impl SuwayomiSupervisor {
   }
 
   fn transition(&self, state: EngineState, err: Option<String>) {
-    let mut g = self.inner.lock().unwrap();
+    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     g.state = state;
     if state != EngineState::Ready {
       g.port = None;
@@ -154,8 +167,16 @@ impl SuwayomiSupervisor {
     }
   }
 
+  /// Terminal degrade for the single-boot engine: flip to `Degraded` and record the
+  /// reason WITH the app-relaunch hint. JNI can't recreate the VM in-process, so a
+  /// degrade here is final — surfacing an actionable `lastError` keeps the failure
+  /// legible to the UI instead of a silently dead engine (JS reads `{state,lastError}`).
+  fn degrade(&self, reason: impl std::fmt::Display) {
+    self.transition(EngineState::Degraded, Some(format!("{reason}{RESTART_HINT}")));
+  }
+
   pub fn status(&self) -> Status {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     Status {
       state: g.state.as_str().to_string(),
       version: g.version.clone(),
@@ -164,7 +185,7 @@ impl SuwayomiSupervisor {
   }
 
   pub fn base_url(&self) -> Option<String> {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     if g.state == EngineState::Ready {
       g.port.map(|p| format!("http://127.0.0.1:{p}"))
     } else {
@@ -173,7 +194,7 @@ impl SuwayomiSupervisor {
   }
 
   fn ready_endpoint(&self) -> Option<(u16, reqwest::Client)> {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     if g.state == EngineState::Ready {
       g.port.map(|p| (p, self.client.clone()))
     } else {
@@ -201,6 +222,61 @@ fn broker_port() -> std::io::Result<u16> {
   let port = listener.local_addr()?.port();
   drop(listener);
   Ok(port)
+}
+
+/// Is `port` bindable on loopback right now? Binding `127.0.0.1:port` (not `:0`) and
+/// immediately dropping proves nobody else holds it at this instant — the last check
+/// we can make before the (irreversible) VM creation.
+fn port_is_bindable(port: u16) -> bool {
+  std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Acquire a loopback port for the engine with a BOUNDED pre-VM retry. Each attempt
+/// brokers a fresh ephemeral port (`broker`) and re-verifies it's still free right
+/// now (`is_bindable`); a port stolen in the broker→verify window, or a transient
+/// broker error, retries with a fresh port (via `backoff`) instead of permanently
+/// degrading the single-boot engine. Returns the secured port, or an error once
+/// `MAX_BOOT_ATTEMPTS` is exhausted.
+///
+/// The closures are injected so the retry logic is unit-testable without real sockets.
+///
+/// Residual race (honest scope): this is the LAST check possible before the
+/// irreversible `JNI_CreateJavaVM`; the engine binds the port fresh, seconds later,
+/// from inside the JVM. A steal in that final window still fails the readiness gate
+/// (→ honest degrade). Closing it entirely needs FD hand-off or an engine-side
+/// bind-retry, neither available: the engine ships as a compiled jar with no
+/// adoptable-FD entrypoint and no reachable source in this repo.
+fn acquire_boot_port(
+  mut broker: impl FnMut() -> std::io::Result<u16>,
+  mut is_bindable: impl FnMut(u16) -> bool,
+  mut backoff: impl FnMut(u32),
+) -> Result<u16, String> {
+  let mut last_err = String::from("no boot attempt was made");
+  for attempt in 1..=MAX_BOOT_ATTEMPTS {
+    match broker() {
+      Ok(port) if is_bindable(port) => return Ok(port),
+      Ok(port) => {
+        last_err = format!("brokered port {port} was taken before boot");
+        log::warn!(
+          target: "suwayomi",
+          "boot port attempt {attempt}/{MAX_BOOT_ATTEMPTS}: {last_err}"
+        );
+      }
+      Err(e) => {
+        last_err = format!("port broker: {e}");
+        log::warn!(
+          target: "suwayomi",
+          "boot port attempt {attempt}/{MAX_BOOT_ATTEMPTS}: {last_err}"
+        );
+      }
+    }
+    if attempt < MAX_BOOT_ATTEMPTS {
+      backoff(attempt);
+    }
+  }
+  Err(format!(
+    "could not secure a free loopback port after {MAX_BOOT_ATTEMPTS} attempts: {last_err}"
+  ))
 }
 
 /// Render the authoritative HOCON `server.conf` — VERBATIM the desktop template
@@ -448,6 +524,9 @@ pub fn start(app: AppHandle) {
     return;
   }
 
+  // Everything below runs BEFORE `JNI_CreateJavaVM`, so it is all retryable. The jar
+  // and data-dir resolution are stable across attempts (resolve once); only the port
+  // acquisition — the sole TOCTOU-prone step — spins in `acquire_boot_port`.
   let boot = || -> Result<(PathBuf, PathBuf, u16), String> {
     check_bundled_runtime()?;
     let jar = resolve_jar(&app)?;
@@ -456,7 +535,16 @@ pub fn start(app: AppHandle) {
       .app_data_dir()
       .map_err(|e| format!("resolve app_data_dir: {e}"))?
       .join("suwayomi");
-    let port = broker_port().map_err(|e| format!("port broker: {e}"))?;
+    // Bounded retry: broker a port, re-verify it's still free right before we commit
+    // to the irreversible VM creation, and retry with a fresh port on a transient
+    // steal. Only once a port is secured do we write the conf and boot the VM.
+    let port = acquire_boot_port(broker_port, port_is_bindable, |attempt| {
+      log::info!(
+        target: "suwayomi",
+        "retrying boot port acquisition (attempt {attempt} failed)"
+      );
+      std::thread::sleep(BOOT_RETRY_BACKOFF);
+    })?;
     prepare_data_dir(&data_dir, port)?;
     Ok((jar, data_dir, port))
   };
@@ -465,7 +553,7 @@ pub fn start(app: AppHandle) {
     Ok(v) => v,
     Err(e) => {
       log::warn!(target: "suwayomi", "engine unavailable: {e}");
-      sup.transition(EngineState::Degraded, Some(e));
+      sup.degrade(e);
       return;
     }
   };
@@ -487,14 +575,16 @@ pub fn start(app: AppHandle) {
     .stack_size(JVM_THREAD_STACK)
     .spawn(move || {
       if let Err(e) = run_jvm(&jar, &data_dir) {
+        // Failure here is AFTER `JNI_CreateJavaVM` (or a spawn/classpath fault) and
+        // is genuinely unrecoverable in-process — a terminal, actionable degrade.
         log::error!(target: "suwayomi", "engine boot failed: {e}");
-        sup_jvm.transition(EngineState::Degraded, Some(e));
+        sup_jvm.degrade(e);
       }
     });
   if let Err(e) = spawned {
     let msg = format!("spawn suwayomi-jvm thread: {e}");
     log::error!(target: "suwayomi", "{msg}");
-    sup.transition(EngineState::Degraded, Some(msg));
+    sup.degrade(msg);
     return;
   }
 
@@ -510,11 +600,13 @@ pub fn start(app: AppHandle) {
         sup.set_ready(port, version);
       }
       Err(e) => {
-        // Don't clobber a more precise error from the JVM thread.
+        // Readiness failed after the retryable pre-VM steps were exhausted, so this
+        // means "genuinely couldn't boot," not "lost a port race once." Don't clobber
+        // a more precise error already recorded by the JVM thread.
         let already_degraded = sup.status().state == "degraded";
         log::error!(target: "suwayomi", "engine readiness failed: {e}");
         if !already_degraded {
-          sup.transition(EngineState::Degraded, Some(e));
+          sup.degrade(e);
         }
       }
     }
@@ -569,17 +661,43 @@ fn validate_image_path(path: &str) -> Result<(), String> {
       "suwayomi_image: path must start with /api/, got {path:?}"
     ));
   }
-  if path.contains("..") {
+  // Percent-decode ONCE (mirrors the engine's own HTTP-layer decode) before the
+  // traversal checks, so `%2e%2e` / `%5c` can't slip past the literal guards.
+  let decoded = percent_decode_once(path);
+  if decoded.contains("..") {
     return Err(format!(
       "suwayomi_image: path must not contain '..', got {path:?}"
     ));
   }
-  if path.contains('\\') {
+  if decoded.contains('\\') {
     return Err(format!(
       "suwayomi_image: path must not contain '\\', got {path:?}"
     ));
   }
   Ok(())
+}
+
+/// Single-pass, lossy percent-decode — verbatim desktop's (`suwayomi.rs`). One
+/// decode level matches the engine's HTTP router, catching `%2e%2e`/`%5c` without
+/// over-decoding (`%252e` stays `%2e`).
+fn percent_decode_once(s: &str) -> String {
+  let bytes = s.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%' && i + 2 < bytes.len() {
+      let hi = (bytes[i + 1] as char).to_digit(16);
+      let lo = (bytes[i + 2] as char).to_digit(16);
+      if let (Some(hi), Some(lo)) = (hi, lo) {
+        out.push((hi * 16 + lo) as u8);
+        i += 3;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+  String::from_utf8_lossy(&out).into_owned()
 }
 
 /// IPC-proxy transport for engine image bytes (verbatim desktop behavior).
@@ -589,6 +707,13 @@ pub async fn suwayomi_image(
   path: String,
 ) -> Result<tauri::ipc::Response, String> {
   validate_image_path(&path)?;
+  // Share the process-wide image concurrency cap with `fetch_image`. Especially
+  // load-bearing on iOS: the in-process JVM runs under `-Xmx256m` in a jetsam-
+  // limited process, so unbounded 32 MiB buffers here trip the OS OOM killer.
+  let _permit = crate::image_fetch_semaphore()
+    .acquire()
+    .await
+    .map_err(|_| "image fetch pool closed".to_string())?;
   let (port, client) = state
     .ready_endpoint()
     .ok_or_else(|| "suwayomi engine not ready".to_string())?;
@@ -635,8 +760,84 @@ mod tests {
   #[test]
   fn image_path_guard_matches_desktop() {
     assert!(validate_image_path("/api/v1/manga/3/thumbnail").is_ok());
-    for bad in ["", "/foo", "http://evil", "//evil", "/api/../s", "/api/\\x"] {
+    for bad in [
+      "", "/foo", "http://evil", "//evil", "/api/../s", "/api/\\x",
+      "/api/%2e%2e/s", "/api/%2E%2E/s", "/api/x%5cy",
+    ] {
       assert!(validate_image_path(bad).is_err(), "{bad:?} must be rejected");
     }
+  }
+
+  use std::cell::Cell;
+
+  /// A port stolen on the first attempt must NOT permanently degrade the single-boot
+  /// engine: `acquire_boot_port` retries with a fresh port and succeeds.
+  #[test]
+  fn acquire_boot_port_retries_past_a_stolen_port() {
+    let brokered = Cell::new(0u32);
+    let backoffs = Cell::new(0u32);
+    let port = acquire_boot_port(
+      // Each attempt brokers a distinct, ever-increasing port.
+      || {
+        let n = brokered.get() + 1;
+        brokered.set(n);
+        Ok(40000 + n as u16)
+      },
+      // First brokered port is "stolen" (not bindable); anything from attempt 2 on is free.
+      |_p| brokered.get() >= 2,
+      |_attempt| backoffs.set(backoffs.get() + 1),
+    )
+    .expect("should secure a port on a later attempt, not degrade");
+    assert_eq!(port, 40002, "should boot on the 2nd port after the 1st was stolen");
+    assert_eq!(brokered.get(), 2, "should have brokered exactly twice");
+    assert_eq!(backoffs.get(), 1, "should have backed off once between the attempts");
+  }
+
+  /// The first-brokered port being free is the happy path: one attempt, no backoff.
+  #[test]
+  fn acquire_boot_port_succeeds_first_try_without_backoff() {
+    let backoffs = Cell::new(0u32);
+    let port = acquire_boot_port(|| Ok(45678), |_| true, |_| backoffs.set(backoffs.get() + 1))
+      .expect("a free first port should boot immediately");
+    assert_eq!(port, 45678);
+    assert_eq!(backoffs.get(), 0, "no retry, so no backoff");
+  }
+
+  /// Only after the bounded budget is exhausted (a port taken on EVERY attempt) does
+  /// it give up — that is the point where an honest `degraded` is warranted.
+  #[test]
+  fn acquire_boot_port_degrades_only_after_exhausting_attempts() {
+    let backoffs = Cell::new(0u32);
+    let err = acquire_boot_port(|| Ok(50000), |_| false, |_| backoffs.set(backoffs.get() + 1))
+      .expect_err("a port taken on every attempt must eventually fail");
+    assert!(err.contains(&format!("after {MAX_BOOT_ATTEMPTS} attempts")), "err: {err}");
+    assert_eq!(
+      backoffs.get(),
+      MAX_BOOT_ATTEMPTS - 1,
+      "backs off between attempts but not after the last"
+    );
+  }
+
+  /// A transient broker error is a retry, not a degrade, as long as a later attempt
+  /// yields a bindable port.
+  #[test]
+  fn acquire_boot_port_retries_past_a_broker_error() {
+    let calls = Cell::new(0u32);
+    let port = acquire_boot_port(
+      || {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n == 1 {
+          Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "transient"))
+        } else {
+          Ok(46000)
+        }
+      },
+      |_| true,
+      |_| {},
+    )
+    .expect("a transient broker error should retry, not degrade");
+    assert_eq!(port, 46000);
+    assert_eq!(calls.get(), 2);
   }
 }

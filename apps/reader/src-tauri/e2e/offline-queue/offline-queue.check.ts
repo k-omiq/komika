@@ -96,6 +96,7 @@ async function main(): Promise<void> {
 		const rec: Recorded = { progress: [], mark: [] };
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
 		const be = new CompositeBackend({ hosted: mockHosted(state, rec), queue });
+		be.setCurrentUser('u1'); // C1: ops are stamped with the signed-in user
 
 		let threw = false;
 		await be.setProgress('ch1', 3, false).catch(() => (threw = true));
@@ -119,6 +120,7 @@ async function main(): Promise<void> {
 		const rec: Recorded = { progress: [], mark: [] };
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
 		const be = new CompositeBackend({ hosted: mockHosted(state, rec), queue });
+		be.setCurrentUser('u1'); // C1: ops are stamped with the signed-in user
 
 		let threw = false;
 		await be.mark('s1', true).catch(() => (threw = true));
@@ -138,6 +140,7 @@ async function main(): Promise<void> {
 		const rec: Recorded = { progress: [], mark: [] };
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
 		const be = new CompositeBackend({ hosted: mockHosted(state, rec), queue });
+		be.setCurrentUser('u1'); // C1: ops are stamped with the signed-in user
 
 		await be.setProgress('chA', 1, false); // enqueue #1 (progress)
 		await be.mark('sB', true).catch(() => {}); // enqueue #2 (mark)
@@ -146,10 +149,13 @@ async function main(): Promise<void> {
 
 		state.online = true;
 		// Drive a drain directly (equivalent to the constructor / 'online' event path).
-		await queue.drain((op) =>
-			op.kind === 'progress'
-				? mockHosted(state, rec).setProgress(op.chapterId, op.lastPageRead, op.read)
-				: mockHosted(state, rec).mark(op.seriesId, op.marked).then(() => {}),
+		// Scoped to the current user (C1).
+		await queue.drain(
+			(op) =>
+				op.kind === 'progress'
+					? mockHosted(state, rec).setProgress(op.chapterId, op.lastPageRead, op.read)
+					: mockHosted(state, rec).mark(op.seriesId, op.marked).then(() => {}),
+			'u1',
 		);
 		check('queue empties after online drain', queue.size() === 0);
 		check(
@@ -173,18 +179,20 @@ async function main(): Promise<void> {
 			},
 		} as unknown as Backend;
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
-		queue.enqueue({ kind: 'progress', chapterId: 'poison', lastPageRead: 0, read: false });
+		queue.enqueue({ kind: 'progress', chapterId: 'poison', lastPageRead: 0, read: false, userId: 'u1' });
 
 		// Each drain increments tries by 1 (fails at head, stops). After MAX_TRIES drains
 		// the op is dropped. The queue never grows.
 		let maxSeen = 0;
 		for (let i = 0; i < MAX_TRIES; i++) {
-			await queue.drain((op) =>
-				alwaysFail.setProgress(
-					(op as { chapterId: string }).chapterId,
-					(op as { lastPageRead: number }).lastPageRead,
-					(op as { read: boolean }).read,
-				),
+			await queue.drain(
+				(op) =>
+					alwaysFail.setProgress(
+						(op as { chapterId: string }).chapterId,
+						(op as { lastPageRead: number }).lastPageRead,
+						(op as { read: boolean }).read,
+					),
+				'u1',
 			);
 			maxSeen = Math.max(maxSeen, queue.size());
 		}
@@ -211,6 +219,32 @@ async function main(): Promise<void> {
 				ops[1].kind === 'mark' &&
 				ops[1].seriesId === 's-persist',
 		);
+	}
+
+	// ---- (6) C1: a foreign user's queued ops NEVER replay under another account ----
+	{
+		const state = { online: true };
+		const rec: Recorded = { progress: [], mark: [] };
+		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
+		// User A queues a write (offline capture stamps ownership).
+		queue.enqueue({ kind: 'progress', chapterId: 'a-secret', lastPageRead: 5, read: true, userId: 'userA' });
+		check('user A op is queued', queue.size() === 1);
+
+		// User B is now signed in and a drain fires (reconnect / flush).
+		await queue.drain(
+			(op) =>
+				op.kind === 'progress'
+					? mockHosted(state, rec).setProgress(op.chapterId, op.lastPageRead, op.read)
+					: mockHosted(state, rec).mark(op.seriesId, op.marked).then(() => {}),
+			'userB',
+		);
+		check("user A's op is purged, never replayed under user B", queue.size() === 0);
+		check('hosted recorded NO write for the foreign op (C1)', rec.progress.length === 0 && rec.mark.length === 0);
+
+		// Identity-unknown drain defers instead of dropping the rightful owner's ops.
+		queue.enqueue({ kind: 'mark', seriesId: 's-defer', marked: true, userId: 'userA' });
+		await queue.drain(() => Promise.resolve(), null);
+		check('drain with unknown identity (null) defers, keeps the op', queue.size() === 1);
 	}
 
 	console.log('');

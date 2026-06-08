@@ -12,7 +12,9 @@ import type {
 	CanonicalUpdate,
 	Chapter,
 	ComicType as DomainComicType,
+	DiscoveryFeed,
 	Series,
+	SeriesProgress,
 	SeriesStatus,
 	Translator,
 	WorkSource,
@@ -54,10 +56,7 @@ async function live<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
  * instead of a misleading "not found" / "no results" empty state. Mock mode
  * (`!LIVE`) is never an error — it's just empty.
  */
-async function liveResult<T>(
-	fn: () => Promise<T>,
-	empty: T,
-): Promise<{ data: T; error: boolean }> {
+async function liveResult<T>(fn: () => Promise<T>, empty: T): Promise<{ data: T; error: boolean }> {
 	if (!LIVE) return { data: empty, error: false };
 	try {
 		return { data: await fn(), error: false };
@@ -144,6 +143,10 @@ function toCanonicalCard(u: CanonicalUpdate): Card {
 }
 
 function toCatalogEntry(s: Series, i: number): CatalogEntry {
+	// `added` stays the positional (backend-order) index for back-compat; `addedAt`
+	// carries the real catalogue-entry timestamp so Browse "Newest" can sort by
+	// recency (b.addedAt - a.addedAt) rather than by arrival order. NaN/absent → 0.
+	const addedAt = s.createdAt ? Date.parse(s.createdAt) : NaN;
 	return {
 		title: s.title,
 		author: s.author ?? '',
@@ -152,6 +155,7 @@ function toCatalogEntry(s: Series, i: number): CatalogEntry {
 		rating: s.rating.average,
 		status: toViewStatus(s.status),
 		added: i,
+		addedAt: Number.isFinite(addedAt) ? addedAt : 0,
 		type: toViewType(s.type),
 		cover: s.coverUrl,
 		id: s.id,
@@ -331,20 +335,29 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 	// Source mappings (suwayomi translators) + the canonical spine chapters + the
 	// canonical series (S2 enrichment: credits + localized descriptions), in
 	// parallel. Individual rejections are tolerated (canonicalChapters/canonicalSeries
-	// legitimately 404 for a federation-only work), but if ALL THREE reject the
-	// backend is effectively down — rethrow so the caller surfaces an honest error
-	// rather than a false "not found".
+	// legitimately 404 for a federation-only work), but if every method that is
+	// actually present rejects the backend is effectively down — rethrow so the caller
+	// surfaces an honest error rather than a false "not found".
+	const hasWorkSources = !!backend.workSources;
+	const hasCanonChapters = !!backend.canonicalChapters;
+	const hasCanonSeries = !!backend.canonicalSeries;
 	const [wsRes, spineRes, canonRes] = await Promise.allSettled([
-		backend.workSources ? backend.workSources(workId) : Promise.resolve([] as WorkSource[]),
-		backend.canonicalChapters ? backend.canonicalChapters(workId) : Promise.resolve([] as Chapter[]),
-		backend.canonicalSeries ? backend.canonicalSeries(workId) : Promise.resolve(null),
+		hasWorkSources ? backend.workSources!(workId) : Promise.resolve([] as WorkSource[]),
+		hasCanonChapters ? backend.canonicalChapters!(workId) : Promise.resolve([] as Chapter[]),
+		hasCanonSeries ? backend.canonicalSeries!(workId) : Promise.resolve(null),
 	]);
-	if (
-		wsRes.status === 'rejected' &&
-		spineRes.status === 'rejected' &&
-		canonRes.status === 'rejected'
-	) {
-		throw wsRes.reason;
+	// "Backend fully down" honest-error guard: an ABSENT optional method resolves to a
+	// benign default and must NOT be counted as evidence the backend is up (otherwise a
+	// backend missing e.g. canonicalChapters would mask a real outage of the methods it
+	// DOES have and degrade to a false "not found"). Rethrow only when every method that
+	// was actually present rejected — a true outage — and at least one was present.
+	const present = [
+		{ has: hasWorkSources, res: wsRes },
+		{ has: hasCanonChapters, res: spineRes },
+		{ has: hasCanonSeries, res: canonRes },
+	].filter((m) => m.has);
+	if (present.length > 0 && present.every((m) => m.res.status === 'rejected')) {
+		throw (present.find((m) => m.res.status === 'rejected')!.res as PromiseRejectedResult).reason;
 	}
 	const wsList: WorkSource[] = wsRes.status === 'fulfilled' ? wsRes.value : [];
 	const spineChapters: Chapter[] = spineRes.status === 'fulfilled' ? spineRes.value : [];
@@ -515,7 +528,10 @@ export async function getNativeSearch(
 			minRating: filters.minRating,
 			maxRating: filters.maxRating,
 		});
-		return items.map((s, i) => ({ ...toCatalogEntryFull(s, i), translators: [] as TranslatorChip[] }));
+		return items.map((s, i) => ({
+			...toCatalogEntryFull(s, i),
+			translators: [] as TranslatorChip[],
+		}));
 	}, [] as FederatedResultView[]);
 	return { items: r.data, error: r.error };
 }
@@ -538,7 +554,10 @@ export interface FederatedResultView extends CatalogEntry {
 }
 
 /** Like {@link toCatalogEntry} but keeps the NSFW flag + full genre list for the grid. */
-function toCatalogEntryFull(s: Series, i: number): CatalogEntry & { isNsfw: boolean; genres: string[] } {
+function toCatalogEntryFull(
+	s: Series,
+	i: number,
+): CatalogEntry & { isNsfw: boolean; genres: string[] } {
 	return { ...toCatalogEntry(s, i), isNsfw: s.isNsfw, genres: s.genres };
 }
 
@@ -601,9 +620,11 @@ export function getUpdates() {
 		// "New" is the scanner-driven Updates feed (series with freshly-detected
 		// chapters, newest-first). "Trending"/"Hot" reuse the discovery Trending
 		// feed. Empty (no detections yet) renders the page's empty state.
+		// Each feed is caught independently (mirrors getHome): one outage — e.g. the
+		// scanner `updates` feed — must not collapse the whole screen (incl. Trending).
 		const [feeds, updates, canonical] = await Promise.all([
-			backend.discovery(),
-			backend.updates(),
+			backend.discovery().catch(() => [] as DiscoveryFeed[]),
+			backend.updates().catch(() => ({ items: [] as Series[] })),
 			// Canonical (MangaDex-mirrored) updates — openable via their `w_` workId
 			// through the canonical reader path. Optional method; empty on failure/off.
 			backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
@@ -625,15 +646,18 @@ export function getUpdates() {
 export interface LibraryRowView {
 	id?: string;
 	title: string;
+	cover: string;
 	genre: string;
 	rating: string;
 	shelf: Shelf;
+	favorite: boolean;
 	read: number;
 	total: number;
 }
 export interface ContinueRowView {
 	id?: string;
 	title: string;
+	cover: string;
 	ch: string;
 	progress: number;
 	genre: string;
@@ -646,39 +670,45 @@ export function getLibrary() {
 	};
 	return live<typeof fallback>(async () => {
 		const lib = await backend.library();
-		// Per-series read progress from real chapter state (one fetch per series —
-		// fine for a modest library).
-		const rows = await Promise.all(
-			lib.map(async (s) => {
-				const chs = await backend.chapters(s.id).catch(() => [] as Chapter[]);
-				const total = chs.length || s.chapterCount;
-				const read = chs.filter((c) => c.read).length;
-				return { s, chs, total, read };
-			}),
-		);
+		// Per-series read progress in ONE batched query, joined by id. This replaces
+		// a `chapters()` fetch per series — an N-round-trip fan-out that hung this
+		// page on a large library (hundreds of series). Series without cached
+		// progress fall back to their chapter count as unread. Backends that don't
+		// expose `libraryProgress` (Suwayomi/native) degrade to all-unread.
+		const progress = backend.libraryProgress
+			? await backend.libraryProgress().catch(() => [] as SeriesProgress[])
+			: [];
+		const byId = new Map(progress.map((p) => [p.id, p]));
+		const rows = lib.map((s) => {
+			const p = byId.get(s.id);
+			const total = p?.total || s.chapterCount;
+			const read = p?.read ?? 0;
+			return { s, total, read };
+		});
 		const libraryCatalog = rows.map(({ s, total, read }) => ({
 			id: s.id,
 			title: s.title,
+			cover: s.coverUrl,
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
-			shelf: shelfFor(read, total),
+			// An explicit shelf the viewer filed wins; otherwise derive from progress.
+			shelf: (s.libraryStatus as Shelf | null) ?? shelfFor(read, total),
+			favorite: s.isFavorite ?? false,
 			read,
 			total,
 		}));
-		// Continue-reading: series with progress underway, next unread chapter first.
+		// Continue-reading: series with progress underway. The resume label is the
+		// next chapter number (read + 1), since chapters run 1..total.
 		const continueRow = rows
 			.filter(({ read, total }) => read > 0 && read < total)
-			.map(({ s, chs, read, total }) => {
-				const asc = [...chs].sort((a, b) => a.number - b.number);
-				const next = asc.find((c) => !c.read) ?? asc[asc.length - 1];
-				return {
-					id: s.id,
-					title: s.title,
-					ch: `Ch. ${next?.number ?? read + 1}`,
-					progress: total ? Math.round((read / total) * 100) : 0,
-					genre: s.genres[0] ?? '',
-				};
-			});
+			.map(({ s, read, total }) => ({
+				id: s.id,
+				title: s.title,
+				cover: s.coverUrl,
+				ch: `Ch. ${read + 1}`,
+				progress: total ? Math.round((read / total) * 100) : 0,
+				genre: s.genres[0] ?? '',
+			}));
 		return { libraryCatalog, continueRow };
 	}, fallback);
 }
@@ -705,6 +735,9 @@ export interface SeriesDetailView {
 	rating: string;
 	votes: string;
 	totalCh: number;
+	/** All-time view count (chapter opens) — the popularity stat shown on the page.
+	 *  0 until reads accrue or when the backend doesn't track views. */
+	viewsTotal: number;
 	updated: string;
 	statusLabel: string;
 	author: string;
@@ -718,6 +751,10 @@ export interface SeriesDetailView {
 	 *  (S2 aggregation); null = MangaDex mirror; undefined for single-source. */
 	startChapterSrc?: string | null;
 	isMarked: boolean;
+	/** Whether the viewer favourited this series (per-viewer; false when signed out). */
+	isFavorite: boolean;
+	/** The viewer's explicit library shelf, or null to derive from progress. */
+	libraryStatus: Shelf | null;
 	/** Full author/artist credit list (S2 enrichment); empty → fall back to the
 	 *  single author/artist line. Deduped display is left to the component. */
 	credits: { role: string; name: string }[];
@@ -802,7 +839,8 @@ const NO_TRANSLATORS: TranslatorMeta = {
 
 /** The viewer's/app language tag (lowercased), e.g. `en`, `pt-br`. */
 function appLang(): string {
-	if (typeof navigator !== 'undefined' && navigator.language) return navigator.language.toLowerCase();
+	if (typeof navigator !== 'undefined' && navigator.language)
+		return navigator.language.toLowerCase();
 	return 'en';
 }
 
@@ -859,6 +897,7 @@ function mapSeriesView(
 			rating: s.rating.average.toFixed(1),
 			votes: String(s.rating.count),
 			totalCh: s.chapterCount || chs.length,
+			viewsTotal: s.views?.total ?? 0,
 			updated: relTime(s.updatedAt) || 'recently',
 			statusLabel: STATUS_WORD[s.status],
 			author: s.author ?? '',
@@ -869,6 +908,8 @@ function mapSeriesView(
 			continueCh: firstUnread?.number ?? 1,
 			startChapterId: firstUnread?.id,
 			isMarked: s.isMarked,
+			isFavorite: s.isFavorite ?? false,
+			libraryStatus: (s.libraryStatus as Shelf | null) ?? null,
 			credits,
 			descriptions,
 			descLang: desc.lang,
@@ -1032,6 +1073,42 @@ export async function setLibraryMark(seriesId: string, marked: boolean): Promise
 	}
 }
 
+/**
+ * File a series under an explicit shelf (`reading`/`completed`/`onhold`/`plan`), or
+ * pass `null` to clear it back to progress-derived shelving. Adds the series to the
+ * library if it isn't there yet. Returns the effective shelf the caller should show
+ * (`null` when cleared → the UI falls back to its derived shelf), or the optimistic
+ * value when offline/mock. No-op backends (Suwayomi/native) resolve optimistically.
+ */
+export async function setLibraryStatus(
+	seriesId: string,
+	status: Shelf | null,
+): Promise<Shelf | null> {
+	if (!LIVE || !backend.setLibraryStatus) return status;
+	try {
+		const s = await backend.setLibraryStatus(seriesId, status);
+		return (s.libraryStatus as Shelf | null) ?? null;
+	} catch (err) {
+		console.warn('[komika] setLibraryStatus failed:', err);
+		return status;
+	}
+}
+
+/**
+ * Toggle the viewer's favourite flag on a series (adds it to the library if absent).
+ * Returns the resulting favourite state, or the optimistic value when offline/mock.
+ */
+export async function setFavorite(seriesId: string, favorite: boolean): Promise<boolean> {
+	if (!LIVE || !backend.setFavorite) return favorite;
+	try {
+		const s = await backend.setFavorite(seriesId, favorite);
+		return s.isFavorite ?? favorite;
+	} catch (err) {
+		console.warn('[komika] setFavorite failed:', err);
+		return favorite;
+	}
+}
+
 /** Persist reading progress for a chapter (best-effort; no-op offline/mock). */
 export async function saveProgress(
 	chapterId: string | undefined,
@@ -1046,6 +1123,22 @@ export async function saveProgress(
 		await backend.setProgress(chapterId, lastPageRead, read);
 	} catch (err) {
 		console.warn('[komika] setProgress failed:', err);
+	}
+}
+
+/**
+ * Record one view (a chapter open) for a series — the popularity signal behind
+ * Trending and the series-page view count. Fire-and-forget: no auth (anonymous reads
+ * count too), and a failure never affects reading. `seriesId` is the reader's series
+ * id (`w_` work or numeric); the server normalises it. No-op offline/mock or when the
+ * backend doesn't track views.
+ */
+export async function recordView(seriesId: string | undefined): Promise<void> {
+	if (!LIVE || !seriesId || !backend.recordView) return;
+	try {
+		await backend.recordView(seriesId);
+	} catch (err) {
+		console.warn('[komika] recordView failed:', err);
 	}
 }
 
@@ -1190,7 +1283,9 @@ export function getReaderChapter(
 					? await backend.canonicalPages(target.id)
 					: await backend.pages(target.id);
 			const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
-			const readingSrc = readFromSrc ? (srcParam as string) : (resolved.selected.suwayomiMangaId ?? null);
+			const readingSrc = readFromSrc
+				? (srcParam as string)
+				: (resolved.selected.suwayomiMangaId ?? null);
 			return buildReaderView(
 				seriesId,
 				chs,
@@ -1237,13 +1332,14 @@ export interface ProfileView {
 	stats: { value: string; label: string }[];
 	reading: { id?: string; title: string; genre: string; ch: number; total: number }[];
 	favGenres: { name: string; pct: number }[];
-	activity: { icon: string; iconBg: string; text: string; time: string }[];
+	activity: { id: string; icon: string; iconBg: string; text: string; time: string }[];
 	shelves: {
 		id?: string;
 		title: string;
 		genre: string;
 		rating: string;
 		shelf: string;
+		favorite: boolean;
 		ch: number;
 		total: number;
 	}[];
@@ -1264,14 +1360,19 @@ export function getProfile(): Promise<ProfileView | null> {
 		if (!session) return null;
 		const user = session.user;
 		const lib = await backend.library().catch(() => [] as Series[]);
-		const rows = await Promise.all(
-			lib.map(async (s) => {
-				const chs = await backend.chapters(s.id).catch(() => [] as Chapter[]);
-				const total = chs.length || s.chapterCount;
-				const read = chs.filter((c) => c.read).length;
-				return { s, total, read };
-			}),
-		);
+		// Read progress via one batched query (not a chapters() fetch per series —
+		// the old N+1 that stalled this page for a signed-in user with a large
+		// library, leaving the profile stuck behind the sign-in state).
+		const progress = backend.libraryProgress
+			? await backend.libraryProgress().catch(() => [] as SeriesProgress[])
+			: [];
+		const byId = new Map(progress.map((p) => [p.id, p]));
+		const rows = lib.map((s) => {
+			const p = byId.get(s.id);
+			const total = p?.total || s.chapterCount;
+			const read = p?.read ?? 0;
+			return { s, total, read };
+		});
 		const chaptersRead = rows.reduce((n, r) => n + r.read, 0);
 		const readingNow = rows.filter((r) => r.read > 0 && r.read < r.total);
 		const completed = rows.filter((r) => r.total > 0 && r.read >= r.total);
@@ -1298,7 +1399,9 @@ export function getProfile(): Promise<ProfileView | null> {
 			title: s.title,
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
-			shelf: total > 0 && read >= total ? 'completed' : 'reading',
+			// Explicit shelf wins; else derive (completed when fully read, else reading).
+			shelf: (s.libraryStatus as string | null) ?? (total > 0 && read >= total ? 'completed' : 'reading'),
+			favorite: s.isFavorite ?? false,
 			ch: read,
 			total,
 		}));
@@ -1317,7 +1420,7 @@ export function getProfile(): Promise<ProfileView | null> {
 					: a.kind === 'library_add'
 						? { icon: '＋', iconBg: 'rgba(95,191,126,0.16)', text: `Added ${on} to library` }
 						: { icon: '💬', iconBg: 'rgba(255,255,255,0.07)', text: `Commented on ${on}` };
-			return { ...view, time: relTimeAgo(a.createdAt) };
+			return { id: a.id, ...view, time: relTimeAgo(a.createdAt) };
 		});
 
 		return {

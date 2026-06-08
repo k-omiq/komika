@@ -1,7 +1,6 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
-	import Footer from '$lib/components/Footer.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import { FLAG, type ComicType } from '$lib/data/types';
@@ -120,7 +119,6 @@
 	{/if}
 </div>
 
-<Footer />
 
 <style>
 	.trending {

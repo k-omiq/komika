@@ -4,6 +4,7 @@ import type {
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
+	ComicType,
 	Comment,
 	CommentTargetType,
 	DiscoveryFeed,
@@ -11,6 +12,7 @@ import type {
 	FederatedSearchPage,
 	GenreFacet,
 	Id,
+	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
 	MergeWorksResult,
@@ -19,6 +21,7 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesProgress,
 	SeriesSourceGroup,
 	SeriesStatus,
 	SourceBrowsePage,
@@ -51,6 +54,16 @@ export interface Backend {
 	 * Suwayomi adapter has no auth and omits it. Call after login/logout.
 	 */
 	setToken?(token: string | null): void;
+	/**
+	 * Bind the backend to the currently-authenticated user id (or `null` when
+	 * signed out). Distinct from {@link setToken}: the token authenticates a
+	 * request, this identifies the account so an offline write-queue can attribute
+	 * and scope replays and never apply one user's queued writes under another
+	 * account (C1). Optional: only the {@link CompositeBackend} (native offline
+	 * queue) needs it; other backends omit it. Call on login / register / session
+	 * restore / logout, before the token is dropped.
+	 */
+	setCurrentUser?(userId: Id | null): void;
 
 	// --- discovery / catalog (auto-served, no source picking) ---
 	discovery(): Promise<DiscoveryFeed[]>;
@@ -90,8 +103,25 @@ export interface Backend {
 
 	// --- library & progress ---
 	mark(seriesId: Id, marked: boolean): Promise<Series>;
+	/** File a series under an explicit shelf for the viewer, or pass `null` to clear
+	 * it (fall back to progress-derived shelving). Adds the series to the library if
+	 * absent. Optional: only the unified Komika API implements it. */
+	setLibraryStatus?(seriesId: Id, status: LibraryStatus | null): Promise<Series>;
+	/** Toggle the viewer's favourite flag on a series (adds it to the library if
+	 * absent). Optional: only the unified Komika API implements it. */
+	setFavorite?(seriesId: Id, favorite: boolean): Promise<Series>;
 	library(): Promise<Series[]>;
+	/** Per-series read progress for every in-library series, batched into ONE query
+	 * so the Library/Profile screens can shelve the whole library by progress
+	 * without a `chapters()` fan-out per series. Optional: only the unified Komika
+	 * API implements it; callers fall back to `chapterCount` (unread) when absent. */
+	libraryProgress?(): Promise<SeriesProgress[]>;
 	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
+	/** Record one view (a chapter open) for a series — the popularity signal behind
+	 * Trending and the series-page view counts. No auth: anonymous reads count too.
+	 * Best-effort; callers ignore failures. Optional: only the unified Komika API
+	 * implements it (other backends no-op). */
+	recordView?(seriesId: Id): Promise<void>;
 
 	// --- viewer preferences ---
 	/** Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2), returning
@@ -144,9 +174,15 @@ export interface Backend {
 	 * (null if none / signed out). Optional: only the unified Komika API implements it. */
 	myReview?(seriesId: Id): Promise<Review | null>;
 	postReview(input: PostReviewInput): Promise<Review>;
-	/** Comments on a chapter thread or a series-level discussion (polymorphic target). */
+	/** Comments on a chapter thread or a series-level discussion (polymorphic target).
+	 *  Returns a page of root comments plus all their descendants (flat); the client
+	 *  assembles the reply tree via `parentId`. `total`/`hasNextPage` count roots. */
 	comments(targetType: CommentTargetType, targetId: Id, page?: number): Promise<Paginated<Comment>>;
 	postComment(input: PostCommentInput): Promise<Comment>;
+	/** Upload one image to attach to a comment. The server downscales + re-encodes it
+	 *  as budgeted WebP and stages it (unlinked); pass the returned `mediaId` to
+	 *  {@link postComment} to attach it. Optional: only the unified Komika API implements it. */
+	uploadCommentMedia?(file: Blob): Promise<CommentMediaUpload>;
 
 	// --- admin "manga DB" (requires an admin session) ---
 	/** Upsert per-series admin overrides (scan cadence, pause, status). Optional:
@@ -158,6 +194,26 @@ export interface Backend {
 	/** Force an immediate re-scan of one series, bypassing adaptive gating.
 	 * Optional: only the unified Komika API implements it. */
 	triggerScan?(seriesId: Id): Promise<Series>;
+
+	// --- admin series-detail editor (requires an admin session) ---
+	/** Edit a canonical work's user-facing metadata (title/description/type/nsfw/
+	 * tags) as an override layer; the source stays immutable. Each field is
+	 * three-valued: OMIT the key => leave unchanged; `null` => clear the override;
+	 * a value => set it. `tags` is a whole-list replace. Returns the recomputed
+	 * series. Optional: only the unified Komika API implements it. */
+	updateSeriesMetadata?(input: SeriesMetadataInput): Promise<Series>;
+	/** Raw metadata-override state of a series' canonical work (pinned vs derived),
+	 * for the series-detail editor. Optional. */
+	seriesAdminMeta?(seriesId: Id): Promise<SeriesAdminMeta>;
+	/** A work's aggregated chapters WITH override state (hidden/renamed), unfiltered
+	 * — the editor needs to see and un-hide soft-hidden chapters. Optional. */
+	workChaptersAdmin?(workId: Id): Promise<AdminChapter[]>;
+	/** Force an immediate re-scan of every installed Suwayomi source of a work;
+	 * returns how many sources were scanned. Optional. */
+	rescanWork?(workId: Id): Promise<number>;
+	/** Soft-hide (reversible) or rename one chapter of a work by aggregate number;
+	 * non-destructive. Optional. */
+	setChapterOverride?(input: ChapterOverrideInput): Promise<boolean>;
 
 	// --- admin moderation (requires an admin session) ---
 	/** Suspend (`banned: true`) or restore a user account. Optional: only the
@@ -328,8 +384,21 @@ export interface PostReviewInput {
 export interface PostCommentInput {
 	targetType: CommentTargetType;
 	targetId: Id;
+	/** Reply target; must be a comment on the same target. Omit for a top-level comment. */
+	parentId?: Id | null;
 	body: string;
 	hasSpoiler: boolean;
+	/** A previously-uploaded comment-media id to attach (owned by the poster, unlinked). */
+	mediaId?: Id | null;
+}
+
+/** Result of staging a comment image via `POST /comment-media`. Pass `mediaId` to
+ *  {@link Backend.postComment} to attach it; `url`/`width`/`height` drive the preview. */
+export interface CommentMediaUpload {
+	mediaId: Id;
+	url: string;
+	width: number;
+	height: number;
 }
 
 /** Admin "manga DB" overrides. Whole-state: null clears an override. */
@@ -339,4 +408,52 @@ export interface SeriesAdminInput {
 	pollEveryMinutes?: number | null;
 	paused?: boolean | null;
 	status?: SeriesStatus | null;
+}
+
+/**
+ * Admin series-detail metadata edits. Each optional field is three-valued: OMIT
+ * the key (`undefined`) => leave unchanged; `null` => clear the override (use the
+ * derived/source value); a value => set the override. `tags` replaces the whole
+ * curated set.
+ */
+export interface SeriesMetadataInput {
+	seriesId: Id;
+	title?: string | null;
+	description?: string | null;
+	type?: ComicType | null;
+	isNsfw?: boolean | null;
+	tags?: string[] | null;
+}
+
+/** Raw metadata-override state of a work (pinned vs derived) for the editor. */
+export interface SeriesAdminMeta {
+	/** null when the series isn't catalogued yet (nothing can be pinned). */
+	workId: Id | null;
+	titleOverride: string | null;
+	descriptionOverride: string | null;
+	contentTypeOverride: ComicType | null;
+	isNsfwOverride: boolean | null;
+	/** Effective genres: the curated set if any, else source-derived. */
+	tags: string[];
+	hasCuratedTags: boolean;
+}
+
+/** One chapter of a work in the admin editor, with its override state. */
+export interface AdminChapter {
+	number: number;
+	/** Aggregate bucket key — the override key passed to {@link ChapterOverrideInput}. */
+	key: string;
+	sourceTitle: string | null;
+	titleOverride: string | null;
+	effectiveTitle: string | null;
+	hidden: boolean;
+	sourceCount: number;
+}
+
+/** Admin edit to one chapter (soft-hide / rename). Three-valued optionals. */
+export interface ChapterOverrideInput {
+	workId: Id;
+	chapterKey: string;
+	hidden?: boolean | null;
+	title?: string | null;
 }

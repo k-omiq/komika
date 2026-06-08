@@ -1,28 +1,47 @@
 import type {
 	AdminUser,
+	AggregatedChapter,
+	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
 	Comment,
 	CommentTargetType,
 	DiscoveryFeed,
+	ExtensionInfo,
+	FederatedSearchPage,
+	GenreFacet,
 	Id,
+	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
+	MergeWorksResult,
 	Page,
 	Paginated,
 	Review,
 	ScanStatus,
 	Series,
+	SeriesProgress,
+	SeriesSourceGroup,
+	SourceBrowsePage,
+	SourceBrowseType,
+	SourceIngestJob,
+	SourceInfo,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
 import type {
 	Activity,
+	AdminChapter,
 	Backend,
+	ChapterOverrideInput,
+	CommentMediaUpload,
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
+	SearchFilters,
 	SeriesAdminInput,
+	SeriesAdminMeta,
+	SeriesMetadataInput,
 	Session,
 	UpdateProfileInput,
 } from './backend.js';
@@ -89,15 +108,27 @@ export class CompositeBackend implements Backend {
 		const queue = this.opts.queue;
 		if (!queue) return;
 		try {
-			await queue.drain((op: WriteOp) =>
-				op.kind === 'progress'
-					? this.opts.hosted.setProgress(op.chapterId, op.lastPageRead, op.read)
-					: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {}),
+			await queue.drain(
+				(op: WriteOp) =>
+					op.kind === 'progress'
+						? this.opts.hosted.setProgress(op.chapterId, op.lastPageRead, op.read)
+						: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {}),
+				// Scope the replay to the signed-in user so A's offline writes can never
+				// be applied under B's account (C1). Null (identity not yet known) defers.
+				this.currentUserId,
 			);
 		} catch {
 			/* defensive: drain is self-contained, but never let a drain reject a caller */
 		}
 	}
+
+	/**
+	 * The currently-authenticated user id, or `null` when signed out / not yet
+	 * known. Every queued offline write is stamped with this at enqueue and the
+	 * drain is scoped to it, so a write enqueued by one account is never replayed
+	 * under another (C1). Set via {@link setCurrentUser} by the auth layer.
+	 */
+	private currentUserId: Id | null = null;
 
 	/**
 	 * Reconciliation map from a hosted canonical chapter id (a globally-unique uuid) to
@@ -152,6 +183,23 @@ export class CompositeBackend implements Backend {
 	setToken(token: string | null): void {
 		this.opts.hosted.setToken?.(token);
 	}
+	/**
+	 * Bind the composite to the signed-in user (C1). On any identity change —
+	 * including logout (`null`) — the offline queue drops every op that doesn't
+	 * belong to the new identity BEFORE it could be replayed, and subsequent
+	 * enqueues/drains are scoped to this id. This, together with the per-op userId
+	 * guard in {@link flushQueue}, makes cross-user replay impossible.
+	 */
+	setCurrentUser(userId: Id | null): void {
+		if (userId === this.currentUserId) return;
+		this.currentUserId = userId;
+		// Clear foreign (and, on logout, all) queued ops before the token is dropped.
+		this.opts.queue?.dropForeign(userId);
+		// Now that identity is known, opportunistically replay this user's own backlog
+		// (e.g. writes enqueued before session restore validated the token). Guarded and
+		// scoped to `userId`, so it can only ever flush this account's ops.
+		if (userId != null) void this.flushQueue();
+	}
 
 	// --- discovery / catalog ---
 	discovery(): Promise<DiscoveryFeed[]> {
@@ -160,8 +208,14 @@ export class CompositeBackend implements Backend {
 	updates(page?: number): Promise<Paginated<Series>> {
 		return this.opts.hosted.updates(page);
 	}
-	search(query: string, page?: number): Promise<Paginated<Series>> {
-		return this.opts.hosted.search(query, page);
+	search(query: string, page?: number, filters?: SearchFilters): Promise<Paginated<Series>> {
+		return this.opts.hosted.search(query, page, filters);
+	}
+	searchAllSources(query: string, page?: number): Promise<FederatedSearchPage> {
+		return this.opts.hosted.searchAllSources!(query, page);
+	}
+	genreFacets(): Promise<GenreFacet[]> {
+		return this.opts.hosted.genreFacets!();
 	}
 	series(id: Id): Promise<Series> {
 		// Always hosted. Local serving for canonical works happens in the `canonical*`
@@ -174,6 +228,9 @@ export class CompositeBackend implements Backend {
 		// Always hosted — see `series` above. Canonical chapter reconciliation (and any
 		// on-device serving) lives in `canonicalChapters` / `canonicalPages`.
 		return this.opts.hosted.chapters(seriesId);
+	}
+	aggregatedChapters(workId: Id): Promise<AggregatedChapter[]> {
+		return this.opts.hosted.aggregatedChapters!(workId);
 	}
 	pages(chapterId: Id): Promise<Page[]> {
 		// Always hosted — see `series` above. On-device page bytes for canonical works
@@ -197,12 +254,21 @@ export class CompositeBackend implements Backend {
 			void this.flushQueue();
 			return s;
 		} catch (err) {
-			this.opts.queue.enqueue({ kind: 'mark', seriesId, marked });
+			this.opts.queue.enqueue({ kind: 'mark', seriesId, marked, userId: this.currentUserId });
 			throw err;
 		}
 	}
+	setLibraryStatus(seriesId: Id, status: LibraryStatus | null): Promise<Series> {
+		return this.opts.hosted.setLibraryStatus!(seriesId, status);
+	}
+	setFavorite(seriesId: Id, favorite: boolean): Promise<Series> {
+		return this.opts.hosted.setFavorite!(seriesId, favorite);
+	}
 	library(): Promise<Series[]> {
 		return this.opts.hosted.library();
+	}
+	libraryProgress(): Promise<SeriesProgress[]> {
+		return this.opts.hosted.libraryProgress!();
 	}
 	/**
 	 * Reading progress is a hosted write (D2). Without a queue this delegates
@@ -218,7 +284,13 @@ export class CompositeBackend implements Backend {
 			await this.opts.hosted.setProgress(chapterId, lastPageRead, read);
 			void this.flushQueue();
 		} catch {
-			this.opts.queue.enqueue({ kind: 'progress', chapterId, lastPageRead, read });
+			this.opts.queue.enqueue({
+				kind: 'progress',
+				chapterId,
+				lastPageRead,
+				read,
+				userId: this.currentUserId,
+			});
 		}
 	}
 
@@ -361,11 +433,18 @@ export class CompositeBackend implements Backend {
 	postReview(input: PostReviewInput): Promise<Review> {
 		return this.opts.hosted.postReview(input);
 	}
-	comments(targetType: CommentTargetType, targetId: Id, page?: number): Promise<Paginated<Comment>> {
+	comments(
+		targetType: CommentTargetType,
+		targetId: Id,
+		page?: number,
+	): Promise<Paginated<Comment>> {
 		return this.opts.hosted.comments(targetType, targetId, page);
 	}
 	postComment(input: PostCommentInput): Promise<Comment> {
 		return this.opts.hosted.postComment(input);
+	}
+	uploadCommentMedia(file: Blob): Promise<CommentMediaUpload> {
+		return this.opts.hosted.uploadCommentMedia!(file);
 	}
 
 	// --- admin "manga DB" ---
@@ -377,6 +456,23 @@ export class CompositeBackend implements Backend {
 	}
 	triggerScan(seriesId: Id): Promise<Series> {
 		return this.opts.hosted.triggerScan!(seriesId);
+	}
+
+	// --- admin series-detail editor ---
+	seriesAdminMeta(seriesId: Id): Promise<SeriesAdminMeta> {
+		return this.opts.hosted.seriesAdminMeta!(seriesId);
+	}
+	updateSeriesMetadata(input: SeriesMetadataInput): Promise<Series> {
+		return this.opts.hosted.updateSeriesMetadata!(input);
+	}
+	workChaptersAdmin(workId: Id): Promise<AdminChapter[]> {
+		return this.opts.hosted.workChaptersAdmin!(workId);
+	}
+	setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
+		return this.opts.hosted.setChapterOverride!(input);
+	}
+	rescanWork(workId: Id): Promise<number> {
+		return this.opts.hosted.rescanWork!(workId);
 	}
 
 	// --- admin moderation ---
@@ -404,6 +500,77 @@ export class CompositeBackend implements Backend {
 	}
 	addSourceSeries(suwayomiMangaId: Id): Promise<MatchResult> {
 		return this.opts.hosted.addSourceSeries!(suwayomiMangaId);
+	}
+	mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
+		return this.opts.hosted.mergeWorks!(sourceWorkId, targetWorkId);
+	}
+
+	// --- admin sources & extensions (EXT-1/EXT-2) ---
+	// All hosted-only: the embedded engine is content-fetch, not catalogue admin, so
+	// these delegate straight through. Forwarded explicitly (rather than left to the
+	// optional-method feature-detect) so native mode keeps the full admin surface.
+	extensions(refresh?: boolean): Promise<ExtensionInfo[]> {
+		return this.opts.hosted.extensions!(refresh);
+	}
+	sources(): Promise<SourceInfo[]> {
+		return this.opts.hosted.sources!();
+	}
+	sourceBrowse(
+		sourceId: Id,
+		type: SourceBrowseType,
+		page?: number,
+		query?: string,
+	): Promise<SourceBrowsePage> {
+		return this.opts.hosted.sourceBrowse!(sourceId, type, page, query);
+	}
+	addExtensionRepo(indexUrl: string): Promise<number> {
+		return this.opts.hosted.addExtensionRepo!(indexUrl);
+	}
+	installExtension(pkgName: string): Promise<ExtensionInfo> {
+		return this.opts.hosted.installExtension!(pkgName);
+	}
+	uninstallExtension(pkgName: string): Promise<ExtensionInfo> {
+		return this.opts.hosted.uninstallExtension!(pkgName);
+	}
+	updateExtension(pkgName: string): Promise<ExtensionInfo> {
+		return this.opts.hosted.updateExtension!(pkgName);
+	}
+	bulkAddSourceSeries(suwayomiMangaIds: Id[]): Promise<BulkAddResult> {
+		return this.opts.hosted.bulkAddSourceSeries!(suwayomiMangaIds);
+	}
+	seriesSourcesBatch(seriesIds: Id[]): Promise<SeriesSourceGroup[]> {
+		return this.opts.hosted.seriesSourcesBatch!(seriesIds);
+	}
+	setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
+		return this.opts.hosted.setSeriesPaused!(seriesId, paused);
+	}
+
+	// --- admin background source-ingest jobs (S1) ---
+	sourceIngestJobs(active?: boolean): Promise<SourceIngestJob[]> {
+		return this.opts.hosted.sourceIngestJobs!(active);
+	}
+	startSourceIngest(sourceId: Id): Promise<SourceIngestJob> {
+		return this.opts.hosted.startSourceIngest!(sourceId);
+	}
+	cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {
+		return this.opts.hosted.cancelSourceIngest!(jobId);
+	}
+	startExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+		return this.opts.hosted.startExtensionIngest!(pkgName);
+	}
+	cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
+		return this.opts.hosted.cancelExtensionIngest!(pkgName);
+	}
+
+	// --- admin maintenance ---
+	persistCatalogue(): Promise<number> {
+		return this.opts.hosted.persistCatalogue!();
+	}
+
+	// Popularity view counting is a hosted write; the embedded engine never counts.
+	// Best-effort (a hosted backend that doesn't track views simply no-ops).
+	recordView(seriesId: Id): Promise<void> {
+		return this.opts.hosted.recordView?.(seriesId) ?? Promise.resolve();
 	}
 }
 

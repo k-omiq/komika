@@ -142,11 +142,11 @@ impl SuwayomiSupervisor {
   /// Record the on-device Cloudflare shim URL so `setSettings` can point the engine at it
   /// once ready. Called at most once, before the supervision loop runs.
   pub fn set_cf_shim_url(&self, url: String) {
-    *self.cf_shim_url.lock().unwrap() = Some(url);
+    *self.cf_shim_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
   }
 
   fn set_ready(&self, port: u16, version: String) {
-    let mut g = self.inner.lock().unwrap();
+    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     g.port = Some(port);
     g.state = EngineState::Ready;
     g.version = Some(version);
@@ -155,7 +155,7 @@ impl SuwayomiSupervisor {
 
   /// Move to a non-ready state, clearing the port (base_url must be None off-ready).
   fn transition(&self, state: EngineState, err: Option<String>) {
-    let mut g = self.inner.lock().unwrap();
+    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     g.state = state;
     if state != EngineState::Ready {
       g.port = None;
@@ -166,7 +166,7 @@ impl SuwayomiSupervisor {
   }
 
   pub fn status(&self) -> Status {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     Status {
       state: g.state.as_str().to_string(),
       version: g.version.clone(),
@@ -175,7 +175,7 @@ impl SuwayomiSupervisor {
   }
 
   pub fn base_url(&self) -> Option<String> {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     if g.state == EngineState::Ready {
       g.port.map(|p| format!("http://127.0.0.1:{p}"))
     } else {
@@ -185,7 +185,7 @@ impl SuwayomiSupervisor {
 
   /// The `(port, client)` needed to proxy a GraphQL call, or `None` if not ready.
   fn ready_endpoint(&self) -> Option<(u16, reqwest::Client)> {
-    let g = self.inner.lock().unwrap();
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     if g.state == EngineState::Ready {
       g.port.map(|p| (p, self.client.clone()))
     } else {
@@ -200,7 +200,7 @@ impl SuwayomiSupervisor {
     self.notify.notify_waiters();
     let deadline = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline {
-      if self.inner.lock().unwrap().state == EngineState::Stopped {
+      if self.inner.lock().unwrap_or_else(|e| e.into_inner()).state == EngineState::Stopped {
         break;
       }
       tokio::time::sleep(Duration::from_millis(50)).await;
@@ -365,6 +365,25 @@ async fn stop_child(child: &mut tokio::process::Child) {
   }
 }
 
+/// Park until shutdown is requested, deterministically. `Notify::notify_waiters()` stores
+/// no permit, so a stop signalled while the supervisor isn't parked in `notified()` is
+/// lost. We defend against that by re-checking the `stopping` flag on a short timer: a
+/// missed wake costs at most one 100 ms tick, never a hang. Combined with `stop_and_wait`
+/// storing `stopping = true` BEFORE `notify_waiters()`, every select branch below observes
+/// a stop even if the notify raced the select's registration — so a mid-boot stop is seen
+/// promptly instead of running the full `READY_TIMEOUT` with a live child.
+async fn wait_for_stop(sup: &SuwayomiSupervisor) {
+  loop {
+    if sup.stopping.load(Ordering::SeqCst) {
+      return;
+    }
+    tokio::select! {
+      _ = sup.notify.notified() => return,
+      _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+  }
+}
+
 /// The supervision loop: (re)boot the engine, monitor for unexpected exit, restart with
 /// capped backoff, and exit cleanly on shutdown. Runs on the Tauri async runtime.
 async fn run_supervisor(sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
@@ -372,11 +391,13 @@ async fn run_supervisor(sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
   while !sup.stopping.load(Ordering::SeqCst) {
     sup.transition(EngineState::Starting, None);
 
-    // Prefer a shutdown signal over completing a boot. If notify fires mid-boot the
-    // boot future is dropped, and kill_on_drop reaps any child it had spawned.
+    // Prefer a shutdown signal over completing a boot. If stop fires mid-boot the boot
+    // future is dropped, and kill_on_drop reaps any child it had spawned. `wait_for_stop`
+    // observes the `stopping` flag even if the `notify_waiters` wake was lost, so a stop
+    // during the up-to-`READY_TIMEOUT` boot is seen within ~100 ms rather than at timeout.
     let boot = tokio::select! {
       biased;
-      _ = sup.notify.notified() => break,
+      _ = wait_for_stop(&sup) => break,
       r = boot_engine(&cfg, &sup.client, READY_TIMEOUT) => r,
     };
 
@@ -387,12 +408,13 @@ async fn run_supervisor(sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
         // Point the engine's Cloudflare interceptor at our on-device shim (N-CF). Best
         // effort and fire-and-forget: a failure only logs and CF sources fall back to
         // server-fetch — it must never stall or crash the supervision loop.
-        if let Some(shim_url) = sup.cf_shim_url.lock().unwrap().clone() {
+        if let Some(shim_url) = sup.cf_shim_url.lock().unwrap_or_else(|e| e.into_inner()).clone() {
           let client = sup.client.clone();
           tauri::async_runtime::spawn(crate::cloudflare::apply_settings(client, port, shim_url));
         }
         tokio::select! {
-          _ = sup.notify.notified() => {
+          biased;
+          _ = wait_for_stop(&sup) => {
             stop_child(&mut child).await;
             break;
           }
@@ -431,7 +453,8 @@ async fn run_supervisor(sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
     };
 
     tokio::select! {
-      _ = sup.notify.notified() => break,
+      biased;
+      _ = wait_for_stop(&sup) => break,
       _ = tokio::time::sleep(backoff) => {}
     }
     if storm {
@@ -556,7 +579,7 @@ pub fn start(app: AppHandle) {
   };
 
   match acquire_lock(&cfg.data_dir) {
-    Ok(guard) => *sup.lock.lock().unwrap() = Some(guard),
+    Ok(guard) => *sup.lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard),
     Err(e) => {
       log::warn!(target: "suwayomi", "not starting engine: {e}");
       sup.transition(EngineState::Degraded, Some(e));
@@ -630,16 +653,43 @@ fn validate_image_path(path: &str) -> Result<(), String> {
   if !path.starts_with("/api/") {
     return Err(format!("suwayomi_image: path must start with /api/, got {path:?}"));
   }
+  // Percent-decode ONCE (mirrors the engine's own HTTP-layer decode) before the
+  // traversal checks, so encoded forms like `%2e%2e` / `%5c` can't slip past the
+  // literal `..` / `\` guards below.
+  let decoded = percent_decode_once(path);
   // Belt-and-braces: no path traversal, even though it can't escape `/api/` on the
-  // engine — a `/api/../secret` must never be forwarded.
-  if path.contains("..") {
+  // engine — a `/api/../secret` (or `/api/%2e%2e/secret`) must never be forwarded.
+  if decoded.contains("..") {
     return Err(format!("suwayomi_image: path must not contain '..', got {path:?}"));
   }
   // No backslashes (a Windows-y separator that could confuse downstream parsing).
-  if path.contains('\\') {
+  if decoded.contains('\\') {
     return Err(format!("suwayomi_image: path must not contain '\\', got {path:?}"));
   }
   Ok(())
+}
+
+/// Single-pass, lossy percent-decode. One decode level matches what the engine's
+/// HTTP router applies, so decoding here catches `%2e%2e`/`%5c` traversal without
+/// over-decoding (`%252e` stays `%2e`, exactly as the engine would see it).
+fn percent_decode_once(s: &str) -> String {
+  let bytes = s.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%' && i + 2 < bytes.len() {
+      let hi = (bytes[i + 1] as char).to_digit(16);
+      let lo = (bytes[i + 2] as char).to_digit(16);
+      if let (Some(hi), Some(lo)) = (hi, lo) {
+        out.push((hi * 16 + lo) as u8);
+        i += 3;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+  String::from_utf8_lossy(&out).into_owned()
 }
 
 /// IPC-proxy transport for engine image bytes: stream a page/proxy image from the
@@ -659,6 +709,12 @@ pub async fn suwayomi_image(
   path: String,
 ) -> Result<tauri::ipc::Response, String> {
   validate_image_path(&path)?;
+  // Share the process-wide image concurrency cap with `fetch_image` so the two
+  // paths together can't stack N × MAX_IMAGE_BYTES of native heap.
+  let _permit = crate::image_fetch_semaphore()
+    .acquire()
+    .await
+    .map_err(|_| "image fetch pool closed".to_string())?;
   let (port, client) = state
     .ready_endpoint()
     .ok_or_else(|| "suwayomi engine not ready".to_string())?;
@@ -724,8 +780,11 @@ mod tests {
       "http://evil",             // absolute URL
       "//evil",                  // scheme-relative host
       "/api/../secret",          // traversal out of /api/
+      "/api/%2e%2e/secret",      // percent-encoded traversal
+      "/api/%2E%2E/secret",      // percent-encoded traversal (upper hex)
       "../x",                    // relative traversal
       "/api/\\windows",          // backslash separator
+      "/api/x%5cy",              // percent-encoded backslash
       "api/v1/manga",            // not rooted
     ] {
       assert!(

@@ -43,6 +43,12 @@ const SHIM_BIND: &str = "127.0.0.1:0";
 const SHIM_VERSION: &str = "komika-cf-shim/1.0.0";
 /// Default solve budget if the engine omits `maxTimeout` (engine default is 60 s).
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+/// Hard wall-clock cap on a single solve, regardless of the engine-requested
+/// `maxTimeout`. Enforced by clamping the timeout handed to the solver, so the
+/// solver's own deadline path still runs (the hidden window is always closed on
+/// timeout — no leak). Kept well under the old 60 s so a hung WebView solve can
+/// never head-of-line-block the listener for long, and shutdown stays prompt.
+const MAX_SOLVE_WALL_MS: u64 = 45_000;
 /// Cadence for polling the WebView cookie store for `cf_clearance`.
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// Hidden-solve grace before we surface the window for an interactive challenge.
@@ -218,6 +224,10 @@ pub struct CfShim {
   port: u16,
   server: Arc<tiny_http::Server>,
   handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+  /// Woken on shutdown to cancel any in-flight solve promptly (belt-and-braces
+  /// with `MAX_SOLVE_WALL_MS`). The listener itself is stopped via `server.unblock()`;
+  /// this only shortens a solve that is already running when the app exits.
+  shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl CfShim {
@@ -234,15 +244,18 @@ impl CfShim {
       .ok_or_else(|| "cf shim: no ip port".to_string())?;
     let server = Arc::new(server);
     let srv = server.clone();
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_srv = shutdown.clone();
     let handle = std::thread::Builder::new()
       .name("komika-cf-shim".to_string())
-      .spawn(move || serve_loop(&srv, solver.as_ref()))
+      .spawn(move || serve_loop(&srv, solver, shutdown_srv))
       .map_err(|e| format!("spawn cf shim thread: {e}"))?;
     log::info!(target: "suwayomi", "cloudflare shim listening on 127.0.0.1:{port}");
     Ok(CfShim {
       port,
       server,
       handle: Mutex::new(Some(handle)),
+      shutdown,
     })
   }
 
@@ -256,7 +269,13 @@ impl CfShim {
   }
 
   /// Stop the listener and join the serving thread. Idempotent (safe to call twice).
+  ///
+  /// The join is now bounded: each `/v1` solve runs on its OWN task (not the serving
+  /// thread), so the thread only ever loops over `incoming_requests()` and returns as
+  /// soon as `unblock()` ends it — it never blocks on a ~60 s solve. `notify_waiters`
+  /// additionally cancels any in-flight solve so it doesn't linger past app exit.
   pub fn shutdown(&self) {
+    self.shutdown.notify_waiters();
     self.server.unblock();
     if let Some(h) = self.handle.lock().unwrap().take() {
       let _ = h.join();
@@ -271,10 +290,17 @@ impl Drop for CfShim {
   }
 }
 
-/// Serve until `unblock()` ends `incoming_requests()`.
-fn serve_loop(server: &tiny_http::Server, solver: &dyn CloudflareSolver) {
+/// Serve until `unblock()` ends `incoming_requests()`. The loop itself does no solving:
+/// it routes fast (health/404) responses inline and dispatches each `/v1` solve onto its
+/// own task, so a slow (~60 s) WebView solve can never head-of-line-block the next
+/// request — nor the join at shutdown.
+fn serve_loop(
+  server: &tiny_http::Server,
+  solver: Arc<dyn CloudflareSolver>,
+  shutdown: Arc<tokio::sync::Notify>,
+) {
   for request in server.incoming_requests() {
-    handle_request(request, solver);
+    handle_request(request, &solver, &shutdown);
   }
 }
 
@@ -286,8 +312,14 @@ fn json_response(resp: &FsResp) -> tiny_http::Response<std::io::Cursor<Vec<u8>>>
   tiny_http::Response::from_data(body).with_header(header)
 }
 
-/// Route one request: `GET /` health, `POST /v1` solve; everything else 404.
-fn handle_request(mut request: tiny_http::Request, solver: &dyn CloudflareSolver) {
+/// Route one request: `GET /` health, `POST /v1` solve; everything else 404. The health
+/// and 404 paths respond inline (instant); the `/v1` solve is dispatched onto its own
+/// task so a slow solve never blocks the listener.
+fn handle_request(
+  mut request: tiny_http::Request,
+  solver: &Arc<dyn CloudflareSolver>,
+  shutdown: &Arc<tokio::sync::Notify>,
+) {
   use tiny_http::{Method, Response};
 
   let method = request.method().clone();
@@ -302,6 +334,9 @@ fn handle_request(mut request: tiny_http::Request, solver: &dyn CloudflareSolver
     return;
   }
 
+  // Read the (small) request body synchronously on the listener thread — this is fast;
+  // only the solve itself is slow. Then hand the request off to its own task so the
+  // next `/v1` POST is serviced immediately instead of queuing behind a ~60 s solve.
   let mut body = String::new();
   if request.as_reader().read_to_string(&mut body).is_err() {
     let resp = error_resp("", "failed to read request body".to_string(), now_ms());
@@ -309,13 +344,44 @@ fn handle_request(mut request: tiny_http::Request, solver: &dyn CloudflareSolver
     return;
   }
 
-  let resp = match serde_json::from_str::<FsReq>(&body) {
-    // The solver is async; we are on a dedicated std thread (not a tokio worker), so
-    // `block_on` is safe and also enters the runtime context the solver needs.
-    Ok(req) => tauri::async_runtime::block_on(handle_v1(req, solver)),
-    Err(e) => error_resp("", format!("invalid FlareSolverr request: {e}"), now_ms()),
-  };
-  let _ = request.respond(json_response(&resp));
+  let solver = solver.clone();
+  let shutdown = shutdown.clone();
+  // Dispatch onto Tauri's async runtime. `tiny_http::Request` is `Send`, so it moves
+  // into the task and responds there once the solve completes.
+  tauri::async_runtime::spawn(async move {
+    let resp = match serde_json::from_str::<FsReq>(&body) {
+      Ok(req) => solve_bounded(req, solver.as_ref(), &shutdown).await,
+      Err(e) => error_resp("", format!("invalid FlareSolverr request: {e}"), now_ms()),
+    };
+    let _ = request.respond(json_response(&resp));
+  });
+}
+
+/// Run one solve under two independent bounds so it can never hang the shim:
+/// (1) the engine-requested `maxTimeout` is clamped to `MAX_SOLVE_WALL_MS`, which the
+/// solver enforces via its OWN deadline — so it always closes the hidden window on
+/// timeout (no leak); (2) a shutdown signal cancels an in-flight solve promptly at app
+/// exit. On either bound the engine gets an `error_resp` → clean server-fetch fallback.
+async fn solve_bounded(
+  mut req: FsReq,
+  solver: &dyn CloudflareSolver,
+  shutdown: &tokio::sync::Notify,
+) -> FsResp {
+  let start = now_ms();
+  let url = req.url.clone();
+  req.max_timeout = Some(
+    req
+      .max_timeout
+      .unwrap_or(DEFAULT_TIMEOUT_MS)
+      .min(MAX_SOLVE_WALL_MS),
+  );
+  tokio::select! {
+    biased;
+    // Only fires when the app is shutting down (WebViews torn down with the process),
+    // so dropping the in-flight `handle_v1` future here cannot leak a window.
+    _ = shutdown.notified() => error_resp(&url, "cf shim shutting down".to_string(), start),
+    resp = handle_v1(req, solver) => resp,
+  }
 }
 
 // ---- Real Tauri-WebView solver ---------------------------------------------
@@ -367,7 +433,13 @@ async fn solve_in_webview(app: AppHandle, url: String, timeout: Duration) -> Res
     other => return Err(format!("unsupported scheme: {other}")),
   }
   let label = challenge_label();
-  build_challenge_window(&app, &label, parsed.clone())?;
+  if let Err(e) = build_challenge_window(&app, &label, parsed.clone()) {
+    // The builder can finish just AFTER the `recv_timeout` fired: in that race the
+    // hidden window is created but we're on the error path, so best-effort close it
+    // too — otherwise a late build leaks a hidden window for the app's lifetime.
+    close_window(&app, &label);
+    return Err(e);
+  }
   let result = poll_for_clearance(&app, &label, &parsed, timeout).await;
   close_window(&app, &label);
   result

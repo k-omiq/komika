@@ -1,6 +1,6 @@
 //! GraphQL types — a 1:1 code-first mirror of `packages/api/src/schema/komika.graphql`.
 
-use async_graphql::{Enum, InputObject, SimpleObject, ID};
+use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject, ID};
 
 use crate::suwayomi::SuwayomiChapter;
 
@@ -99,6 +99,22 @@ pub struct Cover {
     pub is_primary: bool,
 }
 
+/// Per-series view (chapter-read) counts across the three windows — the popularity
+/// signal behind Trending, surfaced on the series page. Resolved lazily on `Series`
+/// (only when selected), so feeds that don't ask for it pay nothing.
+#[derive(SimpleObject, Clone, Copy, Default)]
+pub struct SeriesViews {
+    /// All-time total views.
+    pub total: i32,
+    /// Views in the last 7 days. Named explicitly so the GraphQL field is `last7d`
+    /// (async-graphql's default camelCasing would otherwise emit `last7D`).
+    #[graphql(name = "last7d")]
+    pub last7d: i32,
+    /// Views in the last 24 hours (see `last7d` re: the explicit name).
+    #[graphql(name = "last24h")]
+    pub last24h: i32,
+}
+
 #[derive(SimpleObject, Clone)]
 #[graphql(complex)]
 pub struct Series {
@@ -115,7 +131,9 @@ pub struct Series {
     pub cover_url: String,
     pub source_id: String,
     pub chapter_count: i32,
-    pub is_marked: bool,
+    // `is_marked` (per-user library membership) is resolved dynamically per viewer
+    // in the `#[ComplexObject]` impl — it is NOT a stored field, so every feed
+    // reflects the signed-in user's own library rather than a shared flag.
     /// NSFW per the canonical model (CATALOGUE.md §2); false until the series is
     /// catalogued. Drives `show_nsfw` filtering of discovery/search/updates feeds.
     pub is_nsfw: bool,
@@ -123,6 +141,21 @@ pub struct Series {
     pub scan: ScanPolicy,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Per-series read progress for the whole library, returned by `libraryProgress`
+/// in ONE batched query. Lets the Library and Profile screens shelve every series
+/// by progress without fetching each series' chapter list (the old N+1 that hung
+/// those pages). `read`/`total` are counted from the cached chapter state — the
+/// same source `chapters(seriesId)` reads — so the numbers match exactly.
+#[derive(SimpleObject, Clone)]
+pub struct SeriesProgress {
+    /// The Suwayomi series id (matches `Series.id` for library series).
+    pub id: ID,
+    /// Chapters marked read.
+    pub read: i32,
+    /// Total chapters known for the series (cached chapter count).
+    pub total: i32,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -225,15 +258,24 @@ pub struct Review {
 }
 
 /// A comment on a polymorphic target: a chapter thread (`target_type = "chapter"`)
-/// or a series discussion (`target_type = "series"`).
+/// or a series discussion (`target_type = "series"`). Comments form arbitrary-depth
+/// reply trees via `parent_id` (NULL = a top-level comment) and may carry one
+/// optional attached image (`media_url` + its pixel dimensions).
 #[derive(SimpleObject, Clone)]
 pub struct Comment {
     pub id: ID,
     pub target_type: String,
     pub target_id: ID,
+    /// The comment this one replies to, or `null` for a top-level comment.
+    pub parent_id: Option<ID>,
     pub author: UserRef,
     pub body: String,
     pub has_spoiler: bool,
+    /// Path to the attached image (`/comment-media/<id>.webp`), if any.
+    pub media_url: Option<String>,
+    /// Attached image dimensions, so the client can reserve layout space.
+    pub media_width: Option<i32>,
+    pub media_height: Option<i32>,
     pub created_at: String,
 }
 
@@ -351,8 +393,14 @@ pub struct PostCommentInput {
     /// `"chapter"` or `"series"`.
     pub target_type: String,
     pub target_id: ID,
+    /// The comment being replied to, or `null`/omitted for a top-level comment.
+    /// Must belong to the same target, or the mutation is rejected.
+    pub parent_id: Option<ID>,
     pub body: String,
     pub has_spoiler: bool,
+    /// A previously-uploaded `comment_media` id (from `POST /comment-media`) to
+    /// attach. Must be owned by the poster and not yet linked to another comment.
+    pub media_id: Option<ID>,
 }
 
 #[derive(InputObject)]
@@ -373,6 +421,67 @@ pub struct SeriesAdminInput {
     pub paused: Option<bool>,
     /// Override the source status; null uses the source-derived status.
     pub status: Option<SeriesStatus>,
+}
+
+/// Admin edits to a canonical work's user-facing metadata (series-detail editor).
+/// Each optional field uses `MaybeUndefined` three-valued semantics so a partial
+/// edit is unambiguous: OMITTED => leave unchanged; NULL => clear the override
+/// (fall back to the derived/source value); VALUE => set the override.
+#[derive(InputObject)]
+pub struct SeriesMetadataInput {
+    /// A numeric Suwayomi series id or a `w_` canonical work id — both resolve to
+    /// the underlying `work` the overrides are written to.
+    pub series_id: ID,
+    pub title: MaybeUndefined<String>,
+    pub description: MaybeUndefined<String>,
+    pub r#type: MaybeUndefined<ComicType>,
+    pub is_nsfw: MaybeUndefined<bool>,
+    /// The full curated tag/genre set (a whole-list replace). NULL clears the
+    /// curated set so genres derive from the source again.
+    pub tags: MaybeUndefined<Vec<String>>,
+}
+
+/// The raw override state of a work, for the series-detail editor to show what is
+/// pinned vs derived (parallel to how `ScanPolicy` exposes its raw overrides).
+#[derive(SimpleObject, Clone)]
+pub struct SeriesAdminMeta {
+    /// The canonical work id the overrides live on (null if the series isn't
+    /// catalogued yet — nothing can be pinned until it has a work).
+    pub work_id: Option<ID>,
+    pub title_override: Option<String>,
+    pub description_override: Option<String>,
+    pub content_type_override: Option<ComicType>,
+    pub is_nsfw_override: Option<bool>,
+    /// The effective genre list (curated set if any, else derived from the source).
+    pub tags: Vec<String>,
+    /// Whether `tags` is an admin-curated set (true) or derived from the source (false).
+    pub has_curated_tags: bool,
+}
+
+/// One chapter of a canonical work in the admin editor: its aggregate identity plus
+/// the override state (hidden / renamed) so the console can show and toggle both.
+#[derive(SimpleObject, Clone)]
+pub struct AdminChapter {
+    pub number: f64,
+    /// The aggregate bucket key (`round(number*100)` as text) — the override key.
+    pub key: String,
+    pub source_title: Option<String>,
+    pub title_override: Option<String>,
+    pub effective_title: Option<String>,
+    pub hidden: bool,
+    /// How many sources provide this chapter number.
+    pub source_count: i32,
+}
+
+/// Admin edit to one chapter of a work (soft-hide / rename). `MaybeUndefined` so a
+/// toggle of one field doesn't clobber the other: OMITTED => unchanged.
+#[derive(InputObject)]
+pub struct ChapterOverrideInput {
+    pub work_id: ID,
+    /// The aggregate bucket key from `AdminChapter.key`.
+    pub chapter_key: String,
+    pub hidden: MaybeUndefined<bool>,
+    pub title: MaybeUndefined<String>,
 }
 
 // ---- Sources & Extensions admin surface (EXT-1) ------------------------------
@@ -650,13 +759,100 @@ pub fn komika_status(s: &str) -> Option<SeriesStatus> {
     }
 }
 
-/// Best-effort comic type from the source language.
-pub fn type_from_lang(lang: Option<&str>) -> ComicType {
-    match lang {
-        Some(l) if l.to_lowercase().starts_with("ko") => ComicType::Manhwa,
-        Some(l) if l.to_lowercase().starts_with("zh") => ComicType::Manhua,
-        _ => ComicType::Manga,
+/// The stored/serialized word for a comic type (matches the GraphQL enum + the
+/// `content_type_override` column values).
+pub fn content_type_word(t: ComicType) -> &'static str {
+    match t {
+        ComicType::Manga => "MANGA",
+        ComicType::Manhwa => "MANHWA",
+        ComicType::Manhua => "MANHUA",
+        ComicType::Webtoon => "WEBTOON",
+        ComicType::Comic => "COMIC",
     }
+}
+
+/// Parse a stored comic-type word (`content_type_override`) back to the enum.
+/// Case-insensitive; `None` for an unrecognized value.
+pub fn comic_type_from_word(s: &str) -> Option<ComicType> {
+    match s.trim().to_uppercase().as_str() {
+        "MANGA" => Some(ComicType::Manga),
+        "MANHWA" => Some(ComicType::Manhwa),
+        "MANHUA" => Some(ComicType::Manhua),
+        "WEBTOON" => Some(ComicType::Webtoon),
+        "COMIC" => Some(ComicType::Comic),
+        _ => None,
+    }
+}
+
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+}
+
+fn is_kana(c: char) -> bool {
+    matches!(c, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}')
+}
+
+fn is_han(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
+}
+
+/// Resolve the effective comic type, in precedence order:
+/// 1. explicit admin override (`content_type_override`),
+/// 2. the original language (ko→Manhwa, zh→Manhua, ja→Manga),
+/// 3. a genre/tag heuristic (an explicit `Manhwa`/`Manhua` tag),
+/// 4. a title-script heuristic (Hangul→Manhwa; Han without kana→Manhua),
+/// 5. default Manga.
+/// Steps 3–5 only fire when the origin language is unknown — the common case for
+/// series ingested from a Suwayomi/Keiyoushi extension, whose source language is
+/// the TRANSLATION language and must not be treated as the origin.
+pub fn resolve_comic_type(
+    override_word: Option<&str>,
+    original_language: Option<&str>,
+    genres: &[String],
+    title: &str,
+) -> ComicType {
+    if let Some(t) = override_word.and_then(comic_type_from_word) {
+        return t;
+    }
+    match original_language.map(|l| l.to_lowercase()) {
+        Some(l) if l.starts_with("ko") => return ComicType::Manhwa,
+        Some(l) if l.starts_with("zh") => return ComicType::Manhua,
+        Some(l) if l.starts_with("ja") => return ComicType::Manga,
+        _ => {}
+    }
+    // Explicit origin tags win (format + origin-country tags — some sources carry a
+    // "Korean"/"Chinese"/"Japanese" origin tag, the most precise signal after language).
+    for g in genres {
+        let g = g.to_lowercase();
+        if g.contains("manhwa") || g.contains("korean") {
+            return ComicType::Manhwa;
+        }
+        if g.contains("manhua") || g.contains("chinese") {
+            return ComicType::Manhua;
+        }
+        if g.contains("japanese") {
+            return ComicType::Manga;
+        }
+    }
+    // Webtoon-format tags (e.g. "Long Strip", "Webtoon", "Web Comic") — these
+    // catalogues are Korean-webtoon-dominant and the reader collapses WEBTOON→Manhwa,
+    // so a long-strip series with no explicit manhua tag and unknown origin language
+    // (the common Solo-Leveling shape: en source, no MangaDex anchor) reads as Manhwa
+    // rather than the Manga default. A genuine Chinese webtoon is corrected by its
+    // explicit "Manhua" tag above, by MangaDex enrichment, or by an admin override.
+    for g in genres {
+        let g = g.to_lowercase();
+        if g.contains("webtoon") || g.contains("long strip") || g.contains("web comic") {
+            return ComicType::Manhwa;
+        }
+    }
+    if title.chars().any(is_hangul) {
+        return ComicType::Manhwa;
+    }
+    if title.chars().any(is_han) && !title.chars().any(is_kana) {
+        return ComicType::Manhua;
+    }
+    ComicType::Manga
 }
 
 /// Coerce a Suwayomi epoch timestamp (seconds or millis, as a string) to ISO 8601.
@@ -666,12 +862,23 @@ pub fn to_iso(v: Option<&str>) -> Option<String> {
     if n <= 0 {
         return None;
     }
-    let ms = if n > 1_000_000_000_000 { n } else { n * 1000 };
+    // `checked_mul` so a pathological seconds value can't overflow i64 (panic in
+    // debug, wrong date in release) when scaled to millis.
+    let ms = if n > 1_000_000_000_000 {
+        n
+    } else {
+        n.checked_mul(1000)?
+    };
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
-/// Map a Suwayomi chapter onto the Komika `Chapter` (no DB lookup needed).
-pub fn map_chapter(c: SuwayomiChapter) -> Chapter {
+/// Map a Suwayomi chapter onto the Komika `Chapter`. Read state is per-VIEWER
+/// (`suwayomi_progress`), passed in as `progress`; the cached `is_read`/
+/// `last_page_read` on the shared `suwayomi_chapter` row are ignored — they were
+/// global state. Anonymous / never-read chapters default to unread (mirrors the
+/// canonical `map_canonical_chapter` path).
+pub fn map_chapter(c: SuwayomiChapter, progress: Option<(i32, bool)>) -> Chapter {
+    let (last_page_read, read) = progress.unwrap_or((0, false));
     Chapter {
         id: ID(c.id.to_string()),
         series_id: ID(c.manga_id.to_string()),
@@ -680,9 +887,101 @@ pub fn map_chapter(c: SuwayomiChapter) -> Chapter {
         page_count: c.page_count as i32,
         uploaded_at: to_iso(c.upload_date.as_deref()),
         scanlator: c.scanlator,
-        read: c.is_read,
-        last_page_read: c.last_page_read as i32,
+        read,
+        last_page_read,
         bookmarked: c.is_bookmarked,
         is_downloaded: c.is_downloaded,
+    }
+}
+
+#[cfg(test)]
+mod comic_type_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn admin_override_wins_over_everything() {
+        // Even a Japanese original language + kana title is Manhua if pinned.
+        assert_eq!(
+            resolve_comic_type(Some("MANHUA"), Some("ja"), &s(&["Action"]), "テスト"),
+            ComicType::Manhua
+        );
+    }
+
+    #[test]
+    fn original_language_maps_ko_zh_ja() {
+        assert_eq!(resolve_comic_type(None, Some("ko"), &[], ""), ComicType::Manhwa);
+        assert_eq!(resolve_comic_type(None, Some("zh-hk"), &[], ""), ComicType::Manhua);
+        assert_eq!(resolve_comic_type(None, Some("ja"), &[], ""), ComicType::Manga);
+    }
+
+    #[test]
+    fn genre_heuristic_fires_when_language_unknown() {
+        // The Solo-Leveling case: served by an English source (no origin language),
+        // but the source tags it "Manhwa" → classified Manhwa, not the Manga default.
+        assert_eq!(
+            resolve_comic_type(None, None, &s(&["Action", "Manhwa"]), "Solo Leveling"),
+            ComicType::Manhwa
+        );
+        assert_eq!(
+            resolve_comic_type(None, Some("en"), &s(&["Manhua"]), "Tales"),
+            ComicType::Manhua
+        );
+    }
+
+    #[test]
+    fn webtoon_format_tags_classify_as_manhwa() {
+        // The real Solo Leveling shape: English source, no origin language, romanized
+        // title, and webtoon-format tags but NO explicit "Manhwa" tag.
+        let solo = s(&[
+            "Adaptation",
+            "Award Winning",
+            "Full Color",
+            "Long Strip",
+            "Web Comic",
+            "Action",
+            "Adventure",
+            "Fantasy",
+        ]);
+        assert_eq!(
+            resolve_comic_type(None, None, &solo, "Solo Leveling"),
+            ComicType::Manhwa
+        );
+        // An explicit Manhua tag still wins over the webtoon-format fallback.
+        assert_eq!(
+            resolve_comic_type(None, None, &s(&["Long Strip", "Manhua"]), "Battle Through"),
+            ComicType::Manhua
+        );
+    }
+
+    #[test]
+    fn script_heuristic_detects_hangul_and_han() {
+        assert_eq!(resolve_comic_type(None, None, &[], "나 혼자만 레벨업"), ComicType::Manhwa);
+        assert_eq!(resolve_comic_type(None, None, &[], "斗破苍穹"), ComicType::Manhua);
+        // Han + kana => Japanese, not Manhua.
+        assert_eq!(resolve_comic_type(None, None, &[], "鬼滅の刃"), ComicType::Manga);
+    }
+
+    #[test]
+    fn defaults_to_manga_with_no_signal() {
+        assert_eq!(resolve_comic_type(None, None, &[], "Some Title"), ComicType::Manga);
+        assert_eq!(resolve_comic_type(None, Some("en"), &[], "Some Title"), ComicType::Manga);
+    }
+
+    #[test]
+    fn word_round_trips() {
+        for t in [
+            ComicType::Manga,
+            ComicType::Manhwa,
+            ComicType::Manhua,
+            ComicType::Webtoon,
+            ComicType::Comic,
+        ] {
+            assert_eq!(comic_type_from_word(content_type_word(t)), Some(t));
+        }
+        assert_eq!(comic_type_from_word("nonsense"), None);
     }
 }

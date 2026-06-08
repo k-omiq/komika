@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import type { CanonicalUpdate } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadCanonicalUpdates } from '$lib/data';
@@ -13,10 +12,7 @@
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
 
-	// Redirect out if we're not signed in (admin console).
-	$effect(() => {
-		if (auth.ready && !auth.user) goto('/login');
-	});
+	// Auth redirect is centralized in +layout.svelte.
 
 	$effect(() => {
 		if (!auth.user) return;
