@@ -1746,10 +1746,12 @@ impl QueryRoot {
              SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'suwayomi' AND ss.source_key = sss.series_id \
                AND w.is_nsfw = 1))";
-        // Series ids with a detected new-chapter timestamp, newest-first. Fetch one
-        // extra to compute has_next without a second round-trip.
-        let ids: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT series_id FROM series_scan_state sss \
+        // Series ids with a detected new-chapter timestamp, newest-first, carrying that
+        // timestamp so the feed can report a FAITHFUL "updated" time (when the series
+        // actually got a new chapter — not its last poll, which `updatedAt` otherwise
+        // reflects). Fetch one extra to compute has_next without a second round-trip.
+        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+            "SELECT series_id, last_new_chapter_at FROM series_scan_state sss \
              WHERE last_new_chapter_at IS NOT NULL AND {NSFW_FILTER} \
              ORDER BY last_new_chapter_at DESC, series_id ASC LIMIT ? OFFSET ?"
         ))
@@ -1759,6 +1761,9 @@ impl QueryRoot {
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
+        let new_chapter_at: std::collections::HashMap<String, String> =
+            rows.iter().cloned().collect();
+        let ids: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
         let total: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM series_scan_state sss \
              WHERE last_new_chapter_at IS NOT NULL AND {NSFW_FILTER}"
@@ -1784,7 +1789,14 @@ impl QueryRoot {
                 }
             }
         }
-        let items = map_series_batch(st, resolved).await;
+        let mut items = map_series_batch(st, resolved).await;
+        // Override `updatedAt` with the new-chapter detection time (RFC3339) so the
+        // reader's "Latest Updates" row shows when each series last gained a chapter.
+        for it in &mut items {
+            if let Some(ts) = new_chapter_at.get(&it.id.0) {
+                it.updated_at = ts.clone();
+            }
+        }
         Ok(SeriesPage {
             items,
             page,
@@ -5941,6 +5953,62 @@ mod tests {
             .first()
             .map(|e| e.message.clone())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn updates_feed_is_newest_first_and_reports_new_chapter_time() {
+        // "Latest Updates" orders by the scanner's new-chapter detection time
+        // (newest first) AND reports that time as `updatedAt` — not the series' last
+        // poll — so the reader shows a faithful "updated X ago".
+        let (s, pool) = setup_full(100).await;
+        for (id, title, new_at) in [
+            (10_i64, "Older Update", "2026-07-01T00:00:00+00:00"),
+            (20, "Newer Update", "2026-07-10T00:00:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+                 VALUES (?, ?, 'ONGOING', 'src', 5, '2026-07-15T00:00:00+00:00')",
+            )
+            .bind(id)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO series_scan_state \
+                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
+                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00')",
+            )
+            .bind(id.to_string())
+            .bind(new_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let r = exec(
+            &s,
+            r#"{ updates { items { id title updatedAt } total } }"#,
+            None,
+            "1.2.3.4",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "updates failed: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let items = data["updates"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // Newest new-chapter time first.
+        assert_eq!(items[0]["title"], serde_json::json!("Newer Update"));
+        assert_eq!(items[1]["title"], serde_json::json!("Older Update"));
+        // updatedAt is the new-chapter time, NOT the '2026-07-15' poll/update stamp.
+        assert_eq!(
+            items[0]["updatedAt"],
+            serde_json::json!("2026-07-10T00:00:00+00:00")
+        );
+        assert_eq!(
+            items[1]["updatedAt"],
+            serde_json::json!("2026-07-01T00:00:00+00:00")
+        );
     }
 
     #[tokio::test]

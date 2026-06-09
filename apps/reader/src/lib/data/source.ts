@@ -129,6 +129,12 @@ function toCard(s: Series): Card {
 	};
 }
 
+/** Like {@link toCard} but the time is the CATALOGUE-ADD time (`createdAt`), not the
+ *  last-update time — for the "Latest Added" row, so "Added 2d" is faithful. */
+function toAddedCard(s: Series): Card {
+	return { ...toCard(s), time: relTime(s.createdAt) };
+}
+
 /** A canonical-updates row → home/updates Card, linking by its `w_` workId so the
  *  card opens the MangaDex-mirrored work through the canonical reader path. */
 function toCanonicalCard(u: CanonicalUpdate): Card {
@@ -160,6 +166,22 @@ function toCatalogEntry(s: Series, i: number): CatalogEntry {
 		cover: s.coverUrl,
 		id: s.id,
 	};
+}
+
+/** Dedupe a Card list by title (case-insensitive), preserving first-seen order. Used
+ *  where a series can arrive under two identities — e.g. a numeric Suwayomi scanner
+ *  update and its `w_` MangaDex-mirror update — which share a title but not an id. */
+function dedupeCardsByTitle(cards: Card[]): Card[] {
+	const seen = new Set<string>();
+	const out: Card[] = [];
+	for (const c of cards) {
+		const key = c.title.trim().toLowerCase();
+		if (!seen.has(key)) {
+			seen.add(key);
+			out.push(c);
+		}
+	}
+	return out;
 }
 
 /** Dedupe a series list by id, preserving first-seen order. */
@@ -573,12 +595,15 @@ export function getHome() {
 		homeGenres: [] as string[],
 	};
 	return live(async () => {
-		// Discovery drives the curated rows; the scanner-backed `updates` feed drives
-		// "Latest Updates" (not Suwayomi's source "Latest"). The hero is the top of
-		// the live Popular feed (first feed as fallback) — empty when nothing is live.
-		const [feeds, updates] = await Promise.all([
+		// Discovery drives the curated rows; "Latest Updates" merges OUR scanner's
+		// new-chapter detections with the MangaDex mirror's freshest works (so the row
+		// fills even while the scanner is still warming up). The hero is the top of the
+		// live Popular feed (first feed as fallback) — empty when nothing is live.
+		const [feeds, updates, canonical] = await Promise.all([
 			backend.discovery(),
 			backend.updates().catch(() => ({ items: [] as Series[] })),
+			backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
+				Promise.resolve([] as CanonicalUpdate[]),
 		]);
 		const byKind = (k: string) => feeds.find((f) => f.kind === k)?.items ?? [];
 		const popular = byKind('POPULAR');
@@ -586,11 +611,18 @@ export function getHome() {
 		const featured = (popular.length ? popular : (feeds[0]?.items ?? []))
 			.slice(0, 5)
 			.map(toFeatured);
+		// Scanner detections first (most authoritative "new chapter"), then the mirror's
+		// freshest, deduped by title so a series present in both doesn't appear twice,
+		// capped at the 10 the home row shows.
+		const latestUpdates = dedupeCardsByTitle([
+			...updates.items.map(toCard),
+			...canonical.map(toCanonicalCard),
+		]).slice(0, 10);
 		return {
 			featured,
-			latestUpdates: updates.items.map(toCard),
-			trending: byKind('TRENDING').map(toCard),
-			latestAdded: byKind('RECENTLY_ADDED').map(toCard),
+			latestUpdates,
+			trending: byKind('TRENDING').map(toCard).slice(0, 10),
+			latestAdded: byKind('RECENTLY_ADDED').map(toAddedCard).slice(0, 10),
 			formatCards: pool.length ? deriveFormatCards(pool) : FORMAT_CARDS,
 			homeGenres: deriveGenres(pool),
 		};
