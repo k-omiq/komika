@@ -1,56 +1,17 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import Icon from './Icon.svelte';
-	import { searchFilterSections } from '$lib/data/types';
 
+	// A plain search box: type a term, Enter (or the search icon) opens /browse with
+	// the query. All filtration (genre / status / sort / rating / NSFW) lives on the
+	// Browse page now — the search bar no longer carries an "Advanced search" panel.
 	let {
 		open = $bindable(false),
 		placeholder = 'Search series, authors, genres…',
-		advanced = true,
-	}: { open?: boolean; placeholder?: string; advanced?: boolean } = $props();
+	}: { open?: boolean; placeholder?: string } = $props();
 
-	let advancedOpen = $state(false);
 	let q = $state('');
 	let inputEl = $state<HTMLInputElement | undefined>();
-
-	// Advanced-filter selection. Genre is multi-select; the rest are single-select.
-	let selGenres = $state<string[]>([]);
-	let selStatus = $state<string | null>(null);
-	let selSort = $state<string | null>(null);
-	let selMinRating = $state<string | null>(null);
-
-	// Map the human-readable panel labels onto the query params /browse consumes.
-	const SORT_MAP: Record<string, string> = {
-		Trending: 'trending',
-		Newest: 'newest',
-		'Top Rated': 'rating',
-		'Most Chapters': 'chapters',
-	};
-
-	function isSelected(label: string, opt: string): boolean {
-		if (label === 'Genre') return selGenres.includes(opt);
-		if (label === 'Status') return selStatus === opt;
-		if (label === 'Sort by') return selSort === opt;
-		if (label === 'Minimum rating') return selMinRating === opt;
-		return false;
-	}
-	function toggleChip(label: string, opt: string): void {
-		if (label === 'Genre') {
-			selGenres = selGenres.includes(opt) ? selGenres.filter((g) => g !== opt) : [...selGenres, opt];
-		} else if (label === 'Status') {
-			selStatus = selStatus === opt ? null : opt;
-		} else if (label === 'Sort by') {
-			selSort = selSort === opt ? null : opt;
-		} else if (label === 'Minimum rating') {
-			selMinRating = selMinRating === opt ? null : opt;
-		}
-	}
-	function resetFilters(): void {
-		selGenres = [];
-		selStatus = null;
-		selSort = null;
-		selMinRating = null;
-	}
 
 	$effect(() => {
 		if (open && inputEl) {
@@ -61,23 +22,11 @@
 
 	function close() {
 		open = false;
-		advancedOpen = false;
 	}
 	function submit() {
-		const params = new URLSearchParams();
 		const term = q.trim();
-		if (term) params.set('q', term);
-		for (const g of selGenres) params.append('genre', g);
-		if (selStatus) params.set('status', selStatus.toLowerCase());
-		const sortKey = selSort ? SORT_MAP[selSort] : undefined;
-		if (sortKey) params.set('sort', sortKey);
-		if (selMinRating) {
-			const n = parseFloat(selMinRating);
-			if (!Number.isNaN(n)) params.set('minRating', String(n));
-		}
 		close();
-		const qs = params.toString();
-		goto(qs ? `/browse?${qs}` : '/browse');
+		goto(term ? `/browse?q=${encodeURIComponent(term)}` : '/browse');
 	}
 	function onkey(e: KeyboardEvent) {
 		if (e.key === 'Escape') close();
@@ -89,50 +38,12 @@
 	<button class="scrim" aria-label="Close search" onclick={close}></button>
 	<div class="panel">
 		<div class="bar">
-			<Icon name="search" size={21} stroke="#87857f" />
+			<button class="search-btn" aria-label="Search" onclick={submit}>
+				<Icon name="search" size={21} stroke="#87857f" />
+			</button>
 			<input bind:this={inputEl} bind:value={q} {placeholder} onkeydown={onkey} />
-			{#if advanced}
-				<button
-					class="adv-btn"
-					class:on={advancedOpen}
-					aria-label="Advanced search"
-					onclick={() => (advancedOpen = !advancedOpen)}
-				>
-					<Icon name="sliders-h" size={19} />
-				</button>
-			{:else}
-				<button class="esc" onclick={close}>ESC</button>
-			{/if}
+			<button class="esc" onclick={close}>ESC</button>
 		</div>
-
-		{#if advanced && advancedOpen}
-			<div class="adv-panel">
-				<div class="adv-head">
-					<span class="adv-title">Advanced search</span>
-					<button class="hide" onclick={() => (advancedOpen = false)}>Hide</button>
-				</div>
-				{#each searchFilterSections as sec (sec.label)}
-					<div class="sec">
-						<span class="sec-label">{sec.label}</span>
-						<div class="chips">
-							{#each sec.options as opt (opt)}
-								<button
-									type="button"
-									class="chip"
-									class:on={isSelected(sec.label, opt)}
-									aria-pressed={isSelected(sec.label, opt)}
-									onclick={() => toggleChip(sec.label, opt)}>{opt}</button
-								>
-							{/each}
-						</div>
-					</div>
-				{/each}
-				<div class="adv-foot">
-					<button class="ghost" onclick={resetFilters}>Reset</button>
-					<button class="primary" onclick={submit}>Search</button>
-				</div>
-			</div>
-		{/if}
 	</div>
 {/if}
 
@@ -162,11 +73,21 @@
 		align-items: center;
 		gap: 14px;
 		height: 62px;
-		padding: 0 8px 0 24px;
+		padding: 0 8px 0 20px;
 		background: var(--k-surface-3);
 		border: 1px solid var(--k-border-3);
 		border-radius: var(--k-radius-pill);
 		box-shadow: 0 26px 70px rgba(0, 0, 0, 0.55);
+	}
+	.search-btn {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: transparent;
+		border: none;
+		padding: 0;
+		cursor: pointer;
 	}
 	input {
 		flex: 1;
@@ -177,25 +98,6 @@
 		color: var(--k-text);
 		font-size: 16px;
 	}
-	.adv-btn {
-		width: 46px;
-		height: 46px;
-		flex: 0 0 auto;
-		border-radius: 50%;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		background: var(--k-surface-5);
-		border: 1px solid var(--k-border-2);
-		color: #a7a59f;
-		transition: all 0.15s;
-	}
-	.adv-btn.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
-	}
 	.esc {
 		font-size: 12px;
 		font-weight: 700;
@@ -204,101 +106,6 @@
 		border-radius: 6px;
 		padding: 4px 8px;
 		background: transparent;
-		cursor: pointer;
-	}
-	.adv-panel {
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-3);
-		border-radius: var(--k-radius-2xl);
-		box-shadow: 0 26px 70px rgba(0, 0, 0, 0.55);
-		padding: 24px 26px;
-		display: flex;
-		flex-direction: column;
-		gap: 24px;
-	}
-	.adv-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-	.adv-title {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 15px;
-		color: var(--k-text);
-	}
-	.hide {
-		background: none;
-		border: none;
-		font-size: 12.5px;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-	}
-	.sec {
-		display: flex;
-		flex-direction: column;
-		gap: 11px;
-	}
-	.sec-label {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 9px;
-	}
-	.chip {
-		font-size: 13px;
-		color: var(--k-text-3);
-		padding: 7px 14px;
-		border-radius: var(--k-radius-pill);
-		border: 1px solid var(--k-border-4);
-		cursor: pointer;
-		white-space: nowrap;
-		transition: all 0.15s;
-	}
-	.chip:hover {
-		border-color: rgba(255, 255, 255, 0.36);
-		color: var(--k-text);
-		background: var(--k-hover-fill);
-	}
-	.chip.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
-	}
-	.adv-foot {
-		display: flex;
-		align-items: center;
-		justify-content: flex-end;
-		gap: 12px;
-		padding-top: 4px;
-		border-top: 1px solid var(--k-border);
-	}
-	.ghost {
-		height: 42px;
-		padding: 0 18px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		border-radius: 8px;
-		color: var(--k-text-3);
-		font-weight: 600;
-		font-size: 13.5px;
-		cursor: pointer;
-	}
-	.primary {
-		height: 42px;
-		padding: 0 24px;
-		background: var(--k-primary);
-		border: none;
-		border-radius: 8px;
-		color: var(--k-on-primary);
-		font-weight: 700;
-		font-size: 13.5px;
 		cursor: pointer;
 	}
 </style>

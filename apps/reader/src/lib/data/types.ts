@@ -61,19 +61,6 @@ export interface Card {
 	type?: ComicType;
 }
 
-/** Genre filter chips on the Browse screen. */
-export const ALL_GENRES = [
-	'Action',
-	'Fantasy',
-	'Sci-Fi',
-	'Romance',
-	'Horror',
-	'Slice of Life',
-	'Mystery',
-	'Drama',
-	'Supernatural',
-];
-
 /** URL-safe slug for title-based series links (fallback when no id is known). */
 export function slug(title: string): string {
 	return title
@@ -116,14 +103,6 @@ export const FORMAT_CARDS = [
 		glow: 'rgba(95,200,207,0.16)',
 		hover: 'rgba(95,200,207,0.4)',
 	},
-];
-
-/** Advanced-search panel sections (SearchOverlay presentation config). */
-export const searchFilterSections = [
-	{ label: 'Sort by', options: ['Trending', 'Newest', 'Top Rated', 'Most Chapters', 'A–Z'] },
-	{ label: 'Genre', options: ALL_GENRES },
-	{ label: 'Status', options: ['Ongoing', 'Completed', 'Hiatus'] },
-	{ label: 'Minimum rating', options: ['7.0+', '8.0+', '9.0+'] },
 ];
 
 // ---- Library shelves ---------------------------------------------------------

@@ -10,6 +10,7 @@
 		type FederatedResultView,
 	} from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
+	import { backend } from '$lib/context';
 
 	let { data } = $props();
 
@@ -150,6 +151,26 @@
 
 	function retryRows() {
 		reloadKey++;
+	}
+
+	// NSFW visibility: the SERVER filters browse/search results by the viewer's
+	// persisted `show_nsfw` preference, so the toggle flips that preference (via
+	// `setShowNsfw`, shared with the profile setting) and re-fetches. Only meaningful
+	// for signed-in viewers — anonymous browsing is always safe-filtered.
+	const showNsfw = $derived(auth.user?.showNsfw ?? false);
+	let savingNsfw = $state(false);
+	async function toggleNsfw() {
+		if (!auth.user || savingNsfw || !backend.setShowNsfw) return;
+		savingNsfw = true;
+		try {
+			const next = await backend.setShowNsfw(!auth.user.showNsfw);
+			if (auth.user) auth.user.showNsfw = next;
+			reloadKey++; // re-fetch results under the new NSFW posture
+		} catch {
+			// best-effort — leave the toggle as it was
+		} finally {
+			savingNsfw = false;
+		}
 	}
 
 	// Client-side facets the server search doesn't cover (type, status), plus
@@ -357,6 +378,32 @@
 						{s === 'any' ? 'Any' : STATUS_META[s as Status].label}
 					</button>
 				{/each}
+			</div>
+		</div>
+
+		<div class="group">
+			<span class="glabel">Content</span>
+			<div class="nsfw-row">
+				<div class="nsfw-text">
+					<span class="nsfw-label">Show NSFW</span>
+					<span class="nsfw-desc">
+						{auth.user
+							? 'Include adult-rated series'
+							: 'Sign in to include adult-rated series'}
+					</span>
+				</div>
+				<button
+					type="button"
+					class="switch"
+					class:on={showNsfw}
+					role="switch"
+					aria-checked={showNsfw}
+					aria-label="Show NSFW content"
+					disabled={savingNsfw || !auth.user}
+					onclick={toggleNsfw}
+				>
+					<span class="knob"></span>
+				</button>
 			</div>
 		</div>
 
@@ -614,6 +661,63 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: 8px;
+	}
+	.nsfw-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 14px;
+	}
+	.nsfw-text {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+	}
+	.nsfw-label {
+		font-size: 13.5px;
+		font-weight: 600;
+		color: var(--k-text-1);
+	}
+	.nsfw-desc {
+		font-size: 12px;
+		color: var(--k-text-faint);
+		line-height: 1.35;
+	}
+	.switch {
+		flex: 0 0 auto;
+		width: 44px;
+		height: 26px;
+		border-radius: 999px;
+		border: 1px solid var(--k-border-4);
+		background: var(--k-border-1);
+		padding: 0;
+		cursor: pointer;
+		position: relative;
+		transition:
+			background 0.15s,
+			border-color 0.15s;
+	}
+	.switch:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.switch.on {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+	}
+	.switch .knob {
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		background: var(--k-on-primary, #fff);
+		transition: transform 0.15s;
+	}
+	.switch.on .knob {
+		transform: translateX(18px);
 	}
 	.chip {
 		display: inline-flex;

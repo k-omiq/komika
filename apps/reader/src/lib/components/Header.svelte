@@ -10,8 +10,7 @@
 
 	let {
 		searchPlaceholder = 'Search series, authors, genres…',
-		advancedSearch = true,
-	}: { searchPlaceholder?: string; advancedSearch?: boolean } = $props();
+	}: { searchPlaceholder?: string } = $props();
 
 	let searchOpen = $state(false);
 	let menuOpen = $state(false);
@@ -154,7 +153,7 @@
 	</div>
 </header>
 
-<SearchOverlay bind:open={searchOpen} placeholder={searchPlaceholder} advanced={advancedSearch} />
+<SearchOverlay bind:open={searchOpen} placeholder={searchPlaceholder} />
 
 <style>
 	header {
