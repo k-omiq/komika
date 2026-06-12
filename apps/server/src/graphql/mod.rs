@@ -1447,6 +1447,9 @@ struct CommentJoin {
     media_id: Option<String>,
     media_width: Option<i64>,
     media_height: Option<i64>,
+    likes: i64,
+    dislikes: i64,
+    my_vote: i64,
 }
 
 impl From<CommentJoin> for Comment {
@@ -1467,6 +1470,9 @@ impl From<CommentJoin> for Comment {
             media_width: c.media_width.map(|n| n as i32),
             media_height: c.media_height.map(|n| n as i32),
             created_at: c.created_at,
+            likes: c.likes as i32,
+            dislikes: c.dislikes as i32,
+            my_vote: c.my_vote as i32,
         }
     }
 }
@@ -2484,11 +2490,16 @@ impl QueryRoot {
         let target_type = validate_comment_target(&target_type)?;
         let st = state(ctx);
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // The viewer's own vote per comment is selected inline; '' (anonymous) matches
+        // no vote row, yielding my_vote = 0.
+        let viewer_id = current_user(ctx).await.map(|u| u.id).unwrap_or_default();
         // Pagination is over ROOT comments (whole threads); a page returns those
         // roots plus *all* their descendants (flat, ascending) so the client can
         // assemble the full reply tree without extra round-trips. Banned authors'
         // subtrees are pruned at every depth (the recursion re-checks `is_banned`),
         // so a banned reply never orphans the branch beneath it in the response.
+        // Like/dislike tallies and the viewer's vote are correlated subqueries so the
+        // whole thread's votes come back in this one query (no per-comment fan-out).
         let rows: Vec<CommentJoin> = sqlx::query_as(
             "WITH RECURSIVE roots AS ( \
                  SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id \
@@ -2505,7 +2516,13 @@ impl QueryRoot {
              SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, \
                     c.created_at, u.id AS author_id, u.username AS author_username, \
                     u.avatar_url AS author_avatar, \
-                    m.id AS media_id, m.width AS media_width, m.height AS media_height \
+                    m.id AS media_id, m.width AS media_width, m.height AS media_height, \
+                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
+                              WHERE v.comment_id = c.id AND v.value = 1), 0) AS likes, \
+                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
+                              WHERE v.comment_id = c.id AND v.value = -1), 0) AS dislikes, \
+                    COALESCE((SELECT v.value FROM comment_votes v \
+                              WHERE v.comment_id = c.id AND v.user_id = ?), 0) AS my_vote \
              FROM comments c JOIN users u ON u.id = c.user_id \
              LEFT JOIN comment_media m ON m.comment_id = c.id \
              WHERE c.id IN (SELECT id FROM thread) \
@@ -2515,6 +2532,7 @@ impl QueryRoot {
         .bind(target_id.0.clone())
         .bind(PAGE_SIZE)
         .bind(offset)
+        .bind(&viewer_id)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
@@ -2664,6 +2682,54 @@ impl QueryRoot {
         .await
         .map_err(gql_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// The viewer's inbound notifications, newest-first (the bell feed). Empty for
+    /// anonymous viewers. Each carries the actor, a short excerpt of the viewer's own
+    /// comment, and the thread target for deep-linking.
+    async fn notifications(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<Vec<Notification>> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(vec![]);
+        };
+        let st = state(ctx);
+        let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        let rows: Vec<NotificationRow> = sqlx::query_as(
+            "SELECT n.id, n.kind, n.count, n.created_at, n.read_at, n.target_type, \
+                    n.target_id, n.comment_id, a.id AS actor_id, a.username AS actor_username, \
+                    a.avatar_url AS actor_avatar, substr(c.body, 1, 140) AS comment_excerpt \
+             FROM notifications n \
+             LEFT JOIN users a ON a.id = n.actor_id \
+             LEFT JOIN comments c ON c.id = n.comment_id \
+             WHERE n.user_id = ? \
+             ORDER BY n.created_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(&user.id)
+        .bind(PAGE_SIZE)
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows.into_iter().map(Notification::from).collect())
+    }
+
+    /// Count of the viewer's UNREAD notifications — drives the bell badge. 0 for
+    /// anonymous viewers.
+    async fn unread_notification_count(&self, ctx: &Context<'_>) -> Result<i32> {
+        let Some(user) = current_user(ctx).await else {
+            return Ok(0);
+        };
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL",
+        )
+        .bind(&user.id)
+        .fetch_one(&state(ctx).pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(n as i32)
     }
 
     /// Admin "Sources & Extensions" console (EXT-1): every Keiyoushi/Mihon
@@ -3479,6 +3545,45 @@ impl From<ActivityRow> for Activity {
     }
 }
 
+/// Row loader for `notifications` (joined to the actor user + source comment excerpt),
+/// mapped to the `Notification` GraphQL type.
+#[derive(sqlx::FromRow)]
+struct NotificationRow {
+    id: String,
+    kind: String,
+    count: Option<i64>,
+    created_at: String,
+    read_at: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    comment_id: Option<String>,
+    actor_id: Option<String>,
+    actor_username: Option<String>,
+    actor_avatar: Option<String>,
+    comment_excerpt: Option<String>,
+}
+
+impl From<NotificationRow> for Notification {
+    fn from(r: NotificationRow) -> Self {
+        Notification {
+            id: ID(r.id),
+            kind: r.kind,
+            actor: r.actor_id.map(|id| UserRef {
+                id: ID(id),
+                username: r.actor_username.unwrap_or_default(),
+                avatar_url: r.actor_avatar,
+            }),
+            comment_id: r.comment_id.map(ID),
+            comment_excerpt: r.comment_excerpt,
+            target_type: r.target_type,
+            target_id: r.target_id.map(ID),
+            count: r.count.map(|n| n as i32),
+            created_at: r.created_at,
+            read: r.read_at.is_some(),
+        }
+    }
+}
+
 /// Reload a series (canonical `w_` work or numeric Suwayomi id) as a `Series`
 /// whose per-viewer fields (`isMarked` / `libraryStatus` / `isFavorite`) resolve
 /// against `user_id`. Shared by the library mutations to echo the updated state.
@@ -3887,6 +3992,32 @@ impl MutationRoot {
             Some(&input.target_id.0),
         )
         .await;
+        // Notify the parent comment's author that someone replied — one notification
+        // per reply, never to yourself. Fire-and-forget (must not fail the post).
+        if let Some(pid) = parent_id.as_ref() {
+            let parent_author: Option<String> =
+                sqlx::query_scalar("SELECT user_id FROM comments WHERE id = ?")
+                    .bind(pid)
+                    .fetch_optional(&st.pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if let Some(pa) = parent_author {
+                if pa != user.id {
+                    crate::notify::record(
+                        &st.pool,
+                        &pa,
+                        "reply",
+                        Some(&user.id),
+                        Some(pid),
+                        Some(target_type),
+                        Some(&input.target_id.0),
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
         let media_url = input
             .media_id
             .as_ref()
@@ -3907,7 +4038,140 @@ impl MutationRoot {
             media_width: media.map(|(w, _)| w as i32),
             media_height: media.map(|(_, h)| h as i32),
             created_at: now,
+            likes: 0,
+            dislikes: 0,
+            my_vote: 0,
         })
+    }
+
+    /// Like (1), dislike (-1), or clear (0) the viewer's vote on a comment. One vote
+    /// per (comment, viewer); re-voting replaces it. Returns the fresh tallies so the
+    /// client can update that comment without refetching the thread. A like that pushes
+    /// the comment's like count onto a milestone notifies its author (never yourself).
+    async fn vote_comment(&self, ctx: &Context<'_>, comment_id: ID, value: i32) -> Result<CommentVote> {
+        if !(-1..=1).contains(&value) {
+            return Err(Error::new("value must be -1, 0, or 1"));
+        }
+        let user = require_user(ctx).await?;
+        let st = state(ctx);
+        // Resolve the comment's author + thread (for the notification and self-check).
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, target_type, target_id FROM comments WHERE id = ?",
+        )
+        .bind(&comment_id.0)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let Some((author_id, target_type, target_id)) = row else {
+            return Err(Error::new("comment not found"));
+        };
+        let prior_likes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM comment_votes WHERE comment_id = ? AND value = 1")
+                .bind(&comment_id.0)
+                .fetch_one(&st.pool)
+                .await
+                .map_err(gql_err)?;
+
+        if value == 0 {
+            sqlx::query("DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?")
+                .bind(&comment_id.0)
+                .bind(&user.id)
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO comment_votes (comment_id, user_id, value, created_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(comment_id, user_id) DO UPDATE SET \
+                   value = excluded.value, created_at = excluded.created_at",
+            )
+            .bind(&comment_id.0)
+            .bind(&user.id)
+            .bind(value)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        }
+
+        let (likes, dislikes): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0), \
+               COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) \
+             FROM comment_votes WHERE comment_id = ?",
+        )
+        .bind(&comment_id.0)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+
+        // Milestone notification: only when a like just raised the count ONTO a
+        // milestone, for someone else's comment, and not already sent for that count.
+        if value == 1
+            && likes > prior_likes
+            && crate::notify::is_like_milestone(likes)
+            && author_id != user.id
+            && !crate::notify::like_milestone_exists(&st.pool, &comment_id.0, likes).await
+        {
+            crate::notify::record(
+                &st.pool,
+                &author_id,
+                "like_milestone",
+                None,
+                Some(&comment_id.0),
+                Some(&target_type),
+                Some(&target_id),
+                Some(likes),
+            )
+            .await;
+        }
+
+        Ok(CommentVote {
+            likes: likes as i32,
+            dislikes: dislikes as i32,
+            my_vote: value,
+        })
+    }
+
+    /// Mark the viewer's notifications read. Pass a list of ids to mark just those, or
+    /// omit/empty to mark ALL unread read (the "mark all read" action). Returns how many
+    /// rows this transition changed. Scoped to the viewer — you can only read your own.
+    async fn mark_notifications_read(&self, ctx: &Context<'_>, ids: Option<Vec<ID>>) -> Result<i32> {
+        let user = require_user(ctx).await?;
+        let st = state(ctx);
+        let now = Utc::now().to_rfc3339();
+        let affected = match ids {
+            Some(ids) if !ids.is_empty() => {
+                let mut n: u64 = 0;
+                let mut tx = st.pool.begin().await.map_err(gql_err)?;
+                for id in ids {
+                    let r = sqlx::query(
+                        "UPDATE notifications SET read_at = ? \
+                         WHERE id = ? AND user_id = ? AND read_at IS NULL",
+                    )
+                    .bind(&now)
+                    .bind(&id.0)
+                    .bind(&user.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+                    n += r.rows_affected();
+                }
+                tx.commit().await.map_err(gql_err)?;
+                n
+            }
+            _ => sqlx::query(
+                "UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&user.id)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?
+            .rows_affected(),
+        };
+        Ok(affected as i32)
     }
 
     async fn login(
@@ -6008,6 +6272,91 @@ mod tests {
         assert_eq!(
             items[1]["updatedAt"],
             serde_json::json!("2026-07-01T00:00:00+00:00")
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_votes_and_notifications_flow() {
+        let (s, _pool) = setup_full(100).await;
+        // admin posts a root comment on series "s1".
+        let r = exec(
+            &s,
+            r#"mutation { postComment(input: { targetType: "series", targetId: "s1", body: "hi", hasSpoiler: false }) { id likes myVote } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "postComment: {:?}", r.errors);
+        let cid = r.data.into_json().unwrap()["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // bob replies -> admin gets a 'reply' notification.
+        let reply = format!(
+            r#"mutation {{ postComment(input: {{ targetType: "series", targetId: "s1", parentId: "{cid}", body: "yo", hasSpoiler: false }}) {{ id }} }}"#
+        );
+        let r = exec(&s, &reply, Some("bobtok"), "2.2.2.2").await;
+        assert!(r.errors.is_empty(), "reply: {:?}", r.errors);
+
+        // bob likes admin's comment -> tally = 1 like, and admin gets a 'like_milestone'.
+        let vote =
+            format!(r#"mutation {{ voteComment(commentId: "{cid}", value: 1) {{ likes dislikes myVote }} }}"#);
+        let r = exec(&s, &vote, Some("bobtok"), "2.2.2.2").await;
+        assert!(r.errors.is_empty(), "vote: {:?}", r.errors);
+        let v = r.data.into_json().unwrap()["voteComment"].clone();
+        assert_eq!(v["likes"], serde_json::json!(1));
+        assert_eq!(v["myVote"], serde_json::json!(1));
+
+        // admin sees 2 unread notifications (reply + like_milestone).
+        let r = exec(
+            &s,
+            r#"{ unreadNotificationCount notifications { kind count actor { username } commentExcerpt } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["unreadNotificationCount"], serde_json::json!(2));
+        let notifs = d["notifications"].as_array().unwrap();
+        let kinds: Vec<&str> = notifs.iter().map(|n| n["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"reply") && kinds.contains(&"like_milestone"));
+        // The reply notification names the actor; the milestone carries the count.
+        let reply_n = notifs.iter().find(|n| n["kind"] == "reply").unwrap();
+        assert_eq!(reply_n["actor"]["username"], serde_json::json!("bob"));
+        let ms = notifs.iter().find(|n| n["kind"] == "like_milestone").unwrap();
+        assert_eq!(ms["count"], serde_json::json!(1));
+
+        // The comments query shows the like tally; bob (the liker) sees myVote = 1.
+        let r = exec(
+            &s,
+            r#"{ comments(targetType: "series", targetId: "s1") { items { id likes myVote } } }"#,
+            Some("bobtok"),
+            "2.2.2.2",
+        )
+        .await;
+        let items = r.data.into_json().unwrap()["comments"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let root = items.iter().find(|c| c["id"] == serde_json::json!(cid)).unwrap();
+        assert_eq!(root["likes"], serde_json::json!(1));
+        assert_eq!(root["myVote"], serde_json::json!(1));
+
+        // admin marks all read -> 0 unread.
+        let r = exec(&s, r#"mutation { markNotificationsRead }"#, Some("admintok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "markRead: {:?}", r.errors);
+        let r = exec(&s, r#"{ unreadNotificationCount }"#, Some("admintok"), "1.1.1.1").await;
+        assert_eq!(
+            r.data.into_json().unwrap()["unreadNotificationCount"],
+            serde_json::json!(0)
+        );
+
+        // bob (the replier/liker) is never notified of his own actions.
+        let r = exec(&s, r#"{ unreadNotificationCount }"#, Some("bobtok"), "2.2.2.2").await;
+        assert_eq!(
+            r.data.into_json().unwrap()["unreadNotificationCount"],
+            serde_json::json!(0)
         );
     }
 

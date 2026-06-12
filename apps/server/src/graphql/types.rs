@@ -277,6 +277,40 @@ pub struct Comment {
     pub media_width: Option<i32>,
     pub media_height: Option<i32>,
     pub created_at: String,
+    /// Like / dislike tallies for this comment, and the viewer's own vote (1 like,
+    /// -1 dislike, 0 none). Populated by the `comments` query; 0 on a freshly posted one.
+    pub likes: i32,
+    pub dislikes: i32,
+    pub my_vote: i32,
+}
+
+/// The result of `voteComment`: the comment's fresh tallies + the viewer's vote, so the
+/// client updates that comment's counts without refetching the whole thread.
+#[derive(SimpleObject, Clone, Copy)]
+pub struct CommentVote {
+    pub likes: i32,
+    pub dislikes: i32,
+    pub my_vote: i32,
+}
+
+/// One inbound notification for the viewer (the bell feed). `actor` is the user who
+/// triggered it (a replier); null for an aggregate `like_milestone`. `commentExcerpt`
+/// is a short snippet of the viewer's own comment the event is about; `targetType`/
+/// `targetId` deep-link to its thread.
+#[derive(SimpleObject, Clone)]
+pub struct Notification {
+    pub id: ID,
+    /// `'reply'` | `'like_milestone'`.
+    pub kind: String,
+    pub actor: Option<UserRef>,
+    pub comment_id: Option<ID>,
+    pub comment_excerpt: Option<String>,
+    pub target_type: Option<String>,
+    pub target_id: Option<ID>,
+    /// Milestone value for `like_milestone` (e.g. 10 = "reached 10 likes").
+    pub count: Option<i32>,
+    pub created_at: String,
+    pub read: bool,
 }
 
 #[derive(SimpleObject, Clone)]

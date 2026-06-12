@@ -7,6 +7,7 @@ import type {
 	ComicType,
 	Comment,
 	CommentTargetType,
+	CommentVote,
 	DiscoveryFeed,
 	ExtensionInfo,
 	FederatedSearchPage,
@@ -16,6 +17,7 @@ import type {
 	MatchResult,
 	MergeCandidate,
 	MergeWorksResult,
+	Notification,
 	Page,
 	Paginated,
 	Review,
@@ -183,6 +185,19 @@ export interface Backend {
 	 *  as budgeted WebP and stages it (unlinked); pass the returned `mediaId` to
 	 *  {@link postComment} to attach it. Optional: only the unified Komika API implements it. */
 	uploadCommentMedia?(file: Blob): Promise<CommentMediaUpload>;
+	/** Like (1), dislike (-1), or clear (0) the viewer's vote on a comment; returns the
+	 *  fresh tallies. Optional: only the unified Komika API implements it. */
+	voteComment?(commentId: Id, value: number): Promise<CommentVote>;
+
+	// --- notifications (inbound bell feed) ---
+	/** The viewer's notifications, newest-first. Optional: only the unified Komika API
+	 *  implements it (others have no social backend). */
+	notifications?(page?: number): Promise<Notification[]>;
+	/** Count of the viewer's UNREAD notifications (drives the bell badge). Optional. */
+	unreadNotificationCount?(): Promise<number>;
+	/** Mark notifications read: pass ids for a subset, or omit to mark ALL read. Returns
+	 *  how many rows changed. Optional. */
+	markNotificationsRead?(ids?: Id[]): Promise<number>;
 
 	// --- admin "manga DB" (requires an admin session) ---
 	/** Upsert per-series admin overrides (scan cadence, pause, status). Optional:

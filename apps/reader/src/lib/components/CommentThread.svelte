@@ -11,6 +11,7 @@
 		canModerate,
 		deleteComment,
 		banCommenter,
+		voteOnComment,
 		type CommentView,
 		type CommentOpts,
 		type PendingMedia,
@@ -218,6 +219,22 @@
 			modError = err instanceof Error ? err.message : 'Could not delete the comment.';
 		}
 	}
+	// Like (1) / dislike (-1) a comment; clicking your current vote clears it. Optimistic
+	// via the returned list; a failure surfaces in `modError`.
+	let voting = $state<string | null>(null);
+	async function vote(c: CommentView, value: number) {
+		if (needsAuth || voting) return;
+		const next = c.myVote === value ? 0 : value;
+		voting = c.id;
+		modError = null;
+		try {
+			comments = await voteOnComment(c.id, next, comments);
+		} catch (err) {
+			modError = err instanceof Error ? err.message : 'Could not register your vote.';
+		} finally {
+			voting = null;
+		}
+	}
 	async function banAuthor(c: CommentView) {
 		modError = null;
 		if (!confirm(`Ban ${c.name}? They won't be able to sign in.`)) return;
@@ -349,6 +366,28 @@
 				{/if}
 			{/if}
 			<div class="c-actions">
+				<button
+					class="act vote"
+					class:on={c.myVote === 1}
+					disabled={needsAuth || voting === c.id}
+					aria-pressed={c.myVote === 1}
+					title="Like"
+					onclick={() => vote(c, 1)}
+				>
+					<Icon name="thumbs-up" size={14} fill={c.myVote === 1 ? 'currentColor' : 'none'} />{c.likes ||
+						''}
+				</button>
+				<button
+					class="act vote"
+					class:on={c.myVote === -1}
+					disabled={needsAuth || voting === c.id}
+					aria-pressed={c.myVote === -1}
+					title="Dislike"
+					onclick={() => vote(c, -1)}
+				>
+					<Icon name="thumbs-down" size={14} fill={c.myVote === -1 ? 'currentColor' : 'none'} />{c.dislikes ||
+						''}
+				</button>
 				{#if !needsAuth}
 					<button
 						class="act"
@@ -724,6 +763,19 @@
 	}
 	.c-actions .act:hover {
 		color: var(--k-primary);
+	}
+	.c-actions .act:disabled {
+		cursor: default;
+	}
+	.c-actions .act:disabled:hover {
+		color: var(--k-text-faint);
+	}
+	/* The viewer's active vote: like tints primary, dislike tints danger. */
+	.c-actions .act.vote.on {
+		color: var(--k-primary);
+	}
+	.c-actions .act.vote:nth-of-type(2).on {
+		color: var(--k-danger, #e08a8a);
 	}
 	.mod {
 		color: var(--k-text-dimmer);

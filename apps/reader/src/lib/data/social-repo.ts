@@ -69,8 +69,10 @@ export interface CommentView {
 	mediaHeight?: number | null;
 	isOp: boolean;
 	mine: boolean;
+	/** Like/dislike tallies + the viewer's own vote (1 like, -1 dislike, 0 none). */
 	likes: number;
-	liked: boolean;
+	dislikes: number;
+	myVote: number;
 }
 
 /** Result of staging a comment image, ready to attach to the next posted comment. */
@@ -163,8 +165,9 @@ function commentToView(c: Comment): CommentView {
 		mediaHeight: c.mediaHeight,
 		isOp: false,
 		mine: !!auth.user && c.author.id === auth.user.id,
-		likes: 0,
-		liked: false,
+		likes: c.likes,
+		dislikes: c.dislikes,
+		myVote: c.myVote,
 	};
 }
 
@@ -320,7 +323,8 @@ async function loadComments(
 		isOp: c.isOp,
 		mine: false,
 		likes: c.likes,
-		liked: c.liked,
+		dislikes: 0,
+		myVote: c.liked ? 1 : 0,
 	}));
 }
 
@@ -380,7 +384,8 @@ async function submitComment(
 			isOp: false,
 			mine: true,
 			likes: 0,
-			liked: false,
+			dislikes: 0,
+			myVote: 0,
 		},
 	];
 	// The localStorage fallback shape is flat and doesn't model replies/media;
@@ -401,7 +406,7 @@ async function submitComment(
 				isOp: c.isOp,
 				hasSpoiler: c.hasSpoiler,
 				likes: c.likes,
-				liked: c.liked,
+				liked: c.myVote === 1,
 				replies: 0,
 				body: c.body,
 			})),
@@ -514,6 +519,26 @@ export async function deleteComment(
 		}
 	}
 	return current.filter((c) => !doomed.has(c.id));
+}
+
+/**
+ * Like (1), dislike (-1), or clear (0) the viewer's vote on a comment, applying the
+ * fresh tallies to the given list (returns a new array). Requires the live backend +
+ * sign-in; throws otherwise so the caller can surface a prompt.
+ */
+export async function voteOnComment(
+	commentId: string,
+	value: number,
+	current: CommentView[],
+): Promise<CommentView[]> {
+	if (!socialLive() || !backend.voteComment) {
+		throw new Error('Voting requires the Komiq backend.');
+	}
+	if (!auth.user) throw new Error('You must be signed in to vote.');
+	const v = await backend.voteComment(commentId, value);
+	return current.map((c) =>
+		c.id === commentId ? { ...c, likes: v.likes, dislikes: v.dislikes, myVote: v.myVote } : c,
+	);
 }
 
 /**

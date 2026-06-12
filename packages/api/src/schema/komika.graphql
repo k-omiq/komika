@@ -48,6 +48,8 @@ type Query {
 	# auth
 	session: Session # [komika] current session or null
 	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
+	notifications(page: Int = 1): [Notification!]! # [komika] the viewer's inbound bell feed, newest-first (empty when signed out)
+	unreadNotificationCount: Int! # [komika] unread count for the bell badge (0 when signed out)
 	# ops / admin (all require isAdmin)
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
@@ -69,6 +71,8 @@ type Mutation {
 	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth, counts everyone; the popularity signal behind Trending
 	postReview(input: PostReviewInput!): Review! # [komika]
 	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
+	voteComment(commentId: ID!, value: Int!): CommentVote! # [komika] like (1) / dislike (-1) / clear (0) a comment
+	markNotificationsRead(ids: [ID!]): Int! # [komika] mark given (or all, if omitted) notifications read; returns count changed
 	login(username: String!, password: String!): Session! # [komika]
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
@@ -277,6 +281,31 @@ type Comment {
 	mediaWidth: Int # [komika] attached image dimensions (reserve layout space)
 	mediaHeight: Int
 	createdAt: String!
+	likes: Int! # [komika] like tally
+	dislikes: Int! # [komika] dislike tally
+	myVote: Int! # [komika] the viewer's own vote: 1 like, -1 dislike, 0 none
+}
+
+# [komika] Result of voteComment — a comment's fresh tallies + the viewer's vote.
+type CommentVote {
+	likes: Int!
+	dislikes: Int!
+	myVote: Int!
+}
+
+# [komika] One inbound notification (the bell feed). `actor` is null for an aggregate
+# like_milestone; `commentExcerpt` snippets the viewer's own comment; target* deep-links.
+type Notification {
+	id: ID!
+	kind: String! # 'reply' | 'like_milestone'
+	actor: UserRef
+	commentId: ID
+	commentExcerpt: String
+	targetType: String
+	targetId: ID
+	count: Int # milestone value for like_milestone
+	createdAt: String!
+	read: Boolean!
 }
 
 type Session {

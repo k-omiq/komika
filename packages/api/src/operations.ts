@@ -368,6 +368,9 @@ export const COMMENTS = /* GraphQL */ `
 				mediaWidth
 				mediaHeight
 				createdAt
+				likes
+				dislikes
+				myVote
 			}
 			page
 			hasNextPage
@@ -393,7 +396,55 @@ export const POST_COMMENT = /* GraphQL */ `
 			mediaWidth
 			mediaHeight
 			createdAt
+			likes
+			dislikes
+			myVote
 		}
+	}
+`;
+
+// Like (1), dislike (-1), or clear (0) a comment; returns the fresh tallies.
+export const VOTE_COMMENT = /* GraphQL */ `
+	mutation VoteComment($commentId: ID!, $value: Int!) {
+		voteComment(commentId: $commentId, value: $value) {
+			likes
+			dislikes
+			myVote
+		}
+	}
+`;
+
+// ---- notifications ---------------------------------------------------------
+
+export const NOTIFICATIONS = /* GraphQL */ `
+	${USER_REF}
+	query Notifications($page: Int) {
+		notifications(page: $page) {
+			id
+			kind
+			actor {
+				...UserRefFields
+			}
+			commentId
+			commentExcerpt
+			targetType
+			targetId
+			count
+			createdAt
+			read
+		}
+	}
+`;
+
+export const UNREAD_NOTIFICATION_COUNT = /* GraphQL */ `
+	query UnreadNotificationCount {
+		unreadNotificationCount
+	}
+`;
+
+export const MARK_NOTIFICATIONS_READ = /* GraphQL */ `
+	mutation MarkNotificationsRead($ids: [ID!]) {
+		markNotificationsRead(ids: $ids)
 	}
 `;
 

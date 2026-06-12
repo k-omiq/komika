@@ -7,6 +7,7 @@
 	import Icon from './Icon.svelte';
 	import Avatar from './Avatar.svelte';
 	import SearchOverlay from './SearchOverlay.svelte';
+	import NotificationBell from './NotificationBell.svelte';
 
 	let {
 		searchPlaceholder = 'Search series, authors, genres…',
@@ -118,6 +119,7 @@
 		{#if !auth.ready && !auth.user}
 			<div class="avatar skeleton" aria-hidden="true"></div>
 		{:else if auth.user}
+			<NotificationBell />
 			<div class="account">
 				<button
 					class="avatar"

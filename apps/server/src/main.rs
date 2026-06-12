@@ -9,6 +9,7 @@ mod graphql;
 mod ingest;
 mod mangadex;
 mod media;
+mod notify;
 mod phash;
 mod scanner;
 mod series_cache;

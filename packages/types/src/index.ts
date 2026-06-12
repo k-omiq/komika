@@ -557,6 +557,36 @@ export interface Comment {
 	mediaWidth: number | null;
 	mediaHeight: number | null;
 	createdAt: string;
+	/** Like / dislike tallies, and the viewer's own vote: 1 (like), -1 (dislike),
+	 *  0 (none). */
+	likes: number;
+	dislikes: number;
+	myVote: number;
+}
+
+/** The result of `voteComment`: a comment's fresh vote tallies + the viewer's vote. */
+export interface CommentVote {
+	likes: number;
+	dislikes: number;
+	myVote: number;
+}
+
+/** One inbound notification (the bell feed). `actor` is the triggering user (a
+ *  replier); null for an aggregate `like_milestone`. `targetType`/`targetId` deep-link
+ *  to the thread; `commentExcerpt` is a snippet of the viewer's own comment. */
+export interface Notification {
+	id: Id;
+	/** `'reply'` | `'like_milestone'`. */
+	kind: string;
+	actor: UserRef | null;
+	commentId: Id | null;
+	commentExcerpt: string | null;
+	targetType: string | null;
+	targetId: Id | null;
+	/** Milestone value for `like_milestone` (e.g. 10 = "reached 10 likes"). */
+	count: number | null;
+	createdAt: string;
+	read: boolean;
 }
 
 // ---- Discovery ---------------------------------------------------------------

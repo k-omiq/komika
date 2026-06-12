@@ -5,6 +5,8 @@ import type {
 	CanonicalUpdate,
 	Chapter,
 	Comment,
+	CommentVote,
+	Notification,
 	CommentTargetType,
 	DiscoveryFeed,
 	ExtensionInfo,
@@ -233,6 +235,27 @@ export class GraphQLBackend implements Backend {
 	async postComment(input: PostCommentInput): Promise<Comment> {
 		const d = await this.gql<{ postComment: Comment }>(ops.POST_COMMENT, { input });
 		return d.postComment;
+	}
+
+	async voteComment(commentId: Id, value: number): Promise<CommentVote> {
+		const d = await this.gql<{ voteComment: CommentVote }>(ops.VOTE_COMMENT, { commentId, value });
+		return d.voteComment;
+	}
+
+	// --- notifications ---
+	async notifications(page = 1): Promise<Notification[]> {
+		const d = await this.gql<{ notifications: Notification[] }>(ops.NOTIFICATIONS, { page });
+		return d.notifications;
+	}
+	async unreadNotificationCount(): Promise<number> {
+		const d = await this.gql<{ unreadNotificationCount: number }>(ops.UNREAD_NOTIFICATION_COUNT, {});
+		return d.unreadNotificationCount;
+	}
+	async markNotificationsRead(ids?: Id[]): Promise<number> {
+		const d = await this.gql<{ markNotificationsRead: number }>(ops.MARK_NOTIFICATIONS_READ, {
+			ids: ids ?? null,
+		});
+		return d.markNotificationsRead;
 	}
 
 	// --- admin ---

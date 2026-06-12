@@ -5,6 +5,8 @@ import type {
 	CanonicalUpdate,
 	Chapter,
 	Comment,
+	CommentVote,
+	Notification,
 	CommentTargetType,
 	DiscoveryFeed,
 	ExtensionInfo,
@@ -445,6 +447,18 @@ export class CompositeBackend implements Backend {
 	}
 	uploadCommentMedia(file: Blob): Promise<CommentMediaUpload> {
 		return this.opts.hosted.uploadCommentMedia!(file);
+	}
+	voteComment(commentId: Id, value: number): Promise<CommentVote> {
+		return this.opts.hosted.voteComment!(commentId, value);
+	}
+	notifications(page?: number): Promise<Notification[]> {
+		return this.opts.hosted.notifications!(page);
+	}
+	unreadNotificationCount(): Promise<number> {
+		return this.opts.hosted.unreadNotificationCount!();
+	}
+	markNotificationsRead(ids?: Id[]): Promise<number> {
+		return this.opts.hosted.markNotificationsRead!(ids);
 	}
 
 	// --- admin "manga DB" ---
