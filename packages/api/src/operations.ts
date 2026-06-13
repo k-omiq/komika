@@ -429,6 +429,7 @@ export const NOTIFICATIONS = /* GraphQL */ `
 			commentExcerpt
 			targetType
 			targetId
+			seriesId
 			count
 			createdAt
 			read

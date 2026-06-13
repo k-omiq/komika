@@ -2697,9 +2697,24 @@ impl QueryRoot {
         };
         let st = state(ctx);
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // For a `chapter`-target notification, resolve the OWNING series id so the
+        // client can deep-link to the reader (`/read/<seriesId>?ch=<targetId>`): a
+        // numeric id maps via `suwayomi_chapter.manga_id`, a MangaDex uuid via its
+        // `source_series.work_id`. The `NOT GLOB '*[^0-9]*'` guard keeps a uuid that
+        // happens to start with a digit out of the numeric branch. Null for `series`
+        // targets (targetId already is the series) and unresolvable chapters.
         let rows: Vec<NotificationRow> = sqlx::query_as(
             "SELECT n.id, n.kind, n.count, n.created_at, n.read_at, n.target_type, \
-                    n.target_id, n.comment_id, a.id AS actor_id, a.username AS actor_username, \
+                    n.target_id, \
+                    CASE WHEN n.target_type = 'chapter' THEN COALESCE( \
+                        (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc \
+                         WHERE n.target_id <> '' AND n.target_id NOT GLOB '*[^0-9]*' \
+                           AND sc.id = CAST(n.target_id AS INTEGER)), \
+                        (SELECT ss.work_id FROM chapter ch \
+                         JOIN source_series ss ON ss.id = ch.source_series_id \
+                         WHERE ch.external_id = n.target_id AND ss.source_type = 'mangadex') \
+                    ) END AS series_id, \
+                    n.comment_id, a.id AS actor_id, a.username AS actor_username, \
                     a.avatar_url AS actor_avatar, substr(c.body, 1, 140) AS comment_excerpt \
              FROM notifications n \
              LEFT JOIN users a ON a.id = n.actor_id \
@@ -3556,6 +3571,7 @@ struct NotificationRow {
     read_at: Option<String>,
     target_type: Option<String>,
     target_id: Option<String>,
+    series_id: Option<String>,
     comment_id: Option<String>,
     actor_id: Option<String>,
     actor_username: Option<String>,
@@ -3577,6 +3593,7 @@ impl From<NotificationRow> for Notification {
             comment_excerpt: r.comment_excerpt,
             target_type: r.target_type,
             target_id: r.target_id.map(ID),
+            series_id: r.series_id.map(ID),
             count: r.count.map(|n| n as i32),
             created_at: r.created_at,
             read: r.read_at.is_some(),
@@ -6358,6 +6375,54 @@ mod tests {
             r.data.into_json().unwrap()["unreadNotificationCount"],
             serde_json::json!(0)
         );
+    }
+
+    #[tokio::test]
+    async fn chapter_comment_notification_resolves_owning_series() {
+        // A reply on a CHAPTER thread notifies with the owning series id resolved, so
+        // the client can deep-link to `/read/<seriesId>?ch=<chapterId>`.
+        let (s, pool) = setup_full(100).await;
+        // A numeric Suwayomi chapter 9001 belonging to series 500.
+        sqlx::query(
+            "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
+             VALUES (9001, 500, 'Ch 1', 1, 10, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // admin comments on the chapter thread; bob replies.
+        let r = exec(
+            &s,
+            r#"mutation { postComment(input: { targetType: "chapter", targetId: "9001", body: "root", hasSpoiler: false }) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "postComment: {:?}", r.errors);
+        let cid = r.data.into_json().unwrap()["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reply = format!(
+            r#"mutation {{ postComment(input: {{ targetType: "chapter", targetId: "9001", parentId: "{cid}", body: "re", hasSpoiler: false }}) {{ id }} }}"#
+        );
+        let r = exec(&s, &reply, Some("bobtok"), "2.2.2.2").await;
+        assert!(r.errors.is_empty(), "reply: {:?}", r.errors);
+
+        // admin's notification carries targetType=chapter, targetId=9001, seriesId=500.
+        let r = exec(
+            &s,
+            r#"{ notifications { kind targetType targetId seriesId } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let n = r.data.into_json().unwrap()["notifications"][0].clone();
+        assert_eq!(n["kind"], serde_json::json!("reply"));
+        assert_eq!(n["targetType"], serde_json::json!("chapter"));
+        assert_eq!(n["targetId"], serde_json::json!("9001"));
+        assert_eq!(n["seriesId"], serde_json::json!("500"));
     }
 
     #[tokio::test]

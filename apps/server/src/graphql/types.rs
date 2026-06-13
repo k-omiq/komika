@@ -307,6 +307,10 @@ pub struct Notification {
     pub comment_excerpt: Option<String>,
     pub target_type: Option<String>,
     pub target_id: Option<ID>,
+    /// The owning series id for deep-linking a `chapter`-target notification to the
+    /// reader (`/read/<seriesId>?ch=<targetId>`). Null for `series` targets — there
+    /// `targetId` already IS the series — and when the chapter can't be resolved.
+    pub series_id: Option<ID>,
     /// Milestone value for `like_milestone` (e.g. 10 = "reached 10 likes").
     pub count: Option<i32>,
     pub created_at: String,

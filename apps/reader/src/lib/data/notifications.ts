@@ -53,10 +53,14 @@ function messageFor(n: Notification): string {
 	return 'New activity on your comment';
 }
 
-/** Deep-link to the thread. Series discussions route cleanly; a chapter thread needs a
- *  series slug we don't carry, so it's left non-navigating (null). */
+/** Deep-link to the thread: a series discussion opens the series page; a chapter thread
+ *  opens the reader at that chapter (the server resolves the owning `seriesId`). Null
+ *  when it can't be resolved (non-navigating). */
 function hrefFor(n: Notification): string | null {
 	if (n.targetType === 'series' && n.targetId) return `/series/${n.targetId}`;
+	if (n.targetType === 'chapter' && n.seriesId && n.targetId) {
+		return `/read/${n.seriesId}?ch=${n.targetId}`;
+	}
 	return null;
 }
 

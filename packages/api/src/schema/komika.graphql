@@ -303,6 +303,7 @@ type Notification {
 	commentExcerpt: String
 	targetType: String
 	targetId: ID
+	seriesId: ID # [komika] owning series for a chapter target — deep-links to /read/<seriesId>?ch=<targetId>
 	count: Int # milestone value for like_milestone
 	createdAt: String!
 	read: Boolean!

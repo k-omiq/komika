@@ -583,6 +583,10 @@ export interface Notification {
 	commentExcerpt: string | null;
 	targetType: string | null;
 	targetId: Id | null;
+	/** Owning series for a `chapter`-target notification, for deep-linking to the
+	 *  reader (`/read/<seriesId>?ch=<targetId>`); null for `series` targets and
+	 *  unresolvable chapters. */
+	seriesId: Id | null;
 	/** Milestone value for `like_milestone` (e.g. 10 = "reached 10 likes"). */
 	count: number | null;
 	createdAt: string;
