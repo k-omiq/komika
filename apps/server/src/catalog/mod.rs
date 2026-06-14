@@ -1242,18 +1242,19 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
 /// So Tsukimichi — 117 whole chapters carried as 151 scanlator-duplicated rows plus 4
 /// ".5" extras — reports 117, while a split-numbered series like "Villainess Level 99"
 /// (…9.1, 9.2, 10.1…) still reports its ~22 real chapters rather than the 12 whole
-/// numbers that happen to appear. Numbers below 1 (a "chapter 0" prologue, a 0.5 teaser)
-/// and non-finite sentinels aren't main chapters; a source with no such numbers at all
-/// falls back to its raw row count so it never collapses to zero.
+/// numbers that happen to appear. A real "Chapter 0 / Episode 0" first chapter IS
+/// counted (common in webtoons/manhwa) by grouping on the floor and keeping group 0;
+/// only NEGATIVE / non-finite sentinels are dropped. A source with no non-negative
+/// numbers at all falls back to its raw row count so it never collapses to zero.
 pub fn main_chapter_count<I: IntoIterator<Item = f64>>(numbers: I) -> i64 {
     use std::collections::HashSet;
     let mut groups: HashSet<i64> = HashSet::new();
     let mut total: i64 = 0;
     for n in numbers {
         total += 1;
-        // Non-finite/sentinel rows and sub-1 prologue/teaser numbers aren't main
-        // chapters (but still count toward the raw-row fallback below).
-        if !n.is_finite() || n < 1.0 {
+        // Non-finite/sentinel and negative rows aren't chapters (but still count toward
+        // the raw-row fallback below). A "chapter 0" is real content, so it's kept.
+        if !n.is_finite() || n < 0.0 {
             continue;
         }
         groups.insert(n.floor() as i64);
@@ -2044,13 +2045,18 @@ mod tests {
         // Here chapters 1,2, then 3.1/3.2, 4.1/4.2 → 4 chapters (1,2,3,4), not 2.
         assert_eq!(main_chapter_count([1.0, 2.0, 3.1, 3.2, 4.1, 4.2]), 4);
 
-        // Sub-1 prologue/teaser (0, 0.5) and non-finite sentinels aren't main chapters.
-        assert_eq!(main_chapter_count([0.0, 0.5, 1.0, 2.0, f64::NAN]), 2);
+        // A real "Chapter 0" first chapter is counted (webtoon/manhwa episode 0): chapters
+        // 0,1,2 → 3, and a 0.5 teaser folds into group 0 (still one chapter there).
+        assert_eq!(main_chapter_count([0.0, 0.5, 1.0, 2.0, f64::NAN]), 3);
+        assert_eq!(main_chapter_count([0.5, 0.9]), 1);
 
-        // Fallback: no main-chapter numbers at all → raw row count (never zero-out a
+        // Negatives / non-finite are sentinels, never chapters.
+        assert_eq!(main_chapter_count([-1.0, -5.0, 1.0, 2.0]), 2);
+
+        // Fallback: no non-negative numbers at all → raw row count (never zero-out a
         // series that genuinely has chapters).
         assert_eq!(main_chapter_count([f64::NAN, f64::NAN, f64::NAN]), 3);
-        assert_eq!(main_chapter_count([0.5, 0.9]), 2);
+        assert_eq!(main_chapter_count([-1.0, -2.0]), 2);
     }
 
     #[tokio::test]

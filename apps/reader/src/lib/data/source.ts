@@ -621,8 +621,11 @@ export function getHome() {
 		return {
 			featured,
 			latestUpdates,
-			trending: byKind('TRENDING').map(toCard).slice(0, 10),
-			latestAdded: byKind('RECENTLY_ADDED').map(toAddedCard).slice(0, 10),
+			// Dedup by title (like latestUpdates): the catalogue carries same-title rows
+			// (per-language sources, and a series under both its numeric + `w_` identity),
+			// which would collide on the home row's `{#each}` key and could show twice.
+			trending: dedupeCardsByTitle(byKind('TRENDING').map(toCard)).slice(0, 10),
+			latestAdded: dedupeCardsByTitle(byKind('RECENTLY_ADDED').map(toAddedCard)).slice(0, 10),
 			formatCards: pool.length ? deriveFormatCards(pool) : FORMAT_CARDS,
 			homeGenres: deriveGenres(pool),
 		};

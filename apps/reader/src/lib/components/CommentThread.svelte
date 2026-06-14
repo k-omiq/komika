@@ -61,6 +61,9 @@
 	let replyFileInput = $state<HTMLInputElement | null>(null);
 
 	const needsAuth = $derived(socialLive() && !auth.user);
+	// Voting needs the live backend AND a signed-in user; on a Suwayomi/mock deployment
+	// (no social layer) the buttons show counts but stay disabled rather than erroring.
+	const canVote = $derived(socialLive() && !!auth.user);
 	const canMod = $derived(canModerate());
 
 	// Reply tree, derived from the flat list. Roots (top-level, plus any orphan whose
@@ -223,7 +226,7 @@
 	// via the returned list; a failure surfaces in `modError`.
 	let voting = $state<string | null>(null);
 	async function vote(c: CommentView, value: number) {
-		if (needsAuth || voting) return;
+		if (!canVote || voting) return;
 		const next = c.myVote === value ? 0 : value;
 		voting = c.id;
 		modError = null;
@@ -369,24 +372,22 @@
 				<button
 					class="act vote"
 					class:on={c.myVote === 1}
-					disabled={needsAuth || voting === c.id}
+					disabled={!canVote || voting === c.id}
 					aria-pressed={c.myVote === 1}
 					title="Like"
 					onclick={() => vote(c, 1)}
 				>
-					<Icon name="thumbs-up" size={14} fill={c.myVote === 1 ? 'currentColor' : 'none'} />{c.likes ||
-						''}
+					<Icon name="thumbs-up" size={14} />{c.likes || ''}
 				</button>
 				<button
 					class="act vote"
 					class:on={c.myVote === -1}
-					disabled={needsAuth || voting === c.id}
+					disabled={!canVote || voting === c.id}
 					aria-pressed={c.myVote === -1}
 					title="Dislike"
 					onclick={() => vote(c, -1)}
 				>
-					<Icon name="thumbs-down" size={14} fill={c.myVote === -1 ? 'currentColor' : 'none'} />{c.dislikes ||
-						''}
+					<Icon name="thumbs-down" size={14} />{c.dislikes || ''}
 				</button>
 				{#if !needsAuth}
 					<button

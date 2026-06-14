@@ -295,8 +295,9 @@ pub struct CommentVote {
 
 /// One inbound notification for the viewer (the bell feed). `actor` is the user who
 /// triggered it (a replier); null for an aggregate `like_milestone`. `commentExcerpt`
-/// is a short snippet of the viewer's own comment the event is about; `targetType`/
-/// `targetId` deep-link to its thread.
+/// is a short snippet of the referenced comment — the REPLY's text for a `reply`, the
+/// viewer's own comment for a `like_milestone`; `targetType`/`targetId` deep-link to
+/// the thread.
 #[derive(SimpleObject, Clone)]
 pub struct Notification {
     pub id: ID,

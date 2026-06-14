@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { auth } from '$lib/auth.svelte';
 	import Icon from './Icon.svelte';
 	import Avatar from './Avatar.svelte';
 	import {
@@ -14,7 +14,17 @@
 	let unread = $state(0);
 	let loading = $state(false);
 
-	onMount(() => {
+	// Refresh the unread badge on first mount AND whenever the signed-in user changes —
+	// login/logout are reactive here (no full reload), so an onMount-only fetch would
+	// leave the badge stuck. Signing out closes the panel and clears state.
+	$effect(() => {
+		const uid = auth.user?.id;
+		if (!uid) {
+			open = false;
+			items = [];
+			unread = 0;
+			return;
+		}
 		void refreshCount();
 	});
 
@@ -63,7 +73,7 @@
 	<button
 		class="icon-btn"
 		class:on={open}
-		aria-label="Notifications"
+		aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
 		aria-haspopup="menu"
 		aria-expanded={open}
 		title="Notifications"
@@ -92,11 +102,19 @@
 					{#each items as n (n.id)}
 						<li>
 							{#if n.href}
-								<a class="n-item" class:unread={!n.read} href={n.href} onclick={close}>
+								<a
+									class="n-item"
+									class:unread={!n.read}
+									role="menuitem"
+									href={n.href}
+									onclick={close}
+								>
 									{@render body(n)}
 								</a>
 							{:else}
-								<div class="n-item static" class:unread={!n.read}>{@render body(n)}</div>
+								<div class="n-item static" class:unread={!n.read} role="menuitem">
+									{@render body(n)}
+								</div>
 							{/if}
 						</li>
 					{/each}

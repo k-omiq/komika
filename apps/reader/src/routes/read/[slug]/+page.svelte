@@ -56,7 +56,9 @@
 	let lastViewedChapter = '';
 	$effect(() => {
 		const key = chKey;
-		if (!data.seriesId || key === lastViewedChapter) return;
+		// Only count a view when the chapter actually rendered pages — an empty/broken
+		// ("No pages available") reader state must not inflate the popularity signal.
+		if (!data.seriesId || data.pages.length === 0 || key === lastViewedChapter) return;
 		lastViewedChapter = key;
 		void recordView(data.seriesId);
 	});

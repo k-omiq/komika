@@ -14,10 +14,6 @@ use sqlx::SqlitePool;
 /// notification per like.
 pub const LIKE_MILESTONES: &[i64] = &[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
-pub fn is_like_milestone(n: i64) -> bool {
-    LIKE_MILESTONES.contains(&n)
-}
-
 /// Insert one notification for `recipient_id`. `actor_id` is the triggering user (the
 /// replier), NULL for an aggregate milestone. `comment_id` is the recipient's own
 /// comment the event is about; `target_type`/`target_id` carry its thread for
@@ -54,17 +50,33 @@ pub async fn record(
     }
 }
 
-/// Whether a `like_milestone` notification for this comment+count already exists, so a
-/// like that re-crosses a milestone (after an unlike) doesn't notify twice.
-pub async fn like_milestone_exists(pool: &SqlitePool, comment_id: &str, count: i64) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(SELECT 1 FROM notifications \
-         WHERE comment_id = ? AND kind = 'like_milestone' AND count = ?)",
+/// Record a `like_milestone` notification, idempotent per (comment, count): the partial
+/// UNIQUE index `idx_notifications_like_milestone` makes a second identical milestone a
+/// no-op via `INSERT OR IGNORE`, so concurrent likes crossing the same milestone — or a
+/// like that re-crosses it after an unlike — notify exactly once. Fire-and-forget.
+pub async fn record_like_milestone(
+    pool: &SqlitePool,
+    recipient_id: &str,
+    comment_id: &str,
+    target_type: &str,
+    target_id: &str,
+    count: i64,
+) {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO notifications \
+           (id, user_id, kind, actor_id, comment_id, target_type, target_id, count, created_at) \
+         VALUES (?, ?, 'like_milestone', NULL, ?, ?, ?, ?, ?)",
     )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(recipient_id)
     .bind(comment_id)
+    .bind(target_type)
+    .bind(target_id)
     .bind(count)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0)
-        != 0
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, count, "failed to record like_milestone notification");
+    }
 }

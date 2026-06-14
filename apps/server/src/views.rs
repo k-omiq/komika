@@ -43,13 +43,24 @@ fn current_hour() -> i64 {
 /// Resolve a reader-facing series id to its normalised view key (see module docs).
 /// Numeric Suwayomi ids — the primary display identity — key on themselves; a canonical
 /// `w_` work folds into its Suwayomi source id when it has one, else keeps its `w_` key.
+///
+/// The fold picks the smallest source id by NUMERIC order (source_key is the numeric
+/// Suwayomi manga id) so it's stable and matches how the app numbers ids.
+///
+/// LIMITATION: for a work with MULTIPLE Suwayomi sources, views recorded via a
+/// non-chosen source's numeric page key under that other id and won't merge into the
+/// work's total — and a pure-MangaDex work that later GAINS a Suwayomi source splits
+/// its pre/post views across the two keys. Fully unifying those would need a persistent
+/// canonical-source-per-work concept; single-source works (the common case) unify
+/// exactly.
 pub async fn view_key(pool: &SqlitePool, series_id: &str) -> String {
     if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
         return series_id.to_string();
     }
     let numeric: Option<String> = sqlx::query_scalar(
         "SELECT source_key FROM source_series \
-         WHERE work_id = ? AND source_type = 'suwayomi' ORDER BY source_key LIMIT 1",
+         WHERE work_id = ? AND source_type = 'suwayomi' \
+         ORDER BY CAST(source_key AS INTEGER) LIMIT 1",
     )
     .bind(series_id)
     .fetch_optional(pool)
@@ -136,10 +147,13 @@ pub async fn trending_keys(pool: &SqlitePool, limit: i64) -> Result<Vec<(String,
 }
 
 /// Delete hourly buckets older than the retention window. Called by the GC sweep so the
-/// bucket table stays bounded; the all-time totals in `series_views` are untouched.
+/// bucket table stays bounded; the all-time totals in `series_views` are untouched. The
+/// boundary uses `<=` to match the windows' strict `hour_ts > now - N` — the bucket at
+/// exactly `now - RETENTION` is never summed by any window, so it's pruned rather than
+/// kept forever.
 pub async fn prune_buckets(pool: &SqlitePool) -> Result<u64> {
     let cutoff = current_hour() - BUCKET_RETENTION_HOURS;
-    let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts < ?")
+    let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= ?")
         .bind(cutoff)
         .execute(pool)
         .await?;
@@ -173,6 +187,31 @@ mod tests {
         let top = trending_keys(&pool, 10).await.unwrap();
         assert_eq!(top[0], ("42".to_string(), 3));
         assert_eq!(top[1], ("7".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn windows_actually_bound_by_age() {
+        // A view 30 hours ago must fall OUT of last24h but stay IN last7d and total —
+        // proving the windows key on hour_ts, not just "any bucket". `record` writes the
+        // current hour; backdate that bucket to hour-30.
+        let pool = pool().await;
+        record(&pool, "42").await.unwrap();
+        let h30 = current_hour() - 30;
+        sqlx::query("UPDATE series_view_bucket SET hour_ts = ? WHERE series_key = '42'")
+            .bind(h30)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A second, fresh (current-hour) view.
+        record(&pool, "42").await.unwrap();
+
+        let c = counts_for(&pool, "42").await;
+        assert_eq!(c.total, 2, "all-time counts both");
+        assert_eq!(c.last24h, 1, "only the fresh view is within 24h");
+        assert_eq!(c.last7d, 2, "both are within 7 days");
+        // Trending's 24h ranking sees only the in-window view.
+        let top = trending_keys(&pool, 10).await.unwrap();
+        assert_eq!(top[0], ("42".to_string(), 1));
     }
 
     #[tokio::test]

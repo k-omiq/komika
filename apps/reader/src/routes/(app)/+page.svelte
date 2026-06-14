@@ -121,10 +121,10 @@
 					<a class="view-all" href="/updates">View all</a>
 				</div>
 				<div class="row">
-					{#each home.latestUpdates as item (item.title + item.ch)}
+					{#each home.latestUpdates as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
-							sub={`${item.ch} · ${item.time}`}
+							sub={item.ch ? `${item.ch} · ${item.time}` : item.time}
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
@@ -140,10 +140,10 @@
 			<section class="block">
 				<h2>Trending</h2>
 				<div class="row">
-					{#each home.trending as item (item.title + item.ch)}
+					{#each home.trending as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
-							sub={`${item.ch} · ${item.time}`}
+							sub={item.ch ? `${item.ch} · ${item.time}` : item.time}
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
@@ -159,7 +159,7 @@
 			<section class="block">
 				<h2>Latest Added</h2>
 				<div class="row">
-					{#each home.latestAdded as item (item.title + item.ch)}
+					{#each home.latestAdded as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
 							sub={`${item.ch} · Added ${item.time}`}

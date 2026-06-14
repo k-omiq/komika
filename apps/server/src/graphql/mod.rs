@@ -1175,15 +1175,15 @@ async fn series_by_keys(st: &AppState, keys: &[String]) -> Vec<Series> {
                 out.push(None);
             }
         } else if let Ok(n) = key.parse::<i64>() {
-            let m = match crate::series_cache::get_series(&st.pool, n).await.ok().flatten() {
-                Some(m) => Some(m),
-                None => st.suwayomi.series(n).await.ok(),
-            };
-            if let Some(m) = m {
-                pending.push((out.len(), m));
-                out.push(None); // slot filled by the batched map below
-            } else {
-                out.push(None);
+            // Resolve DB-first through the shared cached path (single-flight collapsing,
+            // result caching, and stale-row fallback) rather than a naive live fetch —
+            // this runs on the discovery/home hot path, up to `limit` keys.
+            match resolve_series_cached(st, n).await {
+                Ok(m) => {
+                    pending.push((out.len(), m));
+                    out.push(None); // slot filled by the batched map below
+                }
+                Err(_) => out.push(None),
             }
         } else {
             out.push(None);
@@ -1675,8 +1675,10 @@ impl QueryRoot {
         // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
         // popularity signal from `recordView`, replacing the old "first 6 of Popular").
         // During cold start — before reads accumulate — this is empty, so pad with
-        // Popular (dedup by id) to keep the row populated; it becomes fully
-        // view-ranked as views come in.
+        // Popular to keep the row populated; it becomes fully view-ranked as views come
+        // in. Dedup by id AND title: a series whose views split across two identities
+        // (its `w_` work and its numeric source — see `views::view_key`) would otherwise
+        // resolve to two cards with the same title, so title-dedup collapses them.
         let trending = {
             let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
                 .await
@@ -1684,18 +1686,27 @@ impl QueryRoot {
                 .into_iter()
                 .map(|(k, _)| k)
                 .collect();
-            let mut items = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
-            let mut seen: std::collections::HashSet<String> =
-                items.iter().map(|s| s.id.0.clone()).collect();
-            for s in &popular {
+            let ranked = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_titles: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut items: Vec<Series> = Vec::with_capacity(10);
+            for s in ranked.into_iter().chain(popular.iter().cloned()) {
                 if items.len() >= 10 {
                     break;
                 }
-                if seen.insert(s.id.0.clone()) {
-                    items.push(s.clone());
+                let title_key = s.title.trim().to_lowercase();
+                let dup = seen_ids.contains(&s.id.0)
+                    || (!title_key.is_empty() && seen_titles.contains(&title_key));
+                if dup {
+                    continue;
                 }
+                seen_ids.insert(s.id.0.clone());
+                if !title_key.is_empty() {
+                    seen_titles.insert(title_key);
+                }
+                items.push(s);
             }
-            items.truncate(10);
             items
         };
 
@@ -2720,7 +2731,7 @@ impl QueryRoot {
              LEFT JOIN users a ON a.id = n.actor_id \
              LEFT JOIN comments c ON c.id = n.comment_id \
              WHERE n.user_id = ? \
-             ORDER BY n.created_at DESC LIMIT ? OFFSET ?",
+             ORDER BY n.created_at DESC, n.id DESC LIMIT ? OFFSET ?",
         )
         .bind(&user.id)
         .bind(PAGE_SIZE)
@@ -4021,12 +4032,14 @@ impl MutationRoot {
                     .flatten();
             if let Some(pa) = parent_author {
                 if pa != user.id {
+                    // Reference the NEW reply (id) as the notification's comment so the
+                    // bell previews what the replier said, not the recipient's own text.
                     crate::notify::record(
                         &st.pool,
                         &pa,
                         "reply",
                         Some(&user.id),
-                        Some(pid),
+                        Some(&id),
                         Some(target_type),
                         Some(&input.target_id.0),
                         None,
@@ -4082,6 +4095,11 @@ impl MutationRoot {
         let Some((author_id, target_type, target_id)) = row else {
             return Err(Error::new("comment not found"));
         };
+        // You can't vote on your own comment — that would let an author inflate their
+        // own like tally (which feeds everyone's milestones and any like-ranking).
+        if author_id == user.id {
+            return Err(Error::new("you can't vote on your own comment"));
+        }
         let prior_likes: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM comment_votes WHERE comment_id = ? AND value = 1")
                 .bind(&comment_id.0)
@@ -4123,25 +4141,25 @@ impl MutationRoot {
         .await
         .map_err(gql_err)?;
 
-        // Milestone notification: only when a like just raised the count ONTO a
-        // milestone, for someone else's comment, and not already sent for that count.
-        if value == 1
-            && likes > prior_likes
-            && crate::notify::is_like_milestone(likes)
-            && author_id != user.id
-            && !crate::notify::like_milestone_exists(&st.pool, &comment_id.0, likes).await
-        {
-            crate::notify::record(
-                &st.pool,
-                &author_id,
-                "like_milestone",
-                None,
-                Some(&comment_id.0),
-                Some(&target_type),
-                Some(&target_id),
-                Some(likes),
-            )
-            .await;
+        // Notify the author for EVERY milestone this like crossed (prior_likes, likes],
+        // not just an exact landing — so a like that jumps 4→6 (concurrent likes) still
+        // fires milestone 5. `record_like_milestone` is idempotent per (comment, count),
+        // so re-crossing after an unlike, or a concurrent double-send, notifies once.
+        // (Self-votes are already rejected above, so this is always someone else's like.)
+        if value == 1 && likes > prior_likes {
+            for &m in crate::notify::LIKE_MILESTONES {
+                if m > prior_likes && m <= likes {
+                    crate::notify::record_like_milestone(
+                        &st.pool,
+                        &author_id,
+                        &comment_id.0,
+                        &target_type,
+                        &target_id,
+                        m,
+                    )
+                    .await;
+                }
+            }
         }
 
         Ok(CommentVote {
@@ -6375,6 +6393,55 @@ mod tests {
             r.data.into_json().unwrap()["unreadNotificationCount"],
             serde_json::json!(0)
         );
+    }
+
+    #[tokio::test]
+    async fn vote_self_rejected_and_milestone_dedupes() {
+        let (s, _pool) = setup_full(100).await;
+        let r = exec(
+            &s,
+            r#"mutation { postComment(input: { targetType: "series", targetId: "s1", body: "x", hasSpoiler: false }) { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        let cid = r.data.into_json().unwrap()["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The author can't vote on their own comment.
+        let self_vote =
+            format!(r#"mutation {{ voteComment(commentId: "{cid}", value: 1) {{ likes }} }}"#);
+        let r = exec(&s, &self_vote, Some("admintok"), "1.1.1.1").await;
+        assert!(!r.errors.is_empty(), "self-vote must be rejected");
+
+        // bob likes (milestone 1) → unlikes → re-likes: still exactly ONE like_milestone
+        // (idempotent per comment+count), never a duplicate on re-crossing.
+        let like =
+            format!(r#"mutation {{ voteComment(commentId: "{cid}", value: 1) {{ likes }} }}"#);
+        let clear =
+            format!(r#"mutation {{ voteComment(commentId: "{cid}", value: 0) {{ likes }} }}"#);
+        for q in [&like, &clear, &like] {
+            let r = exec(&s, q, Some("bobtok"), "2.2.2.2").await;
+            assert!(r.errors.is_empty(), "vote failed: {:?}", r.errors);
+        }
+
+        let r = exec(&s, r#"{ notifications { kind count } }"#, Some("admintok"), "1.1.1.1").await;
+        let notifs = r.data.into_json().unwrap()["notifications"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let milestones: Vec<_> = notifs
+            .iter()
+            .filter(|n| n["kind"] == "like_milestone")
+            .collect();
+        assert_eq!(
+            milestones.len(),
+            1,
+            "milestone-1 must not duplicate on unlike/relike"
+        );
+        assert_eq!(milestones[0]["count"], serde_json::json!(1));
     }
 
     #[tokio::test]

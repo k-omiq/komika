@@ -448,17 +448,20 @@ export class CompositeBackend implements Backend {
 	uploadCommentMedia(file: Blob): Promise<CommentMediaUpload> {
 		return this.opts.hosted.uploadCommentMedia!(file);
 	}
+	// All social writes/reads delegate to the hosted backend; null-safe so a hosted
+	// backend without a social layer degrades gracefully instead of throwing.
 	voteComment(commentId: Id, value: number): Promise<CommentVote> {
-		return this.opts.hosted.voteComment!(commentId, value);
+		if (!this.opts.hosted.voteComment) return Promise.reject(new Error('Voting unavailable'));
+		return this.opts.hosted.voteComment(commentId, value);
 	}
 	notifications(page?: number): Promise<Notification[]> {
-		return this.opts.hosted.notifications!(page);
+		return this.opts.hosted.notifications?.(page) ?? Promise.resolve([]);
 	}
 	unreadNotificationCount(): Promise<number> {
-		return this.opts.hosted.unreadNotificationCount!();
+		return this.opts.hosted.unreadNotificationCount?.() ?? Promise.resolve(0);
 	}
 	markNotificationsRead(ids?: Id[]): Promise<number> {
-		return this.opts.hosted.markNotificationsRead!(ids);
+		return this.opts.hosted.markNotificationsRead?.(ids) ?? Promise.resolve(0);
 	}
 
 	// --- admin "manga DB" ---
