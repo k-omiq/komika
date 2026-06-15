@@ -2,6 +2,7 @@ mod auth;
 mod avatar;
 mod catalog;
 mod config;
+mod cover;
 mod db;
 mod dedup;
 mod gc;
@@ -344,6 +345,43 @@ async fn serve_avatar(
     }
 }
 
+/// `GET /covers/{work_id}.webp` — public serve of a cached work cover from
+/// `work_cover_blob`. Same BLOB-in-SQLite + immutable-cache model as avatars; the
+/// stored path carries a `?v=<version>` cache-buster so this can be immutable. A
+/// missing blob is a 404 (the caller only builds this URL when
+/// `work.cover_cached_version` is set, so a 404 means a race with a cache clear).
+async fn serve_cover(
+    State(pool): State<sqlx::SqlitePool>,
+    UrlPath(file): UrlPath<String>,
+) -> axum::response::Response {
+    let Some(work_id) = file.strip_suffix(".webp") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let webp: Option<Vec<u8>> =
+        match sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = ?")
+            .bind(work_id)
+            .fetch_optional(&pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "cover read failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    match webp {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// `POST /comment-media` — authenticated multipart upload of one image to attach to
 /// a comment. The bytes are decoded, downscaled (aspect-preserving) and re-encoded
 /// as budgeted lossless WebP (`media::process_comment_image`), then stored as a
@@ -377,12 +415,13 @@ async fn upload_comment_media(
     // Cap the number of staged (unattached) uploads a user can accumulate, so the
     // GC-eligible backlog can't be inflated faster than it's swept. 20 pending
     // drafts is far more than any real compose flow needs.
-    let staged: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM comment_media WHERE user_id = ? AND comment_id IS NULL")
-            .bind(&user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(0);
+    let staged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM comment_media WHERE user_id = ? AND comment_id IS NULL",
+    )
+    .bind(&user.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
     if staged >= 20 {
         return avatar_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -569,6 +608,7 @@ async fn main() -> anyhow::Result<()> {
         session_ttl_secs: cfg.session_ttl_secs,
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
+        cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Startup recovery: an ingest job still `running` was interrupted by the
@@ -622,6 +662,22 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("metadata auto-enrichment disabled (set METADATA_BACKFILL=on to enable)");
     }
 
+    // Automatic cover-cache drainer — populates the DB cover cache (`/covers/…`,
+    // off the CF image Worker) with NO manual trigger. Defaults ON; hits MangaDex
+    // under the shared limiter, so keep it to one replica (COVER_CACHE=off elsewhere).
+    if cfg.cover_cache_enabled {
+        cover::spawn(
+            pool.clone(),
+            mangadex.clone(),
+            state.cover_crawl_running.clone(),
+            cfg.cover_cache_interval_secs,
+            cfg.cover_cache_batch,
+            shutdown_tx.subscribe(),
+        );
+    } else {
+        tracing::info!("cover cache drainer disabled (COVER_CACHE=off)");
+    }
+
     let schema = build_schema(state, !cfg.graphiql_enabled);
 
     let origins: Vec<_> = cfg
@@ -657,6 +713,11 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route("/avatars/{file}", get(serve_avatar))
+        // Public serve of DB-backed work covers (WebP BLOB in `work_cover_blob`).
+        // Lets the web reader load covers from our own origin instead of the CF
+        // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
+        // (admin `materializeCatalogueCovers`).
+        .route("/covers/{file}", get(serve_cover))
         // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
         // model as avatars. The upload route raises the body limit above the raw
         // image cap enforced in `media::process_comment_image`.

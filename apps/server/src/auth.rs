@@ -156,7 +156,10 @@ mod tests {
         .unwrap();
 
         // The plaintext token resolves to the user (round-trip through the hash).
-        let user = user_for_token(&pool, &tok).await.unwrap().expect("resolves");
+        let user = user_for_token(&pool, &tok)
+            .await
+            .unwrap()
+            .expect("resolves");
         assert_eq!(user.id, "u1");
 
         // The stored column is the HASH, not the raw token.

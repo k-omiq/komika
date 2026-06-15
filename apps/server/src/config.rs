@@ -90,6 +90,16 @@ pub struct Config {
     /// Works enriched per auto-enrichment tick. Kept small (one `/cover` request
     /// each) so a tick stays polite. Default 25.
     pub metadata_backfill_batch: i64,
+    /// Automatic cover-cache drainer: fetch each catalogued work's cover once and
+    /// store it as a WebP BLOB so the web reader serves covers off the CF Worker.
+    /// Defaults ON (no manual trigger needed); `COVER_CACHE=off` disables it.
+    pub cover_cache_enabled: bool,
+    /// Interval between cover-drainer ticks (seconds). First tick fires on startup.
+    /// Default 5 min.
+    pub cover_cache_interval_secs: u64,
+    /// Covers fetched + stored per drainer tick. Bounded so a tick stays polite
+    /// (each is one MangaDex-CDN fetch under the shared limiter). Default 500.
+    pub cover_cache_batch: i64,
 }
 
 impl Config {
@@ -222,6 +232,25 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &i64| v > 0)
             .unwrap_or(25);
+        // Cover cache drainer defaults ON (unlike the other MangaDex-hitting tasks):
+        // covers should populate automatically with no manual admin trigger. Set
+        // COVER_CACHE=off to disable (e.g. on non-primary replicas).
+        let cover_cache_enabled = env::var("COVER_CACHE")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "off" || v == "0" || v == "false")
+            })
+            .unwrap_or(true);
+        let cover_cache_interval_secs = env::var("COVER_CACHE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(300);
+        let cover_cache_batch = env::var("COVER_CACHE_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &i64| v > 0)
+            .unwrap_or(500);
         Self {
             port,
             database_url,
@@ -249,6 +278,9 @@ impl Config {
             metadata_backfill_enabled,
             metadata_backfill_interval_secs,
             metadata_backfill_batch,
+            cover_cache_enabled,
+            cover_cache_interval_secs,
+            cover_cache_batch,
         }
     }
 }

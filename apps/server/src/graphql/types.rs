@@ -952,9 +952,18 @@ mod comic_type_tests {
 
     #[test]
     fn original_language_maps_ko_zh_ja() {
-        assert_eq!(resolve_comic_type(None, Some("ko"), &[], ""), ComicType::Manhwa);
-        assert_eq!(resolve_comic_type(None, Some("zh-hk"), &[], ""), ComicType::Manhua);
-        assert_eq!(resolve_comic_type(None, Some("ja"), &[], ""), ComicType::Manga);
+        assert_eq!(
+            resolve_comic_type(None, Some("ko"), &[], ""),
+            ComicType::Manhwa
+        );
+        assert_eq!(
+            resolve_comic_type(None, Some("zh-hk"), &[], ""),
+            ComicType::Manhua
+        );
+        assert_eq!(
+            resolve_comic_type(None, Some("ja"), &[], ""),
+            ComicType::Manga
+        );
     }
 
     #[test]
@@ -998,16 +1007,31 @@ mod comic_type_tests {
 
     #[test]
     fn script_heuristic_detects_hangul_and_han() {
-        assert_eq!(resolve_comic_type(None, None, &[], "나 혼자만 레벨업"), ComicType::Manhwa);
-        assert_eq!(resolve_comic_type(None, None, &[], "斗破苍穹"), ComicType::Manhua);
+        assert_eq!(
+            resolve_comic_type(None, None, &[], "나 혼자만 레벨업"),
+            ComicType::Manhwa
+        );
+        assert_eq!(
+            resolve_comic_type(None, None, &[], "斗破苍穹"),
+            ComicType::Manhua
+        );
         // Han + kana => Japanese, not Manhua.
-        assert_eq!(resolve_comic_type(None, None, &[], "鬼滅の刃"), ComicType::Manga);
+        assert_eq!(
+            resolve_comic_type(None, None, &[], "鬼滅の刃"),
+            ComicType::Manga
+        );
     }
 
     #[test]
     fn defaults_to_manga_with_no_signal() {
-        assert_eq!(resolve_comic_type(None, None, &[], "Some Title"), ComicType::Manga);
-        assert_eq!(resolve_comic_type(None, Some("en"), &[], "Some Title"), ComicType::Manga);
+        assert_eq!(
+            resolve_comic_type(None, None, &[], "Some Title"),
+            ComicType::Manga
+        );
+        assert_eq!(
+            resolve_comic_type(None, Some("en"), &[], "Some Title"),
+            ComicType::Manga
+        );
     }
 
     #[test]

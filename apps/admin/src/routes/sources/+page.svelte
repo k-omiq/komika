@@ -18,6 +18,7 @@
 		loadExtensions,
 		loadSourceIngestJobs,
 		loadSources,
+		materializeCatalogueCovers,
 		persistCatalogue,
 		startExtensionIngest,
 		startSourceIngest,
@@ -39,6 +40,32 @@
 	let persistError = $state<string | null>(null);
 	/** Series count from the last successful run, for honest reporting. */
 	let persistCount = $state<number | null>(null);
+
+	// ---- Maintenance: materialize covers into the DB (off the CF Worker) ------
+	// Crawls the whole catalogue, fetches each still-uncached work's MangaDex
+	// cover, and stores a bounded WebP in the DB so the web reader serves covers
+	// from /covers/{id}.webp instead of the image Worker. A polite background
+	// crawl (bounded by the MangaDex limiter); the returned number is how many
+	// works were still uncached (queued) at kick-off — progress lands in logs.
+	let coversConfirm = $state(false);
+	let coversRunning = $state(false);
+	let coversError = $state<string | null>(null);
+	let coversQueued = $state<number | null>(null);
+
+	async function runMaterializeCovers(): Promise<void> {
+		if (coversRunning) return;
+		coversRunning = true;
+		coversError = null;
+		coversQueued = null;
+		try {
+			coversQueued = await materializeCatalogueCovers();
+			coversConfirm = false;
+		} catch (err) {
+			coversError = err instanceof Error ? err.message : 'Failed to start cover materialization.';
+		} finally {
+			coversRunning = false;
+		}
+	}
 
 	async function runPersistCatalogue(): Promise<void> {
 		if (persisting) return;
@@ -69,7 +96,8 @@
 	let rowMsg = $state<Record<string, string>>({});
 
 	// One-time "add repo" affordance shown when nothing is seeded.
-	const KEIYOUSHI_URL = 'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
+	const KEIYOUSHI_URL =
+		'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
 	let repoUrl = $state(KEIYOUSHI_URL);
 	let addingRepo = $state(false);
 	let repoMsg = $state<string | null>(null);
@@ -125,7 +153,9 @@
 		// consequential actions.
 		if (
 			verb === 'uninstall' &&
-			!confirm(`Uninstall ${e.name}? This removes the source and its catalogue picker entry until you reinstall it.`)
+			!confirm(
+				`Uninstall ${e.name}? This removes the source and its catalogue picker entry until you reinstall it.`,
+			)
 		)
 			return;
 		busyPkg = e.pkgName;
@@ -140,11 +170,17 @@
 						: updateExtension;
 			const updated = await fn(e.pkgName);
 			exts = exts.map((x) => (x.pkgName === updated.pkgName ? updated : x));
-			rowMsg = { ...rowMsg, [e.pkgName]: verb === 'uninstall' ? 'Uninstalled.' : `Installed ${updated.versionName}.` };
+			rowMsg = {
+				...rowMsg,
+				[e.pkgName]: verb === 'uninstall' ? 'Uninstalled.' : `Installed ${updated.versionName}.`,
+			};
 			// Installed sources changed — make the catalogue tab re-fetch its picker.
 			sourcesLoaded = false;
 		} catch (err) {
-			rowMsg = { ...rowMsg, [e.pkgName]: err instanceof Error ? err.message : `Failed to ${verb}.` };
+			rowMsg = {
+				...rowMsg,
+				[e.pkgName]: err instanceof Error ? err.message : `Failed to ${verb}.`,
+			};
 		} finally {
 			busyPkg = null;
 		}
@@ -669,8 +705,7 @@
 			else scheduleExtPoll(EXT_POLL_BASE_MS);
 		} catch (err) {
 			extPollFailures += 1;
-			extError =
-				err instanceof Error ? err.message : 'Failed to poll extension ingest progress.';
+			extError = err instanceof Error ? err.message : 'Failed to poll extension ingest progress.';
 			if (extPollFailures >= POLL_MAX_FAILURES) {
 				stopExtPolling();
 				extPollStopped = true;
@@ -843,6 +878,53 @@
 		</div>
 	</section>
 
+	<section class="maint" aria-label="Cover cache">
+		<div class="maint-copy">
+			<div class="maint-head">
+				<span class="maint-kicker">Production maintenance</span>
+				<h2>Cache covers in the DB</h2>
+			</div>
+			<p class="maint-lede">
+				Fetch every catalogue cover once and store it in the DB, so the web reader loads covers from
+				our own origin (<code>/covers/…</code>) instead of the Cloudflare image Worker. Runs as a
+				polite background crawl bounded by the MangaDex rate limiter; safe to re-run (only
+				still-uncached works are fetched).
+			</p>
+			{#if coversError}
+				<p class="maint-msg error">{coversError}</p>
+			{:else if coversQueued !== null}
+				<p class="maint-msg ok">
+					Crawl started for {coversQueued} uncached {coversQueued === 1 ? 'work' : 'works'}. Covers
+					fill in the background; watch the server logs for progress.
+				</p>
+			{/if}
+		</div>
+		<div class="maint-actions">
+			{#if coversConfirm}
+				<span class="maint-confirm-q">Crawl all covers now?</span>
+				<button class="act primary" disabled={coversRunning} onclick={runMaterializeCovers}>
+					{coversRunning ? 'Starting…' : 'Confirm crawl'}
+				</button>
+				<button class="act" disabled={coversRunning} onclick={() => (coversConfirm = false)}>
+					Cancel
+				</button>
+			{:else}
+				<button
+					class="act primary"
+					disabled={coversRunning}
+					onclick={() => {
+						coversError = null;
+						coversQueued = null;
+						coversConfirm = true;
+					}}
+					title="Materialize every catalogue cover into the DB (served off the CF Worker)"
+				>
+					{coversRunning ? 'Starting…' : 'Cache all covers'}
+				</button>
+			{/if}
+		</div>
+	</section>
+
 	{#if tab === 'extensions'}
 		{#if extsError && exts.length === 0}
 			<div class="notice error">{extsError}</div>
@@ -915,11 +997,7 @@
 						<!-- Double-click is a pointer affordance for discoverability; the Browse
 						     button below is the keyboard/a11y-accessible path to the same action. -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div
-							class="row"
-							class:clickable={e.isInstalled}
-							ondblclick={() => browseExtension(e)}
-						>
+						<div class="row" class:clickable={e.isInstalled} ondblclick={() => browseExtension(e)}>
 							<div class="cell-ext">
 								{#if e.iconUrl && !failedIcons[e.pkgName]}
 									<img
@@ -1028,9 +1106,7 @@
 			{#if extError}
 				<div class="notice error poll-error">
 					<span>
-						{extError}{extPollStopped
-							? ' — progress updates paused after repeated failures.'
-							: ''}
+						{extError}{extPollStopped ? ' — progress updates paused after repeated failures.' : ''}
 					</span>
 					{#if extPollStopped}
 						<button class="act" onclick={retryExtPolling}>Retry</button>
@@ -1082,7 +1158,8 @@
 					<div class="ext-rows">
 						{#each extJobs as ej (ej.id)}
 							<div class="ext-row">
-								<span class="ext-row-state {ej.state}">{JOB_STATE_LABEL[ej.state] ?? ej.state}</span>
+								<span class="ext-row-state {ej.state}">{JOB_STATE_LABEL[ej.state] ?? ej.state}</span
+								>
 								<span class="ext-row-src">source {ej.sourceId}</span>
 								<span class="ext-row-nums">
 									{ej.itemsSeen} seen · {ej.newWorks} new · {ej.alreadyExisting} existing{ej.queuedForReview >
@@ -1103,9 +1180,7 @@
 			<div class="toolbar">
 				<select bind:value={sourceId} onchange={onPickSource} aria-label="Pick a source">
 					<option value="" disabled>
-						{extScope && scopedSources.length !== 1
-							? 'Pick a language…'
-							: 'Pick a source…'}
+						{extScope && scopedSources.length !== 1 ? 'Pick a language…' : 'Pick a source…'}
 					</option>
 					{#each scopedSources as s (s.id)}
 						<option value={String(s.id)}>{s.name} ({s.lang}){s.isNsfw ? ' · NSFW' : ''}</option>
@@ -1152,9 +1227,7 @@
 			{#if jobError}
 				<div class="notice error poll-error">
 					<span>
-						{jobError}{pollStopped
-							? ' — progress updates paused after repeated failures.'
-							: ''}
+						{jobError}{pollStopped ? ' — progress updates paused after repeated failures.' : ''}
 					</span>
 					{#if pollStopped}
 						<button class="act" onclick={retryPolling}>Retry</button>
@@ -1229,7 +1302,8 @@
 					<div class="summary">
 						<span class="chip">{bulkResult.succeeded}/{bulkResult.total} succeeded</span>
 						{#if bulkResult.failed > 0}<span class="chip bad">{bulkResult.failed} failed</span>{/if}
-						{#if bulkResult.newWorks > 0}<span class="chip new">{bulkResult.newWorks} new</span>{/if}
+						{#if bulkResult.newWorks > 0}<span class="chip new">{bulkResult.newWorks} new</span
+							>{/if}
 						{#if bulkResult.autoMerged > 0}<span class="chip merged"
 								>{bulkResult.autoMerged} auto-merged</span
 							>{/if}
@@ -1294,8 +1368,8 @@
 			{:else if !sourceId}
 				{#if extScope && scopedSources.length === 0}
 					<div class="notice">
-						{extScope.name} is installed but the engine hasn't exposed any sources for it yet. Try
-						again shortly, or pick another source.
+						{extScope.name} is installed but the engine hasn't exposed any sources for it yet. Try again
+						shortly, or pick another source.
 					</div>
 				{:else if extScope && scopedSources.length > 1}
 					<div class="notice">Pick a language above to browse {extScope.name}.</div>
@@ -1339,8 +1413,10 @@
 					{/each}
 				</div>
 				<div class="pager">
-					<button class="act" disabled={browsing || pageNum <= 1} onclick={() => browse(pageNum - 1)}
-						>Prev</button
+					<button
+						class="act"
+						disabled={browsing || pageNum <= 1}
+						onclick={() => browse(pageNum - 1)}>Prev</button
 					>
 					<span class="page-no">Page {pageNum}</span>
 					<button class="act" disabled={browsing || !hasNext} onclick={() => browse(pageNum + 1)}

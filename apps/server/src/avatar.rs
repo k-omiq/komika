@@ -60,7 +60,7 @@ pub fn process_avatar(bytes: &[u8]) -> Result<Vec<u8>> {
 /// `MAX_UPLOAD_BYTES` cap only bounds the *compressed* input) can't OOM the
 /// process before we ever downscale. Caps pixel dimensions and the decode
 /// allocation; an over-limit image is rejected as a client error, not decoded.
-fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
+pub(crate) fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .context("unsupported or corrupt image")?;
@@ -82,7 +82,7 @@ fn to_square(img: &image::DynamicImage) -> RgbaImage {
 }
 
 /// Encode an RGBA buffer as lossless WebP (VP8L) into a byte vector.
-fn encode_lossless(img: &RgbaImage) -> Result<Vec<u8>> {
+pub(crate) fn encode_lossless(img: &RgbaImage) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     WebPEncoder::new_lossless(&mut out)
         .encode(

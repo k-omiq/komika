@@ -375,6 +375,21 @@ impl MangaDexClient {
         crate::phash::dhash(&bytes)
     }
 
+    /// Download a work's 512px cover thumbnail as raw bytes, for the DB-backed
+    /// cover cache (`cover::crawl_uncached_covers`). Same source URL + rate limit
+    /// as `cover_phash`, but returns the bytes instead of hashing them.
+    /// Best-effort: `None` on any network / non-success failure so a single bad
+    /// cover never aborts the crawl.
+    pub async fn cover_thumb_bytes(&self, manga_id: &str, file_name: &str) -> Option<Vec<u8>> {
+        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
+        self.limiter.acquire().await;
+        let res = self.http.get(url).send().await.ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        Some(res.bytes().await.ok()?.to_vec())
+    }
+
     /// Resolve a chapter's ordered page image URLs via MangaDex@Home
     /// (`GET /at-home/server/{chapterId}` → `{ baseUrl, chapter: { hash, data[] } }`).
     /// Each page URL is `{baseUrl}/data/{hash}/{filename}`. These are dynamic

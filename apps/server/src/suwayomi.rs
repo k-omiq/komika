@@ -157,7 +157,11 @@ fn parse_records<T: DeserializeOwned>(raw: Vec<Value>, what: &str) -> Vec<T> {
         }
     }
     if skipped > 0 {
-        tracing::warn!(skipped, kind = what, "suwayomi: skipped unparseable records");
+        tracing::warn!(
+            skipped,
+            kind = what,
+            "suwayomi: skipped unparseable records"
+        );
     }
     out
 }
@@ -440,7 +444,10 @@ impl SuwayomiClient {
                     chapters: Nodes,
                 }
                 let d: Data = self.gql(&doc, json!({ "id": series_id })).await?;
-                Ok(parse_records::<SuwayomiChapter>(d.chapters.nodes, "chapters"))
+                Ok(parse_records::<SuwayomiChapter>(
+                    d.chapters.nodes,
+                    "chapters",
+                ))
             }
         }
     }

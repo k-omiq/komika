@@ -280,7 +280,10 @@
 	});
 	function langName(code: string): string {
 		try {
-			const dn = new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' });
+			// `navigator` is absent during SSR — fall back to 'en' so the server and
+			// first client render agree (avoids a hydration mismatch on the label).
+			const locale = typeof navigator !== 'undefined' ? navigator.language || 'en' : 'en';
+			const dn = new Intl.DisplayNames([locale], { type: 'language' });
 			return dn.of(code) ?? code.toUpperCase();
 		} catch {
 			return code.toUpperCase();
@@ -666,7 +669,6 @@
 		/>
 	{/if}
 </div>
-
 
 <style>
 	.discussion {

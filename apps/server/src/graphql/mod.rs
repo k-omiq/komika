@@ -148,6 +148,9 @@ pub struct AppState {
     /// Single-flight locks collapsing concurrent Suwayomi chapter-list refreshes
     /// for the same manga id (S1 TTL refresh).
     pub chapters_inflight: KeyedLocks,
+    /// Guards the DB-backed cover crawl (`materializeCatalogueCovers`) so two
+    /// admin clicks can't run overlapping catalogue-wide MangaDex crawls.
+    pub cover_crawl_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -583,8 +586,14 @@ fn assemble_series(
     let id = m.id.to_string();
     // Admin metadata overrides win over the source values (same as map_canonical_series,
     // so an edit shows on the numeric Suwayomi path too — feeds and the editor's return).
-    let title = ov_meta.title_override.clone().unwrap_or_else(|| m.title.clone());
-    let description = ov_meta.description_override.clone().or(m.description.clone());
+    let title = ov_meta
+        .title_override
+        .clone()
+        .unwrap_or_else(|| m.title.clone());
+    let description = ov_meta
+        .description_override
+        .clone()
+        .or(m.description.clone());
     // Status: admin override wins over the source-derived status.
     let status = ov
         .status_override
@@ -673,7 +682,10 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series
     let mut out = Vec::with_capacity(list.len());
     for m in list {
         let id = m.id.to_string();
-        let rating = ratings.get(&id).cloned().unwrap_or_else(RatingSummary::empty);
+        let rating = ratings
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(RatingSummary::empty);
         let ov = admins.get(&id).cloned().unwrap_or_default();
         let scan = scans.get(&id).cloned();
         // Drop any alt title equal to the primary so only genuine alternatives show.
@@ -706,10 +718,7 @@ fn in_placeholders(n: usize) -> String {
 
 /// Batched `rating_summary`: one grouped query for all series → per-series summary.
 /// Missing ids (no reviews) are simply absent; the caller defaults them to empty.
-async fn rating_summary_batch(
-    pool: &SqlitePool,
-    ids: &[String],
-) -> HashMap<String, RatingSummary> {
+async fn rating_summary_batch(pool: &SqlitePool, ids: &[String]) -> HashMap<String, RatingSummary> {
     if ids.is_empty() {
         return HashMap::new();
     }
@@ -729,7 +738,9 @@ async fn rating_summary_batch(
     // (distribution[10], sum, count) per series — same fold as `rating_summary`.
     let mut acc: HashMap<String, (Vec<i32>, i64, i64)> = HashMap::new();
     for (sid, score, n) in rows {
-        let e = acc.entry(sid).or_insert_with(|| (vec![0i32; 10], 0i64, 0i64));
+        let e = acc
+            .entry(sid)
+            .or_insert_with(|| (vec![0i32; 10], 0i64, 0i64));
         e.1 += score * n;
         e.2 += n;
         let idx = (score - 1).clamp(0, 9) as usize;
@@ -924,13 +935,14 @@ async fn canonical_overrides_batch(
             description_override,
         } = r;
         // Rows are ordered by (source_key, w.id); keep only the first per key.
-        map.entry(source_key).or_insert_with(|| SuwayomiWorkOverrides {
-            work_id: Some(work_id),
-            content_type_override,
-            original_language,
-            title_override,
-            description_override,
-        });
+        map.entry(source_key)
+            .or_insert_with(|| SuwayomiWorkOverrides {
+                work_id: Some(work_id),
+                content_type_override,
+                original_language,
+                title_override,
+                description_override,
+            });
     }
     map
 }
@@ -1212,10 +1224,14 @@ async fn map_canonical_series(
     work: catalog::CanonicalWork,
     chapter_count: i32,
 ) -> Series {
-    let cover_url = match (&work.mangadex_id, &work.cover_file_name) {
-        (Some(mid), Some(fname)) => crate::mangadex::cover_thumb_url(mid, fname),
-        _ => String::new(),
-    };
+    // Prefer the DB-cached cover (served from our own origin, off the Worker) and
+    // fall back to the proxy-ready MangaDex URL when no blob is cached yet.
+    let cover_url = crate::cover::work_cover_url(
+        &work.work_id,
+        work.cover_cached_version,
+        work.mangadex_id.as_deref(),
+        work.cover_file_name.as_deref(),
+    );
     let title = work
         .title_override
         .clone()
@@ -1839,7 +1855,9 @@ impl QueryRoot {
         let rows = sqlx::query_as::<_, CanonicalUpdate>(
             "SELECT ss.work_id AS work_id, ss.source_key AS mangadex_id, \
                     w.primary_title AS title, w.is_nsfw AS is_nsfw, \
-                    CASE WHEN w.cover_file_name IS NOT NULL \
+                    CASE WHEN w.cover_cached_version IS NOT NULL \
+                         THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
+                         WHEN w.cover_file_name IS NOT NULL \
                          THEN 'https://uploads.mangadex.org/covers/' || ss.source_key || '/' \
                               || w.cover_file_name || '.512.jpg' \
                          ELSE NULL END AS cover_url, \
@@ -2011,7 +2029,10 @@ impl QueryRoot {
             work_id: Some(ID(work_id)),
             title_override: row.title_override,
             description_override: row.description_override,
-            content_type_override: row.content_type_override.as_deref().and_then(comic_type_from_word),
+            content_type_override: row
+                .content_type_override
+                .as_deref()
+                .and_then(comic_type_from_word),
             is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
             tags,
             has_curated_tags,
@@ -2021,7 +2042,11 @@ impl QueryRoot {
     /// Admin: a work's aggregated chapters WITH their override state (hidden/renamed),
     /// UNFILTERED — the series-detail editor needs to see and un-hide soft-hidden
     /// chapters, unlike the reader's `aggregatedChapters`.
-    async fn work_chapters_admin(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<AdminChapter>> {
+    async fn work_chapters_admin(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+    ) -> Result<Vec<AdminChapter>> {
         require_admin(ctx).await?;
         let st = state(ctx);
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
@@ -3521,9 +3546,13 @@ async fn federated_search(
         let chapters = catalog::load_canonical_chapters(&st.pool, &wid)
             .await
             .map_err(gql_err)?;
-        let series =
-            map_canonical_series(&st.pool, uid, work, catalog::main_chapter_count_str(&chapters) as i32)
-                .await;
+        let series = map_canonical_series(
+            &st.pool,
+            uid,
+            work,
+            catalog::main_chapter_count_str(&chapters) as i32,
+        )
+        .await;
         let translators = work_sources_to_translators(
             st,
             load_work_sources(&st.pool, &wid, show_nsfw).await?,
@@ -3753,7 +3782,12 @@ impl MutationRoot {
 
     /// Toggle whether the viewer has favourited a series. Adds it to the library if
     /// not already present — favouriting implies membership. Per-user.
-    async fn set_favorite(&self, ctx: &Context<'_>, series_id: ID, favorite: bool) -> Result<Series> {
+    async fn set_favorite(
+        &self,
+        ctx: &Context<'_>,
+        series_id: ID,
+        favorite: bool,
+    ) -> Result<Series> {
         let st = state(ctx);
         let user = require_user(ctx).await?;
         let now = Utc::now().to_rfc3339();
@@ -4078,20 +4112,24 @@ impl MutationRoot {
     /// per (comment, viewer); re-voting replaces it. Returns the fresh tallies so the
     /// client can update that comment without refetching the thread. A like that pushes
     /// the comment's like count onto a milestone notifies its author (never yourself).
-    async fn vote_comment(&self, ctx: &Context<'_>, comment_id: ID, value: i32) -> Result<CommentVote> {
+    async fn vote_comment(
+        &self,
+        ctx: &Context<'_>,
+        comment_id: ID,
+        value: i32,
+    ) -> Result<CommentVote> {
         if !(-1..=1).contains(&value) {
             return Err(Error::new("value must be -1, 0, or 1"));
         }
         let user = require_user(ctx).await?;
         let st = state(ctx);
         // Resolve the comment's author + thread (for the notification and self-check).
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT user_id, target_type, target_id FROM comments WHERE id = ?",
-        )
-        .bind(&comment_id.0)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(gql_err)?;
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT user_id, target_type, target_id FROM comments WHERE id = ?")
+                .bind(&comment_id.0)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
         let Some((author_id, target_type, target_id)) = row else {
             return Err(Error::new("comment not found"));
         };
@@ -4100,12 +4138,13 @@ impl MutationRoot {
         if author_id == user.id {
             return Err(Error::new("you can't vote on your own comment"));
         }
-        let prior_likes: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM comment_votes WHERE comment_id = ? AND value = 1")
-                .bind(&comment_id.0)
-                .fetch_one(&st.pool)
-                .await
-                .map_err(gql_err)?;
+        let prior_likes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM comment_votes WHERE comment_id = ? AND value = 1",
+        )
+        .bind(&comment_id.0)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
 
         if value == 0 {
             sqlx::query("DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?")
@@ -4172,7 +4211,11 @@ impl MutationRoot {
     /// Mark the viewer's notifications read. Pass a list of ids to mark just those, or
     /// omit/empty to mark ALL unread read (the "mark all read" action). Returns how many
     /// rows this transition changed. Scoped to the viewer — you can only read your own.
-    async fn mark_notifications_read(&self, ctx: &Context<'_>, ids: Option<Vec<ID>>) -> Result<i32> {
+    async fn mark_notifications_read(
+        &self,
+        ctx: &Context<'_>,
+        ids: Option<Vec<ID>>,
+    ) -> Result<i32> {
         let user = require_user(ctx).await?;
         let st = state(ctx);
         let now = Utc::now().to_rfc3339();
@@ -4594,13 +4637,15 @@ impl MutationRoot {
                     Value(v) => Some(v.as_str()),
                     _ => None,
                 };
-                sqlx::query("UPDATE work SET description_override = ?, updated_at = ? WHERE id = ?")
-                    .bind(v)
-                    .bind(&now)
-                    .bind(&work_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
+                sqlx::query(
+                    "UPDATE work SET description_override = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(v)
+                .bind(&now)
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
             }
         }
         match input.r#type {
@@ -4610,13 +4655,15 @@ impl MutationRoot {
                     Value(t) => Some(content_type_word(t)),
                     _ => None,
                 };
-                sqlx::query("UPDATE work SET content_type_override = ?, updated_at = ? WHERE id = ?")
-                    .bind(word)
-                    .bind(&now)
-                    .bind(&work_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
+                sqlx::query(
+                    "UPDATE work SET content_type_override = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(word)
+                .bind(&now)
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
             }
         }
         match input.is_nsfw {
@@ -5222,6 +5269,46 @@ impl MutationRoot {
             "persistCatalogue: metadata materialized; chapters filling in background"
         );
         Ok(persisted)
+    }
+
+    /// Admin: materialize the whole catalogue's cover images into the DB
+    /// (`work_cover_blob`) so the WEB reader serves covers from our own origin
+    /// (`/covers/{id}.webp`) instead of routing every cover through the Cloudflare
+    /// image Worker. Fetches each still-uncached work's MangaDex cover, re-encodes
+    /// to a bounded WebP, and stores the bytes — a polite background crawl bounded
+    /// by the MangaDex rate limiter (a full catalogue takes a while). Returns how
+    /// many works are QUEUED (still missing a cover) at kick-off; progress lands in
+    /// the server logs. Idempotent + resumable (only `cover_cached_version IS NULL`
+    /// works are processed), and single-flighted so overlapping runs can't hammer
+    /// MangaDex. Gated by `require_admin`.
+    async fn materialize_catalogue_covers(&self, ctx: &Context<'_>) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        // Single-flight: refuse a second concurrent crawl (compare-and-set false→true).
+        if st
+            .cover_crawl_running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(gql_err(
+                "a cover materialization run is already in progress",
+            ));
+        }
+        let queued = crate::cover::pending_cover_count(&st.pool)
+            .await
+            .map_err(gql_err)? as i32;
+        tokio::spawn(async move {
+            crate::cover::crawl_uncached_covers(&st.pool, &st.mangadex, None).await;
+            st.cover_crawl_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        tracing::info!(queued, "materializeCatalogueCovers: crawl started");
+        Ok(queued)
     }
 
     /// Admin: start an "add all from this source" background ingest job (S1).
@@ -6230,6 +6317,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         (build_schema(state, false), pool)
     }
@@ -6335,8 +6423,9 @@ mod tests {
         assert!(r.errors.is_empty(), "reply: {:?}", r.errors);
 
         // bob likes admin's comment -> tally = 1 like, and admin gets a 'like_milestone'.
-        let vote =
-            format!(r#"mutation {{ voteComment(commentId: "{cid}", value: 1) {{ likes dislikes myVote }} }}"#);
+        let vote = format!(
+            r#"mutation {{ voteComment(commentId: "{cid}", value: 1) {{ likes dislikes myVote }} }}"#
+        );
         let r = exec(&s, &vote, Some("bobtok"), "2.2.2.2").await;
         assert!(r.errors.is_empty(), "vote: {:?}", r.errors);
         let v = r.data.into_json().unwrap()["voteComment"].clone();
@@ -6359,7 +6448,10 @@ mod tests {
         // The reply notification names the actor; the milestone carries the count.
         let reply_n = notifs.iter().find(|n| n["kind"] == "reply").unwrap();
         assert_eq!(reply_n["actor"]["username"], serde_json::json!("bob"));
-        let ms = notifs.iter().find(|n| n["kind"] == "like_milestone").unwrap();
+        let ms = notifs
+            .iter()
+            .find(|n| n["kind"] == "like_milestone")
+            .unwrap();
         assert_eq!(ms["count"], serde_json::json!(1));
 
         // The comments query shows the like tally; bob (the liker) sees myVote = 1.
@@ -6374,21 +6466,42 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        let root = items.iter().find(|c| c["id"] == serde_json::json!(cid)).unwrap();
+        let root = items
+            .iter()
+            .find(|c| c["id"] == serde_json::json!(cid))
+            .unwrap();
         assert_eq!(root["likes"], serde_json::json!(1));
         assert_eq!(root["myVote"], serde_json::json!(1));
 
         // admin marks all read -> 0 unread.
-        let r = exec(&s, r#"mutation { markNotificationsRead }"#, Some("admintok"), "1.1.1.1").await;
+        let r = exec(
+            &s,
+            r#"mutation { markNotificationsRead }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
         assert!(r.errors.is_empty(), "markRead: {:?}", r.errors);
-        let r = exec(&s, r#"{ unreadNotificationCount }"#, Some("admintok"), "1.1.1.1").await;
+        let r = exec(
+            &s,
+            r#"{ unreadNotificationCount }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
         assert_eq!(
             r.data.into_json().unwrap()["unreadNotificationCount"],
             serde_json::json!(0)
         );
 
         // bob (the replier/liker) is never notified of his own actions.
-        let r = exec(&s, r#"{ unreadNotificationCount }"#, Some("bobtok"), "2.2.2.2").await;
+        let r = exec(
+            &s,
+            r#"{ unreadNotificationCount }"#,
+            Some("bobtok"),
+            "2.2.2.2",
+        )
+        .await;
         assert_eq!(
             r.data.into_json().unwrap()["unreadNotificationCount"],
             serde_json::json!(0)
@@ -6427,7 +6540,13 @@ mod tests {
             assert!(r.errors.is_empty(), "vote failed: {:?}", r.errors);
         }
 
-        let r = exec(&s, r#"{ notifications { kind count } }"#, Some("admintok"), "1.1.1.1").await;
+        let r = exec(
+            &s,
+            r#"{ notifications { kind count } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
         let notifs = r.data.into_json().unwrap()["notifications"]
             .as_array()
             .unwrap()
@@ -6508,7 +6627,13 @@ mod tests {
         .unwrap();
 
         for _ in 0..3 {
-            let r = exec(&s, r#"mutation { recordView(seriesId: "777") }"#, None, "9.9.9.9").await;
+            let r = exec(
+                &s,
+                r#"mutation { recordView(seriesId: "777") }"#,
+                None,
+                "9.9.9.9",
+            )
+            .await;
             assert!(r.errors.is_empty(), "recordView failed: {:?}", r.errors);
             assert_eq!(
                 r.data.into_json().unwrap()["recordView"],
@@ -6703,6 +6828,7 @@ mod tests {
                 session_ttl_secs: 30 * 24 * 60 * 60,
                 series_inflight: KeyedLocks::default(),
                 chapters_inflight: KeyedLocks::default(),
+                cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         };
         const Q: &str = "{ __schema { queryType { name } } }";
@@ -6809,6 +6935,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let s = build_schema(state, false);
         // A configured admin name is reserved (case-insensitive) — open
@@ -7059,11 +7186,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let forced_nsfw: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-forcensfw'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let forced_nsfw: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-forcensfw'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE work SET is_nsfw_override = 1 WHERE id = ?")
             .bind(&forced_nsfw)
             .execute(&pool)
@@ -7094,11 +7222,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let forced_sfw: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-forcesfw'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let forced_sfw: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-forcesfw'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE work SET is_nsfw_override = 0 WHERE id = ?")
             .bind(&forced_sfw)
             .execute(&pool)
@@ -7106,7 +7235,11 @@ mod tests {
             .unwrap();
         let q = format!(r#"{{ canonicalSeries(workId: "{forced_sfw}") {{ title }} }}"#);
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
-        assert!(r.errors.is_empty(), "force-SFW must un-gate: {:?}", r.errors);
+        assert!(
+            r.errors.is_empty(),
+            "force-SFW must un-gate: {:?}",
+            r.errors
+        );
         assert!(data_json(&r).contains("Forced SFW"));
     }
 
@@ -8442,6 +8575,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let s = build_schema(state, false);
         let r = exec(
@@ -8514,6 +8648,7 @@ mod tests {
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

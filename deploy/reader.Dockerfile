@@ -2,9 +2,12 @@
 # Build context is the REPO ROOT:
 #   docker build -f deploy/reader.Dockerfile -t komika-reader .
 #
-# adapter-static emits a fully static SPA to apps/reader/build with an
-# index.html fallback, so any tiny static server works. nginx is used here for
-# the SPA rewrite + long-cache immutable assets.
+# This is the STATIC / self-host path. The default `pnpm build` now targets
+# Cloudflare edge SSR (adapter-cloudflare); this image forces the static SPA
+# build with KOMIKA_TARGET=tauri (adapter-static), which emits a fully static
+# SPA to apps/reader/build with an index.html fallback so any tiny static server
+# works. nginx is used here for the SPA rewrite + long-cache immutable assets.
+# For the edge-SSR web deploy, use apps/reader/wrangler.toml instead.
 #
 # Build-time public config is baked in (Vite inlines PUBLIC_* at build time).
 # Point the reader at the backend by passing build args, e.g.:
@@ -37,7 +40,9 @@ ENV PUBLIC_KOMIKA_BACKEND=$PUBLIC_KOMIKA_BACKEND \
     PUBLIC_KOMIKA_IMG_MODE=$PUBLIC_KOMIKA_IMG_MODE \
     PUBLIC_KOMIKA_IMG_WORKER=$PUBLIC_KOMIKA_IMG_WORKER
 
-RUN pnpm --filter @komika/reader build
+# Force the static SPA target (adapter-static → apps/reader/build). Without this,
+# the default build targets Cloudflare and would not emit `build/`.
+RUN KOMIKA_TARGET=tauri pnpm --filter @komika/reader build
 
 # ---- runtime ----------------------------------------------------------------
 FROM nginx:1.27-alpine AS runtime

@@ -584,6 +584,10 @@ export class CompositeBackend implements Backend {
 		return this.opts.hosted.persistCatalogue!();
 	}
 
+	materializeCatalogueCovers(): Promise<number> {
+		return this.opts.hosted.materializeCatalogueCovers!();
+	}
+
 	// Popularity view counting is a hosted write; the embedded engine never counts.
 	// Best-effort (a hosted backend that doesn't track views simply no-ops).
 	recordView(seriesId: Id): Promise<void> {

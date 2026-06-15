@@ -252,6 +252,10 @@ pub struct CanonicalWork {
     pub description_override: Option<String>,
     pub is_nsfw_override: Option<bool>,
     pub cover_file_name: Option<String>,
+    /// Version of the DB-cached cover blob (`work_cover_blob`), or NULL when no
+    /// cover is cached — then the reader falls back to the Worker-proxied MangaDex
+    /// URL. See `cover::work_cover_url`.
+    pub cover_cached_version: Option<i64>,
     pub alt_titles: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -332,13 +336,14 @@ pub async fn load_canonical_work(
         description_override: Option<String>,
         is_nsfw_override: Option<i64>,
         cover_file_name: Option<String>,
+        cover_cached_version: Option<i64>,
         created_at: String,
         updated_at: String,
     }
     let row = sqlx::query_as::<_, Row>(
         "SELECT primary_title, description, year, original_language, status, author, artist, \
                 is_nsfw, content_type_override, title_override, description_override, \
-                is_nsfw_override, cover_file_name, created_at, updated_at \
+                is_nsfw_override, cover_file_name, cover_cached_version, created_at, updated_at \
          FROM work WHERE id = ?",
     )
     .bind(work_id)
@@ -383,6 +388,7 @@ pub async fn load_canonical_work(
         description_override: row.description_override,
         is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
         cover_file_name: row.cover_file_name,
+        cover_cached_version: row.cover_cached_version,
         alt_titles,
         created_at: row.created_at,
         updated_at: row.updated_at,

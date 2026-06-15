@@ -759,6 +759,16 @@ export const PERSIST_CATALOGUE = /* GraphQL */ `
 	}
 `;
 
+// Admin maintenance: materialize every canonical work's cover into the DB
+// (work_cover_blob) so the web reader serves covers from /covers/{id}.webp instead
+// of the Cloudflare image Worker. Kicks off a polite background crawl and returns
+// how many works are still uncached (queued) at start. Admin-gated (require_admin).
+export const MATERIALIZE_CATALOGUE_COVERS = /* GraphQL */ `
+	mutation MaterializeCatalogueCovers {
+		materializeCatalogueCovers
+	}
+`;
+
 // ---- profile ---------------------------------------------------------------
 
 export const UPDATE_PROFILE = /* GraphQL */ `

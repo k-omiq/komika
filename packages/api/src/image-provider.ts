@@ -29,7 +29,18 @@ export interface WebImageProviderConfig {
 	 * proxies source images itself), so no Worker is needed.
 	 */
 	direct?: boolean;
+	/**
+	 * Origin of the Komika API (the GraphQL endpoint minus `/graphql`). Covers
+	 * cached in the DB are served from this origin under `/covers/...` (and
+	 * avatars under `/avatars/...`); those are same-origin / CORS-safe, so they are
+	 * returned directly instead of routed through the Worker. Relative `/covers/…`
+	 * paths are resolved against it.
+	 */
+	apiOrigin?: string;
 }
+
+/** API-origin asset paths the reader serves itself (never Worker-proxied). */
+const OWN_ASSET_PREFIXES = ['/covers/', '/avatars/'];
 
 /**
  * MangaDex host patterns (uploads.mangadex.org + *.mangadex.network). Doubles as
@@ -59,6 +70,22 @@ export class WebImageProvider implements ImageProvider {
 		return `${base}/img?src=${encodeURIComponent(sourceUrl)}`;
 	}
 
+	/** True for an asset the reader serves from its own API origin (cached covers,
+	 * avatars) — relative `/covers/…` or an absolute URL under `apiOrigin`. */
+	private isOwnAsset(url: string): boolean {
+		if (OWN_ASSET_PREFIXES.some((p) => url.startsWith(p))) return true;
+		const origin = this.config.apiOrigin;
+		return !!origin && url.startsWith(origin);
+	}
+
+	/** Resolve an own-origin asset to a loadable absolute URL (prefix relative
+	 * paths with `apiOrigin`; already-absolute URLs pass through). */
+	private toAbsoluteOwn(url: string): string {
+		if (/^https?:\/\//.test(url)) return url;
+		const origin = (this.config.apiOrigin ?? '').replace(/\/$/, '');
+		return origin + (url.startsWith('/') ? '' : '/') + url;
+	}
+
 	private warnIfProxyRequired(sourceUrl: string): void {
 		if (this.directGuardWarned) return;
 		let host: string;
@@ -81,6 +108,13 @@ export class WebImageProvider implements ImageProvider {
 	}
 
 	async resolveCover(sourceUrl: string): Promise<string> {
+		if (!sourceUrl) return '';
+		// Covers cached on our own origin (the DB cover cache) are same-origin /
+		// CORS-safe — serve them directly, never through the Worker. Everything else
+		// (uncached MangaDex covers) still goes through the proxy.
+		if (!this.config.direct && this.isOwnAsset(sourceUrl)) {
+			return this.toAbsoluteOwn(sourceUrl);
+		}
 		return this.resolve(sourceUrl);
 	}
 }
@@ -101,6 +135,8 @@ export class WebImageProvider implements ImageProvider {
  *  3. Everything else (absolute non-engine URLs) → `resolveViaLocalProxy`.
  */
 export class NativeImageProvider implements ImageProvider {
+	constructor(private readonly config: WebImageProviderConfig = { workerBaseUrl: '' }) {}
+
 	private async fetchBytes(sourceUrl: string): Promise<ArrayBuffer> {
 		const { invoke } = await import('@tauri-apps/api/core');
 		// Rust `fetch_image` returns the raw image bytes as an ArrayBuffer.
@@ -165,6 +201,12 @@ export class NativeImageProvider implements ImageProvider {
 	private async resolve(sourceUrl: string): Promise<string> {
 		if (!sourceUrl) return '';
 		if (this.isEnginePath(sourceUrl)) return this.engineToBlobUrl(sourceUrl);
+		// Covers/avatars cached on the hosted API origin: fetch the absolute URL
+		// (relative `/covers/…` resolved against apiOrigin) via the generic path.
+		if (OWN_ASSET_PREFIXES.some((p) => sourceUrl.startsWith(p))) {
+			const origin = (this.config.apiOrigin ?? '').replace(/\/$/, '');
+			return this.toBlobUrl(origin + sourceUrl);
+		}
 		return this.isMangaDexHost(sourceUrl)
 			? this.toBlobUrl(sourceUrl)
 			: this.resolveViaLocalProxy(sourceUrl);
@@ -184,5 +226,5 @@ export class NativeImageProvider implements ImageProvider {
 }
 
 export function createImageProvider(config: WebImageProviderConfig): ImageProvider {
-	return isTauri() ? new NativeImageProvider() : new WebImageProvider(config);
+	return isTauri() ? new NativeImageProvider(config) : new WebImageProvider(config);
 }

@@ -248,7 +248,10 @@ export class GraphQLBackend implements Backend {
 		return d.notifications;
 	}
 	async unreadNotificationCount(): Promise<number> {
-		const d = await this.gql<{ unreadNotificationCount: number }>(ops.UNREAD_NOTIFICATION_COUNT, {});
+		const d = await this.gql<{ unreadNotificationCount: number }>(
+			ops.UNREAD_NOTIFICATION_COUNT,
+			{},
+		);
 		return d.unreadNotificationCount;
 	}
 	async markNotificationsRead(ids?: Id[]): Promise<number> {
@@ -473,6 +476,13 @@ export class GraphQLBackend implements Backend {
 	async persistCatalogue(): Promise<number> {
 		const d = await this.gql<{ persistCatalogue: number }>(ops.PERSIST_CATALOGUE);
 		return d.persistCatalogue;
+	}
+
+	async materializeCatalogueCovers(): Promise<number> {
+		const d = await this.gql<{ materializeCatalogueCovers: number }>(
+			ops.MATERIALIZE_CATALOGUE_COVERS,
+		);
+		return d.materializeCatalogueCovers;
 	}
 
 	// --- viewer preferences ---

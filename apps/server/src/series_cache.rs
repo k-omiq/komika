@@ -217,15 +217,13 @@ pub async fn get_series_fresh(pool: &SqlitePool, id: i64) -> Result<Option<(Suwa
 /// `updated_at` written by `put_chapters`), or `None` if no chapters are cached.
 /// `put_series` never touches chapter rows, so this cleanly tracks chapter fetches.
 pub async fn chapters_last_fetched(pool: &SqlitePool, manga_id: i64) -> Result<Option<String>> {
-    Ok(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
-        )
-        .bind(manga_id)
-        .fetch_optional(pool)
-        .await?
-        .flatten(),
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
     )
+    .bind(manga_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
 }
 
 /// Load the cached chapter list for a manga (source order: newest first by number).

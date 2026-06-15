@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
-	import favicon from '$lib/assets/favicon.svg';
+	import mark from '$lib/assets/mark.png';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth, initAuth, logout } from '$lib/auth.svelte';
@@ -37,8 +37,13 @@
 </script>
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
 	<title>Komiq · manga DB</title>
+	<link rel="icon" href="/favicon.ico" sizes="any" />
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+	<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+	<link rel="manifest" href="/manifest.webmanifest" />
+	<meta name="theme-color" content="#0c0c0d" />
 </svelte:head>
 
 {#if !auth.ready}
@@ -47,6 +52,7 @@
 	{#if auth.user && !onLogin}
 		<header class="admin-header">
 			<div class="brand">
+				<img class="brand-mark" src={mark} alt="" />
 				<span class="mark">KOMIQ</span>
 				<span class="sub">manga DB</span>
 				<nav class="nav">
@@ -100,8 +106,13 @@
 	}
 	.brand {
 		display: flex;
-		align-items: baseline;
+		align-items: center;
 		gap: 16px;
+	}
+	.brand-mark {
+		display: block;
+		width: auto;
+		height: 18px;
 	}
 	.nav {
 		display: flex;

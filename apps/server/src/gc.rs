@@ -54,7 +54,10 @@ async fn sweep(pool: &SqlitePool) {
         .await
     {
         Ok(r) if r.rows_affected() > 0 => {
-            tracing::info!(deleted = r.rows_affected(), "gc: swept orphaned comment media");
+            tracing::info!(
+                deleted = r.rows_affected(),
+                "gc: swept orphaned comment media"
+            );
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "gc: comment-media sweep failed"),

@@ -94,10 +94,7 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
  * source_series mappings + user data to the target, then DELETE the source work.
  * The target survives as canonical. IRREVERSIBLE.
  */
-export async function mergeWorks(
-	sourceWorkId: Id,
-	targetWorkId: Id,
-): Promise<MergeWorksResult> {
+export async function mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
 	if (!backend.mergeWorks) throw new Error('Work merge is unavailable on this backend.');
 	return backend.mergeWorks(sourceWorkId, targetWorkId);
 }
@@ -133,8 +130,7 @@ export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]>
  * `refresh: true` re-fetches the store indexes so hasUpdate/versions are fresh.
  */
 export async function loadExtensions(refresh = false): Promise<ExtensionInfo[]> {
-	if (!backend.extensions)
-		throw new Error('Extension management is unavailable on this backend.');
+	if (!backend.extensions) throw new Error('Extension management is unavailable on this backend.');
 	return backend.extensions(refresh);
 }
 
@@ -210,8 +206,7 @@ export async function loadSeriesSources(seriesIds: Id[]): Promise<SeriesSourceGr
  * returns the recomputed series.
  */
 export async function setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
-	if (!backend.setSeriesPaused)
-		throw new Error('Pause management is unavailable on this backend.');
+	if (!backend.setSeriesPaused) throw new Error('Pause management is unavailable on this backend.');
 	return backend.setSeriesPaused(seriesId, paused);
 }
 
@@ -221,8 +216,7 @@ export async function setSeriesPaused(seriesId: Id, paused: boolean): Promise<Se
  * progress while a job runs.
  */
 export async function loadSourceIngestJobs(active = false): Promise<SourceIngestJob[]> {
-	if (!backend.sourceIngestJobs)
-		throw new Error('Source ingest is unavailable on this backend.');
+	if (!backend.sourceIngestJobs) throw new Error('Source ingest is unavailable on this backend.');
 	return backend.sourceIngestJobs(active);
 }
 
@@ -232,15 +226,13 @@ export async function loadSourceIngestJobs(active = false): Promise<SourceIngest
  * and for an NSFW source unless the admin opted in.
  */
 export async function startSourceIngest(sourceId: Id): Promise<SourceIngestJob> {
-	if (!backend.startSourceIngest)
-		throw new Error('Source ingest is unavailable on this backend.');
+	if (!backend.startSourceIngest) throw new Error('Source ingest is unavailable on this backend.');
 	return backend.startSourceIngest(sourceId);
 }
 
 /** Request cancellation of a running ingest job; progress so far is preserved. */
 export async function cancelSourceIngest(jobId: Id): Promise<SourceIngestJob> {
-	if (!backend.cancelSourceIngest)
-		throw new Error('Source ingest is unavailable on this backend.');
+	if (!backend.cancelSourceIngest) throw new Error('Source ingest is unavailable on this backend.');
 	return backend.cancelSourceIngest(jobId);
 }
 
@@ -273,6 +265,18 @@ export async function persistCatalogue(): Promise<number> {
 	if (!backend.persistCatalogue)
 		throw new Error('Catalogue persistence is unavailable on this backend.');
 	return backend.persistCatalogue();
+}
+
+/**
+ * Maintenance: materialize every canonical work's cover into the DB
+ * (`work_cover_blob`) so the web reader serves covers from `/covers/{id}.webp`
+ * instead of the Cloudflare image Worker. Kicks off a polite background crawl and
+ * returns how many works are still uncached (queued) at kick-off. Admin-gated.
+ */
+export async function materializeCatalogueCovers(): Promise<number> {
+	if (!backend.materializeCatalogueCovers)
+		throw new Error('Cover materialization is unavailable on this backend.');
+	return backend.materializeCatalogueCovers();
 }
 
 // ---- Series-detail editor (metadata + chapters + rescan) --------------------
@@ -313,13 +317,15 @@ export async function loadWorkSources(workId: string): Promise<WorkSource[]> {
 
 /** A work's aggregated chapters WITH override state (hidden/renamed), unfiltered. */
 export async function loadWorkChaptersAdmin(workId: string): Promise<AdminChapter[]> {
-	if (!backend.workChaptersAdmin) throw new Error('Chapter editing is unavailable on this backend.');
+	if (!backend.workChaptersAdmin)
+		throw new Error('Chapter editing is unavailable on this backend.');
 	return backend.workChaptersAdmin(workId);
 }
 
 /** Soft-hide (reversible) or rename one chapter of a work. */
 export async function setChapterOverride(input: ChapterOverrideInput): Promise<boolean> {
-	if (!backend.setChapterOverride) throw new Error('Chapter editing is unavailable on this backend.');
+	if (!backend.setChapterOverride)
+		throw new Error('Chapter editing is unavailable on this backend.');
 	return backend.setChapterOverride(input);
 }
 

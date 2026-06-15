@@ -336,6 +336,13 @@ export interface Backend {
 	 * pre-warm action, gated server-side by `require_admin`. Returns how many
 	 * series were persisted. Optional: only the unified Komika API implements it. */
 	persistCatalogue?(): Promise<number>;
+	/** Materialize every canonical work's cover into the DB (`work_cover_blob`) so
+	 * the web reader serves covers from `/covers/{id}.webp` instead of the
+	 * Cloudflare image Worker. Kicks off a polite, single-flighted background crawl
+	 * (bounded by the MangaDex rate limiter) and returns how many works are still
+	 * uncached (queued) at kick-off. Admin-gated. Optional: only the unified Komika
+	 * API implements it. */
+	materializeCatalogueCovers?(): Promise<number>;
 }
 
 /** Server-side catalogue-search filters (S4). All optional; omit to not filter. */

@@ -9,7 +9,7 @@ import {
 	isTauri,
 	OfflineWriteQueue,
 } from '@komika/api';
-import { config } from './config';
+import { apiOrigin, config } from './config';
 
 /**
  * App-wide singletons. The UI only ever talks to these two seams:
@@ -38,6 +38,9 @@ export const backend =
 export const images = createImageProvider({
 	workerBaseUrl: config.imgWorkerBaseUrl,
 	direct: config.imgDirect,
+	// Cached covers are served from the API origin under `/covers/...`; the provider
+	// passes those through directly instead of routing them via the Worker.
+	apiOrigin,
 });
 export const platform = currentPlatform();
 
