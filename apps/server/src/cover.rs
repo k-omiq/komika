@@ -97,15 +97,27 @@ pub fn work_cover_url(
     }
 }
 
-/// Store (or replace) a work's cover blob and flip `work.cover_cached_version` to
-/// the new version in one transaction, so a reader never sees the version pointer
-/// without the bytes behind it. The version is a wall-clock timestamp — monotonic
-/// enough to bust caches on every re-save.
-pub async fn put_work_cover(pool: &SqlitePool, work_id: &str, webp: &[u8]) -> Result<()> {
+/// Store (or replace) a work's cover blob (in the separate `covers` DB) and flip
+/// `work.cover_cached_version` (in the `main` DB) to the new version. The version
+/// is a wall-clock timestamp — monotonic enough to bust caches on every re-save.
+///
+/// The blob and its version pointer live in DIFFERENT databases (covers is
+/// un-replicated; see `db::init_covers`), so a single cross-DB transaction is
+/// impossible. We preserve the invariant "`cover_cached_version` set ⇒ blob exists"
+/// by ORDERING: write the blob first, set the pointer second. A crash in between
+/// leaves a blob with no pointer — harmless: the resolver falls back to the proxy
+/// URL, and the drainer re-runs (it selects `cover_cached_version IS NULL`) and
+/// re-sets the pointer. The reverse order could point at a missing blob → 404.
+pub async fn put_work_cover(
+    main: &SqlitePool,
+    covers: &SqlitePool,
+    work_id: &str,
+    webp: &[u8],
+) -> Result<()> {
     let now = Utc::now();
     let version = now.timestamp();
     let ts = now.to_rfc3339();
-    let mut tx = pool.begin().await?;
+    // 1) Blob first, into the un-replicated covers DB.
     sqlx::query(
         "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
          VALUES (?, ?, ?, ?) \
@@ -116,14 +128,14 @@ pub async fn put_work_cover(pool: &SqlitePool, work_id: &str, webp: &[u8]) -> Re
     .bind(webp)
     .bind(version)
     .bind(&ts)
-    .execute(&mut *tx)
+    .execute(covers)
     .await?;
+    // 2) Version pointer second, into the main (replicated) DB.
     sqlx::query("UPDATE work SET cover_cached_version = ? WHERE id = ?")
         .bind(version)
         .bind(work_id)
-        .execute(&mut *tx)
+        .execute(main)
         .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -157,7 +169,8 @@ pub async fn pending_cover_count(pool: &SqlitePool) -> Result<i64> {
 /// works whose upstream fetch failed last time). Best-effort per work — one
 /// failure never aborts the crawl.
 pub async fn crawl_uncached_covers(
-    pool: &SqlitePool,
+    main: &SqlitePool,
+    covers: &SqlitePool,
     mangadex: &MangaDexClient,
     limit: Option<i64>,
 ) {
@@ -178,12 +191,12 @@ pub async fn crawl_uncached_covers(
                 "{BASE} LIMIT ?"
             ))
             .bind(n)
-            .fetch_all(pool)
+            .fetch_all(main)
             .await
         }
         None => {
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(BASE)
-                .fetch_all(pool)
+                .fetch_all(main)
                 .await
         }
     };
@@ -217,7 +230,7 @@ pub async fn crawl_uncached_covers(
             .await
         {
             Some(bytes) => match process_cover(&bytes) {
-                Ok(webp) => match put_work_cover(pool, &job.work_id, &webp).await {
+                Ok(webp) => match put_work_cover(main, covers, &job.work_id, &webp).await {
                     Ok(()) => saved += 1,
                     Err(e) => {
                         failed += 1;
@@ -249,7 +262,8 @@ pub async fn crawl_uncached_covers(
 /// FLEET CONSTRAINT: like the catalogue sync / metadata backfill, this hits
 /// MangaDex under the in-process rate limiter, so run it on exactly ONE replica.
 pub fn spawn(
-    pool: SqlitePool,
+    main: SqlitePool,
+    covers: SqlitePool,
     mangadex: Arc<MangaDexClient>,
     inflight: Arc<AtomicBool>,
     interval_secs: u64,
@@ -271,9 +285,9 @@ pub fn spawn(
                     {
                         continue;
                     }
-                    match pending_cover_count(&pool).await {
+                    match pending_cover_count(&main).await {
                         Ok(0) => { /* nothing to do this tick */ }
-                        Ok(_) => crawl_uncached_covers(&pool, &mangadex, Some(batch)).await,
+                        Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, Some(batch)).await,
                         Err(e) => tracing::warn!(error = %e, "cover drainer: count failed"),
                     }
                     inflight.store(false, Ordering::SeqCst);
@@ -350,40 +364,58 @@ mod tests {
     #[tokio::test]
     async fn put_work_cover_stores_blob_and_flips_version() {
         use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
+        // Main (replicated) DB: `work` + the `cover_cached_version` pointer. After
+        // migration 0040 it has NO `work_cover_blob` table.
+        let main = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        // Covers (un-replicated) DB: just the blob table, as `db::init_covers` builds.
+        let covers = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
+             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO work (id, created_at, updated_at) \
              VALUES ('w_test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
-        .execute(&pool)
+        .execute(&main)
         .await
         .unwrap();
 
         // No cache yet → resolver falls back to the MangaDex thumbnail URL.
         let ver0: Option<i64> =
             sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_test'")
-                .fetch_one(&pool)
+                .fetch_one(&main)
                 .await
                 .unwrap();
         assert!(ver0.is_none());
 
         let webp = process_cover(&noisy_png(400, 600)).unwrap();
-        put_work_cover(&pool, "w_test", &webp).await.unwrap();
+        put_work_cover(&main, &covers, "w_test", &webp)
+            .await
+            .unwrap();
 
-        // Blob is stored and the work's version pointer matches it (no dangling pointer).
+        // Blob is stored in the covers DB and the work's version pointer (main DB)
+        // matches it (invariant: no version pointer without the bytes behind it).
         let (blob, blob_ver): (Vec<u8>, i64) =
             sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_test'")
-                .fetch_one(&pool)
+                .fetch_one(&covers)
                 .await
                 .unwrap();
         let work_ver: Option<i64> =
             sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_test'")
-                .fetch_one(&pool)
+                .fetch_one(&main)
                 .await
                 .unwrap();
         assert_eq!(blob, webp, "stored bytes round-trip");
@@ -399,7 +431,7 @@ mod tests {
         );
 
         // pending_cover_count excludes the now-cached work.
-        assert_eq!(pending_cover_count(&pool).await.unwrap(), 0);
+        assert_eq!(pending_cover_count(&main).await.unwrap(), 0);
     }
 
     #[test]

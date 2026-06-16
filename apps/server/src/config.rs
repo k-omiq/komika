@@ -20,6 +20,11 @@ impl std::fmt::Debug for Secret {
 pub struct Config {
     pub port: u16,
     pub database_url: String,
+    /// SQLite URL for the SEPARATE cover-cache DB. Kept out of `database_url` on
+    /// purpose: cover blobs are large and re-derivable from MangaDex, so this DB is
+    /// NOT Litestream-replicated (only `database_url` is). Defaults to a
+    /// `covers.sqlite3` sibling of the main DB; override with `COVERS_DATABASE_URL`.
+    pub covers_database_url: String,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -110,6 +115,11 @@ impl Config {
             .unwrap_or(8080);
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://komika.sqlite3".to_string());
+        // Cover-cache DB lives next to the main DB by default (a `covers.sqlite3`
+        // sibling), but is a distinct file so Litestream (which replicates only
+        // `database_url`) never ships cover bytes to R2.
+        let covers_database_url =
+            env::var("COVERS_DATABASE_URL").unwrap_or_else(|_| derive_covers_url(&database_url));
         let suwayomi_url =
             env::var("SUWAYOMI_URL").unwrap_or_else(|_| "http://localhost:4567".to_string());
         let suwayomi_public_url = env::var("SUWAYOMI_PUBLIC_URL")
@@ -281,6 +291,25 @@ impl Config {
             cover_cache_enabled,
             cover_cache_interval_secs,
             cover_cache_batch,
+            covers_database_url,
         }
     }
+}
+
+/// Place `covers.sqlite3` next to the main DB file, preserving the URL's scheme
+/// prefix. Handles `sqlite:///abs/dir/komika.sqlite3`, `sqlite://rel.sqlite3`, and
+/// `sqlite:rel.sqlite3`. A `:memory:` URL (tests only — prod is always a file) maps
+/// to its own in-memory DB.
+fn derive_covers_url(database_url: &str) -> String {
+    if database_url.contains(":memory:") {
+        return "sqlite::memory:".to_string();
+    }
+    if let Some(i) = database_url.rfind('/') {
+        return format!("{}/covers.sqlite3", &database_url[..i]);
+    }
+    // No path separator, e.g. `sqlite:komika.sqlite3` — swap after the scheme colon.
+    if let Some(i) = database_url.rfind(':') {
+        return format!("{}:covers.sqlite3", &database_url[..i]);
+    }
+    "covers.sqlite3".to_string()
 }

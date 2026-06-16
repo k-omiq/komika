@@ -126,6 +126,9 @@ impl KeyedLocks {
 /// Shared, request-independent application state.
 pub struct AppState {
     pub pool: SqlitePool,
+    /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
+    /// `pool` so Litestream/R2 backs up only the main DB; see `db::init_covers`.
+    pub cover_pool: SqlitePool,
     pub suwayomi: SuwayomiClient,
     /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
     /// works via MangaDex@Home (CATALOGUE.md §5). Shared with the catalogue sync.
@@ -572,6 +575,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
 /// Assemble a `Series` from a manga plus its already-resolved per-series lookups.
 /// Pure (no DB): every value it needs is passed in, so the single- and batch-map
 /// paths share exactly this construction. Mirrors the old inline `map_series` body.
+#[allow(clippy::too_many_arguments)]
 fn assemble_series(
     st: &AppState,
     m: SuwayomiManga,
@@ -713,7 +717,7 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series
 /// Build the `?,?,…` placeholder list for an `IN (…)` clause of `n` values. Values
 /// are always bound (never interpolated), so this only ever emits placeholders.
 fn in_placeholders(n: usize) -> String {
-    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
 /// Batched `rating_summary`: one grouped query for all series → per-series summary.
@@ -5303,7 +5307,7 @@ impl MutationRoot {
             .await
             .map_err(gql_err)? as i32;
         tokio::spawn(async move {
-            crate::cover::crawl_uncached_covers(&st.pool, &st.mangadex, None).await;
+            crate::cover::crawl_uncached_covers(&st.pool, &st.cover_pool, &st.mangadex, None).await;
             st.cover_crawl_running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         });
@@ -6306,6 +6310,7 @@ mod tests {
         .unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
+            cover_pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -6813,6 +6818,7 @@ mod tests {
         let mk_state = || {
             std::sync::Arc::new(AppState {
                 pool: pool.clone(),
+                cover_pool: pool.clone(),
                 suwayomi: crate::suwayomi::SuwayomiClient::new(
                     "http://127.0.0.1:1".into(),
                     None,
@@ -6924,6 +6930,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
+            cover_pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -8563,7 +8570,8 @@ mod tests {
             .unwrap();
         }
         let state = std::sync::Arc::new(AppState {
-            pool,
+            pool: pool.clone(),
+            cover_pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -8636,7 +8644,8 @@ mod tests {
     /// dead port; `map_series` never dials it, so read-shape tests stay offline).
     fn state_with_pool(pool: SqlitePool) -> std::sync::Arc<AppState> {
         std::sync::Arc::new(AppState {
-            pool,
+            pool: pool.clone(),
+            cover_pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,

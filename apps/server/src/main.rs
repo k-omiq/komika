@@ -152,6 +152,9 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) ->
 struct RouterState {
     schema: ApiSchema,
     pool: sqlx::SqlitePool,
+    /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
+    /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
+    cover_pool: sqlx::SqlitePool,
     trusted_proxies: Arc<Vec<Cidr>>,
     /// Per-user sliding-window limiter for the CPU-bound upload routes
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
@@ -166,6 +169,15 @@ impl FromRef<RouterState> for ApiSchema {
 impl FromRef<RouterState> for sqlx::SqlitePool {
     fn from_ref(s: &RouterState) -> Self {
         s.pool.clone()
+    }
+}
+/// Newtype for the cover-cache pool so a handler can extract it via `State`
+/// without colliding with the main-pool `FromRef<RouterState> for SqlitePool`.
+#[derive(Clone)]
+struct CoverDb(sqlx::SqlitePool);
+impl FromRef<RouterState> for CoverDb {
+    fn from_ref(s: &RouterState) -> Self {
+        CoverDb(s.cover_pool.clone())
     }
 }
 impl FromRef<RouterState> for Arc<Vec<Cidr>> {
@@ -351,7 +363,7 @@ async fn serve_avatar(
 /// missing blob is a 404 (the caller only builds this URL when
 /// `work.cover_cached_version` is set, so a 404 means a race with a cache clear).
 async fn serve_cover(
-    State(pool): State<sqlx::SqlitePool>,
+    State(CoverDb(pool)): State<CoverDb>,
     UrlPath(file): UrlPath<String>,
 ) -> axum::response::Response {
     let Some(work_id) = file.strip_suffix(".webp") else {
@@ -573,6 +585,32 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?cfg, "starting komika-server");
 
     let pool = db::init(&cfg.database_url).await?;
+    // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
+    // of the main DB so Litestream ships only accounts/social/catalogue to R2, never
+    // the large (re-derivable) cover thumbnails.
+    let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
+
+    // DR reconciliation: if the covers DB is empty (e.g. a fresh host that restored
+    // the main DB from R2 but has no covers.sqlite3), clear any surviving
+    // `cover_cached_version` pointers so cover URLs fall back to the Worker proxy
+    // until the drainer re-materializes them — otherwise those pointers would 404.
+    // Cheap no-op in steady state (covers DB non-empty → skip the UPDATE).
+    let cover_blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
+        .fetch_one(&cover_pool)
+        .await?;
+    if cover_blob_count == 0 {
+        let cleared = sqlx::query(
+            "UPDATE work SET cover_cached_version = NULL WHERE cover_cached_version IS NOT NULL",
+        )
+        .execute(&pool)
+        .await?;
+        if cleared.rows_affected() > 0 {
+            tracing::warn!(
+                cleared = cleared.rows_affected(),
+                "covers DB empty — cleared stale cover version pointers; covers will re-cache"
+            );
+        }
+    }
 
     // Provision/promote configured admin accounts (idempotent). This is the only
     // path to admin: `register` reserves these names and never grants admin.
@@ -596,6 +634,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let state = Arc::new(AppState {
         pool: pool.clone(),
+        cover_pool: cover_pool.clone(),
         suwayomi,
         mangadex: mangadex.clone(),
         admin_users: cfg.admin_users.clone(),
@@ -668,6 +707,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.cover_cache_enabled {
         cover::spawn(
             pool.clone(),
+            cover_pool.clone(),
             mangadex.clone(),
             state.cover_crawl_running.clone(),
             cfg.cover_cache_interval_secs,
@@ -777,6 +817,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(RouterState {
             schema,
             pool,
+            cover_pool,
             trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
             // ~20 uploads/min per user across the avatar + comment-media routes.
             upload_limiter: Arc::new(RateLimiter::new(20, 60)),
