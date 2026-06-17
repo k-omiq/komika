@@ -841,6 +841,7 @@ fn is_han(c: char) -> bool {
 /// 3. a genre/tag heuristic (an explicit `Manhwa`/`Manhua` tag),
 /// 4. a title-script heuristic (Hangul→Manhwa; Han without kana→Manhua),
 /// 5. default Manga.
+///
 /// Steps 3–5 only fire when the origin language is unknown — the common case for
 /// series ingested from a Suwayomi/Keiyoushi extension, whose source language is
 /// the TRANSLATION language and must not be treated as the origin.

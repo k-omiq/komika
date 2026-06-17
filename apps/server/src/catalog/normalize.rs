@@ -98,9 +98,7 @@ fn is_roman_numeral(s: &str) -> bool {
         m += 1;
     }
     // hundreds: CM | CD | D?C{0,3}
-    if i + 1 < b.len() && b[i] == b'c' && b[i + 1] == b'm' {
-        i += 2;
-    } else if i + 1 < b.len() && b[i] == b'c' && b[i + 1] == b'd' {
+    if i + 1 < b.len() && b[i] == b'c' && (b[i + 1] == b'm' || b[i + 1] == b'd') {
         i += 2;
     } else {
         if i < b.len() && b[i] == b'd' {
@@ -113,9 +111,7 @@ fn is_roman_numeral(s: &str) -> bool {
         }
     }
     // tens: XC | XL | L?X{0,3}
-    if i + 1 < b.len() && b[i] == b'x' && b[i + 1] == b'c' {
-        i += 2;
-    } else if i + 1 < b.len() && b[i] == b'x' && b[i + 1] == b'l' {
+    if i + 1 < b.len() && b[i] == b'x' && (b[i + 1] == b'c' || b[i + 1] == b'l') {
         i += 2;
     } else {
         if i < b.len() && b[i] == b'l' {
@@ -128,9 +124,7 @@ fn is_roman_numeral(s: &str) -> bool {
         }
     }
     // units: IX | IV | V?I{0,3}
-    if i + 1 < b.len() && b[i] == b'i' && b[i + 1] == b'x' {
-        i += 2;
-    } else if i + 1 < b.len() && b[i] == b'i' && b[i + 1] == b'v' {
+    if i + 1 < b.len() && b[i] == b'i' && (b[i + 1] == b'x' || b[i + 1] == b'v') {
         i += 2;
     } else {
         if i < b.len() && b[i] == b'v' {

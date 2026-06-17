@@ -218,7 +218,8 @@ pub fn avg_interval_hours(chapters: &[SuwayomiChapter]) -> Option<f64> {
 }
 
 /// The latest (highest) chapter number seen, or `None` for an empty list.
-/// Used both for new-chapter detection (SC4) and log output.
+/// Test-only helper for the SC4 new-chapter-detection assertions.
+#[cfg(test)]
 fn latest_number(chapters: &[SuwayomiChapter]) -> Option<f64> {
     chapters
         .iter()
