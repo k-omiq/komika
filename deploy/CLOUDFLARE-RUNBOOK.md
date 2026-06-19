@@ -221,6 +221,47 @@ wrangler deploy
 Then add the **Custom Domain** `komiq.cc` (and `www.komiq.cc`) to the `komika-reader`
 Worker in the dashboard.
 
+## Part F — Admin console → admin.komiq.cc
+
+The admin console (`apps/admin`) is a **static SPA** (`@sveltejs/adapter-static`,
+`fallback: index.html`) — no `_worker.js`, unlike the reader. Its
+`apps/admin/wrangler.toml` deploys the prebuilt `build/` as static assets with
+`not_found_handling = "single-page-application"` so client-side deep links
+(e.g. `/sources`) and refreshes serve `index.html` instead of 404-ing.
+
+It reads exactly **one** build-time env var, `PUBLIC_KOMIKA_API` (Vite bakes it in),
+so — like the reader — set it **before** `build`:
+
+```sh
+cd apps/admin
+PUBLIC_KOMIKA_API=https://api.komiq.cc/graphql pnpm build   # emits build/
+wrangler deploy
+```
+
+Then add the **Custom Domain** `admin.komiq.cc` to the `komika-admin` Worker in the
+dashboard (Workers & Pages → komika-admin → Settings → Domains & Routes).
+
+**CORS:** the admin origin must be allowed by the API server. Add it to
+`CORS_ORIGINS` in `deploy/.env` (comma-separated, alongside the reader origins) and
+restart the server, or every admin GraphQL call is blocked:
+
+```sh
+# deploy/.env
+CORS_ORIGINS=https://komiq.cc,https://www.komiq.cc,https://admin.komiq.cc
+cd deploy && docker compose up -d server
+```
+
+**Rebuild-on-change:** because `PUBLIC_KOMIKA_API` is baked at build time, if the API
+domain ever changes the admin app must be **rebuilt and redeployed** (same as the
+reader/image Workers).
+
+**Auth & hardening:** the console is gated by the admin *account*
+(`KOMIKA_ADMIN_USERS` / `KOMIKA_ADMIN_PASSWORD` on the server) — there is no separate
+admin auth. For defense-in-depth on a management surface, optionally put
+**Cloudflare Access** in front of the `admin.komiq.cc` hostname (Zero Trust → Access
+→ Applications) so the login page isn't even reachable without passing Access first.
+Don't expose the hostname more broadly than needed.
+
 ## DNS records
 
 All records are **proxied** (orange cloud):
@@ -229,6 +270,7 @@ All records are **proxied** (orange cloud):
 | --- | --- | --- |
 | `komiq.cc` | `komika-reader` Worker | Worker custom domain |
 | `img.komiq.cc` | `komika-img` Worker | Worker custom domain |
+| `admin.komiq.cc` | `komika-admin` Worker | Worker custom domain |
 | `api.komiq.cc` | Tunnel | CNAME (`<UUID>.cfargotunnel.com`) |
 
 **Nothing points at Suwayomi** — it has no DNS and no public port.
