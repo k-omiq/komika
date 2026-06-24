@@ -36,7 +36,7 @@ ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network"
 #   "https://komika.app,https://read.komika.app,http://localhost:5173"
 # NOTE: this is a hotlink deterrent, not an abuse cap — the per-IP abuse cap is
 # the IMG_RATE_LIMITER binding below.
-ALLOWED_ORIGINS = ""
+ALLOWED_ORIGINS = "https://komiq.cc,https://www.komiq.cc"
 
 # ---------------------------------------------------------------------------
 # Native per-IP rate limiter (Cloudflare Rate Limiting binding). Caps bandwidth
