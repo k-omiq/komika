@@ -18,6 +18,14 @@ compatibility_date = "2024-11-06"
 # SvelteKit's server runtime uses Node built-ins; required on Workers.
 compatibility_flags = ["nodejs_compat"]
 
+# This account has no workers.dev subdomain, so serve on the apex + www custom
+# domains directly. custom_domain = true provisions each host's DNS record + cert.
+workers_dev = false
+routes = [
+  { pattern = "komiq.cc", custom_domain = true },
+  { pattern = "www.komiq.cc", custom_domain = true },
+]
+
 # Static client assets (hashed `_app/immutable/*`, icons, manifest). Wrangler
 # serves these directly from the edge and only invokes the Worker for the
 # SSR/dynamic routes listed in the adapter-generated `_routes.json`. `_worker.js`,

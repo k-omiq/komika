@@ -15,6 +15,13 @@
 name = "komika-admin"
 compatibility_date = "2024-11-06"
 
+# This account has no workers.dev subdomain, so serve ONLY on the custom domain.
+# custom_domain = true provisions the proxied DNS record + edge cert for the host.
+workers_dev = false
+routes = [
+  { pattern = "admin.komiq.cc", custom_domain = true },
+]
+
 # Static SPA output from adapter-static. `not_found_handling =
 # "single-page-application" serves index.html for any unmatched path so client-
 # side deep links / refreshes (e.g. /sources) resolve instead of 404-ing.
