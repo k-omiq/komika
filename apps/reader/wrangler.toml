@@ -8,10 +8,13 @@
 # Public catalog routes (home, browse, series, updates, support) are
 # server-rendered here; the rest of the app hydrates client-side (see $lib/ssr).
 #
-# NOTE: runtime backend wiring (PUBLIC_KOMIKA_API, PUBLIC_KOMIKA_IMG_WORKER, …) is
-# baked at BUILD time by Vite, not read here — set those env vars before `build`
-# (same as deploy/reader.Dockerfile). This Worker itself needs no secrets: the
-# SSR loads only fetch the public/anonymous catalog.
+# NOTE: backend wiring (PUBLIC_KOMIKA_API, PUBLIC_KOMIKA_IMG_WORKER, …) is baked at
+# BUILD time by Vite via `$env/static/public` — the committed apps/reader/.env.production
+# supplies the prod values, inlined into the bundle. It is intentionally NOT read from
+# a Worker `[vars]` block: adapter-cloudflare evaluates $lib/config.ts at edge cold-start
+# with no request context, so a runtime `[vars]`/`$env/dynamic/public` value never
+# reaches the frozen module-scope constants (this is the empty-feeds bug). This Worker
+# needs no secrets: the SSR loads only fetch the public/anonymous catalog.
 name = "komika-reader"
 main = ".svelte-kit/cloudflare/_worker.js"
 compatibility_date = "2024-11-06"

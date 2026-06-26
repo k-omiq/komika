@@ -206,17 +206,28 @@ ingress firewall completely — the only inbound port you ever need is SSH.
 
 ## Part E — Reader Worker → komiq.cc
 
-The reader's backend URLs are **baked at build time** (Vite inlines `PUBLIC_*`), so
-build with the env inline, then deploy:
+The reader's backend URLs are **baked at build time** via `$env/static/public` (Vite
+inlines them into the bundle). The prod values are **committed** in
+`apps/reader/.env.production` — you do **not** pass them inline. Just build and deploy:
 
 ```sh
 cd apps/reader
-PUBLIC_KOMIKA_BACKEND=on PUBLIC_KOMIKA_BACKEND_KIND=komika \
-PUBLIC_KOMIKA_API=https://api.komiq.cc/graphql \
-PUBLIC_KOMIKA_IMG_MODE=proxy PUBLIC_KOMIKA_IMG_WORKER=https://img.komiq.cc \
-pnpm build
+pnpm build          # loads .env + .env.production → api.komiq.cc, backend on, img proxy
 wrangler deploy
 ```
+
+> **Why not a Worker `[vars]` block / `$env/dynamic/public`?** adapter-cloudflare
+> evaluates `$lib/config.ts` (and the `backend`/`images` singletons it seeds) at edge
+> cold-start, where there is **no request context** — a runtime env value is empty there,
+> so `apiEndpoint` would freeze to `localhost` and the home/browse feeds render empty even
+> though the API is up. `$env/static/public` is inlined at build, so it resolves correctly
+> at module scope. To change an endpoint, edit `apps/reader/.env.production` and rebuild.
+
+The public catalog pages (home, browse, series, updates, support) are **edge-SSR**: their
+`load` awaits the backend on the server so real content is in the HTML (Svelte SSR only
+renders the pending branch of `{#await}`, so streamed promises would ship skeletons forever).
+Verify with a plain `curl https://komiq.cc/` — it must contain `/series/…` links, not just
+`k-skeleton` placeholders.
 
 Then add the **Custom Domain** `komiq.cc` (and `www.komiq.cc`) to the `komika-reader`
 Worker in the dashboard.

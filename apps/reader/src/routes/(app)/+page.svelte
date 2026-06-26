@@ -7,6 +7,11 @@
 
 	let { data } = $props();
 
+	// The home feeds are a resolved object on the server/hydration (edge SSR renders
+	// real cards) and a pending Promise on client navigations (skeletons via {#await}).
+	// See +page.ts. `HomeData` is the resolved shape either way.
+	type HomeData = Awaited<typeof data.home>;
+
 	let heroIndex = $state(0);
 	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
 	let heroPicked = $state(false);
@@ -27,7 +32,9 @@
 	// auto-rotate). `data.home` never rejects (empty results on error); an empty
 	// featured list keeps the placeholder hero (same look as the loading hero).
 	$effect(() => {
-		data.home.then((h) => {
+		// `data.home` is a Promise on the client and a resolved object on the server;
+		// `Promise.resolve` normalises both so the hero fills in either case.
+		Promise.resolve(data.home).then((h) => {
 			featured = h.featured;
 		});
 	});
@@ -48,7 +55,19 @@
 	const current = $derived(featured[heroIndex]);
 </script>
 
-{#await data.home}
+<!-- Resolved object on the server (SSR renders cards) vs pending Promise on the
+     client (skeletons via {#await}). Both feed the same `content` snippet. -->
+{#if data.home instanceof Promise}
+	{#await data.home}
+		{@render loading()}
+	{:then home}
+		{@render content(home)}
+	{/await}
+{:else}
+	{@render content(data.home)}
+{/if}
+
+{#snippet loading()}
 	<!-- LOADING -->
 	<section class="hero hero-loading">
 		<span class="cover-tag">COVER</span>
@@ -68,7 +87,9 @@
 			<CardRowSkeleton />
 		</section>
 	</div>
-{:then home}
+{/snippet}
+
+{#snippet content(home: HomeData)}
 	<!-- HERO -->
 	<section class="hero">
 		{#if current?.cover}
@@ -185,7 +206,7 @@
 			</section>
 		{/if}
 	</div>
-{/await}
+{/snippet}
 
 
 <style>

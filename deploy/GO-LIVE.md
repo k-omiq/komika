@@ -106,18 +106,25 @@ is answering).
 
 ## Step 3 — Reader Worker → `komiq.cc` 💻 (Mac)
 
-Backend URLs are **baked at build time** — set them inline before building:
+Backend URLs are **baked in at build time** (Vite inlines them via `$env/static/public`
+so they work at edge module scope — a runtime Worker `[vars]` value never reaches the
+frozen module constants). The prod values live in the **committed** `apps/reader/.env.production`
+— you do **not** pass them inline. Just build and deploy:
 ```bash
 cd /Users/caved/dev/komika/apps/reader
-PUBLIC_KOMIKA_BACKEND=on PUBLIC_KOMIKA_BACKEND_KIND=komika \
-PUBLIC_KOMIKA_API=https://api.komiq.cc/graphql \
-PUBLIC_KOMIKA_IMG_MODE=proxy PUBLIC_KOMIKA_IMG_WORKER=https://img.komiq.cc \
-pnpm build
+pnpm build          # loads .env + .env.production → api.komiq.cc, backend on, img proxy
 wrangler deploy
 ```
+To change an endpoint, edit `apps/reader/.env.production` (committed) and rebuild — do
+not rely on inline `PUBLIC_* … pnpm build`, which the committed `.env` files would win over.
+
 Dashboard: **komika-reader → Add Custom Domain → `komiq.cc`**, then again for **`www.komiq.cc`**.
 
-Verify: `curl -fsS https://komiq.cc/ | grep -o '<title>.*</title>'`
+Verify (public catalog is edge-SSR — real series titles must be in the HTML, not just skeletons):
+```bash
+curl -fsS https://komiq.cc/ | grep -o '<title>.*</title>'
+curl -fsS "https://komiq.cc/?cb=$RANDOM" | grep -oE 'href="/series/[^"]+"' | head   # non-empty
+```
 
 ---
 
@@ -167,9 +174,14 @@ without passing Access first.
 | Admin calls fail with CORS error | Origin not in server `CORS_ORIGINS`; to add one, edit `deploy/.env` then `cd deploy && docker compose up -d server` |
 | Admin deep-link 404 on refresh | `not_found_handling="single-page-application"` missing — ensure you deployed after Step 0's pull |
 | wrangler picks wrong account | `export CLOUDFLARE_ACCOUNT_ID=c016ecc2b0cf125f1977b70ae8b0b51b` before `wrangler deploy` |
-| Reader shows localhost API | Forgot the inline `PUBLIC_*` env at build — rebuild (Step 3) |
+| Reader shows localhost API / empty rows | `apps/reader/.env.production` missing or wrong — it must carry `PUBLIC_KOMIKA_API=https://api.komiq.cc/graphql` + `PUBLIC_KOMIKA_BACKEND=on`; rebuild + redeploy (Step 3) |
+| Reader home is skeletons in `curl` (but fine in browser) | Edge SSR must render cards, not stream them — confirm `apps/reader/src/routes/(app)/+page.ts` awaits `getHome()` on the server; then a plain `curl https://komiq.cc/` contains `/series/…` links |
 
 ## URLs are baked at build time
-The reader and admin inline `PUBLIC_KOMIKA_API` / img-worker URLs at **build**. If the
-API domain ever changes, **rebuild + redeploy** both (Steps 3 & 4). Only the Tunnel and
-CORS are runtime.
+The reader bakes its `PUBLIC_*` config via `$env/static/public` from the committed
+`apps/reader/.env` (dev) + `apps/reader/.env.production` (prod); the admin inlines
+`PUBLIC_KOMIKA_API` the same way. This is deliberate: adapter-cloudflare evaluates the
+reader's config at edge cold-start with no request context, so a runtime `$env/dynamic/public`
+(or Worker `[vars]`) value is empty there and the app would freeze to localhost + render
+empty feeds. If the API domain ever changes, edit `.env.production` then **rebuild +
+redeploy** both (Steps 3 & 4). Only the Tunnel and CORS are runtime.
