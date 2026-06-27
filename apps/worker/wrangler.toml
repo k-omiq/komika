@@ -28,7 +28,10 @@ routes = [
 # `cmdxd98sb0x3yprd.mangadex.network`) — the `mangadex.network` suffix entry
 # covers every node. Add more as needed, e.g.:
 #   "uploads.mangadex.org,mangadex.network,mangakakalot.com,cdn.komika.app"
-ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network"
+# `api.komiq.cc` is our own API origin: Suwayomi-source chapter pages are proxied
+# through it (Suwayomi's :4567 is loopback-only), so the reader points page URLs at
+# `api.komiq.cc/api/v1/manga/.../page/...` and this Worker fetches + edge-caches them.
+ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network,api.komiq.cc"
 
 # Comma-separated allowlist of browser Origin/Referer values permitted to
 # hotlink the proxy. Requests from a browser (i.e. that send an Origin or

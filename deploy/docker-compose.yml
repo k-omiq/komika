@@ -37,9 +37,11 @@ services:
       # be internet-reachable. The server federates it over the internal network
       # (SUWAYOMI_URL=http://suwayomi:4567), which is unaffected. Browser images go
       # through the Cloudflare image Worker (reader IMG_MODE=proxy below), not this
-      # port. Caveat: because the Worker also can't reach a loopback-bound
-      # Suwayomi, images for *Suwayomi-source* (non-canonical) series won't proxy;
-      # the canonical MangaDex path (uploads.mangadex.org / mangadex.network) does.
+      # port. Suwayomi-source (non-canonical) images ARE reachable: the server
+      # proxies their cover/page bytes at `/api/v1/manga/...` (SUWAYOMI_PUBLIC_URL
+      # points at the server), so covers load from the API origin and pages ride the
+      # image Worker — alongside the canonical MangaDex path (uploads.mangadex.org /
+      # mangadex.network).
       - '127.0.0.1:${SUWAYOMI_PORT:-4567}:4567'
     networks: [komika]
     healthcheck:
@@ -76,8 +78,14 @@ services:
       # User avatars are stored as BLOBs in the SQLite DB, so they are
       # Litestream-replicated with it and any replica can serve any avatar.
       SUWAYOMI_URL: http://suwayomi:4567
-      # Public base for image URLs handed to the browser (NOT the internal host).
-      SUWAYOMI_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:${SUWAYOMI_PORT:-4567}
+      # Public base for the Suwayomi cover/page image URLs handed to the browser.
+      # These point at THIS server, which proxies `/api/v1/manga/{id}/thumbnail` and
+      # `/api/v1/manga/{id}/chapter/{ci}/page/{pi}` from the loopback-only Suwayomi
+      # (:4567 is never internet-reachable). Defaults to the server's own public
+      # origin; for the tunneled prod deploy set SUWAYOMI_PUBLIC_URL=https://api.komiq.cc
+      # in deploy/.env. Covers then load straight from this origin, and page images
+      # ride the Cloudflare image Worker (which allowlists this host).
+      SUWAYOMI_PUBLIC_URL: ${SUWAYOMI_PUBLIC_URL:-http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}}
       # Public reader origin(s) allowed to call the API. Honors CORS_ORIGINS from
       # deploy/.env (e.g. https://komiq.cc); falls back to the local reader port.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://${PUBLIC_HOST:-localhost}:${READER_PORT:-8081}}

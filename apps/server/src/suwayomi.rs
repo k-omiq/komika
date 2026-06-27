@@ -242,6 +242,33 @@ impl SuwayomiClient {
         Some(res.bytes().await.ok()?.to_vec())
     }
 
+    /// Fetch a Suwayomi image (a cover thumbnail or a chapter page) by its internal
+    /// REST path, from the INTERNAL loopback host (`base_url`, e.g. localhost:4567) —
+    /// NOT `image_base_url`. Suwayomi is not publicly exposed, so the browser can't
+    /// reach `:4567`; instead the public cover/page URLs are built against our own
+    /// origin (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and this method fetches the
+    /// bytes server-side so `serve_suwayomi_image` can re-serve them. Fetching against
+    /// `image_base_url` would loop back into ourselves — always use `base_url`.
+    ///
+    /// `path` is a server-validated image path (see `main::is_suwayomi_image_path`),
+    /// so it is trusted. Returns the raw bytes + upstream `Content-Type`.
+    pub async fn fetch_image(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        let url = format!("{}{}", self.base_url, path);
+        let res = self.http.get(url).send().await?;
+        if !res.status().is_success() {
+            return Err(anyhow!("Suwayomi image error {}", res.status()));
+        }
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|ct| ct.starts_with("image/"))
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = res.bytes().await?.to_vec();
+        Ok((bytes, content_type))
+    }
+
     async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
         let res = self
             .http

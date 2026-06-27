@@ -160,6 +160,9 @@ struct RouterState {
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
     /// decode/resize/encode blocking pool.
     upload_limiter: Arc<RateLimiter>,
+    /// Shared app state — for the Suwayomi image proxy (`serve_suwayomi_image`),
+    /// which streams cover/page bytes from the internal loopback engine.
+    app_state: Arc<graphql::AppState>,
 }
 impl FromRef<RouterState> for ApiSchema {
     fn from_ref(s: &RouterState) -> Self {
@@ -188,6 +191,11 @@ impl FromRef<RouterState> for Arc<Vec<Cidr>> {
 impl FromRef<RouterState> for Arc<RateLimiter> {
     fn from_ref(s: &RouterState) -> Self {
         s.upload_limiter.clone()
+    }
+}
+impl FromRef<RouterState> for Arc<graphql::AppState> {
+    fn from_ref(s: &RouterState) -> Self {
+        s.app_state.clone()
     }
 }
 
@@ -391,6 +399,62 @@ async fn serve_cover(
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Whether `rest` — the path tail after `/api/v1/manga/` — is one of the exactly two
+/// Suwayomi image endpoints we proxy: `{id}/thumbnail` (a cover) or
+/// `{mangaId}/chapter/{chapterIndex}/page/{pageIndex}` (a page). Every id segment must
+/// be numeric. This keeps `serve_suwayomi_image` from becoming a general Suwayomi REST
+/// proxy — the GraphQL/library/mutation surface on `:4567` stays unreachable.
+fn is_suwayomi_image_path(rest: &str) -> bool {
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [id, "thumbnail"] => numeric(id),
+        [mid, "chapter", ci, "page", pi] => numeric(mid) && numeric(ci) && numeric(pi),
+        _ => false,
+    }
+}
+
+/// `GET /api/v1/manga/{id}/thumbnail` and
+/// `GET /api/v1/manga/{mangaId}/chapter/{chapterIndex}/page/{pageIndex}` — public proxy
+/// for a Suwayomi-source cover or chapter page.
+///
+/// Suwayomi (`localhost:4567`) is not publicly exposed, so the browser can't reach its
+/// image endpoints. Cover/page URLs are built against THIS origin (set
+/// `SUWAYOMI_PUBLIC_URL=https://api.komiq.cc`) and we fetch the bytes internally
+/// (`suwayomi.fetch_image`, which uses the loopback host) and re-serve them with an
+/// immutable cache — covers load directly from here in the admin + reader, and page
+/// images ride the image Worker's edge cache (which allowlists this host). Only the two
+/// numeric image paths above are honoured (`is_suwayomi_image_path`); anything else 404s.
+async fn serve_suwayomi_image(
+    State(app): State<Arc<graphql::AppState>>,
+    UrlPath(rest): UrlPath<String>,
+) -> axum::response::Response {
+    if !is_suwayomi_image_path(&rest) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = format!("/api/v1/manga/{rest}");
+    match app.suwayomi.fetch_image(&path).await {
+        Ok((bytes, content_type)) => {
+            let ct = HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("image/jpeg"));
+            (
+                [
+                    (header::CONTENT_TYPE, ct),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
     }
 }
 
@@ -718,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("cover cache drainer disabled (COVER_CACHE=off)");
     }
 
-    let schema = build_schema(state, !cfg.graphiql_enabled);
+    let schema = build_schema(state.clone(), !cfg.graphiql_enabled);
 
     let origins: Vec<_> = cfg
         .cors_origins
@@ -758,6 +822,12 @@ async fn main() -> anyhow::Result<()> {
         // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
         // (admin `materializeCatalogueCovers`).
         .route("/covers/{file}", get(serve_cover))
+        // Public proxy for Suwayomi-source cover thumbnails + chapter pages. Suwayomi
+        // is loopback-only, so its image endpoints are unreachable from the browser;
+        // these URLs point HERE (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and we fetch
+        // the bytes internally. Restricted to the two numeric image paths
+        // (`is_suwayomi_image_path`) so it is not a general Suwayomi REST proxy.
+        .route("/api/v1/manga/{*rest}", get(serve_suwayomi_image))
         // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
         // model as avatars. The upload route raises the body limit above the raw
         // image cap enforced in `media::process_comment_image`.
@@ -821,6 +891,7 @@ async fn main() -> anyhow::Result<()> {
             trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
             // ~20 uploads/min per user across the avatar + comment-media routes.
             upload_limiter: Arc::new(RateLimiter::new(20, 60)),
+            app_state: state,
         });
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -889,6 +960,24 @@ mod tests {
 
     fn peer(ip: &str) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+
+    #[test]
+    fn suwayomi_image_path_allows_only_cover_and_page() {
+        // The two proxied image endpoints (tail after `/api/v1/manga/`).
+        assert!(is_suwayomi_image_path("123/thumbnail"));
+        assert!(is_suwayomi_image_path("123/chapter/4/page/0"));
+        assert!(is_suwayomi_image_path("1/chapter/0/page/25"));
+        // Everything else must be rejected so this is not a general Suwayomi REST
+        // proxy — the GraphQL/library/mutation surface on :4567 stays unreachable.
+        assert!(!is_suwayomi_image_path("123")); // bare manga
+        assert!(!is_suwayomi_image_path("123/chapters")); // chapter list
+        assert!(!is_suwayomi_image_path("abc/thumbnail")); // non-numeric id
+        assert!(!is_suwayomi_image_path("123/thumbnail/../../graphql")); // traversal
+        assert!(!is_suwayomi_image_path("123/chapter/4/page")); // missing index
+        assert!(!is_suwayomi_image_path("123/chapter/x/page/0")); // non-numeric chapter
+        assert!(!is_suwayomi_image_path("")); // empty
+        assert!(!is_suwayomi_image_path("123/thumbnail/")); // trailing slash → empty seg
     }
 
     #[test]
