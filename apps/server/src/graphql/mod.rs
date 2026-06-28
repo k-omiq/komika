@@ -4994,9 +4994,24 @@ impl MutationRoot {
             Some(bytes) => crate::phash::dhash(&bytes),
             None => None,
         };
-        add_source_series_core(&st.pool, &m, cover_phash)
+        let result = add_source_series_core(&st.pool, &m, cover_phash)
             .await
-            .map_err(gql_err)
+            .map_err(gql_err)?;
+        // Populate this series' chapters + scan state NOW, so its chapters (and the
+        // chapter count / updates feed derived from scan state) surface immediately
+        // instead of waiting for the next adaptive scan tick (SCAN_TICK_SECONDS).
+        // Best-effort: a scan hiccup must never fail an otherwise-successful enrol —
+        // the scheduler retries on its next pass. Idempotent (record_scan is a
+        // read-modify-write keyed on the series) and rate-limit-safe (a single
+        // chapters fetch for this one series).
+        if let Err(e) = scan_series(st, &m, Utc::now()).await {
+            tracing::warn!(
+                series_id = m.id,
+                error = %e,
+                "immediate scan after enrol failed; will retry on next tick"
+            );
+        }
+        Ok(result)
     }
 
     /// Admin (D1): fold one canonical work into another — for cleaning up two
