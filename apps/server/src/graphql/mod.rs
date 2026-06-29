@@ -2807,7 +2807,7 @@ impl QueryRoot {
         )]
         refresh: bool,
     ) -> Result<Vec<ExtensionInfo>> {
-        let user = require_admin(ctx).await?;
+        require_admin(ctx).await?;
         let st = state(ctx);
         ensure_default_extension_store(st).await?;
         if refresh {
@@ -2819,9 +2819,14 @@ impl QueryRoot {
             st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
             list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
         }
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        // Admin management view: an admin curating the extension store must always be
+        // able to SEE NSFW extensions (incl. MangaDex) to manage them, independent of
+        // their reader-side `show_nsfw` browsing preference — otherwise turning NSFW off
+        // for safe browsing would hide the very sources they administer. Explicit
+        // filtering is still available via the `nsfw` argument. (The reader's public
+        // browse/search stays gated by the viewer's `show_nsfw`.)
         Ok(
-            filter_extensions(list, installed_only, lang.as_deref(), nsfw, show_nsfw)
+            filter_extensions(list, installed_only, lang.as_deref(), nsfw, true)
                 .into_iter()
                 .map(|e| map_extension_info(st, e))
                 .collect(),
@@ -2829,17 +2834,21 @@ impl QueryRoot {
     }
 
     /// Admin: the installed Suwayomi sources — the picker that feeds
-    /// `sourceBrowse(sourceId)` (EXT-1). NSFW sources are hidden unless the
-    /// admin opted in via `show_nsfw` (same posture as the extension listing and
-    /// the browse gate).
+    /// `sourceBrowse(sourceId)` (EXT-1). This is admin-only management tooling, so
+    /// every installed source is listed (incl. NSFW sources like MangaDex) regardless
+    /// of the admin's reader-side `show_nsfw` preference; each carries its `is_nsfw`
+    /// flag for the UI to badge. The public reader browse/search keeps its NSFW gate.
     async fn sources(&self, ctx: &Context<'_>) -> Result<Vec<SourceInfo>> {
-        let user = require_admin(ctx).await?;
+        // Admin management view: always list every installed source (incl. NSFW ones
+        // like MangaDex) so an admin can manage them regardless of their reader-side
+        // `show_nsfw` browsing preference. `require_admin` is the access gate here; the
+        // NSFW flag stays on each `SourceInfo` (is_nsfw) for the UI to badge. The public
+        // reader browse/search keeps its per-viewer NSFW gate.
+        require_admin(ctx).await?;
         let st = state(ctx);
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         let list = st.suwayomi.list_sources().await.map_err(gql_err)?;
         Ok(list
             .into_iter()
-            .filter(|s| show_nsfw || !s.is_nsfw)
             .map(|s| {
                 let icon = st.suwayomi.abs(s.icon_url.as_deref());
                 SourceInfo {
@@ -5322,7 +5331,7 @@ impl MutationRoot {
             .await
             .map_err(gql_err)? as i32;
         tokio::spawn(async move {
-            crate::cover::crawl_uncached_covers(&st.pool, &st.cover_pool, &st.mangadex, None).await;
+            crate::cover::crawl_uncached_covers(&st.pool, &st.cover_pool, &st.mangadex, &st.suwayomi, None).await;
             st.cover_crawl_running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         });
@@ -5502,15 +5511,27 @@ pub(crate) async fn ingest_source_series(
     let mut m = st.suwayomi.series(mid).await?;
     st.suwayomi.set_in_library(mid, true).await?;
     m.in_library = true;
-    // S1: cache the series METADATA so reader loads serve from the DB. Chapters are
-    // cached by the scanner (which scans the library) and lazily on first read — NOT
-    // fetched here, so a bulk ingest isn't slowed by a chapter fetch per item (S3).
+    // S1: cache the series METADATA so reader loads serve from the DB.
     let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
         Some(bytes) => crate::phash::dhash(&bytes),
         None => None,
     };
-    add_source_series_core(&st.pool, &m, cover_phash).await
+    let result = add_source_series_core(&st.pool, &m, cover_phash).await?;
+    // Populate this series' chapters + chapter count + scan state NOW, so it shows a
+    // real chapter count in Browse (and enters the updates feed) immediately instead
+    // of reading 0 chapters until the next adaptive scan tick. This makes the bulk
+    // "add all from source" ingest scan-on-enrol like the single add
+    // (`addSourceSeries`) — one extra chapters fetch per item. Best-effort: a scan
+    // hiccup only logs and leaves the scheduler to retry; it never fails the enrol.
+    if let Err(e) = scan_series(st, &m, Utc::now()).await {
+        tracing::warn!(
+            series_id = m.id,
+            error = %e,
+            "immediate scan after bulk enrol failed; will retry on next tick"
+        );
+    }
+    Ok(result)
 }
 
 /// Minimum normalized-title length for a federated silent consolidation (C2).
@@ -6087,8 +6108,8 @@ mod tests {
     #[tokio::test]
     async fn add_source_series_review_does_not_duplicate_on_re_add() {
         let pool = migrated_pool().await;
-        // Pre-seed a work with a title so a same-titled add lands in Review (title
-        // match, no corroboration → mid score).
+        // Pre-seed a work with a title so a same-titled add auto-merges into it under
+        // the exact-title policy (exact normalized-title hit).
         let existing = crate::catalog::create_work(
             &pool,
             &crate::catalog::WorkInput {
@@ -6105,7 +6126,7 @@ mod tests {
 
         let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src1");
         let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
-        assert_eq!(r1.decision, "review", "title match with no corroboration");
+        assert_eq!(r1.decision, "auto_merge", "exact title auto-merges");
         assert_eq!(r1.matched_work_id.as_deref(), Some(existing.as_str()));
 
         let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
@@ -6116,10 +6137,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(mc_before, 1, "one pending review row after the first add");
+        assert_eq!(mc_before, 0, "exact-title match auto-merged; no review row");
 
-        // DD2: re-add → existing; neither the orphan work nor a duplicate
-        // merge_candidate is created.
+        // DD2: re-add → existing; neither an orphan work nor a merge_candidate is
+        // created.
         let r2 = add_source_series_core(&pool, &m, None).await.unwrap();
         assert_eq!(r2.decision, "existing");
         let works_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
@@ -6173,7 +6194,9 @@ mod tests {
         let r = add_source_series_core_ex(&pool, &m, None, true)
             .await
             .unwrap();
-        assert_eq!(r.decision, "review_consolidated");
+        // Exact normalized-title hit → auto-merges outright (the exact-title policy
+        // supersedes the review-consolidate path for identical titles).
+        assert_eq!(r.decision, "auto_merge");
         assert_eq!(r.work_id, existing, "links to the existing work");
         let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
@@ -6188,12 +6211,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_bare_title_collision_does_not_silently_merge() {
-        // C2 (the critical guard): a bare title-only match — zero corroboration,
-        // exactly MID — must NOT be silently merged even in the federated
-        // (consolidate) path. It falls back to the cautious provisional + a
-        // merge_candidate for human review, so two different same-titled series
-        // are never irreversibly joined.
+    async fn federated_exact_title_collision_auto_merges() {
+        // Exact-title policy (explicit operator decision): a bare exact-title match —
+        // zero corroboration, exactly MID — now AUTO-MERGES into the existing work
+        // rather than minting a provisional + a merge_candidate. Treating identical
+        // normalized titles as the same work is what folds the Suwayomi catalogue into
+        // the MangaDex spine; the accepted trade-off is that two genuinely distinct
+        // same-titled series will merge. (FUZZY title-only collisions still take the
+        // cautious provisional + review path — see `federated_consolidate_ok`.)
         let pool = migrated_pool().await;
         let existing = crate::catalog::create_work(
             &pool,
@@ -6209,38 +6234,31 @@ mod tests {
         .await
         .unwrap();
 
-        // Same title, NO description/cover → title-only, score == MID.
+        // Same title, NO description/cover → exact title-only hit.
         let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
         let r = add_source_series_core_ex(&pool, &m, None, true)
             .await
             .unwrap();
-        assert_eq!(r.decision, "review", "bare title-only is NOT consolidated");
-        assert_ne!(
-            r.work_id, existing,
-            "a distinct provisional work is minted, not a silent merge"
-        );
+        assert_eq!(r.decision, "auto_merge", "exact title auto-merges");
+        assert_eq!(r.work_id, existing, "merged into the existing work");
         let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(works, 2, "two distinct works remain (no merge)");
+        assert_eq!(works, 1, "no provisional minted — merged into the existing work");
         let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(mc, 1, "a merge_candidate is queued for human review");
-        // The new mapping points at the provisional, and the candidate is the existing.
+        assert_eq!(mc, 0, "no review row — the exact-title match auto-merged");
+        // The new source mapping points at the existing (merged-into) work.
         let linked: String =
             sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_id = 'src-ext2'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(linked, r.work_id);
-        let cand: String = sqlx::query_scalar("SELECT candidate_work_id FROM merge_candidate")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(cand, existing, "the review candidate is the existing work");
+        assert_eq!(linked, existing, "the mapping resolves to the existing work");
     }
 
     #[tokio::test]

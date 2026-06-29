@@ -1071,8 +1071,8 @@
 		{:else if sources.length === 0}
 			<div class="notice">
 				No installed sources are visible. Install an extension in the Extensions tab first — and
-				note that NSFW sources are hidden unless your account has NSFW enabled in settings, so the
-				list may be filtered.
+				every installed source (including NSFW ones like MangaDex) is listed here for
+				management.
 			</div>
 		{:else}
 			{#if extScope}

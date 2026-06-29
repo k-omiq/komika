@@ -773,6 +773,7 @@ async fn main() -> anyhow::Result<()> {
             pool.clone(),
             cover_pool.clone(),
             mangadex.clone(),
+            state.suwayomi.clone(),
             state.cover_crawl_running.clone(),
             cfg.cover_cache_interval_secs,
             cfg.cover_cache_batch,

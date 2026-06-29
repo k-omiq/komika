@@ -57,6 +57,7 @@
 	--k-ongoing: #7fd39a;
 	--k-completed: #8fb8ff;
 	--k-hiatus: #e0b354;
+	--k-cancelled: #e08a8a;
 	--k-dot: #5fbf7e;
 
 	/* "inverted" primary button (light on dark) */
@@ -153,6 +154,7 @@
 	--k-ongoing: #2f9e5b;
 	--k-completed: #3f6fd6;
 	--k-hiatus: #b5842a;
+	--k-cancelled: #c0554f;
 	--k-dot: #2f9e5b;
 
 	--k-hatch: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.05) 0 2px, transparent 2px 9px);

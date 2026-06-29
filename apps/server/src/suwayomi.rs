@@ -166,14 +166,17 @@ fn parse_records<T: DeserializeOwned>(raw: Vec<Value>, what: &str) -> Vec<T> {
     out
 }
 
+#[derive(Clone)]
 pub struct SuwayomiClient {
     base_url: String,
     /// Public base used when building image URLs (covers/pages) handed to the
     /// browser. Defaults to `base_url` when no public URL is configured.
     image_base_url: String,
     http: reqwest::Client,
-    /// Cached resolved source id; `Some` once resolved.
-    source_id: Mutex<Option<String>>,
+    /// Cached resolved source id; `Some` once resolved. `Arc<Mutex>` so cheap clones
+    /// (e.g. into the cover drainer task) share the one resolved id rather than each
+    /// re-resolving it against the engine.
+    source_id: std::sync::Arc<Mutex<Option<String>>>,
     configured_source: Option<String>,
 }
 
@@ -201,7 +204,7 @@ impl SuwayomiClient {
             base_url,
             image_base_url,
             http,
-            source_id: Mutex::new(configured_source.clone()),
+            source_id: std::sync::Arc::new(Mutex::new(configured_source.clone())),
             configured_source,
         }
     }

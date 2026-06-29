@@ -151,11 +151,16 @@ struct PendingCover {
 /// MangaDex anchor + cover fileName, no blob yet). Drives the admin button's
 /// "queued N" feedback.
 pub async fn pending_cover_count(pool: &SqlitePool) -> Result<i64> {
+    // Uncached works we can materialize a cover for: a MangaDex-anchored work with a
+    // cover file name, OR a Suwayomi-anchored work (cover comes from its thumbnail).
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work w \
-         WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
-           AND EXISTS (SELECT 1 FROM source_series ss \
-                       WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')",
+         WHERE w.cover_cached_version IS NULL AND ( \
+             (w.cover_file_name IS NOT NULL \
+              AND EXISTS (SELECT 1 FROM source_series ss \
+                          WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')) \
+             OR EXISTS (SELECT 1 FROM source_series ss \
+                        WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi'))",
     )
     .fetch_one(pool)
     .await?;
@@ -172,6 +177,7 @@ pub async fn crawl_uncached_covers(
     main: &SqlitePool,
     covers: &SqlitePool,
     mangadex: &MangaDexClient,
+    suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: Option<i64>,
 ) {
     // The mangadex anchor lives on `source_series`, not `work`; pick the same
@@ -249,6 +255,78 @@ pub async fn crawl_uncached_covers(
         }
     }
     tracing::info!(saved, failed, total, "cover crawl: complete");
+
+    // Second pass: works with no MangaDex cover but anchored to a Suwayomi source
+    // (the bulk of the scanlator/MangaDex-via-Suwayomi catalogue). Materialize their
+    // cover from the Suwayomi thumbnail into the SAME work_cover_blob, so they too
+    // serve from our own `/covers/{work_id}.webp` (immutable, CDN-cacheable) instead
+    // of a live proxy to the Suwayomi engine on every request. Deterministic anchor:
+    // the oldest suwayomi source_series (matches the reader's source pick).
+    const SUW_BASE: &str = "SELECT w.id, \
+                (SELECT s.thumbnail_url FROM source_series ss \
+                 JOIN suwayomi_series s ON CAST(s.id AS TEXT) = ss.source_key \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
+         FROM work w \
+         WHERE w.cover_cached_version IS NULL \
+           AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
+                       AND ss.source_type = 'suwayomi')";
+    let suw_loaded = match limit {
+        Some(n) => {
+            sqlx::query_as::<_, (String, Option<String>)>(&format!("{SUW_BASE} LIMIT ?"))
+                .bind(n)
+                .fetch_all(main)
+                .await
+        }
+        None => {
+            sqlx::query_as::<_, (String, Option<String>)>(SUW_BASE)
+                .fetch_all(main)
+                .await
+        }
+    };
+    let suw_jobs: Vec<(String, String)> = match suw_loaded {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|(work_id, thumb)| {
+                thumb.filter(|t| !t.is_empty()).map(|t| (work_id, t))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cover crawl (suwayomi): failed to load pending works");
+            return;
+        }
+    };
+    let suw_total = suw_jobs.len();
+    tracing::info!(total = suw_total, "cover crawl (suwayomi): starting");
+    let mut suw_saved = 0usize;
+    let mut suw_failed = 0usize;
+    for (work_id, thumb) in suw_jobs {
+        match suwayomi.cover_bytes(Some(&thumb)).await {
+            Some(bytes) => match process_cover(&bytes) {
+                Ok(webp) => match put_work_cover(main, covers, &work_id, &webp).await {
+                    Ok(()) => suw_saved += 1,
+                    Err(e) => {
+                        suw_failed += 1;
+                        tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): store failed");
+                    }
+                },
+                Err(e) => {
+                    suw_failed += 1;
+                    tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
+                }
+            },
+            None => {
+                suw_failed += 1;
+                tracing::warn!(work_id = %work_id, "cover crawl (suwayomi): upstream fetch failed");
+            }
+        }
+    }
+    tracing::info!(
+        saved = suw_saved,
+        failed = suw_failed,
+        total = suw_total,
+        "cover crawl (suwayomi): complete"
+    );
 }
 
 /// Recurring background drainer that keeps the cover cache full with NO manual
@@ -265,6 +343,7 @@ pub fn spawn(
     main: SqlitePool,
     covers: SqlitePool,
     mangadex: Arc<MangaDexClient>,
+    suwayomi: crate::suwayomi::SuwayomiClient,
     inflight: Arc<AtomicBool>,
     interval_secs: u64,
     batch: i64,
@@ -287,7 +366,7 @@ pub fn spawn(
                     }
                     match pending_cover_count(&main).await {
                         Ok(0) => { /* nothing to do this tick */ }
-                        Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, Some(batch)).await,
+                        Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch)).await,
                         Err(e) => tracing::warn!(error = %e, "cover drainer: count failed"),
                     }
                     inflight.store(false, Ordering::SeqCst);

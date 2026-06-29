@@ -5,12 +5,14 @@
 //!   2. normalized-title exact      -> candidate
 //!   3. fuzzy title (token block)   -> candidate shortlist
 //!   4. corroborate (description / cover pHash / author / year) -> confidence score
-//!   5. decide: high -> auto-merge, mid -> manual review queue, low -> new work
+//!   5. decide: exact-title OR external-ID -> auto-merge; fuzzy high (cover-
+//!      corroborated) -> auto-merge; mid -> manual review queue; low -> new work
 //!
-//! Runs at add-time for Tier-2 series, where a human reviews the mid band — so the
-//! decision favors caution: title-only matches land in `Review`, and only an
-//! external-ID hit or a title match corroborated by description/cover reaches
-//! `AutoMerge`.
+//! Runs at add-time for Tier-2 series, where a human reviews the mid band. Operator
+//! policy: an EXACT normalized-title match auto-merges (identical titles = same work);
+//! a FUZZY (token-block) match reaches `AutoMerge` only when cover-corroborated at HIGH,
+//! else it lands in `Review` — so a shared common token can't silently merge distinct
+//! works (prequels/sequels/seasons carry distinct titles and stay separate).
 
 use std::collections::HashSet;
 
@@ -53,7 +55,9 @@ pub enum Decision {
     New,
 }
 
-/// >= HIGH auto-merges; >= MID goes to the manual review queue; below is a new work.
+/// Fuzzy-match bands: a cover-corroborated fuzzy match >= HIGH auto-merges; >= MID
+/// goes to the manual review queue; below is a new work. (An EXACT normalized-title
+/// match bypasses these bands and auto-merges outright — see `resolve`.)
 pub const HIGH: f64 = 0.85;
 pub const MID: f64 = 0.6;
 const FUZZY_BLOCK_LIMIT: i64 = 50;
@@ -159,9 +163,13 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
     };
     let score = scored.score;
 
-    // 5. Decide. A title-driven match (the only kind that reaches here — external-ID
-    //    hits returned above) auto-merges only when a corroborating cover backs it, so
-    //    a shared common title plus description overlap alone routes to Review (DD3).
+    // 5. Decide. Operator policy (explicit): an EXACT normalized-title match
+    //    auto-merges outright — identical titles are treated as the same work (this is
+    //    what consolidates the existing Suwayomi catalogue into the MangaDex spine on
+    //    reconcile). A FUZZY (token-block) match is riskier — a shared common token can
+    //    span distinct works — so it still auto-merges ONLY with cover corroboration at
+    //    HIGH, otherwise it lands in Review. (Prequels/sequels/seasons carry distinct
+    //    titles, so they don't exact-match and stay separate / queued.)
     // `method` labels align to the documented `merge_candidate.method` enum
     // (migration 0005): external_id / title_exact / fuzzy / description / cover. The
     // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
@@ -178,7 +186,7 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
             .as_deref()
             .map(is_discriminative_phash)
             .unwrap_or(false);
-    Ok(if score >= HIGH && cover_corroborated {
+    Ok(if exact_hit || (score >= HIGH && cover_corroborated) {
         Decision::AutoMerge {
             work_id,
             score,
@@ -346,25 +354,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn title_only_goes_to_review() {
+    async fn exact_title_only_auto_merges() {
         let pool = pool().await;
         let w = seed_slime(&pool).await;
-        // Same alt-title, but no description/cover to corroborate.
+        // Same alt-title, no description/cover — an exact normalized-title hit, which
+        // now auto-merges outright under the exact-title policy.
         let cand = Candidate {
             title: "Tensei Shitara Slime Datta Ken".into(),
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
-            Decision::Review { work_id, .. } => assert_eq!(work_id, w),
-            other => panic!("expected review, got {other:?}"),
+            Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, w),
+            other => panic!("expected auto-merge (exact title), got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn exact_title_with_description_only_goes_to_review() {
-        // DD3: an exact alt-title match whose only corroboration is an overlapping
-        // description (no cover pHash) must NOT auto-merge — a same-titled but distinct
-        // work with a copied blurb would otherwise merge unseen. It lands in Review.
+    async fn exact_title_auto_merges_without_cover() {
+        // Operator policy: an EXACT normalized-title match auto-merges outright, even
+        // without a corroborating cover — identical titles are treated as the same work
+        // (this is what folds the Suwayomi catalogue into the MangaDex spine on
+        // reconcile). Distinct works with a genuinely identical title are the accepted
+        // trade-off of this policy; near-matches (sequels/seasons) carry distinct titles
+        // and take the fuzzy path instead.
         let pool = pool().await;
         let w = seed_slime(&pool).await;
         let cand = Candidate {
@@ -376,8 +388,11 @@ mod tests {
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
-            Decision::Review { work_id, .. } => assert_eq!(work_id, w),
-            other => panic!("expected review (DD3: no cover corroboration), got {other:?}"),
+            Decision::AutoMerge { work_id, method, .. } => {
+                assert_eq!(work_id, w);
+                assert_eq!(method, "title_exact");
+            }
+            other => panic!("expected auto-merge (exact title policy), got {other:?}"),
         }
     }
 
@@ -436,11 +451,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tied_review_candidate_is_deterministic() {
+    async fn tied_exact_title_candidate_is_deterministic() {
         // DD7: two distinct works share the exact normalized title with no
-        // corroboration → equal score → Review. The candidate set is a HashSet
-        // (nondeterministic order), so the surfaced work_id must be pinned by the
-        // lowest-work_id tiebreak and stable across repeated resolves.
+        // corroboration → equal score → auto-merge (exact-title policy). The candidate
+        // set is a HashSet (nondeterministic order), so the merged-into work_id must be
+        // pinned by the lowest-work_id tiebreak and stable across repeated resolves.
         let pool = pool().await;
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -467,8 +482,8 @@ mod tests {
         };
         for _ in 0..3 {
             match resolve(&pool, &cand).await.unwrap() {
-                Decision::Review { work_id, .. } => assert_eq!(work_id, expected),
-                other => panic!("expected review, got {other:?}"),
+                Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, expected),
+                other => panic!("expected auto-merge, got {other:?}"),
             }
         }
     }
@@ -478,9 +493,9 @@ mod tests {
         // S2: the cross-extension dedup payoff. A MangaDex spine entry stores ALL
         // its localized alt titles (here the romaji `ja-ro`). A series arriving
         // from another extension under only that localized title — with no shared
-        // description or cover — must still resolve to the same work (via Review,
-        // since title-only lacks corroboration). This is what consolidates the
-        // same series across extensions that each label it differently.
+        // description or cover — must still resolve to the same work. Under the
+        // exact-title policy this now auto-merges outright (an exact alt-title alias
+        // hit), consolidating the same series across extensions automatically.
         let pool = pool().await;
         let w = seed_slime(&pool).await; // primary "That Time..."; alt "Tensei Shitara Slime Datta Ken"
         let localized = Candidate {
@@ -489,7 +504,7 @@ mod tests {
             ..Default::default()
         };
         match resolve(&pool, &localized).await.unwrap() {
-            Decision::Review {
+            Decision::AutoMerge {
                 work_id, method, ..
             } => {
                 assert_eq!(work_id, w, "localized title resolves to the spine work");
@@ -498,16 +513,18 @@ mod tests {
                     "matched via the exact alt-title alias"
                 );
             }
-            other => panic!("expected review via alt title, got {other:?}"),
+            other => panic!("expected auto-merge via alt title, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn author_corroboration_is_order_insensitive_lifts_above_mid() {
+    async fn author_corroboration_is_order_insensitive() {
         // D1: a federated hit that IS the existing MangaDex-anchored work — same
         // title, same author but with the name order reversed (the real Naruto
-        // case: "Kishimoto Masashi" vs "Masashi Kishimoto") — must corroborate
-        // above the bare-title MID band so it can consolidate, NOT mint a dup.
+        // case: "Kishimoto Masashi" vs "Masashi Kishimoto"). The exact title auto-merges
+        // it either way; this asserts the SCORING still corroborates order-insensitively
+        // (author lifts the score above the bare-title MID floor), which drives the
+        // fuzzy path for non-exact titles.
         let pool = pool().await;
         let existing = catalog::create_work(
             &pool,
@@ -531,30 +548,31 @@ mod tests {
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
-            Decision::Review { work_id, score, .. } => {
+            Decision::AutoMerge { work_id, score, .. } => {
                 assert_eq!(work_id, existing);
                 assert!(
                     score > MID,
                     "author corroboration must lift the score above MID ({MID}); got {score}"
                 );
             }
-            other => panic!("expected a review-band match above MID, got {other:?}"),
+            other => panic!("expected an exact-title auto-merge above MID, got {other:?}"),
         }
 
-        // But a bare title-only hit with NO author still scores exactly MID (the
-        // C2 guard's floor) — corroboration genuinely absent, no false lift.
+        // A bare title-only hit with NO author still SCORES exactly MID (the C2 guard's
+        // floor) — corroboration genuinely absent, no false lift — though the exact
+        // title still auto-merges it.
         let bare = Candidate {
             title: "Naruto".into(),
             ..Default::default()
         };
         match resolve(&pool, &bare).await.unwrap() {
-            Decision::Review { score, .. } => {
+            Decision::AutoMerge { score, .. } => {
                 assert!(
                     (score - MID).abs() < 1e-9,
                     "bare title-only must stay at MID; got {score}"
                 );
             }
-            other => panic!("expected bare-title review at MID, got {other:?}"),
+            other => panic!("expected bare-title auto-merge at MID, got {other:?}"),
         }
     }
 

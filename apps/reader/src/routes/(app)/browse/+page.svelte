@@ -33,7 +33,7 @@
 	let genreQuery = $state(''); // filters the (long) facet list
 
 	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
-	const VALID_STATUS = ['ongoing', 'completed', 'hiatus'];
+	const VALID_STATUS = ['ongoing', 'completed', 'hiatus', 'cancelled'];
 	const VALID_SORT = ['trending', 'rating', 'newest', 'chapters'];
 
 	// Re-sync inputs/filters from the URL on same-route client navigation (home
@@ -84,6 +84,16 @@
 	let reloadKey = $state(0);
 	const queryActive = $derived(query.trim().length > 0);
 
+	// Whole-catalogue pagination (native path only): the server pages the ENTIRE
+	// filtered catalogue, so "Load more" pulls the next page and appends rather than
+	// capping Browse at the first 20. Genre/rating filters are applied server-side
+	// across the whole catalogue; type/status are refined client-side over everything
+	// loaded so far, so paging through extends what those filters can match.
+	let catalogPage = $state(1);
+	let hasNext = $state(false);
+	let totalCount = $state<number | null>(null);
+	let loadingMore = $state(false);
+
 	function serverFilters() {
 		return {
 			genres: [...selectedGenres],
@@ -102,6 +112,10 @@
 		// branch skips these reads so it re-fetches only on query/auth change.
 		const nativeFilters = isFederated ? null : serverFilters();
 		rowsLoading = true;
+		// A fresh query/filter run always restarts paging from page 1.
+		catalogPage = 1;
+		hasNext = false;
+		totalCount = null;
 		let cancelled = false;
 		const t = setTimeout(async () => {
 			try {
@@ -113,6 +127,8 @@
 						rowsAreFederated = true;
 						rowsError = false;
 						searchNotice = null;
+						// Federated live search returns a single deduped page (no server pager).
+						hasNext = false;
 					} else if (outcome.kind === 'rateLimited') {
 						// Keep prior results; show a transient message, not "0 results".
 						searchNotice =
@@ -126,6 +142,8 @@
 						rows = r.items;
 						rowsAreFederated = false;
 						rowsError = r.error;
+						hasNext = r.hasNext;
+						totalCount = r.total;
 						searchNotice =
 							outcome.kind === 'error'
 								? 'Live search had a problem — showing catalogue results.'
@@ -137,6 +155,8 @@
 					rows = r.items;
 					rowsAreFederated = false;
 					rowsError = r.error;
+					hasNext = r.hasNext;
+					totalCount = r.total;
 					searchNotice = null;
 				}
 			} finally {
@@ -151,6 +171,25 @@
 
 	function retryRows() {
 		reloadKey++;
+	}
+
+	// Pull the next catalogue page and append it. Native path only — the federated
+	// live search has no server pager. Dedupes by id so an offset shift between pages
+	// (concurrent catalogue writes) can't produce a duplicate `{#each}` key.
+	async function loadMore() {
+		if (loadingMore || !hasNext || rowsAreFederated) return;
+		loadingMore = true;
+		const next = catalogPage + 1;
+		try {
+			const r = await getNativeSearch(query.trim(), serverFilters(), next);
+			const seen = new Set(rows.map((m) => m.id).filter(Boolean));
+			rows = [...rows, ...r.items.filter((m) => !m.id || !seen.has(m.id))];
+			catalogPage = next;
+			hasNext = r.hasNext;
+			totalCount = r.total;
+		} finally {
+			loadingMore = false;
+		}
 	}
 
 	// NSFW visibility: the SERVER filters browse/search results by the viewer's
@@ -277,21 +316,6 @@
 				>
 			{/if}
 		</div>
-		<div class="format-tabs">
-			<button class="ftab" class:on={types.length === 0} onclick={() => (types = [])}
-				>All formats</button
-			>
-			{#each TYPES as t (t)}
-				<button
-					class="ftab"
-					class:on={types.length === 1 && types[0] === t}
-					onclick={() => (types = [t])}
-					title={t}
-				>
-					<span class="flag">{FLAG[t]}</span>
-				</button>
-			{/each}
-		</div>
 	</div>
 </div>
 
@@ -369,7 +393,7 @@
 		<div class="group">
 			<span class="glabel">Status</span>
 			<div class="chips">
-				{#each ['any', 'ongoing', 'completed', 'hiatus'] as s (s)}
+				{#each ['any', 'ongoing', 'completed', 'hiatus', 'cancelled'] as s (s)}
 					<button
 						class="chip"
 						class:on={status === s}
@@ -460,7 +484,7 @@
 						? queryActive
 							? 'Searching all sources…'
 							: 'Loading…'
-						: `${results.length} series`}</span
+						: `${results.length}${hasNext ? '+' : ''} series`}</span
 				>
 			</div>
 			<div class="sort">
@@ -526,6 +550,17 @@
 				<button class="empty-btn" onclick={resetAll}>Clear all</button>
 			</div>
 		{/if}
+
+		{#if !resultsLoading && hasNext && !rowsAreFederated}
+			<div class="load-more">
+				<button class="load-more-btn" disabled={loadingMore} onclick={loadMore}>
+					{loadingMore ? 'Loading…' : 'Load more'}
+				</button>
+				{#if totalCount != null}
+					<span class="load-more-count">Showing {rows.length} of {totalCount}</span>
+				{/if}
+			</div>
+		{/if}
 	</div>
 </div>
 
@@ -578,31 +613,6 @@
 	}
 	.clear:hover {
 		color: var(--k-text);
-	}
-	.format-tabs {
-		display: flex;
-		gap: 10px;
-		margin-top: 18px;
-	}
-	.ftab {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		height: 40px;
-		padding: 0 18px;
-		border-radius: 10px;
-		font-weight: 700;
-		font-size: 13.5px;
-		cursor: pointer;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text-3);
-		transition: all 0.15s;
-	}
-	.ftab.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
 	}
 	.flag {
 		font-size: 17px;
@@ -1011,6 +1021,36 @@
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
 		gap: 30px 22px;
+	}
+	.load-more {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 0 4px;
+	}
+	.load-more-btn {
+		height: 44px;
+		padding: 0 28px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text);
+		font-weight: 700;
+		font-size: 13.5px;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.load-more-btn:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+	}
+	.load-more-btn:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.load-more-count {
+		font-size: 12.5px;
+		color: var(--k-text-faint);
 	}
 	.empty {
 		display: flex;

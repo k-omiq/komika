@@ -5,7 +5,7 @@
  */
 
 export type ComicType = 'Manga' | 'Manhwa' | 'Manhua';
-export type Status = 'ongoing' | 'completed' | 'hiatus';
+export type Status = 'ongoing' | 'completed' | 'hiatus' | 'cancelled';
 
 export const FLAG: Record<ComicType, string> = {
 	Manga: '🇯🇵',
@@ -23,6 +23,7 @@ export const STATUS_META: Record<Status, { label: string; color: string }> = {
 	ongoing: { label: 'Ongoing', color: 'var(--k-ongoing)' },
 	completed: { label: 'Completed', color: 'var(--k-completed)' },
 	hiatus: { label: 'Hiatus', color: 'var(--k-hiatus)' },
+	cancelled: { label: 'Cancelled', color: 'var(--k-cancelled)' },
 };
 
 /** A browse-catalog row as the Browse screen renders it. */

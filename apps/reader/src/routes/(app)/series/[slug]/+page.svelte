@@ -217,7 +217,11 @@
 
 	const chapters = $derived.by(() => {
 		const chs = view?.chapters ?? [];
-		return sort === 'oldest' ? [...chs].reverse() : chs;
+		// The data layer delivers chapters ascending (oldest → newest), but sort
+		// explicitly by chapter number so display order never depends on a source's
+		// arrival order (some sources return newest-first). "Newest" = descending.
+		const asc = [...chs].sort((a, b) => a.n - b.n);
+		return sort === 'newest' ? asc.reverse() : asc;
 	});
 
 	// Translators (sources) available for this work, and switching between them.

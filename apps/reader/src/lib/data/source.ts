@@ -101,6 +101,7 @@ function toViewType(t: DomainComicType): ComicType {
 function toViewStatus(s: Series['status']): Status {
 	if (s === 'COMPLETED') return 'completed';
 	if (s === 'HIATUS') return 'hiatus';
+	if (s === 'CANCELLED') return 'cancelled';
 	return 'ongoing';
 }
 
@@ -543,19 +544,27 @@ export interface CatalogFilters {
 export async function getNativeSearch(
 	query: string,
 	filters: CatalogFilters = {},
-): Promise<{ items: FederatedResultView[]; error: boolean }> {
+	page = 1,
+): Promise<{ items: FederatedResultView[]; error: boolean; hasNext: boolean; total: number | null }> {
+	// Captured from the server envelope so the Browse grid can drive a "Load more"
+	// pager off the server's own paging metadata (whole-catalogue pagination) rather
+	// than being capped at the first page.
+	let hasNext = false;
+	let total: number | null = null;
 	const r = await liveResult(async () => {
-		const { items } = await backend.search(query.trim(), 1, {
+		const res = await backend.search(query.trim(), page, {
 			genres: filters.genres,
 			minRating: filters.minRating,
 			maxRating: filters.maxRating,
 		});
-		return items.map((s, i) => ({
+		hasNext = res.hasNextPage ?? false;
+		total = res.total ?? null;
+		return res.items.map((s, i) => ({
 			...toCatalogEntryFull(s, i),
 			translators: [] as TranslatorChip[],
 		}));
 	}, [] as FederatedResultView[]);
-	return { items: r.data, error: r.error };
+	return { items: r.data, error: r.error, hasNext, total };
 }
 
 /** The full genre facet set for the search filter (S4), most-common first. Never
@@ -950,12 +959,17 @@ function mapSeriesView(
 			descLang: desc.lang,
 			covers,
 		},
-		chapters: chs.map((c, i) => ({
+		// Emit chapters in a CANONICAL ascending order (oldest → newest) so the
+		// series page can sort deterministically. Sources deliver chapters in
+		// inconsistent orders (some newest-first, some oldest-first), so we don't
+		// trust arrival order: map `asc` (sorted by number), and mark the highest 3
+		// numbers as "new" (matching the aggregated path in buildAggregatedChapters).
+		chapters: asc.map((c, i) => ({
 			id: c.id,
 			n: c.number,
 			title: c.title || `Chapter ${c.number}`,
 			date: relTime(c.uploadedAt),
-			isNew: i < 3,
+			isNew: i >= asc.length - 3,
 			read: c.read,
 		})),
 		related: relatedFor(s, pool),
