@@ -5339,6 +5339,43 @@ impl MutationRoot {
         Ok(queued)
     }
 
+    /// Admin: reconcile the existing (provisional, Suwayomi-only) catalogue against
+    /// the MangaDex spine. For each work that has a Suwayomi source but no MangaDex
+    /// source, re-run the dedup matcher against the catalogue: an exact-title (or
+    /// external-id) match folds the provisional work INTO the matched work; a
+    /// mid-confidence match queues a `merge_candidate` for human review; no match
+    /// leaves it as its own work. Runs in the background (batched + paced so it
+    /// coexists with the live catalogue sync); returns how many provisional works are
+    /// pending reconciliation at kickoff. Idempotent + re-runnable (merged works
+    /// vanish, queued works are skipped via their pending candidate). Single-flighted.
+    async fn reconcile_catalogue(&self, ctx: &Context<'_>) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        if RECONCILE_RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(gql_err("a catalogue reconcile is already in progress"));
+        }
+        let pending = pending_reconcile_count(&st.pool).await.map_err(gql_err)? as i32;
+        tokio::spawn(async move {
+            match reconcile_provisional_works(&st.pool).await {
+                Ok((merged, queued, skipped)) => {
+                    tracing::info!(merged, queued, skipped, "reconcile: complete")
+                }
+                Err(e) => tracing::error!(error = %e, "reconcile: failed"),
+            }
+            RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        tracing::info!(pending, "reconcile: started");
+        Ok(pending)
+    }
+
     /// Admin: start an "add all from this source" background ingest job (S1).
     /// Walks the source's POPULAR listing page by page and runs every entry
     /// through the Tier-2 dedup add flow; progress is persisted on the job row
@@ -5712,6 +5749,129 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
         .execute(pool)
         .await;
     Ok(tok)
+}
+
+/// Single-flight guard for the catalogue reconcile (process-global; single replica).
+static RECONCILE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// SQL predicate for a work that still needs reconciling: it has a Suwayomi source,
+/// no MangaDex source, and no pending merge_candidate yet.
+const RECONCILE_PENDING_WHERE: &str = "EXISTS (SELECT 1 FROM source_series ss \
+        WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi') \
+     AND NOT EXISTS (SELECT 1 FROM source_series ss \
+        WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') \
+     AND NOT EXISTS (SELECT 1 FROM merge_candidate mc \
+        JOIN source_series ss ON ss.id = mc.source_series_id \
+        WHERE ss.work_id = w.id AND mc.status = 'pending')";
+
+/// How many provisional (Suwayomi-only) works still need reconciling against the spine.
+async fn pending_reconcile_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let n: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM work w WHERE {RECONCILE_PENDING_WHERE}"
+    ))
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+enum ReconcileAction {
+    Merged,
+    Queued,
+    Skipped,
+}
+
+/// Reconcile every provisional (Suwayomi-only) work against the spine. Keyset-
+/// paginated by work id so one pass terminates even though "no match" works stay
+/// selectable (they're simply left past the cursor for this run). Returns
+/// `(merged, queued, skipped)`.
+async fn reconcile_provisional_works(pool: &SqlitePool) -> anyhow::Result<(i64, i64, i64)> {
+    const BATCH: i64 = 200;
+    let mut cursor = String::new();
+    let (mut merged, mut queued, mut skipped) = (0i64, 0i64, 0i64);
+    loop {
+        let batch: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT w.id FROM work w WHERE {RECONCILE_PENDING_WHERE} AND w.id > ? \
+             ORDER BY w.id ASC LIMIT ?"
+        ))
+        .bind(&cursor)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        for work_id in &batch {
+            cursor.clone_from(work_id);
+            match reconcile_one(pool, work_id).await {
+                Ok(ReconcileAction::Merged) => merged += 1,
+                Ok(ReconcileAction::Queued) => queued += 1,
+                Ok(ReconcileAction::Skipped) => skipped += 1,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(work_id = %work_id, error = %e, "reconcile: work failed");
+                }
+            }
+        }
+        // Yield between batches so the concurrent MangaDex sync + cover drainer keep
+        // getting the single SQLite writer.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    Ok((merged, queued, skipped))
+}
+
+/// Reconcile one provisional work: build a candidate from its own metadata, match it
+/// against the spine (excluding itself), then merge / queue / skip.
+async fn reconcile_one(pool: &SqlitePool, work_id: &str) -> anyhow::Result<ReconcileAction> {
+    let Some(md) = catalog::load_match_data(pool, work_id).await? else {
+        return Ok(ReconcileAction::Skipped); // vanished (e.g. merged by a prior item)
+    };
+    let title = md
+        .primary_title
+        .clone()
+        .or_else(|| md.aliases_norm.first().cloned())
+        .unwrap_or_default();
+    if title.is_empty() && md.aliases_norm.is_empty() {
+        return Ok(ReconcileAction::Skipped);
+    }
+    let cand = crate::dedup::Candidate {
+        title,
+        alt_titles: md.aliases_norm.clone(),
+        description: md.description.clone(),
+        author: md.author.clone(),
+        year: md.year,
+        cover_phash: md.cover_phash.clone(),
+        external_ids: Vec::new(),
+    };
+    match crate::dedup::resolve_ex(pool, &cand, Some(work_id)).await? {
+        crate::dedup::Decision::AutoMerge {
+            work_id: target, ..
+        } => {
+            catalog::merge_works(pool, work_id, &target).await?;
+            Ok(ReconcileAction::Merged)
+        }
+        crate::dedup::Decision::Review {
+            work_id: target,
+            score,
+            method,
+        } => {
+            let ssid: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM source_series WHERE work_id = ? AND source_type = 'suwayomi' \
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(work_id)
+            .fetch_optional(pool)
+            .await?;
+            match ssid {
+                Some(ssid) => {
+                    catalog::insert_merge_candidate(pool, &ssid, &target, score, &method).await?;
+                    Ok(ReconcileAction::Queued)
+                }
+                None => Ok(ReconcileAction::Skipped),
+            }
+        }
+        crate::dedup::Decision::New => Ok(ReconcileAction::Skipped),
+    }
 }
 
 /// Core of the Tier-2 "add source series" flow (DD2/DD1/N1). Separated from the
@@ -6259,6 +6419,61 @@ mod tests {
                 .unwrap();
         assert_eq!(linked, r.work_id);
         assert_eq!(linked, existing, "the mapping resolves to the existing work");
+    }
+
+    #[tokio::test]
+    async fn reconcile_merges_provisional_into_spine_on_exact_title() {
+        let pool = migrated_pool().await;
+        // 1. A Suwayomi series enrolled BEFORE any MangaDex spine → its own provisional
+        //    work (nothing to match against yet).
+        let m = suwayomi_manga(42, "Reconcile Target", &["Action"], "src-suw");
+        let r = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r.decision, "new", "no spine yet → provisional work");
+        let provisional = r.work_id.clone();
+
+        // 2. The MangaDex spine later gains the same title as a separate canonical work
+        //    (as CATALOGUE_SYNC upserts it — no dedup at upsert time).
+        let spine = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Reconcile Target".into()),
+                aliases: vec![crate::catalog::Alias {
+                    raw: "Reconcile Target".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A real spine work carries a MangaDex source_series (upsert_work_from_mangadex
+        // links one) — so it's not itself "provisional".
+        crate::catalog::upsert_source_series(&pool, &spine, "mangadex", "md-src", "md-key", None, false)
+            .await
+            .unwrap();
+
+        // 3. Reconcile: the provisional folds into the spine work (exact title).
+        let (merged, queued, skipped) = reconcile_provisional_works(&pool).await.unwrap();
+        assert_eq!((merged, queued, skipped), (1, 0, 0));
+
+        // The provisional work is gone; the Suwayomi mapping now points at the spine.
+        let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = ?")
+            .bind(&provisional)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, 0, "provisional work merged away");
+        let linked: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = '42'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(linked, spine, "Suwayomi source repointed to the spine work");
+
+        // Re-running is a no-op — nothing provisional remains.
+        let again = reconcile_provisional_works(&pool).await.unwrap();
+        assert_eq!(again, (0, 0, 0), "reconcile is idempotent");
     }
 
     #[tokio::test]

@@ -89,12 +89,27 @@ fn is_discriminative_phash(hex: &str) -> bool {
 
 /// Resolve `cand` against the canonical works in `pool`.
 pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
+    resolve_ex(pool, cand, None).await
+}
+
+/// As [`resolve`], but excludes `exclude_work_id` from the candidate set. The
+/// catalogue reconcile re-matches an existing (provisional) work against the spine,
+/// where the work's own title is one of its aliases — without excluding it, the work
+/// would always "match itself". `None` is the normal add-time path.
+pub async fn resolve_ex(
+    pool: &SqlitePool,
+    cand: &Candidate,
+    exclude_work_id: Option<&str>,
+) -> Result<Decision> {
     // 1. External-ID exact — highest precision, stop on hit.
     for (provider, ext) in &cand.external_ids {
         if provider.is_empty() || ext.is_empty() {
             continue;
         }
         if let Some(work_id) = catalog::find_work_by_external(pool, provider, ext).await? {
+            if Some(work_id.as_str()) == exclude_work_id {
+                continue;
+            }
             return Ok(Decision::AutoMerge {
                 work_id,
                 score: 1.0,
@@ -125,6 +140,15 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
         }
         candidate_ids.extend(ids);
     }
+    // Drop the work being reconciled (it matches its own aliases). If that leaves no
+    // exact candidate, there was no OTHER exact match → clear exact_hit so the fuzzy
+    // fallback still runs and a title-only self-match can't force an auto-merge.
+    if let Some(ex) = exclude_work_id {
+        candidate_ids.remove(ex);
+        if candidate_ids.is_empty() {
+            exact_hit = false;
+        }
+    }
 
     // 3. Fuzzy blocking when no exact hit: block on the top-N longest title tokens
     //    (union), so the discriminating token being shorter than a generic one
@@ -133,6 +157,9 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
         for token in top_tokens(&norm_titles, FUZZY_BLOCK_TOKENS) {
             let ids = catalog::candidate_work_ids_by_token(pool, &token, FUZZY_BLOCK_LIMIT).await?;
             candidate_ids.extend(ids);
+        }
+        if let Some(ex) = exclude_work_id {
+            candidate_ids.remove(ex);
         }
     }
     if candidate_ids.is_empty() {
