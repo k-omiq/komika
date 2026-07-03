@@ -70,6 +70,33 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     smallest.ok_or_else(|| anyhow!("no candidate cover size produced"))
 }
 
+/// Read a resized, origin-cached Suwayomi source cover (keyed by numeric manga id),
+/// or `None` if it hasn't been materialized yet. Errors are swallowed to `None` so a
+/// transient DB hiccup falls back to a live resize rather than failing the request.
+pub async fn get_suwayomi_cover(covers: &SqlitePool, manga_id: i64) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = ?")
+        .bind(manga_id)
+        .fetch_optional(covers)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Store (or replace) a resized Suwayomi source cover in the un-replicated covers DB.
+pub async fn put_suwayomi_cover(covers: &SqlitePool, manga_id: i64, webp: &[u8]) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(manga_id) DO UPDATE SET webp = excluded.webp, updated_at = excluded.updated_at",
+    )
+    .bind(manga_id)
+    .bind(webp)
+    .bind(&ts)
+    .execute(covers)
+    .await?;
+    Ok(())
+}
+
 /// The public path stored/served for a cached work cover, cache-busted with
 /// `?v=<version>` so the browser + edge refetch after a re-save. The
 /// `/covers/{file}` route reads the bytes from `work_cover_blob` keyed by
@@ -403,6 +430,65 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    /// P0.5 opt-level bench (not part of the 191-test suite — `#[ignore]`d).
+    /// Times the two dominant CPU hot paths on a realistic high-entropy cover
+    /// (forces the full 5-edge resize+encode search — the worst case). Run under
+    /// the release profile so it reflects the shipped binary; toggle
+    /// `[profile.release] opt-level` between runs to compare:
+    ///   cargo test --release --bin komika-server opt_level_hot_path_bench \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn opt_level_hot_path_bench() {
+        use std::time::Instant;
+
+        fn stats(label: &str, mut ns: Vec<u128>) {
+            ns.sort_unstable();
+            let n = ns.len();
+            let median = ns[n / 2] as f64 / 1e6;
+            let min = ns[0] as f64 / 1e6;
+            let mean = ns.iter().sum::<u128>() as f64 / n as f64 / 1e6;
+            eprintln!(
+                "  {label:<28} n={n:>4}  min={min:8.3}ms  median={median:8.3}ms  mean={mean:8.3}ms"
+            );
+        }
+
+        // Realistic portrait cover source (~700x1000), high-entropy so no early
+        // candidate edge fits the byte budget → full resize+encode loop runs.
+        let cover_src = noisy_png(700, 1000);
+        let hash_src = noisy_png(512, 728);
+
+        // Warm up (allocator, code paths, page cache) before timing.
+        for _ in 0..3 {
+            let _ = process_cover(&cover_src).expect("warmup process_cover");
+            let _ = crate::phash::dhash(&hash_src);
+        }
+
+        const N_COVER: usize = 20;
+        const N_HASH: usize = 100;
+
+        let mut cover_ns = Vec::with_capacity(N_COVER);
+        for _ in 0..N_COVER {
+            let t = Instant::now();
+            let out = process_cover(&cover_src).expect("process_cover");
+            cover_ns.push(t.elapsed().as_nanos());
+            assert!(out.len() <= MAX_COVER_BYTES);
+        }
+
+        let mut hash_ns = Vec::with_capacity(N_HASH);
+        for _ in 0..N_HASH {
+            let t = Instant::now();
+            let out = crate::phash::dhash(&hash_src);
+            hash_ns.push(t.elapsed().as_nanos());
+            assert!(out.is_some());
+        }
+
+        eprintln!("\n=== opt-level hot-path bench (release profile) ===");
+        stats("process_cover(700x1000)", cover_ns);
+        stats("dhash(512x728)", hash_ns);
+        eprintln!("=================================================\n");
     }
 
     #[test]

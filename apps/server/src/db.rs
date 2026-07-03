@@ -17,7 +17,16 @@ pub async fn init(database_url: &str) -> Result<SqlitePool> {
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(5));
+        // 15s (was 5s) absorbs longer write stalls when the catalogue sync, cover
+        // drainer and scan scheduler contend for SQLite's single writer during a
+        // full seed. All PRAGMAs below are per-connection and invisible to Litestream
+        // (which only ships the WAL) — a 256 MB memory-map + ~16 MB page cache serve
+        // the read-heavy catalogue from RAM, and temp B-trees (sorts, GROUP BY) stay
+        // off disk.
+        .busy_timeout(Duration::from_secs(15))
+        .pragma("mmap_size", "268435456")
+        .pragma("cache_size", "-16000")
+        .pragma("temp_store", "MEMORY");
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(opts)
@@ -39,7 +48,13 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(5));
+        // Match the main pool's contention margin + per-connection cache tuning
+        // (see `init`); the cover DB is point-lookup heavy but shares the writer
+        // stalls during a cover-materialization burst.
+        .busy_timeout(Duration::from_secs(15))
+        .pragma("mmap_size", "268435456")
+        .pragma("cache_size", "-16000")
+        .pragma("temp_store", "MEMORY");
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .connect_with(opts)
@@ -49,6 +64,21 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
              work_id    TEXT PRIMARY KEY,\
              webp       BLOB NOT NULL,\
              version    INTEGER NOT NULL,\
+             updated_at TEXT NOT NULL\
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    // Resized, origin-cached Suwayomi SOURCE covers, keyed by numeric Suwayomi manga
+    // id. The discovery/browse/search feeds hand back the raw `/api/v1/manga/{id}/
+    // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
+    // downscales each cover to a bounded WebP on first request and caches it here.
+    // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
+    // excluded from Litestream backup.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
+             manga_id   INTEGER PRIMARY KEY,\
+             webp       BLOB NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
     )
