@@ -154,6 +154,10 @@ pub struct AppState {
     /// Guards the DB-backed cover crawl (`materializeCatalogueCovers`) so two
     /// admin clicks can't run overlapping catalogue-wide MangaDex crawls.
     pub cover_crawl_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the catalogue sync downloads + pHashes each work's cover during the
+    /// sweep (`Config::catalogue_cover_phash`). Threaded here so the admin
+    /// `resyncCatalogue` kicks a cycle with the same setting as the recurring loop.
+    pub catalogue_cover_phash: bool,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -4297,13 +4301,23 @@ impl MutationRoot {
         .map_err(gql_err)?;
         // Always run an Argon2 verify — against the real hash if the user exists,
         // else a fixed dummy hash — so login time doesn't reveal whether the
-        // username exists (A3).
-        let password_ok = match &row {
-            Some(u) => auth::verify_password(&password, &u.password_hash),
-            None => {
-                auth::verify_password(&password, &DUMMY_PASSWORD_HASH);
-                false
-            }
+        // username exists (A3). Argon2 is ~10-50ms of pure CPU; run it off the async
+        // runtime (spawn_blocking) so a login flood can't stall other request tasks.
+        let has_user = row.is_some();
+        let phc = match &row {
+            Some(u) => u.password_hash.clone(),
+            None => DUMMY_PASSWORD_HASH.clone(),
+        };
+        let password_ok = {
+            let password = password.clone();
+            tokio::task::spawn_blocking(move || {
+                // Always compute the verify (constant-time-ish across exists/not-exists);
+                // only a real user with a matching hash counts as success.
+                let verified = auth::verify_password(&password, &phc);
+                has_user && verified
+            })
+            .await
+            .map_err(gql_err)?
         };
         let user = match row {
             Some(u) if password_ok => u,
@@ -4395,7 +4409,14 @@ impl MutationRoot {
         if taken.is_some() {
             return Err(Error::new("username or email already taken"));
         }
-        let hash = auth::hash_password(&input.password).map_err(gql_err)?;
+        // Argon2 hashing is CPU-bound (~10-50ms): keep it off the async runtime.
+        let hash = {
+            let pw = input.password.clone();
+            tokio::task::spawn_blocking(move || auth::hash_password(&pw))
+                .await
+                .map_err(gql_err)?
+                .map_err(gql_err)?
+        };
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let is_admin = false;
@@ -5000,7 +5021,11 @@ impl MutationRoot {
         // Done here (the only async/network step) so the core is unit-testable
         // without a live Suwayomi.
         let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
-            Some(bytes) => crate::phash::dhash(&bytes),
+            // dhash decodes + grayscales + resizes the cover — CPU-bound; keep it off
+            // the async runtime. Best-effort: a task panic just drops the signal.
+            Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
+                .await
+                .unwrap_or(None),
             None => None,
         };
         let result = add_source_series_core(&st.pool, &m, cover_phash)
@@ -5376,6 +5401,30 @@ impl MutationRoot {
         Ok(pending)
     }
 
+    /// Admin: force a full catalogue re-seed. Clears the `catalogue` + `chapters`
+    /// sync cursors (so `seed_done` resets and the next cycle walks the whole
+    /// `createdAt` history from scratch) and kicks one sync cycle in the background.
+    /// Needed because a truncated seed latches `seed_done = true` and the recurring
+    /// loop then only does incremental refreshes — and the flag can't be reset via
+    /// raw SQL (container-owned DB, no sqlite3 in the image). Single-flighted: refused
+    /// while any sync cycle (recurring or manual) is already running. Watch progress
+    /// in the logs (`catalogue page offset=` climbing, then `catalogue cycle done`).
+    async fn resync_catalogue(&self, ctx: &Context<'_>) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        if !crate::mangadex::spawn_resync(
+            st.pool.clone(),
+            st.mangadex.clone(),
+            st.catalogue_cover_phash,
+        ) {
+            return Err(gql_err(
+                "a catalogue sync cycle is already running; retry in a moment",
+            ));
+        }
+        tracing::info!("resyncCatalogue: fresh full seed kicked");
+        Ok(true)
+    }
+
     /// Admin: start an "add all from this source" background ingest job (S1).
     /// Walks the source's POPULAR listing page by page and runs every entry
     /// through the Tier-2 dedup add flow; progress is persisted on the job row
@@ -5551,7 +5600,11 @@ pub(crate) async fn ingest_source_series(
     // S1: cache the series METADATA so reader loads serve from the DB.
     let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
-        Some(bytes) => crate::phash::dhash(&bytes),
+        // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
+        // runtime. Best-effort: a task panic just drops the signal.
+        Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
+            .await
+            .unwrap_or(None),
         None => None,
     };
     let result = add_source_series_core(&st.pool, &m, cover_phash).await?;
@@ -5715,7 +5768,11 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
     // S1: cache series METADATA (chapters fill on scan / first read — not per item).
     let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
-        Some(bytes) => crate::phash::dhash(&bytes),
+        // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
+        // runtime. Best-effort: a task panic just drops the signal.
+        Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
+            .await
+            .unwrap_or(None),
         None => None,
     };
     add_source_series_core_ex(&st.pool, &m, cover_phash, true).await
@@ -6571,6 +6628,7 @@ mod tests {
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
         });
         (build_schema(state, false), pool)
     }
@@ -7083,6 +7141,7 @@ mod tests {
                 series_inflight: KeyedLocks::default(),
                 chapters_inflight: KeyedLocks::default(),
                 cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                catalogue_cover_phash: false,
             })
         };
         const Q: &str = "{ __schema { queryType { name } } }";
@@ -7191,6 +7250,7 @@ mod tests {
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
         });
         let s = build_schema(state, false);
         // A configured admin name is reserved (case-insensitive) — open
@@ -8832,6 +8892,7 @@ mod tests {
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
         });
         let s = build_schema(state, false);
         let r = exec(
@@ -8906,6 +8967,7 @@ mod tests {
             series_inflight: KeyedLocks::default(),
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
         })
     }
 

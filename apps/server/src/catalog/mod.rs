@@ -1468,6 +1468,18 @@ pub async fn set_sync_cursor(pool: &SqlitePool, job: &str, since: &str) -> Resul
     Ok(())
 }
 
+/// Clear a sync job's row entirely so the next cycle treats it as a fresh seed
+/// (`get_sync_state` → `None` → full createdAt sweep from scratch). Used by the admin
+/// `resyncCatalogue` mutation, since `seed_done` can't be reset via raw SQL (the DB is
+/// container-owned and there's no sqlite3 in the image).
+pub async fn reset_sync_state(pool: &SqlitePool, job: &str) -> Result<()> {
+    sqlx::query("DELETE FROM catalogue_sync_state WHERE job = ?")
+        .bind(job)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1626,25 @@ mod tests {
 
         // Jobs are independent.
         assert!(get_sync_state(&pool, "chapters").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_sync_state_forces_fresh_seed() {
+        let pool = pool().await;
+        // A completed seed: seed_done latched true (the truncated-seed situation).
+        mark_seed_done(&pool, "catalogue", "2026-07-12T00:00:00")
+            .await
+            .unwrap();
+        assert!(get_sync_state(&pool, "catalogue").await.unwrap().unwrap().seed_done);
+
+        // resyncCatalogue clears the row entirely → next cycle sees None → fresh seed.
+        reset_sync_state(&pool, "catalogue").await.unwrap();
+        assert!(
+            get_sync_state(&pool, "catalogue").await.unwrap().is_none(),
+            "reset clears the row so the next cycle re-seeds from createdAt=0"
+        );
+        // Idempotent: resetting an already-absent job is a no-op, not an error.
+        reset_sync_state(&pool, "catalogue").await.unwrap();
     }
 
     fn ch(external_id: &str, number: Option<&str>, lang: Option<&str>) -> CanonicalChapter {

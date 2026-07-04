@@ -429,33 +429,118 @@ fn is_suwayomi_image_path(rest: &str) -> bool {
 /// numeric image paths above are honoured (`is_suwayomi_image_path`); anything else 404s.
 async fn serve_suwayomi_image(
     State(app): State<Arc<graphql::AppState>>,
+    State(CoverDb(covers)): State<CoverDb>,
     UrlPath(rest): UrlPath<String>,
 ) -> axum::response::Response {
     if !is_suwayomi_image_path(&rest) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // Covers (`{id}/thumbnail`) are downscaled to a bounded WebP and origin-cached —
+    // the feeds serve these full-resolution (avg ~0.8 MB, up to several MB) at card
+    // size, so resizing is a ~40x transfer win. Chapter PAGES are served raw: the
+    // reader needs full-resolution page images.
+    if let Some(manga_id) = thumbnail_manga_id(&rest) {
+        return serve_suwayomi_cover(&app, &covers, manga_id).await;
+    }
     let path = format!("/api/v1/manga/{rest}");
     match app.suwayomi.fetch_image(&path).await {
-        Ok((bytes, content_type)) => {
-            let ct = HeaderValue::from_str(&content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("image/jpeg"));
-            (
-                [
-                    (header::CONTENT_TYPE, ct),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static("public, max-age=31536000, immutable"),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
+        Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
         Err(e) => {
             tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// Numeric manga id if `rest` (the tail after `/api/v1/manga/`) is a cover-thumbnail
+/// path (`{id}/thumbnail`), else `None` (a chapter page). `is_suwayomi_image_path`
+/// has already validated the shape + numeric id, so the parse is infallible here.
+fn thumbnail_manga_id(rest: &str) -> Option<i64> {
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [id, "thumbnail"] => id.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Serve a Suwayomi source cover as a bounded WebP: the origin-cached blob when
+/// present, else a live fetch + downscale (`cover::process_cover`) that is cached for
+/// next time. If the source can't be resized (too large / undecodable) the raw bytes
+/// are served so the cover still renders — just unoptimized, and not cached so the
+/// resize is retried on a later request.
+async fn serve_suwayomi_cover(
+    app: &graphql::AppState,
+    covers: &sqlx::SqlitePool,
+    manga_id: i64,
+) -> axum::response::Response {
+    if let Some(webp) = cover::get_suwayomi_cover(covers, manga_id).await {
+        return webp_cover_response(webp);
+    }
+    let path = format!("/api/v1/manga/{manga_id}/thumbnail");
+    match app.suwayomi.fetch_image(&path).await {
+        Ok((bytes, content_type)) => {
+            // Decode + up to 5x Lanczos3 resize + lossless WebP encode is CPU-bound
+            // (~130ms even at opt-level=3): keep it off the async runtime like the
+            // avatar/comment handlers do. On failure the closure hands the original
+            // bytes back so the cover still renders raw.
+            let resized = tokio::task::spawn_blocking(move || {
+                cover::process_cover(&bytes).map_err(|e| (e.to_string(), bytes))
+            })
+            .await;
+            match resized {
+                Ok(Ok(webp)) => {
+                    if let Err(e) = cover::put_suwayomi_cover(covers, manga_id, &webp).await {
+                        tracing::warn!(error = %e, manga_id, "suwayomi cover cache store failed");
+                    }
+                    webp_cover_response(webp)
+                }
+                Ok(Err((err, bytes))) => {
+                    tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
+                    raw_image_response(content_type, bytes)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, manga_id, "suwayomi cover resize task panicked");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path, "suwayomi cover proxy failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+/// Immutable-cached response for a resized WebP cover.
+fn webp_cover_response(bytes: Vec<u8>) -> axum::response::Response {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/webp")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Immutable-cached response for a raw proxied image (chapter pages, un-resizable
+/// covers) — passes the upstream `Content-Type` through.
+fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::Response {
+    let ct = HeaderValue::from_str(&content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("image/jpeg"));
+    (
+        [
+            (header::CONTENT_TYPE, ct),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// `POST /comment-media` — authenticated multipart upload of one image to attach to
@@ -712,6 +797,7 @@ async fn main() -> anyhow::Result<()> {
         series_inflight: KeyedLocks::default(),
         chapters_inflight: KeyedLocks::default(),
         cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        catalogue_cover_phash: cfg.catalogue_cover_phash,
     });
 
     // Startup recovery: an ingest job still `running` was interrupted by the

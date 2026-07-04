@@ -8,6 +8,7 @@
 //! by default (`CATALOGUE_SYNC`); nothing here runs unless explicitly enabled.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,12 @@ const PAGE_LIMIT: i64 = 100; // MangaDex list max for /manga
 /// Stop paging a window before the hard `offset + limit <= 10_000` cap and slide
 /// the `since` window instead.
 const WINDOW_OFFSET_CAP: i64 = 9_900;
+/// How many times to re-fetch the same offset when the API returns an empty page
+/// *before* `offset` has reached the window `total`. A genuine end returns empty at
+/// `offset >= total`; an empty page short of that is a transient blip (rate-limit,
+/// 5xx that slipped the retry layer, momentary index lag), so we retry rather than
+/// truncate the seed. Retries are naturally paced by the 4/s token bucket.
+const EMPTY_PAGE_RETRIES: u32 = 3;
 
 /// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
 /// `createdAt`; recurring incremental refreshes walk only recently-changed records by
@@ -219,13 +226,17 @@ impl MangaDexClient {
     }
 
     /// One page of `/manga`, ordered by `createdAt` asc, cover expanded. Returns the
-    /// parsed mangas (bad individual records are skipped, not fatal) and the total.
+    /// parsed mangas (bad individual records are skipped, not fatal), the total for the
+    /// query, and the RAW page length (records the API returned, before parse-skips).
+    /// The raw length — not `mangas.len()` — is what the sweep uses to detect the last
+    /// page and advance its offset, so a page shortened only by unparseable records is
+    /// never mistaken for the end of the window.
     pub async fn list_manga(
         &self,
         window: SyncWindow,
         since: Option<&str>,
         offset: i64,
-    ) -> Result<(Vec<MdManga>, i64)> {
+    ) -> Result<(Vec<MdManga>, i64, usize)> {
         let mut params: Vec<(String, String)> = vec![
             ("limit".into(), PAGE_LIMIT.to_string()),
             ("offset".into(), offset.to_string()),
@@ -246,7 +257,8 @@ impl MangaDexClient {
             .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga")
             .await?;
         let body: RawList = res.json().await?;
-        let mut mangas = Vec::with_capacity(body.data.len());
+        let raw_len = body.data.len();
+        let mut mangas = Vec::with_capacity(raw_len);
         let mut skipped = 0usize;
         for raw in body.data {
             match serde_json::from_value::<MdManga>(raw) {
@@ -257,7 +269,7 @@ impl MangaDexClient {
         if skipped > 0 {
             tracing::warn!(skipped, "mangadex: skipped unparseable manga records");
         }
-        Ok((mangas, body.total))
+        Ok((mangas, body.total, raw_len))
     }
 
     /// Fetch specific manga by MangaDex ids (max 100 per call — the API's ids[]
@@ -787,6 +799,31 @@ pub fn to_since_next_second(ts: &str) -> Option<String> {
 
 // ---- Sync loops ------------------------------------------------------------
 
+/// What the catalogue page loop does after a fetch, decided purely from the RAW page
+/// length, the current `offset`, and the window `total`. Extracted from `sync_catalogue`
+/// so the premature-truncation fix is unit-testable without a live MangaDex: the whole
+/// point is that a page shortened *only* by unparseable-record skips (which shrink the
+/// PARSED count but not `raw_len`) is still `Process`, never `EndWindow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageStep {
+    /// Non-empty page — process the records, then advance `offset` by `raw_len`.
+    Process,
+    /// Empty page at/after `total` (or an empty window) — genuinely exhausted.
+    EndWindow,
+    /// Empty page *before* `total` — a transient blip; re-fetch the same offset.
+    RetryEmpty,
+}
+
+fn classify_page(raw_len: usize, offset: i64, total: i64) -> PageStep {
+    if raw_len > 0 {
+        PageStep::Process
+    } else if total == 0 || offset >= total {
+        PageStep::EndWindow
+    } else {
+        PageStep::RetryEmpty
+    }
+}
+
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
 /// the `createdAtSince` window past the 10k offset cap, upserting each work. A
 /// failed *record* upsert is logged and skipped, but a page that still errors
@@ -807,13 +844,38 @@ pub async fn sync_catalogue(
         let mut offset = 0i64;
         let mut last_created: Option<String> = None;
         let mut done = false;
+        let mut empty_retries = 0u32;
         loop {
-            let (mangas, total) = client.list_manga(window, since.as_deref(), offset).await?;
-            if mangas.is_empty() {
-                done = true;
-                break;
+            let (mangas, total, raw_len) =
+                client.list_manga(window, since.as_deref(), offset).await?;
+            // Completion is decided by the RAW page length + `total`, NEVER by the
+            // parsed count: a page trimmed only by unparseable records (list_manga skips
+            // them) must not be mistaken for the last page — that single misread at
+            // offset ~1198 is what truncated the original seed and latched seed_done.
+            match classify_page(raw_len, offset, total) {
+                PageStep::EndWindow => {
+                    done = true; // consumed the whole window — genuine end
+                    break;
+                }
+                PageStep::RetryEmpty => {
+                    if empty_retries < EMPTY_PAGE_RETRIES {
+                        empty_retries += 1;
+                        tracing::warn!(
+                            offset, total, empty_retries,
+                            "mangadex: empty catalogue page before reaching total — retrying"
+                        );
+                        continue; // transient blip: re-fetch the same offset
+                    }
+                    tracing::error!(
+                        offset, total,
+                        "mangadex: repeated empty catalogue page before total — ending window"
+                    );
+                    done = true;
+                    break;
+                }
+                PageStep::Process => {}
             }
-            let page_len = mangas.len() as i64;
+            empty_retries = 0;
             for m in &mangas {
                 let (id, mut input) = to_work_input(m);
                 // Cover pHash ingest (opt-in): one extra cover download per work,
@@ -832,14 +894,27 @@ pub async fn sync_catalogue(
                     last_created = Some(ts);
                 }
             }
-            offset += page_len;
+            // Advance by the RAW page size so `offset` stays aligned with the API's
+            // pagination and `total`; parse-skips must not desync the cursor.
+            offset += raw_len as i64;
             tracing::info!(offset, total, upserted, "mangadex: catalogue page");
-            if page_len < PAGE_LIMIT {
-                done = true; // last (partial) page of this window and overall
+            // Checkpoint the seed cursor after EVERY page (not only on window-slide) so a
+            // mid-window crash/restart resumes near here instead of re-walking the window
+            // from its start. Only during the createdAt seed; incremental cursors are
+            // written once, at cycle end.
+            if window == SyncWindow::Created {
+                if let Some(s) = last_created.as_deref().and_then(to_since) {
+                    if let Err(e) = catalog::set_seed_progress(pool, job, &s).await {
+                        tracing::warn!(error = %e, "mangadex: failed to checkpoint catalogue seed");
+                    }
+                }
+            }
+            if offset >= total {
+                done = true; // consumed the whole window
                 break;
             }
             if offset >= WINDOW_OFFSET_CAP {
-                break; // slide the window
+                break; // slide the window past the 10k offset cap
             }
         }
         if done {
@@ -1008,12 +1083,73 @@ pub async fn sync_chapters(
     Ok(stored)
 }
 
+/// Single-flight lock over `run_one_cycle`: only one catalogue sync cycle runs at a
+/// time across the whole process, whether triggered by the recurring loop or an admin
+/// `resyncCatalogue`. This keeps a manual re-seed (which can run for hours) from racing
+/// a recurring tick — overlapping sweeps would double-fetch and could interleave cursor
+/// writes into an inconsistent seed state.
+static CATALOGUE_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Releases the single-flight lock on drop (so a panic mid-cycle can't wedge it — the
+/// binary builds with `panic = "unwind"`, so Drop still runs).
+struct SyncGuard;
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        CATALOGUE_SYNC_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Guarded entry point for the recurring loop: run one cycle unless one is already in
+/// flight, in which case skip this tick.
+async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
+    if CATALOGUE_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::info!("mangadex: a catalogue sync cycle is already running; skipping this tick");
+        return;
+    }
+    let _guard = SyncGuard;
+    run_one_cycle(pool, client, cover_phash).await;
+}
+
+/// Admin-triggered full re-seed: clear the catalogue + chapter sync cursors so the next
+/// cycle does a fresh `createdAt` seed from scratch, then run one cycle in the
+/// background. Returns `false` (doing nothing) if a sync cycle is already running so the
+/// caller can surface "busy, retry" — the single-flight lock is acquired up front and
+/// held for the whole re-seed so a recurring tick can't interleave its own cursor write
+/// between the reset and the seed.
+pub fn spawn_resync(pool: sqlx::SqlitePool, client: Arc<MangaDexClient>, cover_phash: bool) -> bool {
+    if CATALOGUE_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    tokio::spawn(async move {
+        let _guard = SyncGuard; // releases the lock on completion or panic
+        if let Err(e) = catalog::reset_sync_state(&pool, "catalogue").await {
+            tracing::error!(error = %e, "resync: failed to reset catalogue sync state; aborting");
+            return;
+        }
+        if let Err(e) = catalog::reset_sync_state(&pool, "chapters").await {
+            tracing::error!(error = %e, "resync: failed to reset chapter sync state; aborting");
+            return;
+        }
+        tracing::info!("resync: sync state cleared — starting fresh catalogue seed");
+        run_one_cycle(&pool, &client, cover_phash).await;
+        tracing::info!("resync: fresh seed cycle complete");
+    });
+    true
+}
+
 /// Run one catalogue + chapter sync cycle. A job with no stored cursor does a full
 /// `createdAt` seed; a job with a cursor does an incremental `updatedAtSince` refresh
 /// (CATALOGUE.md §5). The cursor advances to the cycle's start time only on success,
 /// so a failed or interrupted cycle safely retries the same window next tick. Catalogue
-/// runs before chapters (chapters attach to already-catalogued works).
-async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
+/// runs before chapters (chapters attach to already-catalogued works). Call via
+/// `sync_cycle` (recurring) or `spawn_resync` (admin) — both hold the single-flight lock.
+async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
     // Wall-clock at cycle start, in MangaDex `since` form. Anything updated during the
     // cycle is >= this, so it's caught by the next cycle rather than missed.
     let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -1184,6 +1320,31 @@ async fn run_recurring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_page_non_empty_always_processes() {
+        // The regression guard: a full RAW page whose PARSED count fell below
+        // PAGE_LIMIT because records were skipped must still be Process, never
+        // EndWindow — parse-skips must not truncate the seed.
+        assert_eq!(classify_page(100, 0, 113_610), PageStep::Process);
+        assert_eq!(classify_page(97, 1_100, 113_610), PageStep::Process); // 3 skipped
+        assert_eq!(classify_page(1, 113_609, 113_610), PageStep::Process);
+    }
+
+    #[test]
+    fn classify_page_empty_at_or_after_total_ends() {
+        assert_eq!(classify_page(0, 113_610, 113_610), PageStep::EndWindow);
+        assert_eq!(classify_page(0, 200_000, 113_610), PageStep::EndWindow);
+        // An empty window (total == 0) is immediately done.
+        assert_eq!(classify_page(0, 0, 0), PageStep::EndWindow);
+    }
+
+    #[test]
+    fn classify_page_empty_before_total_retries() {
+        // A transient empty page short of the total is NOT the end — retry it.
+        assert_eq!(classify_page(0, 1_100, 113_610), PageStep::RetryEmpty);
+        assert_eq!(classify_page(0, 0, 113_610), PageStep::RetryEmpty);
+    }
 
     fn manga_json() -> Value {
         serde_json::json!({
