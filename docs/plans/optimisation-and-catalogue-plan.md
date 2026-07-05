@@ -52,10 +52,10 @@ docker logs komika-server-1 --since 5m 2>&1 | grep -iE "mangadex|catalogue|recon
 
 | ID | Task | Owner | Blocks |
 |----|------|-------|--------|
-| P0.1 | **Confirm irreversible re-seed + re-reconcile** with user (merges can't be undone; exact-title merges are policy-safe). | User | Phase 1+ |
-| P0.2 | **B0 — Cloudflare Cache Rule for covers** (below). Biggest cover win; independent of server. | User | Cover HIT verification |
-| P0.3 | Get a **fresh admin token** (`localStorage['komika-admin-token']` from the user's admin browser) for `require_admin` mutations. Don't read from process memory (classifier blocks it). | User | A2/A3, reconcile |
-| P0.4 | **Baseline:** `cargo check --all-targets` + `cargo test --bin komika-server` (record 191 pass). | Me | — |
+| P0.1 | ✅ **DONE** — user authorized the irreversible re-seed + re-reconcile. | User | Phase 1+ |
+| P0.2 | ✅ **DONE + VERIFIED** — Cloudflare Cache Rule live. `cf-cache-status: HIT`, `image/webp`, ~150 KB, `max-age=31536000, immutable`. Home covers: 40.7 MB → **6.99 MB** (5.8×, all WebP, all edge-cached). Note: hitting the DoD's ~1 MB target needs further downscaling / lossy encoding at card size (Workstream B, deliberate quality tradeoff). | User | Cover HIT verification |
+| P0.3 | ✅ **DONE** — fresh admin token provided (held in-session, not persisted). | User | A2/A3, reconcile |
+| P0.4 | ✅ **DONE** — baseline green: **191 → 195 passed** (added A1/A2 tests), 0 failed. | Me | — |
 | P0.5 | **Benchmark the `opt-level` change (OPT-1) locally** — timing test `cover::tests::opt_level_hot_path_bench` (`#[ignore]`d), run under `--release` at `z` then `3`. No deploy. Validates OPT-1 before it ships in Build #1. | Me | OPT-1 decision |
 
 **P0.5 measured result (2026-07-20, release profile, `lto=true`):** decisive — keep `opt-level=3`.
