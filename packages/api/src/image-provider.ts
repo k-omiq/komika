@@ -16,6 +16,13 @@ export interface ImageProvider {
 	resolvePage(page: Page): Promise<string>;
 	/** Resolve a cover / thumbnail URL (same rules as pages). */
 	resolveCover(sourceUrl: string): Promise<string>;
+	/**
+	 * Synchronous cover resolution, present only when the provider can resolve
+	 * without I/O (the web provider — a pure URL rewrite). Absent on native, where
+	 * a cover becomes an async blob URL. Lets a component render the `<img src>`
+	 * during SSR (LCP) instead of waiting for a browser-only async effect.
+	 */
+	resolveCoverSync?(sourceUrl: string): string;
 	/** Release any object URLs created for a page (native blob URLs leak otherwise). */
 	release?(url: string): void;
 }
@@ -107,7 +114,8 @@ export class WebImageProvider implements ImageProvider {
 		return this.resolve(page.sourceUrl);
 	}
 
-	async resolveCover(sourceUrl: string): Promise<string> {
+	/** Synchronous cover resolution (web is pure URL rewriting — no I/O). */
+	resolveCoverSync(sourceUrl: string): string {
 		if (!sourceUrl) return '';
 		// Covers cached on our own origin (the DB cover cache) are same-origin /
 		// CORS-safe — serve them directly, never through the Worker. Everything else
@@ -116,6 +124,10 @@ export class WebImageProvider implements ImageProvider {
 			return this.toAbsoluteOwn(sourceUrl);
 		}
 		return this.resolve(sourceUrl);
+	}
+
+	async resolveCover(sourceUrl: string): Promise<string> {
+		return this.resolveCoverSync(sourceUrl);
 	}
 }
 

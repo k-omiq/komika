@@ -15,11 +15,27 @@
 		fit?: 'cover' | 'contain';
 	} = $props();
 
-	let resolved = $state('');
+	// Web: the provider resolves covers synchronously (a pure URL rewrite), so resolve
+	// eagerly — including during SSR — so the <img src> is in the server HTML and the
+	// cover counts toward LCP instead of appearing only after a browser-only effect.
+	// Native (Tauri): resolveCoverSync is absent (covers are async blob URLs), so we
+	// fall back to the async effect below.
+	const syncResolve = (s: string): string =>
+		s && images.resolveCoverSync ? images.resolveCoverSync(s) : '';
+
+	let resolved = $state(syncResolve(src));
 	let broken = $state(false);
 
 	$effect(() => {
 		const source = src;
+		// Web sync path: just track `src` changes; no async round-trip, no blob URL to
+		// release. (This branch also re-runs the initial resolve on hydration.)
+		if (images.resolveCoverSync) {
+			resolved = syncResolve(source);
+			broken = false;
+			return;
+		}
+		// Native async path: fetch the blob URL and release it on teardown.
 		resolved = '';
 		broken = false;
 		if (!source) return;
