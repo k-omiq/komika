@@ -31,6 +31,17 @@ const WINDOW_OFFSET_CAP: i64 = 9_900;
 /// 5xx that slipped the retry layer, momentary index lag), so we retry rather than
 /// truncate the seed. Retries are naturally paced by the 4/s token bucket.
 const EMPTY_PAGE_RETRIES: u32 = 3;
+/// How many times to retry a single work upsert that failed with a transient SQLite
+/// "database is locked" (BUSY). During a full seed the cover drainer + scan scheduler
+/// also write the main DB, and even with `busy_timeout` a burst can return BUSY; a
+/// dropped work stays missing until the next full seed, so it's worth a few retries.
+const UPSERT_LOCK_RETRIES: u32 = 4;
+
+/// True if `e` is a transient SQLite lock/BUSY error worth retrying (vs a real failure).
+fn is_locked_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("database is locked") || s.contains("database table is locked")
+}
 
 /// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
 /// `createdAt`; recurring incremental refreshes walk only recently-changed records by
@@ -207,9 +218,14 @@ impl MangaDexClient {
             if status.is_success() {
                 return Ok(res);
             }
-            // 429 (rate limited) and 5xx (transient upstream) are worth retrying;
-            // 4xx (other) are not — they won't fix themselves.
-            let retryable = status.as_u16() == 429 || status.is_server_error();
+            // 429 (rate limited) and 5xx (transient upstream) are worth retrying.
+            // MangaDex ALSO returns sporadic 400s under load that succeed on a plain
+            // retry with identical params (confirmed: the same `/manga` offset 400s
+            // then 200s seconds later) — a single one used to abort a whole 113k seed.
+            // Treat 400 as transient too; MAX_RETRIES bounds it, so a genuinely
+            // malformed request still fails fast. Other 4xx (401/403/404) are real.
+            let retryable =
+                status.as_u16() == 429 || status.as_u16() == 400 || status.is_server_error();
             if !retryable || attempt >= MAX_RETRIES {
                 return Err(anyhow!("MangaDex {label} error {status}"));
             }
@@ -886,7 +902,20 @@ pub async fn sync_catalogue(
                         input.cover_phash = client.cover_phash(&id, &fname).await;
                     }
                 }
-                match catalog::upsert_work_from_mangadex(pool, &id, &input).await {
+                // Retry a lock-contended upsert a few times (the cover drainer +
+                // scanner write the main DB during the seed) so transient BUSY doesn't
+                // silently drop a work from the spine.
+                let mut result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
+                let mut lock_retry = 0u32;
+                while let Err(e) = &result {
+                    if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
+                        break;
+                    }
+                    lock_retry += 1;
+                    tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64)).await;
+                    result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
+                }
+                match result {
                     Ok(_) => upserted += 1,
                     Err(e) => tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed"),
                 }
