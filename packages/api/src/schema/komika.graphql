@@ -1,0 +1,239 @@
+// Komika unified backend — GraphQL contract (SDL).
+//
+// This is the schema the client in `@komika/api` codes against. The Komika server
+// implements it by FEDERATING two concerns:
+//   • Catalog / chapters / pages / library / progress  → sourced from a
+//     Suwayomi/Tachidesk-style server (the operator curates enabled sources;
+//     the catalog is auto-served, so there is NO user-facing source picking).
+//   • Social / auth / discovery / adaptive-scan         → Komika's own services.
+//
+// Fields annotated "[suwayomi]" are proxied/derived from Suwayomi's GraphQL
+// (e.g. MangaType.title/thumbnailUrl/genre/status/inLibrary, ChapterType.*,
+// fetchChapterPages). Fields annotated "[komika]" are Komika-native.
+
+schema {
+	query: Query
+	mutation: Mutation
+}
+
+type Query {
+	# catalog
+	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
+	search(query: String!, page: Int = 1): SeriesPage! # [suwayomi] source/library search
+	series(id: ID!): Series! # [suwayomi] MangaType by id
+	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
+	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
+	# library
+	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
+	# social
+	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
+	comments(chapterId: ID!, page: Int = 1): CommentPage! # [komika]
+	# auth
+	session: Session # [komika] current session or null
+	# ops
+	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
+}
+
+type Mutation {
+	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] pins B2 cache + scan priority)
+	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
+	postReview(input: PostReviewInput!): Review! # [komika]
+	postComment(input: PostCommentInput!): ChapterComment! # [komika]
+	login(username: String!, password: String!): Session! # [komika]
+	register(input: RegisterInput!): Session! # [komika]
+	logout: Boolean! # [komika]
+	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
+}
+
+enum ComicType {
+	MANGA
+	MANHWA
+	MANHUA
+	WEBTOON
+	COMIC
+}
+
+# Maps from Suwayomi MangaStatus: UNKNOWN, ONGOING, COMPLETED, LICENSED,
+# PUBLISHING_FINISHED, CANCELLED, ON_HIATUS.
+enum SeriesStatus {
+	ONGOING
+	COMPLETED
+	HIATUS
+	CANCELLED
+	UNKNOWN
+}
+
+type Series {
+	id: ID!
+	title: String!
+	altTitles: [String!]!
+	author: String
+	artist: String
+	description: String
+	genres: [String!]!
+	type: ComicType! # [komika] classified per source region
+	status: SeriesStatus!
+	coverUrl: String! # [suwayomi] thumbnailUrl (client resolves via ImageProvider)
+	sourceId: String!
+	chapterCount: Int!
+	isMarked: Boolean! # [suwayomi] inLibrary
+	isCached: Boolean! # [komika] served from B2 rather than the Worker proxy
+	rating: RatingSummary! # [komika]
+	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
+	createdAt: String!
+	updatedAt: String!
+}
+
+type RatingSummary {
+	average: Float!
+	count: Int!
+	distribution: [Int!]! # length 10; index 0 => score 1
+}
+
+type ScanPolicy {
+	avgIntervalHours: Float! # rolling average between chapters
+	overrideIntervalHours: Float # admin override (manga DB console)
+	pollEveryMinutes: Int!
+	paused: Boolean! # effective (folded) paused state
+	# Raw admin overrides so the console can tell an explicit choice apart from
+	# the status default even when they coincide. null => no override.
+	statusOverride: SeriesStatus
+	pausedOverride: Boolean
+	lastScannedAt: String
+	nextScanAt: String
+}
+
+type Chapter {
+	id: ID!
+	seriesId: ID!
+	number: Float!
+	title: String
+	pageCount: Int!
+	uploadedAt: String
+	scanlator: String
+	read: Boolean! # [suwayomi] isRead
+	lastPageRead: Int!
+	bookmarked: Boolean! # [suwayomi] isBookmarked
+	isDownloaded: Boolean!
+}
+
+# Upstream image URL; never used directly as <img src> — the client's
+# ImageProvider proxies it via the Cloudflare Worker (web) or fetches it in
+# Rust (native).
+type Page {
+	index: Int!
+	sourceUrl: String!
+	width: Int
+	height: Int
+}
+
+enum DiscoveryFeedKind {
+	POPULAR
+	TRENDING
+	RECENTLY_UPDATED
+	RECENTLY_ADDED
+	GENRE
+}
+
+type DiscoveryFeed {
+	kind: DiscoveryFeedKind!
+	title: String!
+	genre: String
+	items: [Series!]!
+}
+
+type UserRef {
+	id: ID!
+	username: String!
+	avatarUrl: String
+}
+
+type Review {
+	id: ID!
+	seriesId: ID!
+	author: UserRef!
+	score: Int! # 1..10
+	body: String!
+	hasSpoiler: Boolean!
+	createdAt: String!
+	updatedAt: String!
+}
+
+type ChapterComment {
+	id: ID!
+	chapterId: ID!
+	author: UserRef!
+	body: String!
+	hasSpoiler: Boolean!
+	createdAt: String!
+}
+
+type Session {
+	token: String!
+	user: SessionUser!
+}
+
+type SessionUser {
+	id: ID!
+	username: String!
+	avatarUrl: String
+	isAdmin: Boolean!
+}
+
+type SeriesPage {
+	items: [Series!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+type ReviewPage {
+	items: [Review!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+type CommentPage {
+	items: [ChapterComment!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+input PostReviewInput {
+	seriesId: ID!
+	score: Int!
+	body: String!
+	hasSpoiler: Boolean!
+}
+
+input PostCommentInput {
+	chapterId: ID!
+	body: String!
+	hasSpoiler: Boolean!
+}
+
+input RegisterInput {
+	username: String!
+	email: String!
+	password: String!
+}
+
+# Admin "manga DB" overrides. Whole-state: a null field clears that override, so
+# the console sends the full form on save.
+input SeriesAdminInput {
+	seriesId: ID!
+	overrideIntervalHours: Float # null => derive from avgIntervalHours
+	pollEveryMinutes: Int # null => default (30)
+	paused: Boolean # null => auto-pause by status
+	status: SeriesStatus # null => use source status
+}
+
+# [komika] Aggregate health of the adaptive scan scheduler (admin console).
+type ScanStatus {
+	librarySize: Int!
+	overdueCount: Int!
+	lastTickAt: String
+	nextDueAt: String
+}
