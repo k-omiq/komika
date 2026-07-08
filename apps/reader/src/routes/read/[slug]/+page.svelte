@@ -9,6 +9,9 @@
 		socialLive,
 		loadChapterComments,
 		submitChapterComment,
+		canModerate,
+		deleteChapterComment,
+		banCommenter,
 		type CommentView,
 	} from '$lib/data/social-repo';
 	import Icon from '$lib/components/Icon.svelte';
@@ -248,6 +251,29 @@
 		}
 	}
 	const canPost = $derived(draft.trim().length > 0 && !posting);
+
+	// ---- admin moderation (only shown when signed in as admin, live backend) ----
+	const canMod = $derived(canModerate());
+	let modError = $state<string | null>(null);
+	async function removeComment(id: string) {
+		modError = null;
+		try {
+			comments = await deleteChapterComment(id, comments);
+		} catch (err) {
+			modError = err instanceof Error ? err.message : 'Could not delete the comment.';
+		}
+	}
+	async function banAuthor(c: CommentView) {
+		modError = null;
+		if (!confirm(`Ban ${c.name}? They won't be able to sign in.`)) return;
+		try {
+			await banCommenter(c.authorId);
+			// Drop their comments from view; they persist server-side until deleted.
+			comments = comments.filter((x) => x.authorId !== c.authorId);
+		} catch (err) {
+			modError = err instanceof Error ? err.message : 'Could not ban the user.';
+		}
+	}
 
 	function stageClick() {
 		if (!lockChrome) chromeVisible = !chromeVisible;
@@ -571,6 +597,8 @@
 			</div>
 		{/if}
 
+		{#if modError}<p class="post-error">{modError}</p>{/if}
+
 		<div class="c-list">
 			{#each sortedComments as c (c.id)}
 				<div class="comment">
@@ -594,6 +622,16 @@
 								<Icon name="heart" size={15} fill={c.liked ? 'currentColor' : 'none'} />{c.likes}
 							</button>
 							<button class="reply"><Icon name="reply" size={15} />Reply</button>
+							{#if canMod}
+								<button class="mod" onclick={() => removeComment(c.id)}>
+									<Icon name="x" size={14} />Delete
+								</button>
+								{#if !c.mine && c.authorId}
+									<button class="mod danger" onclick={() => banAuthor(c)}>
+										<Icon name="alert" size={14} />Ban
+									</button>
+								{/if}
+							{/if}
 						</div>
 					</div>
 				</div>
@@ -1516,7 +1554,8 @@
 		margin-top: 2px;
 	}
 	.like,
-	.reply {
+	.reply,
+	.mod {
 		display: inline-flex;
 		align-items: center;
 		gap: 6px;
@@ -1530,8 +1569,12 @@
 		transition: color 0.15s;
 	}
 	.like:hover,
-	.reply:hover {
+	.reply:hover,
+	.mod:hover {
 		color: var(--k-text);
+	}
+	.mod.danger:hover {
+		color: #f0808a;
 	}
 	.like.on {
 		color: var(--k-accent);

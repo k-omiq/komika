@@ -9,6 +9,7 @@ import type {
 	ScanStatus,
 	Series,
 	SeriesStatus,
+	UserRef,
 } from '@komika/types';
 
 /**
@@ -59,6 +60,17 @@ export interface Backend {
 	/** Aggregate scan-scheduler health (admin console). Optional: only the
 	 * unified Komika API implements it. */
 	scanStatus?(): Promise<ScanStatus>;
+	/** Force an immediate re-scan of one series, bypassing adaptive gating.
+	 * Optional: only the unified Komika API implements it. */
+	triggerScan?(seriesId: Id): Promise<Series>;
+
+	// --- admin moderation (requires an admin session) ---
+	/** Suspend (`banned: true`) or restore a user account. Optional: only the
+	 * unified Komika API implements it. */
+	banUser?(userId: Id, banned: boolean): Promise<UserRef>;
+	/** Delete a chapter comment. Returns false if it was already gone. Optional:
+	 * only the unified Komika API implements it. */
+	deleteComment?(commentId: Id): Promise<boolean>;
 }
 
 export interface Session {

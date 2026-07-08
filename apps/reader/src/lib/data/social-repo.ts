@@ -47,6 +47,7 @@ export interface ReviewView {
 
 export interface CommentView {
 	id: string;
+	authorId: string;
 	name: string;
 	initial: string;
 	bg: string;
@@ -120,6 +121,7 @@ function commentToView(c: ChapterComment): CommentView {
 	const av = avatarFor(c.author.id);
 	return {
 		id: c.id,
+		authorId: c.author.id,
 		name: c.author.username,
 		initial: initialOf(c.author.username),
 		bg: av.bg,
@@ -245,6 +247,7 @@ export async function loadChapterComments(chapterId: string, key: string): Promi
 	const seeded = local.getComments('chapter', key, readerComments);
 	return seeded.map((c) => ({
 		id: c.id,
+		authorId: '',
 		name: c.name,
 		initial: c.initial,
 		bg: c.bg,
@@ -277,6 +280,7 @@ export async function submitChapterComment(
 	const next: CommentView[] = [
 		{
 			id: 'local-' + Date.now(),
+			authorId: auth.user?.id ?? '',
 			name: me,
 			initial: initialOf(me),
 			bg: '#f2f1ee',
@@ -310,4 +314,39 @@ export async function submitChapterComment(
 		})),
 	);
 	return next;
+}
+
+// ---- admin moderation ------------------------------------------------------
+
+/** True when the signed-in user may moderate (admin on the live backend). */
+export function canModerate(): boolean {
+	return socialLive() && !!auth.user?.isAdmin;
+}
+
+/**
+ * Delete a comment (admin moderation) and return the list without it. In live
+ * mode this removes it server-side; the local fallback just drops it from view.
+ */
+export async function deleteChapterComment(
+	commentId: string,
+	current: CommentView[],
+): Promise<CommentView[]> {
+	if (socialLive()) {
+		if (!auth.user?.isAdmin) throw new Error('Admin access required.');
+		if (!backend.deleteComment) throw new Error('Moderation is unavailable on this backend.');
+		await backend.deleteComment(commentId);
+	}
+	return current.filter((c) => c.id !== commentId);
+}
+
+/**
+ * Ban a user (admin moderation). Their existing comments are left in place —
+ * delete those separately — but they can no longer sign in.
+ */
+export async function banCommenter(userId: string): Promise<void> {
+	if (!socialLive()) throw new Error('Banning requires the live backend.');
+	if (!auth.user?.isAdmin) throw new Error('Admin access required.');
+	if (!backend.banUser) throw new Error('Moderation is unavailable on this backend.');
+	if (!userId) throw new Error('This comment has no account to ban.');
+	await backend.banUser(userId, true);
 }

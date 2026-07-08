@@ -9,7 +9,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::auth::{self, User};
-use crate::scanner::scan_state;
+use crate::scanner::{scan_series, scan_state};
 use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
 use types::*;
 
@@ -717,7 +717,7 @@ impl MutationRoot {
             )));
         }
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, username, email, password_hash, avatar_url, is_admin FROM users WHERE username = ?",
+            "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned FROM users WHERE username = ?",
         )
         .bind(&username)
         .fetch_optional(&st.pool)
@@ -731,6 +731,11 @@ impl MutationRoot {
                 return Err(Error::new("Invalid username or password"));
             }
         };
+        // A suspended account can't sign in even with the right password. This
+        // is not a failed credential attempt, so it doesn't consume the budget.
+        if user.is_banned != 0 {
+            return Err(Error::new("This account has been suspended."));
+        }
         let tok = new_session(&st.pool, &user.id).await?;
         Ok(Session {
             token: tok,
@@ -861,6 +866,72 @@ impl MutationRoot {
         let n = input.series_id.0.parse::<i64>().map_err(gql_err)?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         Ok(map_series(st, m).await)
+    }
+
+    /// Admin: force an immediate re-scan of one series, bypassing the adaptive
+    /// overdue/pause gating. Returns the series with its refreshed scan state.
+    async fn trigger_scan(&self, ctx: &Context<'_>, series_id: ID) -> Result<Series> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
+        let m = st.suwayomi.series(n).await.map_err(gql_err)?;
+        scan_series(st, &m, Utc::now()).await.map_err(gql_err)?;
+        Ok(map_series(st, m).await)
+    }
+
+    /// Admin moderation: suspend or restore a user account. A banned user can't
+    /// sign in and their active sessions are revoked immediately. Admins can't
+    /// ban themselves or another admin.
+    async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<UserRef> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        if user_id.0 == admin.id {
+            return Err(Error::new("You cannot ban your own account."));
+        }
+        let target: Option<(String, String, Option<String>, i64)> =
+            sqlx::query_as("SELECT id, username, avatar_url, is_admin FROM users WHERE id = ?")
+                .bind(&user_id.0)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        let Some((id, username, avatar_url, is_admin)) = target else {
+            return Err(Error::new("No such user."));
+        };
+        if is_admin != 0 {
+            return Err(Error::new("You cannot ban an admin account."));
+        }
+        sqlx::query("UPDATE users SET is_banned = ? WHERE id = ?")
+            .bind(banned as i64)
+            .bind(&id)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        if banned {
+            // Revoke active sessions so the ban takes effect at once.
+            sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                .bind(&id)
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        }
+        Ok(UserRef {
+            id: ID(id),
+            username,
+            avatar_url,
+        })
+    }
+
+    /// Admin moderation: delete a chapter comment. Returns false if it was
+    /// already gone. (Authors don't self-delete here — this is the mod action.)
+    async fn delete_comment(&self, ctx: &Context<'_>, comment_id: ID) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let res = sqlx::query("DELETE FROM comments WHERE id = ?")
+            .bind(&comment_id.0)
+            .execute(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(res.rows_affected() > 0)
     }
 }
 

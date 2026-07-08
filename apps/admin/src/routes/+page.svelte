@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import type { Series, SeriesStatus } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
-	import { loadCatalog, saveSeriesAdmin, STATUS_OPTIONS } from '$lib/data';
+	import { loadCatalog, saveSeriesAdmin, triggerScan, STATUS_OPTIONS } from '$lib/data';
 
 	let query = $state('');
 	let series = $state<Series[]>([]);
@@ -47,10 +47,13 @@
 	let fScanner = $state<Scanner>('auto');
 	let saving = $state(false);
 	let saveError = $state<string | null>(null);
+	let scanning = $state(false);
+	let scanMsg = $state<string | null>(null);
 
 	function openEditor(s: Series): void {
 		editing = s;
 		saveError = null;
+		scanMsg = null;
 		// Decode straight from the raw admin overrides so an explicit choice is
 		// never mistaken for the status default (even when they coincide).
 		fStatus = s.scan.statusOverride ?? 'source';
@@ -88,6 +91,23 @@
 			saveError = err instanceof Error ? err.message : 'Failed to save.';
 		} finally {
 			saving = false;
+		}
+	}
+
+	async function scanNow(): Promise<void> {
+		if (!editing || scanning) return;
+		scanning = true;
+		scanMsg = null;
+		try {
+			const updated = await triggerScan(editing.id);
+			series = series.map((s) => (s.id === updated.id ? updated : s));
+			editing = updated;
+			const at = updated.scan.lastScannedAt;
+			scanMsg = at ? `Scanned just now (${new Date(at).toLocaleTimeString()}).` : 'Scan complete.';
+		} catch (err) {
+			scanMsg = err instanceof Error ? err.message : 'Scan failed.';
+		} finally {
+			scanning = false;
 		}
 	}
 
@@ -227,6 +247,20 @@
 		<div class="field">
 			<span class="label">Poll cadence when overdue (minutes)</span>
 			<input type="text" inputmode="numeric" placeholder="30" bind:value={fPoll} />
+		</div>
+
+		<div class="field">
+			<span class="label">Manual scan</span>
+			<button class="scan-now" onclick={scanNow} disabled={scanning}>
+				{scanning ? 'Scanning…' : 'Scan now'}
+			</button>
+			<span class="help">
+				Force an immediate re-scan, ignoring cadence and pause. Last scanned:
+				{editing.scan.lastScannedAt
+					? new Date(editing.scan.lastScannedAt).toLocaleString()
+					: 'never'}.
+			</span>
+			{#if scanMsg}<span class="help scan-msg">{scanMsg}</span>{/if}
 		</div>
 
 		{#if saveError}<div class="notice error">{saveError}</div>{/if}
@@ -556,6 +590,26 @@
 	.field input:focus {
 		outline: none;
 		border-color: var(--k-border-strong);
+	}
+	.scan-now {
+		height: 42px;
+		padding: 0 18px;
+		border-radius: var(--k-radius-md);
+		background: var(--k-surface);
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text);
+		font-family: var(--k-font-sans);
+		font-weight: 600;
+		font-size: 13.5px;
+		cursor: pointer;
+		align-self: flex-start;
+	}
+	.scan-now:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.scan-msg {
+		color: var(--k-text-dim);
 	}
 	.segmented {
 		display: grid;
