@@ -1866,8 +1866,7 @@ impl QueryRoot {
                     CASE WHEN w.cover_cached_version IS NOT NULL \
                          THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                          WHEN w.cover_file_name IS NOT NULL \
-                         THEN 'https://uploads.mangadex.org/covers/' || ss.source_key || '/' \
-                              || w.cover_file_name || '.512.jpg' \
+                         THEN '/covers/' || w.id || '.webp' \
                          ELSE NULL END AS cover_url, \
                     c.number AS latest_chapter, c.title AS latest_chapter_title, \
                     MAX(COALESCE(c.published_at, c.created_at)) AS latest_at \
@@ -7424,7 +7423,9 @@ mod tests {
                 .await
                 .unwrap();
 
-        // canonicalSeries maps the work; cover URL points at uploads.mangadex.org.
+        // canonicalSeries maps the work; an uncached cover now resolves to our own
+        // lazy /covers/ route (serve_cover fetches + caches the MangaDex cover on first
+        // hit) rather than the raw CDN URL.
         let q = format!(
             r#"{{ canonicalSeries(workId: "{work_id}") {{ id title coverUrl sourceId chapterCount }} }}"#
         );
@@ -7433,7 +7434,7 @@ mod tests {
         let json = data_json(&r);
         assert!(json.contains("Readable Work"), "{json}");
         assert!(
-            json.contains("uploads.mangadex.org/covers/md-safe/cover.jpg"),
+            json.contains(&format!("/covers/{work_id}.webp")),
             "{json}"
         );
         assert!(json.contains("\"chapterCount\":2"), "{json}");

@@ -105,10 +105,12 @@ pub fn cover_path(work_id: &str, version: i64) -> String {
     format!("/covers/{work_id}.webp?v={version}")
 }
 
-/// Resolve the cover URL for a work: the VPS-served cached path when a blob
-/// exists, else the proxy-ready MangaDex thumbnail URL (client routes it through
-/// the Worker), else empty. This is the single seam every cover-URL site uses so
-/// the web/VPS split lives in one place.
+/// Resolve the cover URL for a work. Cached ⇒ the versioned VPS blob path. Uncached
+/// but cover-able (has a MangaDex anchor) ⇒ our own `/covers/{id}.webp` route, which
+/// lazily fetches + caches the MangaDex cover on first request (and 302-falls back to
+/// the CDN if that fails) — so covers land on our origin AS THEY'RE VIEWED, not only
+/// via the slow background drainer. No anchor ⇒ empty. This is the single seam every
+/// cover-URL site uses so the web/VPS split lives in one place.
 pub fn work_cover_url(
     work_id: &str,
     cached_version: Option<i64>,
@@ -119,8 +121,33 @@ pub fn work_cover_url(
         return cover_path(work_id, v);
     }
     match (mangadex_id, cover_file_name) {
-        (Some(mid), Some(fname)) => crate::mangadex::cover_thumb_url(mid, fname),
+        (Some(mid), Some(fname)) if !mid.is_empty() && !fname.is_empty() => {
+            format!("/covers/{work_id}.webp")
+        }
         _ => String::new(),
+    }
+}
+
+/// The MangaDex anchor (`(source_key, cover_file_name)`) for a work — the oldest
+/// MangaDex `source_series` (the same anchor the reader/drainer picks) plus the work's
+/// cover file name. `None` if the work has no MangaDex source or no cover file name, in
+/// which case there's nothing to lazily fetch. Used by `serve_cover`'s lazy cache.
+pub async fn mangadex_cover_anchor(main: &SqlitePool, work_id: &str) -> Option<(String, String)> {
+    let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT ss.source_key, w.cover_file_name \
+         FROM work w \
+         JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' \
+         WHERE w.id = ? \
+         ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
+    )
+    .bind(work_id)
+    .fetch_optional(main)
+    .await
+    .ok()
+    .flatten()?;
+    match row {
+        (Some(mid), Some(fname)) if !mid.is_empty() && !fname.is_empty() => Some((mid, fname)),
+        _ => None,
     }
 }
 
@@ -600,15 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn work_cover_url_prefers_cached_then_mangadex() {
+    fn work_cover_url_prefers_cached_then_own_lazy_route() {
+        // Cached → versioned VPS blob path.
         assert_eq!(
             work_cover_url("w_1", Some(7), Some("md-uuid"), Some("f.jpg")),
             "/covers/w_1.webp?v=7"
         );
+        // Uncached but cover-able → our own lazy /covers/ route (serve_cover fetches +
+        // caches the MangaDex cover on first hit), NOT the raw CDN URL.
         assert_eq!(
             work_cover_url("w_1", None, Some("md-uuid"), Some("f.jpg")),
-            crate::mangadex::cover_thumb_url("md-uuid", "f.jpg")
+            "/covers/w_1.webp"
         );
+        // No anchor → empty.
         assert_eq!(work_cover_url("w_1", None, None, None), "");
+        assert_eq!(work_cover_url("w_1", None, Some("md-uuid"), None), "");
     }
 }

@@ -365,40 +365,61 @@ async fn serve_avatar(
     }
 }
 
-/// `GET /covers/{work_id}.webp` — public serve of a cached work cover from
-/// `work_cover_blob`. Same BLOB-in-SQLite + immutable-cache model as avatars; the
-/// stored path carries a `?v=<version>` cache-buster so this can be immutable. A
-/// missing blob is a 404 (the caller only builds this URL when
-/// `work.cover_cached_version` is set, so a 404 means a race with a cache clear).
+/// `GET /covers/{work_id}.webp` — public serve of a work cover from `work_cover_blob`.
+/// Same BLOB-in-SQLite + immutable-cache model as avatars. On a cache MISS for a
+/// MangaDex-anchored work, lazily fetch its MangaDex cover, downscale to a bounded
+/// WebP, store it (so it's on our origin from now on), and serve it — "save covers as
+/// we fetch". If the lazy fetch/resize fails (or the work has a version but a missing
+/// blob), 302-redirect to the MangaDex CDN so the cover still renders; a genuinely
+/// coverless work 404s.
 async fn serve_cover(
+    State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(pool)): State<CoverDb>,
     UrlPath(file): UrlPath<String>,
 ) -> axum::response::Response {
     let Some(work_id) = file.strip_suffix(".webp") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let webp: Option<Vec<u8>> =
-        match sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = ?")
-            .bind(work_id)
-            .fetch_optional(&pool)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "cover read failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Fast path: already-cached blob.
+    match sqlx::query_scalar::<_, Vec<u8>>("SELECT webp FROM work_cover_blob WHERE work_id = ?")
+        .bind(work_id)
+        .fetch_optional(&pool)
+        .await
+    {
+        Ok(Some(bytes)) => return webp_cover_response(bytes),
+        Ok(None) => {} // fall through to lazy fetch
+        Err(e) => {
+            tracing::warn!(error = %e, "cover read failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    // Lazy cache: this URL is only built for MangaDex-anchored works, so look up the
+    // anchor and materialize the cover on first request.
+    let Some((mangadex_id, file_name)) = cover::mangadex_cover_anchor(&app.pool, work_id).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
+    let Some(bytes) = app.mangadex.cover_thumb_bytes(&mangadex_id, &file_name).await else {
+        return axum::response::Redirect::temporary(&cdn_fallback).into_response();
+    };
+    // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
+    let resized = tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await;
+    match resized {
+        Ok(Ok(webp)) => {
+            if let Err(e) = cover::put_work_cover(&app.pool, &pool, work_id, &webp).await {
+                tracing::warn!(error = %e, work_id, "lazy cover cache store failed");
             }
-        };
-    match webp {
-        Some(bytes) => (
-            [
-                (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+            webp_cover_response(webp)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
+            axum::response::Redirect::temporary(&cdn_fallback).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, work_id, "lazy cover resize task panicked");
+            axum::response::Redirect::temporary(&cdn_fallback).into_response()
+        }
     }
 }
 
