@@ -1,0 +1,95 @@
+import type {
+	Chapter,
+	ChapterComment,
+	DiscoveryFeed,
+	Id,
+	Page,
+	Paginated,
+	Review,
+	ScanStatus,
+	Series,
+	SeriesStatus,
+} from '@komika/types';
+
+/**
+ * The unified Komika backend (Suwayomi/Tachidesk-style server + our services).
+ *
+ * It owns: identity, the auto-served catalog, chapter/page metadata, library &
+ * reading-progress sync, the social layer, and the admin "manga DB". Image bytes
+ * are NOT served here — those flow through an ImageProvider.
+ *
+ * This is the contract the UI codes against. A concrete GraphQL implementation
+ * is wired in `graphql-backend.ts`.
+ */
+export interface Backend {
+	// --- auth ---
+	session(): Promise<Session | null>;
+	login(username: string, password: string): Promise<Session>;
+	register(input: RegisterInput): Promise<Session>;
+	logout(): Promise<void>;
+	/**
+	 * Set (or clear) the bearer token used for authenticated requests. Optional:
+	 * only backends with real auth (the unified Komika API) implement it; the
+	 * Suwayomi adapter has no auth and omits it. Call after login/logout.
+	 */
+	setToken?(token: string | null): void;
+
+	// --- discovery / catalog (auto-served, no source picking) ---
+	discovery(): Promise<DiscoveryFeed[]>;
+	search(query: string, page?: number): Promise<Paginated<Series>>;
+	series(id: Id): Promise<Series>;
+	chapters(seriesId: Id): Promise<Chapter[]>;
+	pages(chapterId: Id): Promise<Page[]>;
+
+	// --- library & progress ---
+	mark(seriesId: Id, marked: boolean): Promise<Series>;
+	library(): Promise<Series[]>;
+	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
+
+	// --- social ---
+	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;
+	postReview(input: PostReviewInput): Promise<Review>;
+	comments(chapterId: Id, page?: number): Promise<Paginated<ChapterComment>>;
+	postComment(input: PostCommentInput): Promise<ChapterComment>;
+
+	// --- admin "manga DB" (requires an admin session) ---
+	/** Upsert per-series admin overrides (scan cadence, pause, status). Optional:
+	 * only the unified Komika API implements it. */
+	updateSeriesAdmin?(input: SeriesAdminInput): Promise<Series>;
+	/** Aggregate scan-scheduler health (admin console). Optional: only the
+	 * unified Komika API implements it. */
+	scanStatus?(): Promise<ScanStatus>;
+}
+
+export interface Session {
+	token: string;
+	user: { id: Id; username: string; avatarUrl: string | null; isAdmin: boolean };
+}
+
+export interface RegisterInput {
+	username: string;
+	email: string;
+	password: string;
+}
+
+export interface PostReviewInput {
+	seriesId: Id;
+	score: number;
+	body: string;
+	hasSpoiler: boolean;
+}
+
+export interface PostCommentInput {
+	chapterId: Id;
+	body: string;
+	hasSpoiler: boolean;
+}
+
+/** Admin "manga DB" overrides. Whole-state: null clears an override. */
+export interface SeriesAdminInput {
+	seriesId: Id;
+	overrideIntervalHours?: number | null;
+	pollEveryMinutes?: number | null;
+	paused?: boolean | null;
+	status?: SeriesStatus | null;
+}
