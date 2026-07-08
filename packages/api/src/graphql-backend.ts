@@ -1,4 +1,5 @@
 import type {
+	AdminUser,
 	Chapter,
 	ChapterComment,
 	DiscoveryFeed,
@@ -156,6 +157,17 @@ export class GraphQLBackend implements Backend {
 	async deleteComment(commentId: Id): Promise<boolean> {
 		const d = await this.gql<{ deleteComment: boolean }>(ops.DELETE_COMMENT, { commentId });
 		return d.deleteComment;
+	}
+
+	// --- admin user management ---
+	async users(page = 1): Promise<Paginated<AdminUser>> {
+		const d = await this.gql<{ users: Paginated<AdminUser> }>(ops.USERS, { page });
+		return d.users;
+	}
+
+	async setUserAdmin(userId: Id, isAdmin: boolean): Promise<AdminUser> {
+		const d = await this.gql<{ setUserAdmin: AdminUser }>(ops.SET_USER_ADMIN, { userId, isAdmin });
+		return d.setUserAdmin;
 	}
 }
 

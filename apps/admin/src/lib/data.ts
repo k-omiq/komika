@@ -2,7 +2,7 @@
  * Admin data layer — catalog listing + override writes, straight through the
  * unified backend (no mock fallback: the console requires the real API).
  */
-import type { Series, SeriesStatus } from '@komika/types';
+import type { AdminUser, Paginated, Series, SeriesStatus } from '@komika/types';
 import type { SeriesAdminInput } from '@komika/api';
 import { backend } from './context';
 
@@ -33,6 +33,24 @@ export async function saveSeriesAdmin(input: SeriesAdminInput): Promise<Series> 
 export async function triggerScan(seriesId: string): Promise<Series> {
 	if (!backend.triggerScan) throw new Error('Manual scan is unavailable on this backend.');
 	return backend.triggerScan(seriesId);
+}
+
+/** Paginated user list for the user-management console. */
+export async function loadUsers(page = 1): Promise<Paginated<AdminUser>> {
+	if (!backend.users) throw new Error('User management is unavailable on this backend.');
+	return backend.users(page);
+}
+
+/** Suspend or restore a user account. */
+export async function setUserBanned(userId: string, banned: boolean): Promise<void> {
+	if (!backend.banUser) throw new Error('User management is unavailable on this backend.');
+	await backend.banUser(userId, banned);
+}
+
+/** Grant or revoke a user's admin flag; returns the updated user. */
+export async function setUserAdmin(userId: string, isAdmin: boolean): Promise<AdminUser> {
+	if (!backend.setUserAdmin) throw new Error('User management is unavailable on this backend.');
+	return backend.setUserAdmin(userId, isAdmin);
 }
 
 export const STATUS_OPTIONS: SeriesStatus[] = [

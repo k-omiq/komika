@@ -50,6 +50,17 @@ export interface ScanStatus {
 	nextDueAt: string | null;
 }
 
+/** A user account as shown in the admin user-management console. */
+export interface AdminUser {
+	id: Id;
+	username: string;
+	email: string;
+	avatarUrl: string | null;
+	isAdmin: boolean;
+	isBanned: boolean;
+	createdAt: string;
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */

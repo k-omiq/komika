@@ -30,8 +30,9 @@ type Query {
 	comments(chapterId: ID!, page: Int = 1): CommentPage! # [komika]
 	# auth
 	session: Session # [komika] current session or null
-	# ops
+	# ops / admin (all require isAdmin)
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
+	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
 }
 
 type Mutation {
@@ -46,6 +47,7 @@ type Mutation {
 	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
 	banUser(userId: ID!, banned: Boolean!): UserRef! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
+	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
 }
 
 enum ComicType {
@@ -239,4 +241,22 @@ type ScanStatus {
 	overdueCount: Int!
 	lastTickAt: String
 	nextDueAt: String
+}
+
+# [komika] A user account as shown in the admin user-management console.
+type AdminUser {
+	id: ID!
+	username: String!
+	email: String!
+	avatarUrl: String
+	isAdmin: Boolean!
+	isBanned: Boolean!
+	createdAt: String!
+}
+
+type AdminUserPage {
+	items: [AdminUser!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
 }
