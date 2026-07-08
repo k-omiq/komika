@@ -1,8 +1,5 @@
-/* App-global styling that layers on top of @komika/ui reset + tokens. */
-
-:root {
-	color-scheme: dark;
-}
+/* App-global styling that layers on top of @komika/ui reset + tokens.
+   color-scheme is owned by the tokens (per data-theme), so it is not forced here. */
 
 body {
 	font-family: var(--k-font-sans);
@@ -20,17 +17,17 @@ h4 {
 	letter-spacing: -0.02em;
 }
 
-/* thin dark scrollbars, matching the comps */
+/* thin scrollbars, matching the comps (theme-adaptive via border tokens) */
 ::-webkit-scrollbar {
 	height: 8px;
 	width: 8px;
 }
 ::-webkit-scrollbar-thumb {
-	background: rgba(255, 255, 255, 0.12);
+	background: var(--k-border-4);
 	border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-	background: rgba(255, 255, 255, 0.2);
+	background: var(--k-border-strong);
 }
 ::-webkit-scrollbar-track {
 	background: transparent;
