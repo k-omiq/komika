@@ -1,0 +1,38 @@
+[package]
+name = "komika-server"
+version = "0.1.0"
+edition = "2021"
+description = "Komika unified GraphQL API — federates Suwayomi + Komika-native social/auth/discovery."
+license = "MIT"
+
+[[bin]]
+name = "komika-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = "0.8"
+async-graphql = "7"
+async-graphql-axum = "7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
