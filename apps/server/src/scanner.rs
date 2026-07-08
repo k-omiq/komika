@@ -344,3 +344,77 @@ pub fn spawn(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(iso: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(iso)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn chap(upload_date: Option<&str>) -> SuwayomiChapter {
+        SuwayomiChapter {
+            id: 1,
+            manga_id: 1,
+            name: "c".into(),
+            chapter_number: 1.0,
+            scanlator: None,
+            upload_date: upload_date.map(|s| s.to_string()),
+            is_read: false,
+            is_bookmarked: false,
+            is_downloaded: false,
+            last_page_read: 0,
+            page_count: 0,
+        }
+    }
+
+    #[test]
+    fn never_scanned_series_is_overdue() {
+        assert!(is_overdue(None, 24.0, at("2026-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn recent_scan_within_interval_is_not_overdue() {
+        // last scan 1h ago, interval 24h
+        assert!(!is_overdue(
+            Some("2025-12-31T23:00:00Z"),
+            24.0,
+            at("2026-01-01T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn stale_scan_past_interval_is_overdue() {
+        // last scan 7d ago, interval 24h
+        assert!(is_overdue(
+            Some("2025-12-25T00:00:00Z"),
+            24.0,
+            at("2026-01-01T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn avg_interval_needs_two_dated_chapters() {
+        assert_eq!(avg_interval_hours(&[]), None);
+        assert_eq!(avg_interval_hours(&[chap(Some("1000"))]), None);
+        // two chapters 24h apart (epoch seconds)
+        let day = 24 * 3600;
+        let a = chap(Some("1000000"));
+        let b = chap(Some(&(1_000_000 + day).to_string()));
+        let avg = avg_interval_hours(&[a, b]).unwrap();
+        assert!((avg - 24.0).abs() < 0.001, "expected ~24h, got {avg}");
+    }
+
+    #[test]
+    fn max_interval_clamp_avoids_duration_overflow() {
+        // The absurd-override guard clamps to MAX_INTERVAL_HOURS; the resulting
+        // Duration math must not overflow or panic (this was the m2 finding).
+        let ms = (MAX_INTERVAL_HOURS * 3_600_000.0) as i64;
+        let now = at("2026-01-01T00:00:00Z");
+        let future = now + chrono::Duration::milliseconds(ms);
+        assert!(future > now);
+    }
+}
