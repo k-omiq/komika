@@ -4771,6 +4771,41 @@ impl MutationRoot {
         }
     }
 
+    /// Admin: force `is_nsfw_override` on EVERY catalogued work that has a Suwayomi
+    /// source under `sourceId` — mark (or, with `isNsfw: false`, un-mark) an entire
+    /// source's series in one shot. Complete + repeatable with no per-series
+    /// enumeration or live source browse: a single UPDATE over `source_series → work`.
+    /// `isNsfw: true` pins NSFW; `isNsfw: false` CLEARS the override (reverts to
+    /// source-derived), so it's a clean undo. Returns how many works were updated.
+    /// Only marks series already INGESTED (they need a `work`); run `startSourceIngest`
+    /// first to catch a source's not-yet-catalogued series, then re-run this.
+    async fn mark_source_nsfw(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+        is_nsfw: bool,
+    ) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let now = Utc::now().to_rfc3339();
+        // true → pin override = 1; false → clear (NULL) so it reverts to derived.
+        let val: Option<i64> = is_nsfw.then_some(1);
+        let res = sqlx::query(
+            "UPDATE work SET is_nsfw_override = ?, updated_at = ? \
+             WHERE id IN (SELECT work_id FROM source_series \
+                          WHERE source_type = 'suwayomi' AND source_id = ?)",
+        )
+        .bind(val)
+        .bind(&now)
+        .bind(&source_id)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let n = res.rows_affected() as i32;
+        tracing::info!(source_id, is_nsfw, updated = n, "markSourceNsfw");
+        Ok(n)
+    }
+
     /// Admin: force an immediate re-scan of every installed Suwayomi source of a
     /// canonical work (each source's `source_key` is a Suwayomi manga id). Returns how
     /// many sources were successfully scanned; unresolvable sources are skipped.
@@ -8948,6 +8983,87 @@ mod tests {
             .await
         )
         .contains("overrideIntervalHours"));
+    }
+
+    #[tokio::test]
+    async fn mark_source_nsfw_flags_a_whole_source_and_requires_admin() {
+        let (s, pool) = setup_full(100).await;
+        // Two works ingested from suwayomi source "1534", one from another source.
+        for (wid, ssid, src) in [
+            ("w_omega1", "sso1", "1534"),
+            ("w_omega2", "sso2", "1534"),
+            ("w_other", "ssx", "9999"),
+        ] {
+            sqlx::query(
+                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
+                 VALUES (?, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+                 VALUES (?, ?, 'suwayomi', ?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(ssid)
+            .bind(wid)
+            .bind(src)
+            .bind(wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Non-admin is refused.
+        let r = exec(
+            &s,
+            r#"mutation { markSourceNsfw(sourceId:"1534", isNsfw:true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(!r.errors.is_empty(), "non-admin must be refused");
+        // Admin marks source "1534" → its two works updated, the other untouched.
+        let r = exec(
+            &s,
+            r#"mutation { markSourceNsfw(sourceId:"1534", isNsfw:true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            data_json(&r).contains("\"markSourceNsfw\":2"),
+            "{}",
+            data_json(&r)
+        );
+        async fn override_of(pool: &SqlitePool, id: &str) -> Option<i64> {
+            sqlx::query_scalar::<_, Option<i64>>("SELECT is_nsfw_override FROM work WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        assert_eq!(override_of(&pool, "w_omega1").await, Some(1));
+        assert_eq!(override_of(&pool, "w_omega2").await, Some(1));
+        assert_eq!(
+            override_of(&pool, "w_other").await,
+            None,
+            "other source untouched"
+        );
+        // Undo: false clears the override back to NULL (source-derived).
+        exec(
+            &s,
+            r#"mutation { markSourceNsfw(sourceId:"1534", isNsfw:false) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            override_of(&pool, "w_omega1").await,
+            None,
+            "false clears the override"
+        );
     }
 
     /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
