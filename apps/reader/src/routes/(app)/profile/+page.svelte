@@ -2,9 +2,24 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Footer from '$lib/components/Footer.svelte';
 	import { slug } from '$lib/data/mock';
+	import { getProfile, type ProfileView } from '$lib/data/source';
+	import { auth } from '$lib/auth.svelte';
 
 	let { data } = $props();
-	const profile = $derived(data.profile);
+	// Re-fetch once auth has restored the session token onto the backend — the
+	// initial `load` can race ahead of `initAuth`, so without this the signed-in
+	// user's real profile wouldn't resolve on first paint. Falls back to the load
+	// result (mock when signed out / backend off) until then.
+	let liveProfile = $state<ProfileView | null>(null);
+	const profile = $derived(liveProfile ?? data.profile);
+	$effect(() => {
+		void auth.ready;
+		void auth.user?.id;
+		if (!auth.ready) return;
+		getProfile().then((p) => {
+			liveProfile = p;
+		});
+	});
 
 	let tab = $state<'reading' | 'completed' | 'favorites'>('reading');
 
@@ -32,7 +47,7 @@
 
 <div class="head k-gutter">
 	<div class="identity">
-		<div class="avatar-lg">K</div>
+		<div class="avatar-lg">{(profile.name.charAt(0) || 'K').toUpperCase()}</div>
 		<div class="who">
 			<div class="name-row">
 				<h1>{profile.name}</h1>
@@ -64,7 +79,7 @@
 			<div class="reading-list">
 				{#each profile.reading as r (r.title)}
 					{@const pct = Math.round((r.ch / r.total) * 100)}
-					<a class="reading-row" href={`/series/${slug(r.title)}`}>
+					<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
 						<div class="mini-cover k-cover"></div>
 						<div class="reading-info">
 							<div class="reading-top">
@@ -89,7 +104,7 @@
 			</div>
 			<div class="shelf-grid">
 				{#each shelfItems as item (item.title + item.shelf)}
-					<a class="shelf-card" href={`/series/${slug(item.title)}`}>
+					<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
 						<div class="cover k-cover">
 							<span class="rating"
 								><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
