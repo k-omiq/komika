@@ -38,6 +38,13 @@ export interface Backend {
 
 	// --- discovery / catalog (auto-served, no source picking) ---
 	discovery(): Promise<DiscoveryFeed[]>;
+	/**
+	 * The Updates feed: library series with newly-detected chapters, newest-first.
+	 * On the unified Komika API this is driven by the adaptive scanner
+	 * (`series_scan_state.last_new_chapter_at`); the Suwayomi adapter approximates
+	 * it with the source "Latest" endpoint.
+	 */
+	updates(page?: number): Promise<Paginated<Series>>;
 	search(query: string, page?: number): Promise<Paginated<Series>>;
 	series(id: Id): Promise<Series>;
 	chapters(seriesId: Id): Promise<Chapter[]>;

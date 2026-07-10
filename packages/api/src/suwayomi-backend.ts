@@ -379,6 +379,13 @@ export class SuwayomiBackend implements Backend {
 		return feeds;
 	}
 
+	async updates(page = 1): Promise<Paginated<Series>> {
+		// Suwayomi has no adaptive scanner; approximate the Updates feed with the
+		// source "Latest" endpoint (newest chapters upstream).
+		const { items, hasNextPage } = await this.fetchSource('LATEST', page);
+		return { items, page, hasNextPage, total: null };
+	}
+
 	async search(query: string, page = 1): Promise<Paginated<Series>> {
 		const type = query.trim() ? 'SEARCH' : 'POPULAR';
 		const { items, hasNextPage } = await this.fetchSource(type, page, query.trim() || undefined);

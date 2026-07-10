@@ -424,6 +424,57 @@ impl QueryRoot {
         Ok(feeds)
     }
 
+    /// The reader's Updates feed: library series the adaptive scanner has
+    /// detected new chapters for, newest-first. Driven by
+    /// `series_scan_state.last_new_chapter_at` (written by `scanner::scan_series`)
+    /// — this reflects OUR scanner, NOT Suwayomi's source "Latest" endpoint.
+    async fn updates(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<SeriesPage> {
+        let st = state(ctx);
+        let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // Series ids with a detected new-chapter timestamp, newest-first. Fetch one
+        // extra to compute has_next without a second round-trip.
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT series_id FROM series_scan_state \
+             WHERE last_new_chapter_at IS NOT NULL \
+             ORDER BY last_new_chapter_at DESC, series_id ASC LIMIT ? OFFSET ?",
+        )
+        .bind(PAGE_SIZE + 1)
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM series_scan_state WHERE last_new_chapter_at IS NOT NULL",
+        )
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let has_next = ids.len() as i64 > PAGE_SIZE;
+
+        // Hydrate each id from Suwayomi. A series that has since been removed from
+        // the source is skipped rather than failing the whole feed.
+        let mut items = Vec::new();
+        for id in ids.into_iter().take(PAGE_SIZE as usize) {
+            let Ok(n) = id.parse::<i64>() else { continue };
+            match st.suwayomi.series(n).await {
+                Ok(m) => items.push(map_series(st, m).await),
+                Err(e) => {
+                    tracing::warn!(series_id = id, error = %e, "updates: skipping unresolvable series")
+                }
+            }
+        }
+        Ok(SeriesPage {
+            items,
+            page,
+            has_next_page: has_next,
+            total: Some(total as i32),
+        })
+    }
+
     async fn search(
         &self,
         ctx: &Context<'_>,
@@ -1340,6 +1391,55 @@ mod tests {
             r.data.into_json().unwrap()["setUserAdmin"]["isAdmin"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn updates_counts_dated_scan_state_rows() {
+        // Build state directly so we can seed series_scan_state, then query updates.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        for (sid, ts) in [
+            ("10", Some("2026-02-01T00:00:00Z")),
+            ("11", Some("2026-03-01T00:00:00Z")),
+            ("12", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO series_scan_state \
+                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
+                 VALUES (?, 0, 0, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(sid)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let state = std::sync::Arc::new(AppState {
+            pool,
+            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            admin_users: vec![],
+            scan_health: Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+        });
+        let s = build_schema(state);
+        let r = exec(
+            &s,
+            r#"{ updates { total hasNextPage items { id } } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "updates errored: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        // Two rows carry a last_new_chapter_at; the null one is excluded.
+        assert_eq!(data["updates"]["total"], serde_json::json!(2));
+        // Suwayomi is unreachable in tests, so hydration is skipped and items are
+        // empty — but the count/pagination path is exercised.
+        assert_eq!(data["updates"]["items"], serde_json::json!([]));
     }
 
     #[tokio::test]

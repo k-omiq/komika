@@ -19,6 +19,7 @@ schema {
 type Query {
 	# catalog
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
+	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, newest-first
 	search(query: String!, page: Int = 1): SeriesPage! # [suwayomi] source/library search
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
