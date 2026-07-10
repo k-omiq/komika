@@ -4806,6 +4806,82 @@ impl MutationRoot {
         Ok(n)
     }
 
+    /// Admin: recompute the DERIVED `is_nsfw` for every ingested Suwayomi work under
+    /// the current rule — adult genre tags OR an adult Suwayomi source
+    /// (`source_extension.is_nsfw`) — and flip the ones currently mis-stored as SFW.
+    /// Backfills the leak where whole adult sources were ingested as SFW (their tags
+    /// weren't in the old keyword list and the source flag was ignored). Uses stored
+    /// genres from the `series` cache, so no re-fetch. Conservative: only flips
+    /// 0 → 1 (never un-flags), and leaves `is_nsfw_override` alone. Returns how many
+    /// works flipped; a per-source breakdown is logged for review.
+    async fn rederive_suwayomi_nsfw(&self, ctx: &Context<'_>) -> Result<i32> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let rows = sqlx::query_as::<_, (String, String, Option<String>, i64, i64)>(
+            "SELECT ss.work_id, ss.source_id, s.genre, w.is_nsfw, COALESCE(se.is_nsfw, 0) \
+             FROM source_series ss \
+             JOIN work w ON w.id = ss.work_id \
+             LEFT JOIN suwayomi_series s ON CAST(s.id AS TEXT) = ss.source_key \
+             LEFT JOIN source_extension se ON se.source_id = ss.source_id \
+             WHERE ss.source_type = 'suwayomi'",
+        )
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+
+        // A work is NSFW if ANY of its Suwayomi sources is adult (genre or source
+        // flag). Track the triggering source for the per-source report.
+        let mut should_nsfw: HashMap<String, bool> = HashMap::new();
+        let mut currently: HashMap<String, i64> = HashMap::new();
+        let mut trigger: HashMap<String, String> = HashMap::new();
+        for (work_id, source_id, genre_json, w_nsfw, src_nsfw) in rows {
+            currently.insert(work_id.clone(), w_nsfw);
+            let genres: Vec<String> = genre_json
+                .as_deref()
+                .and_then(|g| serde_json::from_str(g).ok())
+                .unwrap_or_default();
+            let this_nsfw = src_nsfw != 0 || genre_is_nsfw(&genres);
+            let e = should_nsfw.entry(work_id.clone()).or_insert(false);
+            if this_nsfw {
+                *e = true;
+                trigger.entry(work_id).or_insert(source_id);
+            }
+        }
+        let to_flip: Vec<String> = should_nsfw
+            .iter()
+            .filter(|(wid, &should)| should && currently.get(*wid).copied().unwrap_or(0) == 0)
+            .map(|(wid, _)| wid.clone())
+            .collect();
+
+        let mut per_source: std::collections::BTreeMap<String, i32> = Default::default();
+        for wid in &to_flip {
+            if let Some(src) = trigger.get(wid) {
+                *per_source.entry(src.clone()).or_default() += 1;
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        for chunk in to_flip.chunks(500) {
+            let sql = format!(
+                "UPDATE work SET is_nsfw = 1, updated_at = ? WHERE id IN ({})",
+                in_placeholders(chunk.len())
+            );
+            let mut q = sqlx::query(&sql).bind(&now);
+            for wid in chunk {
+                q = q.bind(wid);
+            }
+            q.execute(&st.pool).await.map_err(gql_err)?;
+        }
+        for (src, n) in &per_source {
+            tracing::info!(source_id = %src, flipped = n, "rederiveSuwayomiNsfw: source flagged");
+        }
+        tracing::info!(
+            total = to_flip.len(),
+            sources = per_source.len(),
+            "rederiveSuwayomiNsfw complete"
+        );
+        Ok(to_flip.len() as i32)
+    }
+
     /// Admin: force an immediate re-scan of every installed Suwayomi source of a
     /// canonical work (each source's `source_key` is a Suwayomi manga id). Returns how
     /// many sources were successfully scanned; unresolvable sources are skipped.
@@ -5684,9 +5760,25 @@ fn federated_consolidate_ok(score: f64, title: &str) -> bool {
 fn genre_is_nsfw(genre: &[String]) -> bool {
     genre.iter().any(|g| {
         let g = g.to_ascii_lowercase();
-        ["hentai", "erotica", "smut", "pornographic", "adult"]
-            .iter()
-            .any(|k| g.contains(k))
+        // Explicit adult genre tags. `mature`/`18+`/`r18` catch adult scanlation
+        // sources (e.g. omegascans) that tag content "Mature"/"18+" rather than
+        // "Adult"/"Erotica" — the tags the original list missed, which leaked to the
+        // home page. Suggestive/ecchi are deliberately NOT here (kept SFW-visible,
+        // matching MangaDex "suggestive"); the source-level flag is the backstop.
+        [
+            "hentai",
+            "erotica",
+            "smut",
+            "pornographic",
+            "adult",
+            "mature",
+            "18+",
+            "nsfw",
+            "r18",
+            "r-18",
+        ]
+        .iter()
+        .any(|k| g.contains(k))
     })
 }
 
@@ -6010,9 +6102,21 @@ async fn add_source_series_core_ex(
         });
     }
 
-    // N1/N5: source-level NSFW derived from the genres already fetched (Suwayomi
-    // exposes no confirmed manga nsfw boolean). CATALOGUE.md §2.
-    let source_nsfw = genre_is_nsfw(&m.genre);
+    // N1/N5: NSFW if the series' own genres look adult OR its Suwayomi source is an
+    // adult source. The source flag (source_extension.is_nsfw, cached by the scan
+    // tick — a cheap PK lookup, no network) is the backstop for adult sources whose
+    // per-series tags don't include an explicit adult genre: that gap ingested whole
+    // adult sources (e.g. omegascans) as SFW and leaked them to the home page.
+    // CATALOGUE.md §2.
+    let source_ext_nsfw = sqlx::query_scalar::<_, i64>(
+        "SELECT is_nsfw FROM source_extension WHERE source_id = ?",
+    )
+    .bind(&m.source_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0)
+        != 0;
+    let source_nsfw = genre_is_nsfw(&m.genre) || source_ext_nsfw;
 
     // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
     // `external_ids` stays empty — the external-ID dedup rung is a no-op here.
@@ -9063,6 +9167,100 @@ mod tests {
             override_of(&pool, "w_omega1").await,
             None,
             "false clears the override"
+        );
+    }
+
+    #[tokio::test]
+    async fn rederive_suwayomi_nsfw_flips_adult_sources_and_genres() {
+        let (s, pool) = setup_full(100).await;
+        // Three suwayomi works, all stored SFW (the leak state).
+        for wid in ["w_genre", "w_srcflag", "w_sfw"] {
+            sqlx::query(
+                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
+                 VALUES (?, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // (work, suwayomi id, source). w_genre+w_sfw on srcA (SFW source), w_srcflag on srcB.
+        for (wid, key, src) in [
+            ("w_genre", "111", "srcA"),
+            ("w_srcflag", "222", "srcB"),
+            ("w_sfw", "333", "srcA"),
+        ] {
+            sqlx::query(
+                "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+                 VALUES (?, ?, 'suwayomi', ?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("ss_{key}"))
+            .bind(wid)
+            .bind(src)
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Cached genres: w_genre is tagged "Mature" (adult genre); the others aren't.
+        for (key, genre) in [
+            ("111", r#"["Romance","Mature"]"#),
+            ("222", r#"["Action"]"#),
+            ("333", r#"["Action"]"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at, genre) \
+                 VALUES (?, 'T', 'ONGOING', 'x', '2026-01-01T00:00:00Z', ?)",
+            )
+            .bind(key.parse::<i64>().unwrap())
+            .bind(genre)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // srcB is an adult SOURCE (its per-series genres don't say so → the leak vector).
+        sqlx::query(
+            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
+             VALUES ('srcB', 'pkg', 'repo', 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"mutation { rederiveSuwayomiNsfw }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            data_json(&r).contains("\"rederiveSuwayomiNsfw\":2"),
+            "{}",
+            data_json(&r)
+        );
+        async fn nsfw_of(pool: &SqlitePool, id: &str) -> i64 {
+            sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        assert_eq!(nsfw_of(&pool, "w_genre").await, 1, "'Mature' genre → NSFW");
+        assert_eq!(nsfw_of(&pool, "w_srcflag").await, 1, "adult source → NSFW");
+        assert_eq!(nsfw_of(&pool, "w_sfw").await, 0, "SFW work stays SFW");
+        // Non-admin refused.
+        assert!(
+            !exec(
+                &s,
+                r#"mutation { rederiveSuwayomiNsfw }"#,
+                Some("bobtok"),
+                "1.1.1.1"
+            )
+            .await
+            .errors
+            .is_empty()
         );
     }
 
