@@ -12,7 +12,10 @@
 
 const KEY = 'komika-social-v1';
 
-type Bucket = 'series' | 'chapter';
+// 'series' = per-series reviews; 'chapter' = per-chapter comments;
+// 'seriesThread' = series-level discussion comments (distinct from reviews so the two
+// don't collide in the local store).
+type Bucket = 'series' | 'chapter' | 'seriesThread';
 
 interface Store {
 	rating: Record<string, number>;

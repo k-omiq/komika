@@ -1,6 +1,7 @@
 import type {
 	Chapter,
-	ChapterComment,
+	Comment,
+	CommentTargetType,
 	DiscoveryFeed,
 	Id,
 	Page,
@@ -463,10 +464,14 @@ export class SuwayomiBackend implements Backend {
 	async postReview(_input: PostReviewInput): Promise<Review> {
 		throw new Error('Reviews are a Komika service, not available via Suwayomi');
 	}
-	async comments(_chapterId: Id, page = 1): Promise<Paginated<ChapterComment>> {
+	async comments(
+		_targetType: CommentTargetType,
+		_targetId: Id,
+		page = 1,
+	): Promise<Paginated<Comment>> {
 		return { items: [], page, hasNextPage: false, total: 0 };
 	}
-	async postComment(_input: PostCommentInput): Promise<ChapterComment> {
+	async postComment(_input: PostCommentInput): Promise<Comment> {
 		throw new Error('Comments are a Komika service, not available via Suwayomi');
 	}
 }

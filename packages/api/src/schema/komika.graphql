@@ -35,7 +35,7 @@ type Query {
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
-	comments(chapterId: ID!, page: Int = 1): CommentPage! # [komika]
+	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null
 	# ops / admin (all require isAdmin)
@@ -48,7 +48,7 @@ type Mutation {
 	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
 	postReview(input: PostReviewInput!): Review! # [komika]
-	postComment(input: PostCommentInput!): ChapterComment! # [komika]
+	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
 	login(username: String!, password: String!): Session! # [komika]
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
@@ -176,9 +176,12 @@ type Review {
 	updatedAt: String!
 }
 
-type ChapterComment {
+# A comment on a polymorphic target: a chapter thread (targetType="chapter") or a
+# series-level discussion (targetType="series"). Distinct from Review (scored, one/user).
+type Comment {
 	id: ID!
-	chapterId: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
 	author: UserRef!
 	body: String!
 	hasSpoiler: Boolean!
@@ -213,7 +216,7 @@ type ReviewPage {
 }
 
 type CommentPage {
-	items: [ChapterComment!]!
+	items: [Comment!]!
 	page: Int!
 	hasNextPage: Boolean!
 	total: Int
@@ -227,7 +230,8 @@ input PostReviewInput {
 }
 
 input PostCommentInput {
-	chapterId: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
 	body: String!
 	hasSpoiler: Boolean!
 }
