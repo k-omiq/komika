@@ -2,7 +2,14 @@
  * Admin data layer — catalog listing + override writes, straight through the
  * unified backend (no mock fallback: the console requires the real API).
  */
-import type { AdminUser, MergeCandidate, Paginated, Series, SeriesStatus } from '@komika/types';
+import type {
+	AdminUser,
+	CanonicalUpdate,
+	MergeCandidate,
+	Paginated,
+	Series,
+	SeriesStatus,
+} from '@komika/types';
 import type { SeriesAdminInput } from '@komika/api';
 import { backend } from './context';
 
@@ -68,6 +75,17 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
 	if (!backend.resolveMergeCandidate)
 		throw new Error('Dedup review is unavailable on this backend.');
 	return backend.resolveMergeCandidate(id, accept);
+}
+
+/**
+ * Recently-updated mirrored MangaDex works + their latest stored chapter, from the
+ * canonical `chapter` mirror (CATALOGUE.md §6). A monitoring feed for the mirror —
+ * these works are not reader-openable yet.
+ */
+export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
+	if (!backend.canonicalUpdates)
+		throw new Error('Catalogue updates are unavailable on this backend.');
+	return backend.canonicalUpdates(page);
 }
 
 export const STATUS_OPTIONS: SeriesStatus[] = [

@@ -24,6 +24,7 @@ type Query {
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId})
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
+	canonicalUpdates(page: Int = 1): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed)
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	# social
@@ -45,6 +46,7 @@ type Mutation {
 	login(username: String!, password: String!): Session! # [komika]
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
+	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
 	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
 	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
 	banUser(userId: ID!, banned: Boolean!): UserRef! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
@@ -86,6 +88,7 @@ type Series {
 	sourceId: String!
 	chapterCount: Int!
 	isMarked: Boolean! # [suwayomi] inLibrary
+	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
 	rating: RatingSummary! # [komika]
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
@@ -186,6 +189,7 @@ type SessionUser {
 	username: String!
 	avatarUrl: String
 	isAdmin: Boolean!
+	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
 }
 
 type SeriesPage {
@@ -273,6 +277,19 @@ type MatchResult {
 	score: Float
 	method: String
 	sourceSeriesId: String!
+}
+
+# [komika] One row of the canonical updates feed (CATALOGUE.md §6): a mirrored
+# MangaDex work + its latest stored chapter, served from the `chapter` mirror. A data
+# feed — the reader's Suwayomi-keyed navigation cannot yet OPEN a canonical work.
+type CanonicalUpdate {
+	workId: String!
+	mangadexId: String!
+	title: String
+	isNsfw: Boolean!
+	latestChapter: String # latest stored chapter number (string; e.g. "10.5")
+	latestChapterTitle: String
+	latestAt: String # publish time of the latest chapter (falls back to ingest time)
 }
 
 # [komika] A pending mid-confidence match awaiting manual admin review.

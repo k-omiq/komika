@@ -22,6 +22,7 @@ const SERIES_FIELDS = /* GraphQL */ `
 		sourceId
 		chapterCount
 		isMarked
+		isNsfw
 		rating {
 			average
 			count
@@ -255,6 +256,7 @@ const SESSION_FIELDS = /* GraphQL */ `
 			username
 			avatarUrl
 			isAdmin
+			showNsfw
 		}
 	}
 `;
@@ -392,5 +394,25 @@ export const MERGE_QUEUE = /* GraphQL */ `
 export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
 		resolveMergeCandidate(id: $id, accept: $accept)
+	}
+`;
+
+export const SET_SHOW_NSFW = /* GraphQL */ `
+	mutation SetShowNsfw($value: Boolean!) {
+		setShowNsfw(value: $value)
+	}
+`;
+
+export const CANONICAL_UPDATES = /* GraphQL */ `
+	query CanonicalUpdates($page: Int) {
+		canonicalUpdates(page: $page) {
+			workId
+			mangadexId
+			title
+			isNsfw
+			latestChapter
+			latestChapterTitle
+			latestAt
+		}
 	}
 `;

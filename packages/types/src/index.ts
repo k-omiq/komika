@@ -83,6 +83,24 @@ export interface MergeCandidate {
 	createdAt: string;
 }
 
+/**
+ * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
+ * work with its most recent stored chapter, served from the `chapter` mirror.
+ * A data feed — the reader's Suwayomi-keyed navigation cannot yet OPEN a canonical
+ * MangaDex work, so `mangadexId`/`workId` identify it but there is no reader route.
+ */
+export interface CanonicalUpdate {
+	workId: Id;
+	mangadexId: string;
+	title: string | null;
+	isNsfw: boolean;
+	/** Latest stored chapter number (string — chapters can be "10.5"). */
+	latestChapter: string | null;
+	latestChapterTitle: string | null;
+	/** Publish time of the latest stored chapter (falls back to ingest time). */
+	latestAt: string | null;
+}
+
 /** Aggregate rating summary for a series. */
 export interface RatingSummary {
 	/** Mean score on a 1–10 scale. */
@@ -110,6 +128,12 @@ export interface Series {
 	chapterCount: number;
 	/** True if the current user marked it (raises scanning priority). */
 	isMarked: boolean;
+	/**
+	 * NSFW per the canonical model (CATALOGUE.md §2); false until the series is
+	 * catalogued. Discovery/search/updates already filter by the viewer's
+	 * `showNsfw` preference server-side — this lets the UI badge/flag it too.
+	 */
+	isNsfw: boolean;
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;

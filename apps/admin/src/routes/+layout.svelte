@@ -22,6 +22,7 @@
 	const nav = [
 		{ href: '/', label: 'Catalog' },
 		{ href: '/review', label: 'Review' },
+		{ href: '/updates', label: 'Updates' },
 		{ href: '/users', label: 'Users' },
 	];
 </script>
