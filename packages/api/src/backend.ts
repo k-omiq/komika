@@ -4,6 +4,7 @@ import type {
 	ChapterComment,
 	DiscoveryFeed,
 	Id,
+	MergeCandidate,
 	Page,
 	Paginated,
 	Review,
@@ -87,6 +88,16 @@ export interface Backend {
 	/** Grant or revoke a user's admin flag. Optional: only the unified Komika API
 	 * implements it. */
 	setUserAdmin?(userId: Id, isAdmin: boolean): Promise<AdminUser>;
+
+	// --- admin dedup review (requires an admin session) ---
+	/** Pending mid-confidence dedup matches awaiting manual review
+	 * (CATALOGUE.md §4). Optional: only the unified Komika API implements it. */
+	mergeQueue?(): Promise<MergeCandidate[]>;
+	/** Resolve a pending match: `accept` merges the source series into the
+	 * candidate work; rejecting keeps it as a distinct first-class work. Returns
+	 * true when the row was closed. Optional: only the unified Komika API
+	 * implements it. */
+	resolveMergeCandidate?(id: Id, accept: boolean): Promise<boolean>;
 }
 
 export interface Session {

@@ -34,6 +34,7 @@ type Query {
 	# ops / admin (all require isAdmin)
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
+	mergeQueue: [MergeCandidate!]! # [komika] dedup review queue — pending mid-confidence matches (requires isAdmin)
 }
 
 type Mutation {
@@ -49,6 +50,8 @@ type Mutation {
 	banUser(userId: ID!, banned: Boolean!): UserRef! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
+	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
+	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 }
 
 enum ComicType {
@@ -259,4 +262,28 @@ type AdminUserPage {
 	page: Int!
 	hasNextPage: Boolean!
 	total: Int
+}
+
+# [komika] Outcome of the Tier-2 dedup matcher (CATALOGUE.md §4).
+# `decision` is one of `auto_merge` | `review` | `new`.
+type MatchResult {
+	decision: String!
+	workId: String!
+	matchedWorkId: String
+	score: Float
+	method: String
+	sourceSeriesId: String!
+}
+
+# [komika] A pending mid-confidence match awaiting manual admin review.
+type MergeCandidate {
+	id: String!
+	sourceSeriesId: String!
+	candidateWorkId: String!
+	candidateTitle: String
+	sourceTitle: String
+	score: Float!
+	method: String!
+	status: String!
+	createdAt: String!
 }

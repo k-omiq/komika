@@ -4,6 +4,7 @@ import type {
 	ChapterComment,
 	DiscoveryFeed,
 	Id,
+	MergeCandidate,
 	Page,
 	Paginated,
 	Review,
@@ -172,6 +173,20 @@ export class GraphQLBackend implements Backend {
 	async setUserAdmin(userId: Id, isAdmin: boolean): Promise<AdminUser> {
 		const d = await this.gql<{ setUserAdmin: AdminUser }>(ops.SET_USER_ADMIN, { userId, isAdmin });
 		return d.setUserAdmin;
+	}
+
+	// --- admin dedup review ---
+	async mergeQueue(): Promise<MergeCandidate[]> {
+		const d = await this.gql<{ mergeQueue: MergeCandidate[] }>(ops.MERGE_QUEUE);
+		return d.mergeQueue;
+	}
+
+	async resolveMergeCandidate(id: Id, accept: boolean): Promise<boolean> {
+		const d = await this.gql<{ resolveMergeCandidate: boolean }>(ops.RESOLVE_MERGE_CANDIDATE, {
+			id,
+			accept,
+		});
+		return d.resolveMergeCandidate;
 	}
 }
 

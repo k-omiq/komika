@@ -31,12 +31,12 @@ Series identity is an opaque Suwayomi manga id (TEXT); `altTitles` is hardcoded 
 The catalogue + dedup direction **deliberately reverses that for metadata**. Komika
 moves to a **hybrid**:
 
-| Dimension | Before | After |
-| --------- | ------ | ----- |
-| Catalogue metadata, aliases, external IDs | live-federated | **stored** (mirror) |
-| Chapter lists | live-federated | **stored** (enables offline update-checking) |
-| Series identity | opaque Suwayomi id | **canonical `work`** (one per series) |
-| Page images / reading | live via Suwayomi → Worker | **unchanged** |
+| Dimension                                 | Before                     | After                                        |
+| ----------------------------------------- | -------------------------- | -------------------------------------------- |
+| Catalogue metadata, aliases, external IDs | live-federated             | **stored** (mirror)                          |
+| Chapter lists                             | live-federated             | **stored** (enables offline update-checking) |
+| Series identity                           | opaque Suwayomi id         | **canonical `work`** (one per series)        |
+| Page images / reading                     | live via Suwayomi → Worker | **unchanged**                                |
 
 This is a pivot, not an addition — it supersedes the "store nothing" premise in
 `0001_init.sql` for the catalogue dimension. Because the **reading path is untouched**,
@@ -44,9 +44,9 @@ the working reader is never at risk while the catalogue subsystem is built.
 
 ## 1. Two-tier source model
 
-| Tier | Source | Ingestion | Stored? |
-| ---- | ------ | --------- | ------- |
-| **1** | **MangaDex** | Full catalogue crawl + chapter mirror + update polling | Yes — mirrored |
+| Tier  | Source                                     | Ingestion                                                       | Stored?                |
+| ----- | ------------------------------------------ | --------------------------------------------------------------- | ---------------------- |
+| **1** | **MangaDex**                               | Full catalogue crawl + chapter mirror + update polling          | Yes — mirrored         |
 | **2** | **Everything else** (Keiyoushi extensions) | **Curated**: admin browses/searches and hand-picks sites/series | Yes — per added series |
 
 **Why this split.** MangaDex has a clean public API worth deep-integrating. The long
@@ -67,7 +67,7 @@ and hand-writing/maintaining that many adapters is not viable.
 - Hardcoded extension repo (standard Mihon/Tachiyomi index, 1,356 extensions),
   loaded by the Suwayomi backend. Already registered in `deploy/bootstrap.py`.
   - Index: `https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json`
-  - APKs:  `https://raw.githubusercontent.com/keiyoushi/extensions/repo/apk/{apk}`
+  - APKs: `https://raw.githubusercontent.com/keiyoushi/extensions/repo/apk/{apk}`
   - (`keiyoushi.github.io` 404s — use the raw `repo` branch.)
 - We do **not** monitor/mirror all sources. The admin adds specific series; each add
   runs the dedup matcher (§4).
@@ -120,14 +120,14 @@ work** (non-MangaDex works are first-class, not hidden or second-class).
 
 ### Schema — new migration `0005`, alongside `series_admin` / `series_scan_state`
 
-| Table | Purpose |
-| ----- | ------- |
-| `work` | the ONE canonical entry — title, description, year, original language, status, demographic, `content_rating`, `is_nsfw`, `cover_phash`, provenance, timestamps |
-| `work_alias` | `(work_id, normalized_title, lang, raw_title)` — alias index, fed by MangaDex altTitles |
-| `work_external_id` | `(work_id, provider, external_id)` **unique** — the gold match key |
-| `source_series` | `(work_id FK, source_type, source_id, source_key, is_nsfw, last_seen)` many-to-one; the Suwayomi manga id lives **here** now |
-| `chapter` | per-`source_series` chapter list (number, volume, lang, title, published_at, external id) — powers stored update-checking |
-| `merge_candidate` | manual-review queue — `(source_series_id, candidate_work_id, score, method, status)` |
+| Table              | Purpose                                                                                                                                                        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `work`             | the ONE canonical entry — title, description, year, original language, status, demographic, `content_rating`, `is_nsfw`, `cover_phash`, provenance, timestamps |
+| `work_alias`       | `(work_id, normalized_title, lang, raw_title)` — alias index, fed by MangaDex altTitles                                                                        |
+| `work_external_id` | `(work_id, provider, external_id)` **unique** — the gold match key                                                                                             |
+| `source_series`    | `(work_id FK, source_type, source_id, source_key, is_nsfw, last_seen)` many-to-one; the Suwayomi manga id lives **here** now                                   |
+| `chapter`          | per-`source_series` chapter list (number, volume, lang, title, published_at, external id) — powers stored update-checking                                      |
+| `merge_candidate`  | manual-review queue — `(source_series_id, candidate_work_id, score, method, status)`                                                                           |
 
 **Migration of existing FKs.** `reviews` / `comments` / `series_admin` /
 `series_scan_state` currently key on `series_id` = Suwayomi id. Backfill one `work` +
@@ -205,13 +205,13 @@ and a bad look.
 
 **What to remove / change:**
 
-| Location | Today | Cleanup |
-| -------- | ----- | ------- |
-| [`mock.ts:503`](apps/reader/src/lib/data/mock.ts) `seriesComments` | 4 hardcoded review-thread entries ("Mika R.", "devon_k", …) | delete the array + `SeriesComment` interface |
-| [`mock.ts:594`](apps/reader/src/lib/data/mock.ts) `readerComments` | hardcoded per-chapter comments ("Aria_reads", …) with fake `likes`/`replies` | delete the array + `ReaderComment` interface |
-| [`social-repo.ts:153`](apps/reader/src/lib/data/social-repo.ts) `loadSeriesSocial` | seeds `seriesComments` into the local fallback | seed with `[]` — honest empty state |
-| [`social-repo.ts:247`](apps/reader/src/lib/data/social-repo.ts) `loadChapterComments` | seeds `readerComments` into the local fallback | seed with `[]` — honest empty state |
-| [`social.ts`](apps/reader/src/lib/data/social.ts) `getComments(bucket, key, seed)` | seed param carries the mock threads | keep the localStorage store; callers pass `[]` |
+| Location                                                                              | Today                                                                        | Cleanup                                        |
+| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------- |
+| [`mock.ts:503`](apps/reader/src/lib/data/mock.ts) `seriesComments`                    | 4 hardcoded review-thread entries ("Mika R.", "devon_k", …)                  | delete the array + `SeriesComment` interface   |
+| [`mock.ts:594`](apps/reader/src/lib/data/mock.ts) `readerComments`                    | hardcoded per-chapter comments ("Aria_reads", …) with fake `likes`/`replies` | delete the array + `ReaderComment` interface   |
+| [`social-repo.ts:153`](apps/reader/src/lib/data/social-repo.ts) `loadSeriesSocial`    | seeds `seriesComments` into the local fallback                               | seed with `[]` — honest empty state            |
+| [`social-repo.ts:247`](apps/reader/src/lib/data/social-repo.ts) `loadChapterComments` | seeds `readerComments` into the local fallback                               | seed with `[]` — honest empty state            |
+| [`social.ts`](apps/reader/src/lib/data/social.ts) `getComments(bucket, key, seed)`    | seed param carries the mock threads                                          | keep the localStorage store; callers pass `[]` |
 
 **Principle:** offline / backend-off mode should render an **honest empty comment
 state** ("No comments yet"), not fabricated engagement. The live path
@@ -229,37 +229,39 @@ shippable. Status as of 2026-07-11:
    series into `work` / `source_series`. No behaviour change.
 2. **M2 — MangaDex client + seed crawl** (§5). ✅ Done (`src/mangadex.rs`). Direct API
    client, `createdAt` windowing, global token-bucket limiter, `work`/aliases/external-ID
-   upserts. Gated by `CATALOGUE_SYNC` (off by default). Cover pHash on ingest is
-   **deferred** (needs the `image` crate) — the comparator ships, the pixel→hash step
-   does not yet.
+   upserts. Gated by `CATALOGUE_SYNC` (off by default). **Cover pHash on ingest** ✅ done
+   (`src/phash.rs`, 64-bit dHash via the `image` crate) — computed per work during sync
+   when `COVER_PHASH=on`, feeding the cover dedup signal.
 3. **M3 — Chapter mirror + incremental sync** (§5). ✅ Done. Global `/chapter` firehose
    with `createdAt` windowing → `chapter` rows. Incremental `updatedAtSince` refresh: the
    `sync_*` fns accept a start timestamp; wiring a recurring refresh on the `scanner.rs`
    pattern is the remaining piece.
 4. **M4 — Dedup matcher** (§4). ✅ Done (`src/dedup.rs`). `resolve()` returns
    `{ auto-merge | review | new }` via the 5-step ladder; unit-tested end-to-end.
-5. **M5 — Tier-2 add flow** (§6). ✅ Done (backend). `addSourceSeries` +
-   `resolveMergeCandidate` mutations and the `mergeQueue` admin query. Admin **UI** in
-   `apps/admin/` is still to build.
-6. **M6 — Serve from canonical model** (§6). ⏳ Deferred. `map_series` still reads live
-   Suwayomi; switching reads to stored `work` + `chapter` deltas and `show_nsfw`
-   filtering is the next step. Reader is unaffected meanwhile.
+5. **M5 — Tier-2 add flow** (§6). ✅ Done. `addSourceSeries` + `resolveMergeCandidate`
+   mutations and the `mergeQueue` admin query, plus the **admin review UI** at
+   `apps/admin/src/routes/review/` (confirm-merge / keep-separate over the queue,
+   threaded through `@komika/api` + `@komika/types`).
+6. **M6 — Serve from canonical model** (§6). ✅ Done. `map_series` folds canonical
+   `work_alias` rows into `Series.altTitles` for any catalogued series (empty until a
+   series is added, so the reader is unaffected otherwise). Preferring stored
+   `chapter` deltas over live Suwayomi and `show_nsfw` filtering remain follow-ups.
 7. **M7 — Social seed cleanup** (§7). ✅ Done. Fabricated seed threads removed;
    empty-state fallbacks.
 
-**Deferred, tracked:** cover pHash ingest (M2, needs `image` crate); recurring
-incremental refresh scheduler (M3); M6 canonical serving; the `apps/admin/` review UI
-(M5).
+**Remaining follow-ups (tracked):** recurring incremental-refresh scheduler on the
+`scanner.rs` pattern (M3); serving stored `chapter` deltas + `show_nsfw` query filtering
+(M6 extension).
 
 ## 9. MangaDex API limits (reference)
 
-| Scope | Limit |
-| ----- | ----- |
-| Global, per IP (`api.mangadex.org`) | **~5 req/s** → 429; persistent abuse → 403 / DDoS ban |
-| `GET /at-home/server/{id}` (read-time page URLs) | **40 req/min** |
-| List pagination | `offset + limit ≤ 10,000`; `limit` max 100 (500 for some feeds) |
-| Connection | TLS 1.2+ w/ SNI, valid `User-Agent` **required**, no `Via` header |
-| Images | **Must proxy** (hotlink = wrong response); no CORS for external sites |
+| Scope                                            | Limit                                                                 |
+| ------------------------------------------------ | --------------------------------------------------------------------- |
+| Global, per IP (`api.mangadex.org`)              | **~5 req/s** → 429; persistent abuse → 403 / DDoS ban                 |
+| `GET /at-home/server/{id}` (read-time page URLs) | **40 req/min**                                                        |
+| List pagination                                  | `offset + limit ≤ 10,000`; `limit` max 100 (500 for some feeds)       |
+| Connection                                       | TLS 1.2+ w/ SNI, valid `User-Agent` **required**, no `Via` header     |
+| Images                                           | **Must proxy** (hotlink = wrong response); no CORS for external sites |
 
 **Fleet-wide budget.** The Worker/backend egress IP is shared across all users, so the
 5 req/s ceiling is a **fleet** budget, not per-user. The catalogue crawl must run behind
@@ -270,8 +272,8 @@ a **global token-bucket limiter**; coalesce/queue rather than fan out.
 1. **Description similarity depth** — **MinHash-only** to start (no ML dependency).
    Semantic embeddings deferred; revisit only if match precision proves insufficient.
 2. **pHash placement** — **server-side**, computed on cover ingest during MangaDex
-   sync (Rust `image` + an image-hash crate). Keeps hashing next to the data; revisit
-   if it measurably bloats the server.
+   sync. ✅ Realized as a hand-rolled 64-bit dHash over the `image` crate's decoders
+   (`src/phash.rs`) — no extra image-hash dependency. Keeps hashing next to the data.
 
 ## Related
 

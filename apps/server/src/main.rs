@@ -5,6 +5,7 @@ mod db;
 mod dedup;
 mod graphql;
 mod mangadex;
+mod phash;
 mod scanner;
 mod suwayomi;
 
@@ -175,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex.
     if cfg.catalogue_sync_enabled {
-        mangadex::spawn(pool.clone(), mangadex.clone());
+        mangadex::spawn(pool.clone(), mangadex.clone(), cfg.catalogue_cover_phash);
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
