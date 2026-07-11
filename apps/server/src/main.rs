@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         pool: pool.clone(),
         suwayomi,
+        mangadex: mangadex.clone(),
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),

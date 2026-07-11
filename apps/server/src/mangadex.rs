@@ -213,6 +213,48 @@ impl MangaDexClient {
         let bytes = res.bytes().await.ok()?;
         crate::phash::dhash(&bytes)
     }
+
+    /// Resolve a chapter's ordered page image URLs via MangaDex@Home
+    /// (`GET /at-home/server/{chapterId}` → `{ baseUrl, chapter: { hash, data[] } }`).
+    /// Each page URL is `{baseUrl}/data/{hash}/{filename}`. These are dynamic
+    /// `*.mangadex.network` hosts and MUST be proxied by the Worker (hotlinks get a
+    /// wrong response). Rate-limited (this endpoint is capped at 40/min; the global
+    /// ~5 req/s bucket keeps us well under). CATALOGUE.md §5, §9.
+    pub async fn at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
+        self.limiter.acquire().await;
+        let res = self
+            .http
+            .get(format!("{API_BASE}/at-home/server/{chapter_id}"))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            return Err(anyhow!("MangaDex /at-home error {}", res.status()));
+        }
+        let body: AtHome = res.json().await?;
+        let base = body.base_url.trim_end_matches('/');
+        let hash = &body.chapter.hash;
+        Ok(body
+            .chapter
+            .data
+            .into_iter()
+            .map(|filename| format!("{base}/data/{hash}/{filename}"))
+            .collect())
+    }
+}
+
+/// MangaDex@Home server response for a chapter (the fields we build page URLs from).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AtHome {
+    base_url: String,
+    chapter: AtHomeChapter,
+}
+
+#[derive(Deserialize)]
+struct AtHomeChapter {
+    hash: String,
+    #[serde(default)]
+    data: Vec<String>,
 }
 
 /// Proxy-ready cover URL for a MangaDex work. Callers must route this through the
@@ -220,6 +262,12 @@ impl MangaDexClient {
 /// pHash ingest and canonical-model serving (CATALOGUE.md §5–6).
 pub fn cover_url(manga_id: &str, file_name: &str) -> String {
     format!("{COVERS_BASE}/{manga_id}/{file_name}")
+}
+
+/// A smaller (512px) cover thumbnail URL — same proxy rules as `cover_url`. Used for
+/// reader browse/list surfaces where the full-resolution cover is wasteful.
+pub fn cover_thumb_url(manga_id: &str, file_name: &str) -> String {
+    format!("{COVERS_BASE}/{manga_id}/{file_name}.512.jpg")
 }
 
 // ---- Response shapes -------------------------------------------------------
@@ -362,6 +410,9 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             author: rel_name(m, "author"),
             artist: rel_name(m, "artist"),
             cover_phash: None, // filled by cover pHash ingest in sync_catalogue when enabled
+            // From the already-expanded cover_art relationship — no extra request. Powers
+            // the reader cover URL for canonical works (independent of the pHash ingest).
+            cover_file_name: cover_file_name(m),
             aliases,
             external_ids,
         },
@@ -739,9 +790,15 @@ mod tests {
         assert!(input.external_ids.contains(&("mal".into(), "70951".into())));
         assert!(!input.external_ids.iter().any(|(p, _)| p == "raw"));
         assert_eq!(cover_file_name(&m).as_deref(), Some("abc.jpg"));
+        // The fileName is carried on the work input so a cover URL can be built later.
+        assert_eq!(input.cover_file_name.as_deref(), Some("abc.jpg"));
         assert_eq!(
             cover_url("md-uuid-1", "abc.jpg"),
             "https://uploads.mangadex.org/covers/md-uuid-1/abc.jpg"
+        );
+        assert_eq!(
+            cover_thumb_url("md-uuid-1", "abc.jpg"),
+            "https://uploads.mangadex.org/covers/md-uuid-1/abc.jpg.512.jpg"
         );
     }
 
