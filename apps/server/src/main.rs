@@ -18,9 +18,12 @@ use axum::{
     routing::get,
     Router,
 };
+use tower::ServiceBuilder;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use config::Config;
@@ -114,12 +117,21 @@ async fn ready(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "komika_server=info,tower_http=info".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "komika_server=info,tower_http=info".into());
+    // LOG_FORMAT=json emits structured JSON logs for prod log aggregation;
+    // anything else keeps the human-readable formatter for local dev.
+    let json_logs = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let cfg = Config::from_env();
     tracing::info!(?cfg, "starting komika-server");
@@ -169,10 +181,30 @@ async fn main() -> anyhow::Result<()> {
         .route("/graphql", get(graphiql).post(graphql_handler))
         .route("/health", get(health))
         .route("/health/ready", get(ready))
+        // Request-id + access-log span. SetRequestId runs first (generates an
+        // x-request-id when the client didn't send one), TraceLayer's span picks
+        // it up, and PropagateRequestId echoes it back on the response.
         .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+                            let request_id = request
+                                .headers()
+                                .get("x-request-id")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("-");
+                            tracing::info_span!(
+                                "request",
+                                method = %request.method(),
+                                uri = %request.uri(),
+                                request_id = %request_id,
+                            )
+                        })
+                        .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                )
+                .layer(PropagateRequestIdLayer::x_request_id()),
         )
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
@@ -193,6 +225,9 @@ async fn main() -> anyhow::Result<()> {
                 "geolocation=(), camera=(), microphone=(), payment=(), usb=()",
             ),
         ))
+        // Outermost: a panicking resolver/handler becomes a 500 (logged) instead
+        // of dropping the connection or killing the worker task.
+        .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(RouterState { schema, pool });
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -205,6 +240,25 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal(shutdown_tx))
     .await?;
     Ok(())
+}
+
+/// Turn a caught panic into a JSON 500 (GraphQL-shaped) and log it with the
+/// panic payload, so a single bad request can't take the server down.
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let details = if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        "unknown panic".to_string()
+    };
+    tracing::error!(panic = %details, "caught panic; returning 500");
+    let body = r#"{"data":null,"errors":[{"message":"Internal Server Error"}]}"#;
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .expect("static panic response is valid")
 }
 
 async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {

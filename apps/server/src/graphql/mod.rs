@@ -105,8 +105,44 @@ pub type ApiSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 /// scheduler so resolvers and the background task see one set of state.
 pub fn build_schema(state: std::sync::Arc<AppState>) -> ApiSchema {
     Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .extension(ErrorLogger)
         .data(state)
         .finish()
+}
+
+/// async-graphql extension that logs every resolver error server-side. GraphQL
+/// returns HTTP 200 with errors in the body, so the TraceLayer access log never
+/// sees them — without this, DB/upstream failures would be invisible in logs.
+/// This is our dependency-light "error tracking": a Sentry/OpenTelemetry hook is
+/// intentionally NOT wired (no hard dependency, no committed DSN); if one is ever
+/// added it should live behind an env-gated optional cargo feature.
+struct ErrorLogger;
+
+impl async_graphql::extensions::ExtensionFactory for ErrorLogger {
+    fn create(&self) -> std::sync::Arc<dyn async_graphql::extensions::Extension> {
+        std::sync::Arc::new(ErrorLoggerExtension)
+    }
+}
+
+struct ErrorLoggerExtension;
+
+#[async_trait::async_trait]
+impl async_graphql::extensions::Extension for ErrorLoggerExtension {
+    async fn request(
+        &self,
+        ctx: &async_graphql::extensions::ExtensionContext<'_>,
+        next: async_graphql::extensions::NextRequest<'_>,
+    ) -> async_graphql::Response {
+        let resp = next.run(ctx).await;
+        for err in &resp.errors {
+            tracing::warn!(
+                error = %err.message,
+                path = ?err.path,
+                "graphql resolver error"
+            );
+        }
+        resp
+    }
 }
 
 fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
