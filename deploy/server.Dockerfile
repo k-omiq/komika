@@ -19,10 +19,10 @@ RUN cargo build --release --locked --bin komika-server \
 
 # ---- runtime ----------------------------------------------------------------
 # Distroless-style slim base kept simple; only CA certs are pulled in for
-# outbound HTTPS to Suwayomi/B2 via reqwest+rustls.
+# outbound HTTPS to Suwayomi and the backup bucket via reqwest+rustls.
 FROM debian:bookworm-slim AS runtime
 
-# Litestream provides continuous SQLite backup (WAL → S3/B2) + restore-on-boot.
+# Litestream provides continuous SQLite backup (WAL → S3-compatible / R2) + restore-on-boot.
 ARG LITESTREAM_VERSION=0.3.13
 
 RUN apt-get update \

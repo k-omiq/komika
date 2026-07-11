@@ -71,12 +71,14 @@ WAL to an S3-compatible bucket continuously (point-in-time restore, ~seconds RPO
 
 - **Off by default.** Leave the `LITESTREAM_*` vars blank in `.env` and the server runs
   without backup (fine for local/testing). Set them to enable it — no code change.
-- **Enable it:** create a bucket (Backblaze B2 recommended — reuse the image-cache
-  account) + an app key, then fill `LITESTREAM_BUCKET` / `LITESTREAM_ENDPOINT` /
+- **Enable it:** create a **Cloudflare R2** bucket (S3-compatible) + an API token with
+  Object Read & Write, then fill `LITESTREAM_BUCKET` / `LITESTREAM_ENDPOINT` /
   `LITESTREAM_REGION` / `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` in
-  `deploy/.env` and `./deploy.sh` (or `docker compose up -d --build server`). WAL mode
-  is already on in the DB, and the server runs under `litestream replicate -exec` inside
-  its container.
+  `deploy/.env` and `./deploy.sh` (or `docker compose up -d --build server`). For R2 use
+  `LITESTREAM_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com` and
+  `LITESTREAM_REGION=auto`. WAL mode is already on in the DB, and the server runs under
+  `litestream replicate -exec` inside its container. (Any S3-compatible store works — the
+  vars are storage-agnostic — but R2 is the reference target.)
 - **Disaster recovery** is automatic: on a brand-new host/volume with the vars set, the
   server pulls the newest snapshot before it starts. To restore manually to a file:
   ```sh
@@ -84,6 +86,52 @@ WAL to an S3-compatible bucket continuously (point-in-time restore, ~seconds RPO
   ```
 - Litestream config: `deploy/litestream.yml`; the container entrypoint is
   `deploy/server-entrypoint.sh` (runs the server plain when Litestream is unconfigured).
+
+### Verify backup → restore locally (tested procedure)
+
+Don't trust a backup you've never restored. This exercises the **real** path — the
+server image's bundled Litestream + `server-entrypoint.sh` + `litestream.yml` —
+against a local **MinIO** standing in for R2 (both are S3-compatible). Verified on
+2026-07-11: a user registered before a full volume wipe was recovered intact.
+
+```sh
+# 0. A MinIO container as an R2/S3 stand-in, on a docker network, + a bucket.
+docker network create lstest-net
+docker run -d --name lstest-minio --network lstest-net -p 9000:9000 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin123 \
+  minio/minio:latest server /data
+docker run --rm --network lstest-net --entrypoint sh minio/mc:latest -c \
+  "mc alias set l http://lstest-minio:9000 minioadmin minioadmin123 && mc mb -p l/komika-backup"
+
+# Reusable env pointing Litestream at MinIO (R2 in prod: endpoint=https://<acct>.r2…, region=auto).
+LS="-e LITESTREAM_BUCKET=komika-backup -e LITESTREAM_ENDPOINT=http://lstest-minio:9000 \
+ -e LITESTREAM_REGION=us-east-1 -e LITESTREAM_ACCESS_KEY_ID=minioadmin \
+ -e LITESTREAM_SECRET_ACCESS_KEY=minioadmin123 -e SUWAYOMI_URL=http://localhost:9999 \
+ -e DATABASE_URL=sqlite:///data/komika.sqlite3 -e KOMIKA_ADMIN_USERS=admin"
+
+# 1. Boot the server under Litestream on a fresh volume, write data, let it replicate.
+docker build -f deploy/server.Dockerfile -t komika-server .   # DOCKER_BUILDKIT=0 on old buildx
+docker run -d --name s1 --network lstest-net -v lstest-data:/data -p 8791:8080 $LS komika-server
+#   → docker logs s1 should show: [entrypoint] Litestream backup ENABLED
+curl -s localhost:8791/graphql -H 'content-type: application/json' --data \
+  '{"query":"mutation{register(input:{username:\"u\",email:\"u@x.dev\",password:\"pw12345\"}){token}}"}'
+sleep 4    # let the WAL replicate; `mc ls -r l/komika-backup` now shows a snapshot + WAL
+
+# 2. Graceful stop (flushes a final snapshot), then DESTROY the volume.
+docker stop s1 && docker rm s1 && docker volume rm lstest-data
+
+# 3. Boot fresh: the entrypoint restores from MinIO before the server starts.
+docker run -d --name s2 --network lstest-net -v lstest-data:/data -p 8791:8080 $LS komika-server
+#   → docker logs s2 shows: msg="restoring snapshot" … then "restoring wal files"
+
+# 4. Confirm the data came back: login must succeed (proves the user row survived the wipe).
+curl -s localhost:8791/graphql -H 'content-type: application/json' --data \
+  '{"query":"mutation{login(username:\"u\",password:\"pw12345\"){user{username}}}"}'
+#   → {"data":{"login":{"user":{"username":"u"}}}}
+
+# Cleanup.
+docker rm -f s2 lstest-minio && docker volume rm lstest-data && docker network rm lstest-net
+```
 
 ## Notes for a real (internet-facing) deploy
 
