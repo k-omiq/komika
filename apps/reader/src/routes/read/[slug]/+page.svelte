@@ -181,7 +181,6 @@
 		})),
 	);
 
-
 	function stageClick() {
 		if (!lockChrome) chromeVisible = !chromeVisible;
 	}

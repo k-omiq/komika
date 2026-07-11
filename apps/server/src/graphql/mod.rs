@@ -1978,9 +1978,7 @@ mod tests {
         assert!(json.contains("\"chapterCount\":2"), "{json}");
 
         // canonicalChapters returns ordered chapters keyed by MangaDex uuid.
-        let q = format!(
-            r#"{{ canonicalChapters(workId: "{work_id}") {{ id number seriesId }} }}"#
-        );
+        let q = format!(r#"{{ canonicalChapters(workId: "{work_id}") {{ id number seriesId }} }}"#);
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
         let data = r.data.into_json().unwrap();
