@@ -1,7 +1,10 @@
 mod auth;
+mod catalog;
 mod config;
 mod db;
+mod dedup;
 mod graphql;
+mod mangadex;
 mod scanner;
 mod suwayomi;
 
@@ -153,6 +156,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.suwayomi_public_url.clone(),
         cfg.source_id.clone(),
     );
+    let mangadex = Arc::new(mangadex::MangaDexClient::new(
+        &cfg.mangadex_user_agent,
+        cfg.mangadex_rate_per_sec,
+    ));
     let state = Arc::new(AppState {
         pool: pool.clone(),
         suwayomi,
@@ -164,6 +171,14 @@ async fn main() -> anyhow::Result<()> {
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
+
+    // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
+    // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex.
+    if cfg.catalogue_sync_enabled {
+        mangadex::spawn(pool.clone(), mangadex.clone());
+    } else {
+        tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
+    }
 
     let schema = build_schema(state);
 

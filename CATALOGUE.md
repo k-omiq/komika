@@ -223,28 +223,33 @@ and stays.
 ## 8. Build sequence
 
 Milestones, ordered so the working reader is never blocked. Each is independently
-shippable.
+shippable. Status as of 2026-07-11:
 
-1. **M1 — Canonical schema.** Migration `0005` (§3) + backfill existing series into
-   `work` / `source_series`. No behaviour change yet.
-2. **M2 — MangaDex client + seed crawl** (§5). Direct API client, `createdAt`
-   windowing, global rate limiter, cover pHash on ingest. Populates `work` / aliases /
-   external IDs.
-3. **M3 — Chapter mirror + incremental sync** (§5). Chapter firehose + `updatedAtSince`
-   refresh on the `scanner.rs` task pattern.
-4. **M4 — Dedup matcher** (§4) as an add-time service returning
-   `{ auto-merge | review | new }`, with the `merge_candidate` review queue.
-5. **M5 — Tier-2 add flow** (§6). `addSourceSeries` mutation + admin review UI; NSFW
-   propagation.
-6. **M6 — Serve from canonical model** (§6). `map_series` reads stored `work`;
-   `updates` from stored chapter deltas; `show_nsfw` filtering.
-7. **M7 — Social seed cleanup** (§7). Strip fabricated `seriesComments` /
-   `readerComments`; empty-state fallbacks. Can land any time after the social backend
-   is the default; independent of M1–M6.
+1. **M1 — Canonical schema.** ✅ Done. Migration `0005` (§3) + backfill of existing
+   series into `work` / `source_series`. No behaviour change.
+2. **M2 — MangaDex client + seed crawl** (§5). ✅ Done (`src/mangadex.rs`). Direct API
+   client, `createdAt` windowing, global token-bucket limiter, `work`/aliases/external-ID
+   upserts. Gated by `CATALOGUE_SYNC` (off by default). Cover pHash on ingest is
+   **deferred** (needs the `image` crate) — the comparator ships, the pixel→hash step
+   does not yet.
+3. **M3 — Chapter mirror + incremental sync** (§5). ✅ Done. Global `/chapter` firehose
+   with `createdAt` windowing → `chapter` rows. Incremental `updatedAtSince` refresh: the
+   `sync_*` fns accept a start timestamp; wiring a recurring refresh on the `scanner.rs`
+   pattern is the remaining piece.
+4. **M4 — Dedup matcher** (§4). ✅ Done (`src/dedup.rs`). `resolve()` returns
+   `{ auto-merge | review | new }` via the 5-step ladder; unit-tested end-to-end.
+5. **M5 — Tier-2 add flow** (§6). ✅ Done (backend). `addSourceSeries` +
+   `resolveMergeCandidate` mutations and the `mergeQueue` admin query. Admin **UI** in
+   `apps/admin/` is still to build.
+6. **M6 — Serve from canonical model** (§6). ⏳ Deferred. `map_series` still reads live
+   Suwayomi; switching reads to stored `work` + `chapter` deltas and `show_nsfw`
+   filtering is the next step. Reader is unaffected meanwhile.
+7. **M7 — Social seed cleanup** (§7). ✅ Done. Fabricated seed threads removed;
+   empty-state fallbacks.
 
-**Housekeeping (separate, noted for tracking):** SPEC.md's Image-pipeline section still
-describes the removed **B2 cache** — stale vs the Workers-only decision. Fix in a docs
-pass; out of scope for the catalogue build.
+**Deferred, tracked:** cover pHash ingest (M2, needs `image` crate); recurring
+incremental refresh scheduler (M3); M6 canonical serving; the `apps/admin/` review UI
+(M5).
 
 ## 9. MangaDex API limits (reference)
 
