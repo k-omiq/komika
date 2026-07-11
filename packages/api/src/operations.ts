@@ -410,9 +410,41 @@ export const CANONICAL_UPDATES = /* GraphQL */ `
 			mangadexId
 			title
 			isNsfw
+			coverUrl
 			latestChapter
 			latestChapterTitle
 			latestAt
+		}
+	}
+`;
+
+// ---- canonical reader path -------------------------------------------------
+
+export const CANONICAL_SERIES = /* GraphQL */ `
+	${SERIES_FIELDS}
+	query CanonicalSeries($workId: ID!) {
+		canonicalSeries(workId: $workId) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const CANONICAL_CHAPTERS = /* GraphQL */ `
+	${CHAPTER_FIELDS}
+	query CanonicalChapters($workId: ID!) {
+		canonicalChapters(workId: $workId) {
+			...ChapterFields
+		}
+	}
+`;
+
+export const CANONICAL_PAGES = /* GraphQL */ `
+	query CanonicalPages($chapterId: ID!) {
+		canonicalPages(chapterId: $chapterId) {
+			index
+			sourceUrl
+			width
+			height
 		}
 	}
 `;

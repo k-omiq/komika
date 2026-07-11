@@ -86,14 +86,16 @@ export interface MergeCandidate {
 /**
  * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
  * work with its most recent stored chapter, served from the `chapter` mirror.
- * A data feed — the reader's Suwayomi-keyed navigation cannot yet OPEN a canonical
- * MangaDex work, so `mangadexId`/`workId` identify it but there is no reader route.
+ * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through
+ * the `canonicalSeries` path.
  */
 export interface CanonicalUpdate {
 	workId: Id;
 	mangadexId: string;
 	title: string | null;
 	isNsfw: boolean;
+	/** Proxy-ready MangaDex cover thumbnail URL; null until the cover is synced. */
+	coverUrl: string | null;
 	/** Latest stored chapter number (string — chapters can be "10.5"). */
 	latestChapter: string | null;
 	latestChapterTitle: string | null;

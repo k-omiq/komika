@@ -58,7 +58,7 @@ Non-secret config lives in `wrangler.toml` under `[vars]`:
 
 | var                    | meaning                                                                                                                                                                     |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLOWED_SOURCE_HOSTS` | Comma-separated upstream host allowlist (prevents open-proxy abuse). Empty = allow all. Matches host exactly or as a suffix.                                                |
+| `ALLOWED_SOURCE_HOSTS` | Comma-separated upstream host allowlist (prevents open-proxy abuse). Empty = allow all. Matches host exactly or as a suffix. For MangaDex, include `uploads.mangadex.org` (covers) **and** `mangadex.network` (the `*.mangadex.network` MangaDex@Home page hosts — the suffix entry covers every node). |
 | `ALLOWED_ORIGINS`      | Comma-separated browser Origin/Referer allowlist (hotlink protection). Empty = disabled. Requests with no Origin/Referer are always allowed (native apps, cache-fill jobs). |
 | `B2_ENDPOINT`          | B2 S3-compatible endpoint, e.g. `https://s3.us-west-004.backblazeb2.com`. Empty = B2 disabled.                                                                              |
 | `B2_REGION`            | Region matching the endpoint, e.g. `us-west-004`.                                                                                                                           |

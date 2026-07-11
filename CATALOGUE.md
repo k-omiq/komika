@@ -202,9 +202,23 @@ See §9 for the rate-limit budget the crawl must respect.
   (we only hide what we positively know is NSFW).
 - **Stored chapter deltas** ✅ — the `canonicalUpdates` query serves recently-updated
   mirrored MangaDex works + their latest stored chapter straight from the `chapter` table
-  (no live Suwayomi round-trip), NSFW-filtered. **Caveat:** it's a data feed — the reader's
-  Suwayomi-keyed navigation cannot yet *open* a canonical MangaDex work, so wiring canonical
-  works into reader browse/read is a separate future piece.
+  (no live Suwayomi round-trip), NSFW-filtered. Each row now also carries a proxy-ready
+  `coverUrl`, and the reader surfaces the feed in its Updates screen with openable cards.
+- **Reader navigation into canonical works** ✅ — MangaDex-mirrored works are now
+  browseable and readable in the reader (migration `0008` stores the cover `fileName`;
+  the sync populates it). A canonical work is addressed by its `work` id, whose `w_`
+  prefix distinguishes it from a numeric Suwayomi id, so the reader routes it down a
+  parallel path without touching the Suwayomi one. New resolvers `canonicalSeries(workId)`
+  / `canonicalChapters(workId)` / `canonicalPages(chapterId)` map `work`/`chapter` onto the
+  shared `Series`/`Chapter`/`Page` shapes (so existing reader components are reused):
+  chapters come from the stored `chapter` mirror, deduped to one row per number (English
+  preferred) and ordered; pages resolve at read-time via **MangaDex@Home**
+  (`MangaDexClient::at_home`, rate-limited under the 40/min + global ~5 req/s budgets).
+  `show_nsfw` gating applies to all three. Covers (`uploads.mangadex.org`) and pages
+  (`*.mangadex.network`) are proxied by the Worker — its `ALLOWED_SOURCE_HOSTS` must
+  include `uploads.mangadex.org` **and** `mangadex.network` (the suffix entry covers every
+  `@Home` node). Progress-sync for canonical chapters is not wired yet (there is no
+  Suwayomi-side store), so reading them doesn't persist per-user progress.
 
 ## 7. Social layer cleanup — retire fabricated seed data
 
@@ -255,14 +269,19 @@ shippable. Status as of 2026-07-11:
 6. **M6 — Serve from canonical model** (§6). ✅ Done. `map_series` folds canonical
    `work_alias` into `Series.altTitles`; `show_nsfw` per-user filtering (migration `0007`)
    over `discovery` / `search` / `updates`; and the `canonicalUpdates` query serving stored
-   `chapter` deltas from the mirror. (Reader navigation into canonical works — opening a
-   MangaDex work through browse/read — is the one remaining piece, tracked below.)
+   `chapter` deltas from the mirror.
 7. **M7 — Social seed cleanup** (§7). ✅ Done. Fabricated seed threads removed;
    empty-state fallbacks.
+8. **M8 — Reader navigation into canonical works** (§6). ✅ Done. Cover `fileName`
+   stored (migration `0008`); `canonicalSeries` / `canonicalChapters` / `canonicalPages`
+   resolvers + MangaDex@Home page fetching; the reader routes `w_`-prefixed work ids down
+   a canonical path (Suwayomi path untouched) and the Updates screen surfaces openable
+   `canonicalUpdates` cards. Worker allowlist extended for `uploads.mangadex.org` +
+   `mangadex.network`.
 
-**Remaining follow-ups (tracked):** wire canonical works into reader browse/read so the
-`canonicalUpdates` feed and MangaDex-mirrored works are openable (today the reader's
-navigation is Suwayomi-keyed); surface `show_nsfw` + `canonicalUpdates` in the reader UI.
+**Remaining follow-ups (tracked):** per-user reading progress + library marking for
+canonical works (today progress-sync is Suwayomi-only); related-series / genres for
+canonical works (MangaDex tags aren't mirrored yet).
 
 ## 9. MangaDex API limits (reference)
 
