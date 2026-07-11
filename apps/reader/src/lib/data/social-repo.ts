@@ -23,7 +23,7 @@ import { backend } from '$lib/context';
 import { config } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
 import * as local from './social';
-import { seriesComments, readerComments } from './mock';
+import type { ReaderComment, SeriesComment } from './mock';
 
 /** Live social requires the unified backend (Suwayomi/mock have no auth layer). */
 export function socialLive(): boolean {
@@ -149,8 +149,9 @@ export async function loadSeriesSocial(seriesId: string, key: string): Promise<S
 			reviews: views.filter((v) => v.body.trim().length > 0),
 		};
 	}
-	// Local fallback: seeded thread + a local per-series rating.
-	const seeded = local.getComments('series', key, seriesComments);
+	// Local fallback: no seeded thread (honest empty state) + a local per-series
+	// rating. Any reviews the user posts offline persist in localStorage.
+	const seeded = local.getComments('series', key, [] as SeriesComment[]);
 	return {
 		myScore: local.getRating('series', key),
 		myBody: '',
@@ -244,7 +245,8 @@ export async function loadChapterComments(chapterId: string, key: string): Promi
 		// Server returns oldest→newest; the reader shows newest first.
 		return items.map(commentToView).reverse();
 	}
-	const seeded = local.getComments('chapter', key, readerComments);
+	// No seeded thread — honest empty state; offline user comments persist locally.
+	const seeded = local.getComments('chapter', key, [] as ReaderComment[]);
 	return seeded.map((c) => ({
 		id: c.id,
 		authorId: '',
