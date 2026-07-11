@@ -176,7 +176,9 @@ New module `apps/server/src/mangadex/` (direct `reqwest` client).
   reset offset, repeat until empty. Upsert → `work` / `work_alias` /
   `work_external_id`; compute cover pHash on ingest.
 - **Chapters** — global `/chapter` firehose with `createdAtSince` windowing → `chapter`
-  rows, attached by the `manga` relationship.
+  rows, attached by the `manga` relationship. **English-only:** the firehose is filtered
+  at the source (`translatedLanguage[]=en`) and the sync skips any stray non-English row,
+  so the mirror stores only English chapters (Komika serves English only).
 - **Incremental refresh** ✅ — `spawn_recurring` (mirrors the `scanner.rs` task pattern)
   seeds once by `createdAt`, then every `CATALOGUE_SYNC_INTERVAL_SECS` (default 6h) does an
   `updatedAtSince` refresh of both catalogue and chapters. The cursor per job lives in
@@ -211,8 +213,8 @@ See §9 for the rate-limit budget the crawl must respect.
   parallel path without touching the Suwayomi one. New resolvers `canonicalSeries(workId)`
   / `canonicalChapters(workId)` / `canonicalPages(chapterId)` map `work`/`chapter` onto the
   shared `Series`/`Chapter`/`Page` shapes (so existing reader components are reused):
-  chapters come from the stored `chapter` mirror, deduped to one row per number (English
-  preferred) and ordered; pages resolve at read-time via **MangaDex@Home**
+  chapters come from the stored `chapter` mirror, **English-only** (`lang = 'en'`), deduped
+  to one row per number and ordered; pages resolve at read-time via **MangaDex@Home**
   (`MangaDexClient::at_home`, rate-limited under the 40/min + global ~5 req/s budgets).
   `show_nsfw` gating applies to all three. Covers (`uploads.mangadex.org`) and pages
   (`*.mangadex.network`) are proxied by the Worker — its `ALLOWED_SOURCE_HOSTS` must
