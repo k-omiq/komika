@@ -65,14 +65,28 @@ the social layer, the admin "manga DB", and cache orchestration. It exposes
 **GraphQL** (`packages/api/src/graphql-backend.ts` — fully implemented against
 `operations.ts`; the UI is built against the stable method signatures).
 
+> **Direction (updated 2026-07-11): catalogue pivot — see [CATALOGUE.md](CATALOGUE.md).**
+> The backend moves from pure live-federation to a **hybrid**: MangaDex metadata
+> and chapter lists are **mirrored** into the DB (Tier 1, full catalogue + update
+> polling via the direct MangaDex API), all other sources come through the
+> **curated** Keiyoushi extension repo (Tier 2, admin hand-picks series), and a
+> **canonical `work`** model with a multi-step dedup matcher guarantees **one entry
+> per series**. Page images stay federated live. This supersedes the "catalog is
+> not stored" premise in `apps/server/migrations/0001_init.sql` for metadata.
+> NSFW content is gated behind a `show_nsfw` setting (default off).
+
 ## Image pipeline (the web/native split)
 
-- **Popular + user-marked** series → cached in **B2 Backblaze** (durable origin).
-- **Long tail** → **not stored**; a **Cloudflare Worker** proxies images on demand.
-- **Web** build → all images resolved to Worker URLs (also serves B2-cached copies;
-  needed because browsers can't cross-origin-scrape — CORS).
+> **Updated: Workers-only — no object-storage image cache.** The earlier B2 image
+> tier was removed (git `6d06784`); images are **never stored**. B2/R2's only job now
+> is Litestream backup of the SQLite DB, not image caching.
+
+- **All series** → **not stored**; a **Cloudflare Worker** proxies images on demand
+  (pure edge cache, `caches.default`). See `apps/worker/src/index.ts`.
+- **Web** build → all images resolved to Worker URLs (browsers can't
+  cross-origin-scrape — CORS — so the proxy is mandatory).
 - **Native** builds → fetch image bytes **directly** from the source CDN via the
-  Rust `fetch_image` command; never touch the Worker/B2.
+  Rust `fetch_image` command; never touch the Worker.
 
 The seam is `ImageProvider` in `packages/api`. The UI calls `resolvePage()` /
 `resolveCover()` and is oblivious to which platform it's on. Chosen at runtime by
