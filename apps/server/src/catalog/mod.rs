@@ -477,6 +477,36 @@ pub async fn insert_merge_candidate(
     Ok(id)
 }
 
+/// Read the sync cursor for a job (`catalogue` | `chapters`). `None` means the job
+/// has never completed a cycle → the caller should do a full `createdAt` seed.
+pub async fn get_sync_cursor(pool: &SqlitePool, job: &str) -> Result<Option<String>> {
+    let v = sqlx::query_scalar::<_, String>(
+        "SELECT last_synced_at FROM catalogue_sync_state WHERE job = ?",
+    )
+    .bind(job)
+    .fetch_optional(pool)
+    .await?;
+    Ok(v)
+}
+
+/// Persist the sync cursor for a job. `since` is the MangaDex `since` timestamp to use
+/// as `updatedAtSince` on the next incremental cycle (typically the wall-clock at the
+/// start of the cycle just completed, so anything updated during it is caught next time).
+pub async fn set_sync_cursor(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(job)
+    .bind(since)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +603,34 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1, "chapter upsert is idempotent on external id");
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_round_trips() {
+        let pool = pool().await;
+        assert_eq!(get_sync_cursor(&pool, "catalogue").await.unwrap(), None);
+        set_sync_cursor(&pool, "catalogue", "2026-07-11T00:00:00")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_sync_cursor(&pool, "catalogue")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-07-11T00:00:00")
+        );
+        // Upsert overwrites, and jobs are independent.
+        set_sync_cursor(&pool, "catalogue", "2026-07-12T00:00:00")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_sync_cursor(&pool, "catalogue")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-07-12T00:00:00")
+        );
+        assert_eq!(get_sync_cursor(&pool, "chapters").await.unwrap(), None);
     }
 
     #[tokio::test]

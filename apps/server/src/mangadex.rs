@@ -22,8 +22,34 @@ const API_BASE: &str = "https://api.mangadex.org";
 const COVERS_BASE: &str = "https://uploads.mangadex.org/covers";
 const PAGE_LIMIT: i64 = 100; // MangaDex list max for /manga
 /// Stop paging a window before the hard `offset + limit <= 10_000` cap and slide
-/// the `createdAtSince` window instead.
+/// the `since` window instead.
 const WINDOW_OFFSET_CAP: i64 = 9_900;
+
+/// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
+/// `createdAt`; recurring incremental refreshes walk only recently-changed records by
+/// `updatedAt` (CATALOGUE.md §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWindow {
+    Created,
+    Updated,
+}
+
+impl SyncWindow {
+    /// The `...Since` query parameter name.
+    fn since_param(self) -> &'static str {
+        match self {
+            SyncWindow::Created => "createdAtSince",
+            SyncWindow::Updated => "updatedAtSince",
+        }
+    }
+    /// The `order[...]` query parameter key (always ascending, so the window slides forward).
+    fn order_key(self) -> &'static str {
+        match self {
+            SyncWindow::Created => "order[createdAt]",
+            SyncWindow::Updated => "order[updatedAt]",
+        }
+    }
+}
 
 /// A simple async token bucket. `capacity` tokens, refilled at `refill_per_sec`.
 struct TokenBucket {
@@ -92,7 +118,8 @@ impl MangaDexClient {
     /// parsed mangas (bad individual records are skipped, not fatal) and the total.
     pub async fn list_manga(
         &self,
-        created_since: Option<&str>,
+        window: SyncWindow,
+        since: Option<&str>,
         offset: i64,
     ) -> Result<(Vec<MdManga>, i64)> {
         let mut params: Vec<(String, String)> = vec![
@@ -101,15 +128,15 @@ impl MangaDexClient {
             ("includes[]".into(), "cover_art".into()),
             ("includes[]".into(), "author".into()),
             ("includes[]".into(), "artist".into()),
-            ("order[createdAt]".into(), "asc".into()),
+            (window.order_key().into(), "asc".into()),
             // Skip nothing on content rating — we store the flag and gate at query time.
             ("contentRating[]".into(), "safe".into()),
             ("contentRating[]".into(), "suggestive".into()),
             ("contentRating[]".into(), "erotica".into()),
             ("contentRating[]".into(), "pornographic".into()),
         ];
-        if let Some(since) = created_since {
-            params.push(("createdAtSince".into(), since.to_string()));
+        if let Some(since) = since {
+            params.push((window.since_param().into(), since.to_string()));
         }
         self.limiter.acquire().await;
         let res = self
@@ -139,17 +166,18 @@ impl MangaDexClient {
     /// One page of the global `/chapter` firehose, ordered by `createdAt` asc.
     pub async fn list_chapters(
         &self,
-        created_since: Option<&str>,
+        window: SyncWindow,
+        since: Option<&str>,
         offset: i64,
     ) -> Result<(Vec<MdChapter>, i64)> {
         let mut params: Vec<(String, String)> = vec![
             ("limit".into(), PAGE_LIMIT.to_string()),
             ("offset".into(), offset.to_string()),
-            ("order[createdAt]".into(), "asc".into()),
+            (window.order_key().into(), "asc".into()),
             ("includes[]".into(), "manga".into()),
         ];
-        if let Some(since) = created_since {
-            params.push(("createdAtSince".into(), since.to_string()));
+        if let Some(since) = since {
+            params.push((window.since_param().into(), since.to_string()));
         }
         self.limiter.acquire().await;
         let res = self
@@ -237,6 +265,7 @@ pub struct MdAttrs {
     #[serde(default)]
     pub links: HashMap<String, String>,
     pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +301,7 @@ pub struct MdChapterAttrs {
     pub translated_language: Option<String>,
     pub publish_at: Option<String>,
     pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 // ---- Mapping ---------------------------------------------------------------
@@ -385,6 +415,22 @@ fn map_status(s: Option<&str>) -> Option<String> {
     )
 }
 
+/// The timestamp a manga sweep slides its window on (per `SyncWindow`).
+fn manga_window_ts(m: &MdManga, window: SyncWindow) -> Option<String> {
+    match window {
+        SyncWindow::Created => m.attributes.created_at.clone(),
+        SyncWindow::Updated => m.attributes.updated_at.clone(),
+    }
+}
+
+/// The timestamp a chapter sweep slides its window on (per `SyncWindow`).
+fn chapter_window_ts(c: &MdChapter, window: SyncWindow) -> Option<String> {
+    match window {
+        SyncWindow::Created => c.attributes.created_at.clone(),
+        SyncWindow::Updated => c.attributes.updated_at.clone(),
+    }
+}
+
 /// The `manga` relationship id on a chapter (which work the chapter belongs to).
 pub fn chapter_manga_id(c: &MdChapter) -> Option<String> {
     c.relationships
@@ -409,6 +455,7 @@ pub fn to_since(ts: &str) -> Option<String> {
 pub async fn sync_catalogue(
     pool: &sqlx::SqlitePool,
     client: &MangaDexClient,
+    window: SyncWindow,
     initial_since: Option<String>,
     cover_phash: bool,
 ) -> Result<u64> {
@@ -419,7 +466,7 @@ pub async fn sync_catalogue(
         let mut last_created: Option<String> = None;
         let mut done = false;
         loop {
-            let (mangas, total) = client.list_manga(since.as_deref(), offset).await?;
+            let (mangas, total) = client.list_manga(window, since.as_deref(), offset).await?;
             if mangas.is_empty() {
                 done = true;
                 break;
@@ -439,8 +486,8 @@ pub async fn sync_catalogue(
                     Ok(_) => upserted += 1,
                     Err(e) => tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed"),
                 }
-                if m.attributes.created_at.is_some() {
-                    last_created = m.attributes.created_at.clone();
+                if let Some(ts) = manga_window_ts(m, window) {
+                    last_created = Some(ts);
                 }
             }
             offset += page_len;
@@ -476,6 +523,7 @@ pub async fn sync_catalogue(
 pub async fn sync_chapters(
     pool: &sqlx::SqlitePool,
     client: &MangaDexClient,
+    window: SyncWindow,
     initial_since: Option<String>,
 ) -> Result<u64> {
     let mut since = initial_since;
@@ -485,15 +533,17 @@ pub async fn sync_chapters(
         let mut last_created: Option<String> = None;
         let mut done = false;
         loop {
-            let (chapters, total) = client.list_chapters(since.as_deref(), offset).await?;
+            let (chapters, total) = client
+                .list_chapters(window, since.as_deref(), offset)
+                .await?;
             if chapters.is_empty() {
                 done = true;
                 break;
             }
             let page_len = chapters.len() as i64;
             for c in &chapters {
-                if c.attributes.created_at.is_some() {
-                    last_created = c.attributes.created_at.clone();
+                if let Some(ts) = chapter_window_ts(c, window) {
+                    last_created = Some(ts);
                 }
                 let Some(manga_id) = chapter_manga_id(c) else {
                     continue;
@@ -547,16 +597,97 @@ pub async fn sync_chapters(
     Ok(stored)
 }
 
-/// Spawn the catalogue + chapter sync as a background task (one full sweep of each,
-/// then idle). Gated by the caller; returns immediately.
-pub fn spawn(pool: sqlx::SqlitePool, client: Arc<MangaDexClient>, cover_phash: bool) {
-    tokio::spawn(async move {
-        tracing::info!(cover_phash, "mangadex: catalogue sync starting");
-        if let Err(e) = sync_catalogue(&pool, &client, None, cover_phash).await {
-            tracing::warn!(error = %e, "mangadex: catalogue sync ended with error");
+/// Run one catalogue + chapter sync cycle. A job with no stored cursor does a full
+/// `createdAt` seed; a job with a cursor does an incremental `updatedAtSince` refresh
+/// (CATALOGUE.md §5). The cursor advances to the cycle's start time only on success,
+/// so a failed or interrupted cycle safely retries the same window next tick. Catalogue
+/// runs before chapters (chapters attach to already-catalogued works).
+async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
+    // Wall-clock at cycle start, in MangaDex `since` form. Anything updated during the
+    // cycle is >= this, so it's caught by the next cycle rather than missed.
+    let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    match catalog::get_sync_cursor(pool, "catalogue").await {
+        Ok(cur) => {
+            let (window, since) = match &cur {
+                Some(ts) => (SyncWindow::Updated, Some(ts.clone())),
+                None => (SyncWindow::Created, None),
+            };
+            match sync_catalogue(pool, client, window, since, cover_phash).await {
+                Ok(n) => {
+                    tracing::info!(
+                        upserted = n,
+                        incremental = cur.is_some(),
+                        "mangadex: catalogue cycle done"
+                    );
+                    if let Err(e) = catalog::set_sync_cursor(pool, "catalogue", &run_start).await {
+                        tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mangadex: catalogue cycle failed (cursor unchanged)")
+                }
+            }
         }
-        if let Err(e) = sync_chapters(&pool, &client, None).await {
-            tracing::warn!(error = %e, "mangadex: chapter sync ended with error");
+        Err(e) => tracing::warn!(error = %e, "mangadex: catalogue cursor read failed; skipping"),
+    }
+
+    match catalog::get_sync_cursor(pool, "chapters").await {
+        Ok(cur) => {
+            let (window, since) = match &cur {
+                Some(ts) => (SyncWindow::Updated, Some(ts.clone())),
+                None => (SyncWindow::Created, None),
+            };
+            match sync_chapters(pool, client, window, since).await {
+                Ok(n) => {
+                    tracing::info!(
+                        stored = n,
+                        incremental = cur.is_some(),
+                        "mangadex: chapter cycle done"
+                    );
+                    if let Err(e) = catalog::set_sync_cursor(pool, "chapters", &run_start).await {
+                        tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mangadex: chapter cycle failed (cursor unchanged)")
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "mangadex: chapter cursor read failed; skipping"),
+    }
+}
+
+/// Spawn the recurring catalogue + chapter sync. The first tick fires immediately
+/// (seeding on startup), then every `interval_secs`. Exits cleanly when `shutdown`
+/// fires. Mirrors the `scanner::spawn` background-task pattern.
+pub fn spawn_recurring(
+    pool: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    cover_phash: bool,
+    interval_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::info!(
+            interval_secs,
+            cover_phash,
+            "mangadex: recurring catalogue sync started"
+        );
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    sync_cycle(&pool, &client, cover_phash).await;
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("mangadex: catalogue sync stopping");
+                        break;
+                    }
+                }
+            }
         }
     });
 }
