@@ -7,7 +7,7 @@ import { isTauri } from './platform.js';
  * component: the reader just asks the provider to resolve a page.
  *
  *  - web    → returns a Cloudflare Worker proxy URL (bypasses CORS; the Worker
- *             also serves the B2-cached copy for popular / marked series).
+ *             fetches upstream bytes and edge-caches them).
  *  - native → invokes a Rust command that fetches the bytes directly from the
  *             source CDN and hands back a displayable URL (blob / asset proto).
  */
