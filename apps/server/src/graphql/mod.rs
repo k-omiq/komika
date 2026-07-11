@@ -250,7 +250,6 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
             .map(|c| c.total_count as i32)
             .unwrap_or(0),
         is_marked: m.in_library,
-        is_cached: false,
         source_id: m.source_id,
         genres: m.genre,
         author: m.author,

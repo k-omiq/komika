@@ -86,10 +86,8 @@ export interface Series {
 	sourceId: string;
 	rating: RatingSummary;
 	chapterCount: number;
-	/** True if the current user marked it (forces B2 caching + priority scanning). */
+	/** True if the current user marked it (raises scanning priority). */
 	isMarked: boolean;
-	/** True if images are served from the B2 cache rather than the Worker proxy. */
-	isCached: boolean;
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;

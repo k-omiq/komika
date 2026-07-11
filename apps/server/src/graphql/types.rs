@@ -81,7 +81,6 @@ pub struct Series {
     pub source_id: String,
     pub chapter_count: i32,
     pub is_marked: bool,
-    pub is_cached: bool,
     pub rating: RatingSummary,
     pub scan: ScanPolicy,
     pub created_at: String,
