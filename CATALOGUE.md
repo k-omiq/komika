@@ -177,8 +177,11 @@ New module `apps/server/src/mangadex/` (direct `reqwest` client).
   `work_external_id`; compute cover pHash on ingest.
 - **Chapters** — global `/chapter` firehose with `createdAtSince` windowing → `chapter`
   rows, attached by the `manga` relationship.
-- **Incremental refresh** — re-run both with `updatedAtSince` = last sync. **Reuse the
-  existing `scanner.rs` tokio background-task pattern** rather than a new scheduler.
+- **Incremental refresh** ✅ — `spawn_recurring` (mirrors the `scanner.rs` task pattern)
+  seeds once by `createdAt`, then every `CATALOGUE_SYNC_INTERVAL_SECS` (default 6h) does an
+  `updatedAtSince` refresh of both catalogue and chapters. The cursor per job lives in
+  `catalogue_sync_state` (migration `0006`) and only advances on success, so a failed cycle
+  safely retries the same window.
 - **Cover URL** (must be proxied — hotlinking returns a wrong response):
   `https://uploads.mangadex.org/covers/{manga-id}/{fileName}` (+ `.512.jpg` / `.256.jpg`).
 
@@ -191,9 +194,17 @@ See §9 for the rate-limit budget the crawl must respect.
   `{ auto-merge | review | new }` → admin confirms in `apps/admin/`. On confirm/new,
   create `source_series` and link/create the `work`. Fold source `nsfw` + MangaDex
   `contentRating` into `is_nsfw`.
-- **Serving** — `graphql/mod.rs` `map_series` / `map_series_list` (`:243` / `:300`) read
-  the stored `work` (altTitles finally populated). Pages/images still fetched live. The
-  `updates` query is sourced from stored `chapter` deltas.
+- **Serving** — `graphql/mod.rs` `map_series` reads the stored `work` (altTitles
+  populated). Pages/images still fetched live.
+- **NSFW filtering** ✅ — per-user `show_nsfw` (migration `0007`, `setShowNsfw` mutation,
+  surfaced on `SessionUser`; default off). `Series.is_nsfw` is set from the canonical model
+  and `discovery` / `search` / `updates` drop NSFW-flagged series unless the viewer opts in
+  (we only hide what we positively know is NSFW).
+- **Stored chapter deltas** ✅ — the `canonicalUpdates` query serves recently-updated
+  mirrored MangaDex works + their latest stored chapter straight from the `chapter` table
+  (no live Suwayomi round-trip), NSFW-filtered. **Caveat:** it's a data feed — the reader's
+  Suwayomi-keyed navigation cannot yet *open* a canonical MangaDex work, so wiring canonical
+  works into reader browse/read is a separate future piece.
 
 ## 7. Social layer cleanup — retire fabricated seed data
 
@@ -233,9 +244,8 @@ shippable. Status as of 2026-07-11:
    (`src/phash.rs`, 64-bit dHash via the `image` crate) — computed per work during sync
    when `COVER_PHASH=on`, feeding the cover dedup signal.
 3. **M3 — Chapter mirror + incremental sync** (§5). ✅ Done. Global `/chapter` firehose
-   with `createdAt` windowing → `chapter` rows. Incremental `updatedAtSince` refresh: the
-   `sync_*` fns accept a start timestamp; wiring a recurring refresh on the `scanner.rs`
-   pattern is the remaining piece.
+   → `chapter` rows, plus the recurring `updatedAtSince` scheduler (`spawn_recurring` +
+   `catalogue_sync_state`, migration `0006`) seeding once then refreshing every interval.
 4. **M4 — Dedup matcher** (§4). ✅ Done (`src/dedup.rs`). `resolve()` returns
    `{ auto-merge | review | new }` via the 5-step ladder; unit-tested end-to-end.
 5. **M5 — Tier-2 add flow** (§6). ✅ Done. `addSourceSeries` + `resolveMergeCandidate`
@@ -243,15 +253,16 @@ shippable. Status as of 2026-07-11:
    `apps/admin/src/routes/review/` (confirm-merge / keep-separate over the queue,
    threaded through `@komika/api` + `@komika/types`).
 6. **M6 — Serve from canonical model** (§6). ✅ Done. `map_series` folds canonical
-   `work_alias` rows into `Series.altTitles` for any catalogued series (empty until a
-   series is added, so the reader is unaffected otherwise). Preferring stored
-   `chapter` deltas over live Suwayomi and `show_nsfw` filtering remain follow-ups.
+   `work_alias` into `Series.altTitles`; `show_nsfw` per-user filtering (migration `0007`)
+   over `discovery` / `search` / `updates`; and the `canonicalUpdates` query serving stored
+   `chapter` deltas from the mirror. (Reader navigation into canonical works — opening a
+   MangaDex work through browse/read — is the one remaining piece, tracked below.)
 7. **M7 — Social seed cleanup** (§7). ✅ Done. Fabricated seed threads removed;
    empty-state fallbacks.
 
-**Remaining follow-ups (tracked):** recurring incremental-refresh scheduler on the
-`scanner.rs` pattern (M3); serving stored `chapter` deltas + `show_nsfw` query filtering
-(M6 extension).
+**Remaining follow-ups (tracked):** wire canonical works into reader browse/read so the
+`canonicalUpdates` feed and MangaDex-mirrored works are openable (today the reader's
+navigation is Suwayomi-keyed); surface `show_nsfw` + `canonicalUpdates` in the reader UI.
 
 ## 9. MangaDex API limits (reference)
 

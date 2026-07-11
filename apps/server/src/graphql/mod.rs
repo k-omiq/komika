@@ -243,6 +243,53 @@ async fn canonical_alt_titles(pool: &SqlitePool, suwayomi_id: &str) -> Vec<Strin
     .unwrap_or_default()
 }
 
+/// Whether a federated Suwayomi series is NSFW per the canonical model (CATALOGUE.md
+/// §2). True once it's linked to a `work` flagged NSFW; false when uncatalogued (we
+/// only hide what we positively know is NSFW).
+async fn canonical_is_nsfw(pool: &SqlitePool, suwayomi_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(w.is_nsfw), 0) FROM source_series ss \
+         JOIN work w ON w.id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key = ?",
+    )
+    .bind(suwayomi_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+        != 0
+}
+
+/// The viewer's NSFW preference (default false, including for anonymous requests).
+async fn viewer_show_nsfw(ctx: &Context<'_>) -> bool {
+    match current_user(ctx).await {
+        Some(u) => user_show_nsfw(&state(ctx).pool, &u.id).await,
+        None => false,
+    }
+}
+
+/// Read a user's persisted `show_nsfw` flag (default false on any lookup failure).
+async fn user_show_nsfw(pool: &SqlitePool, user_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT show_nsfw FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        != 0
+}
+
+/// Drop NSFW series from a feed unless the viewer opted in. Pure over the already-set
+/// `Series.is_nsfw`, so it's one canonical lookup per series (in `map_series`), not per feed.
+fn filter_nsfw(show_nsfw: bool, items: Vec<Series>) -> Vec<Series> {
+    if show_nsfw {
+        return items;
+    }
+    items.into_iter().filter(|s| !s.is_nsfw).collect()
+}
+
 async fn admin_overrides(pool: &SqlitePool, series_id: &str) -> AdminOverrides {
     sqlx::query_as::<_, AdminOverrides>(
         "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
@@ -268,6 +315,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
     // equal the primary title so the reader shows only genuine alternatives.
     let mut alt_titles = canonical_alt_titles(&st.pool, &id).await;
     alt_titles.retain(|t| t != &m.title);
+    let is_nsfw = canonical_is_nsfw(&st.pool, &id).await;
 
     // Status: admin override wins over the source-derived status.
     let status = ov
@@ -309,6 +357,7 @@ async fn map_series(st: &AppState, m: SuwayomiManga) -> Series {
             .map(|c| c.total_count as i32)
             .unwrap_or(0),
         is_marked: m.in_library,
+        is_nsfw,
         source_id: m.source_id,
         genres: m.genre,
         author: m.author,
@@ -417,12 +466,13 @@ impl From<AdminUserRow> for AdminUser {
     }
 }
 
-fn session_user(u: &User) -> SessionUser {
+fn session_user(u: &User, show_nsfw: bool) -> SessionUser {
     SessionUser {
         id: ID(u.id.clone()),
         username: u.username.clone(),
         avatar_url: u.avatar_url.clone(),
         is_admin: u.is_admin != 0,
+        show_nsfw,
     }
 }
 
@@ -440,6 +490,24 @@ pub struct MatchResult {
     pub score: Option<f64>,
     pub method: Option<String>,
     pub source_series_id: String,
+}
+
+/// One row of the canonical updates feed: a mirrored MangaDex work with its most
+/// recent stored chapter (CATALOGUE.md §6). Served from the `chapter` mirror, not a
+/// live Suwayomi round-trip. `mangadex_id` identifies the source work (covers/reading
+/// resolve through MangaDex separately — the reader's Suwayomi-keyed navigation does
+/// not yet open canonical works, so this is a data feed).
+#[derive(SimpleObject, sqlx::FromRow)]
+pub struct CanonicalUpdate {
+    pub work_id: String,
+    pub mangadex_id: String,
+    pub title: Option<String>,
+    pub is_nsfw: bool,
+    /// Latest stored chapter number (string — chapters can be "10.5").
+    pub latest_chapter: Option<String>,
+    pub latest_chapter_title: Option<String>,
+    /// Publish time of the latest stored chapter (falls back to ingest time).
+    pub latest_at: Option<String>,
 }
 
 /// A pending mid-confidence match awaiting manual admin review.
@@ -478,8 +546,10 @@ impl QueryRoot {
             .map(|r| r.1)
             .unwrap_or_default();
 
-        let popular = map_series_list(st, popular).await;
-        let latest = map_series_list(st, latest).await;
+        // Hide NSFW-flagged works unless the viewer opted in (CATALOGUE.md §2).
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let popular = filter_nsfw(show_nsfw, map_series_list(st, popular).await);
+        let latest = filter_nsfw(show_nsfw, map_series_list(st, latest).await);
 
         let mut feeds = vec![
             DiscoveryFeed {
@@ -555,12 +625,49 @@ impl QueryRoot {
                 }
             }
         }
+        let items = filter_nsfw(viewer_show_nsfw(ctx).await, items);
         Ok(SeriesPage {
             items,
             page,
             has_next_page: has_next,
             total: Some(total as i32),
         })
+    }
+
+    /// Canonical updates feed: recently-updated mirrored MangaDex works with their
+    /// latest stored chapter, newest first (CATALOGUE.md §6). Served from the `chapter`
+    /// mirror (no live Suwayomi round-trip) and NSFW-filtered by the viewer's
+    /// preference. Data-only — see `CanonicalUpdate`.
+    async fn canonical_updates(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<Vec<CanonicalUpdate>> {
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
+        // SQLite bare-column-with-MAX: latest_chapter / title / mangadex_id are taken
+        // from the row holding MAX(latest_at) within each work group.
+        let rows = sqlx::query_as::<_, CanonicalUpdate>(
+            "SELECT ss.work_id AS work_id, ss.source_key AS mangadex_id, \
+                    w.primary_title AS title, w.is_nsfw AS is_nsfw, \
+                    c.number AS latest_chapter, c.title AS latest_chapter_title, \
+                    MAX(COALESCE(c.published_at, c.created_at)) AS latest_at \
+             FROM chapter c \
+             JOIN source_series ss ON ss.id = c.source_series_id \
+             JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'mangadex' AND (? = 1 OR w.is_nsfw = 0) \
+             GROUP BY ss.work_id \
+             ORDER BY latest_at DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(show_nsfw as i64)
+        .bind(PAGE_SIZE)
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(rows)
     }
 
     async fn search(
@@ -582,7 +689,10 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?;
         Ok(SeriesPage {
-            items: map_series_list(st, mangas).await,
+            items: filter_nsfw(
+                viewer_show_nsfw(ctx).await,
+                map_series_list(st, mangas).await,
+            ),
             page,
             has_next_page: has_next,
             total: None,
@@ -794,10 +904,13 @@ impl QueryRoot {
             return Ok(None);
         };
         match current_user(ctx).await {
-            Some(u) => Ok(Some(Session {
-                token: tok,
-                user: session_user(&u),
-            })),
+            Some(u) => {
+                let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await;
+                Ok(Some(Session {
+                    token: tok,
+                    user: session_user(&u, show_nsfw),
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -960,9 +1073,10 @@ impl MutationRoot {
             return Err(Error::new("This account has been suspended."));
         }
         let tok = new_session(&st.pool, &user.id).await?;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         Ok(Session {
             token: tok,
-            user: session_user(&user),
+            user: session_user(&user, show_nsfw),
         })
     }
 
@@ -1023,6 +1137,7 @@ impl MutationRoot {
                 username: username.to_string(),
                 avatar_url: None,
                 is_admin,
+                show_nsfw: false, // fresh accounts default to hiding NSFW
             },
         })
     }
@@ -1037,6 +1152,19 @@ impl MutationRoot {
                 .map_err(gql_err)?;
         }
         Ok(true)
+    }
+
+    /// Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2).
+    /// Returns the new value.
+    async fn set_show_nsfw(&self, ctx: &Context<'_>, value: bool) -> Result<bool> {
+        let user = require_user(ctx).await?;
+        sqlx::query("UPDATE users SET show_nsfw = ? WHERE id = ?")
+            .bind(value as i64)
+            .bind(&user.id)
+            .execute(&state(ctx).pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(value)
     }
 
     /// Admin "manga DB" console: upsert the per-series overrides (whole-state;
@@ -1447,6 +1575,12 @@ mod tests {
     }
 
     async fn setup_with_limit(max: u32) -> ApiSchema {
+        setup_full(max).await.0
+    }
+
+    /// Like `setup_with_limit`, but also hands back the pool so tests can seed
+    /// canonical-catalogue rows directly.
+    async fn setup_full(max: u32) -> (ApiSchema, SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1465,13 +1599,13 @@ mod tests {
                 .unwrap();
         }
         let state = std::sync::Arc::new(AppState {
-            pool,
+            pool: pool.clone(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
         });
-        build_schema(state)
+        (build_schema(state), pool)
     }
 
     async fn exec(
@@ -1491,6 +1625,121 @@ mod tests {
             .first()
             .map(|e| e.message.clone())
             .unwrap_or_default()
+    }
+
+    fn data_json(resp: &async_graphql::Response) -> String {
+        serde_json::to_string(&resp.data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_show_nsfw_persists_and_requires_auth() {
+        let s = setup().await;
+        // Default is hidden.
+        let r = exec(
+            &s,
+            r#"{ session { user { showNsfw } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(data_json(&r).contains("\"showNsfw\":false"));
+        // Toggle on.
+        let r = exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let r = exec(
+            &s,
+            r#"{ session { user { showNsfw } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(data_json(&r).contains("\"showNsfw\":true"));
+        // Anonymous cannot set it.
+        let r = exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    async fn seed_canonical(pool: &SqlitePool, md_id: &str, title: &str, nsfw: bool, ch: &str) {
+        let input = crate::catalog::WorkInput {
+            primary_title: Some(title.to_string()),
+            is_nsfw: nsfw,
+            ..Default::default()
+        };
+        crate::catalog::upsert_work_from_mangadex(pool, md_id, &input)
+            .await
+            .unwrap();
+        let ssid = crate::catalog::find_source_series_id(pool, "mangadex", "mangadex", md_id)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::catalog::upsert_chapter(
+            pool,
+            &ssid,
+            &crate::catalog::ChapterInput {
+                external_id: format!("{md_id}-{ch}"),
+                number: Some(ch.to_string()),
+                published_at: Some(format!("2026-07-0{ch}T00:00:00Z")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_updates_filters_nsfw_by_preference() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-safe", "Safe Work", false, "2").await;
+        seed_canonical(&pool, "md-nsfw", "Spicy Work", true, "1").await;
+
+        // Default (hidden): only the safe work; newest chapter first.
+        let r = exec(
+            &s,
+            r#"{ canonicalUpdates { title latestChapter isNsfw } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let json = data_json(&r);
+        assert!(json.contains("Safe Work"), "{json}");
+        assert!(
+            !json.contains("Spicy Work"),
+            "nsfw work must be hidden: {json}"
+        );
+
+        // Opt in → both appear.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let r = exec(
+            &s,
+            r#"{ canonicalUpdates { title } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let json = data_json(&r);
+        assert!(
+            json.contains("Safe Work") && json.contains("Spicy Work"),
+            "{json}"
+        );
     }
 
     #[tokio::test]

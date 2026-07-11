@@ -81,6 +81,9 @@ pub struct Series {
     pub source_id: String,
     pub chapter_count: i32,
     pub is_marked: bool,
+    /// NSFW per the canonical model (CATALOGUE.md §2); false until the series is
+    /// catalogued. Drives `show_nsfw` filtering of discovery/search/updates feeds.
+    pub is_nsfw: bool,
     pub rating: RatingSummary,
     pub scan: ScanPolicy,
     pub created_at: String,
@@ -153,6 +156,8 @@ pub struct SessionUser {
     pub username: String,
     pub avatar_url: Option<String>,
     pub is_admin: bool,
+    /// Whether this user has opted into seeing NSFW-flagged works (CATALOGUE.md §2).
+    pub show_nsfw: bool,
 }
 
 #[derive(SimpleObject, Clone)]
