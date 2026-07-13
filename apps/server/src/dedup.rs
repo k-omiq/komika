@@ -171,12 +171,16 @@ pub async fn resolve_ex(
     //    HashSet with nondeterministic iteration, so ties are broken by the lowest
     //    work_id — otherwise the surfaced Review candidate would be arbitrary across
     //    runs when several equal-scoring works share the exact title (DD7).
+    // Batch-load all blocked candidates' match data in two queries (OPT-7) rather than
+    // 2 round-trips per candidate — up to ~300 candidates on a reconcile.
+    let candidate_id_list: Vec<String> = candidate_ids.iter().cloned().collect();
+    let match_data = catalog::load_match_data_batch(pool, &candidate_id_list).await?;
     let mut best: Option<(Scored, String)> = None;
     for wid in &candidate_ids {
-        let Some(md) = catalog::load_match_data(pool, wid).await? else {
+        let Some(md) = match_data.get(wid) else {
             continue;
         };
-        let scored = score_candidate(cand, &norm_titles, &md);
+        let scored = score_candidate(cand, &norm_titles, md);
         let replace = match best.as_ref() {
             None => true,
             Some((s, w)) => scored.score > s.score || (scored.score == s.score && wid < w),

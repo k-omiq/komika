@@ -5704,11 +5704,28 @@ pub(crate) async fn ingest_source_series(
     let mid: i64 = raw_id
         .parse()
         .map_err(|_| anyhow::anyhow!("suwayomiMangaId must be an integer id"))?;
+    // OPT-6: idempotency pre-check BEFORE any upstream fetch. If this Suwayomi manga is
+    // already linked to a work we're done — a re-enrol was previously fetched, put in
+    // library, and scanned, so re-running all of that (series fetch, set_in_library,
+    // cover download, dhash, immediate scan) is pure waste. The manga id is a global
+    // key, so linkage resolves without first fetching the manga to learn its source_id.
+    // (The full-fidelity idempotency + concurrent-claim handling still lives in
+    // add_source_series_core_ex for the non-short-circuited path.)
+    if let Some((ssid, work_id)) =
+        crate::catalog::find_source_series_by_key(&st.pool, "suwayomi", &mid.to_string()).await?
+    {
+        return Ok(MatchResult {
+            decision: "existing".into(),
+            work_id,
+            matched_work_id: None,
+            score: None,
+            method: None,
+            source_series_id: ssid,
+        });
+    }
     let mut m = st.suwayomi.series(mid).await?;
     st.suwayomi.set_in_library(mid, true).await?;
     m.in_library = true;
-    // S1: cache the series METADATA so reader loads serve from the DB.
-    let _ = crate::series_cache::put_series(&st.pool, &m).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
         // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
         // runtime. Best-effort: a task panic just drops the signal.
@@ -6458,6 +6475,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(works_after, works_before, "DD2: no orphan work on re-add");
+    }
+
+    #[tokio::test]
+    async fn opt6_relinked_series_short_circuits_before_upstream() {
+        // OPT-6: ingest_source_series pre-checks linkage by manga id ALONE (no
+        // source_id) and returns early before any upstream fetch. SuwayomiClient is a
+        // concrete HTTP client (not unit-mockable), so we assert the predicate that
+        // gates that early return: once a series is linked, find_source_series_by_key
+        // resolves its (ssid, work_id) by key only — which is exactly what lets the
+        // enrol path answer "existing" without fetching the manga to learn its
+        // source_id. An unlinked id resolves to None, so a genuinely-new enrol still
+        // proceeds to the full fetch+dedup path.
+        let pool = migrated_pool().await;
+        let m = suwayomi_manga(4242, "Only Enrolled Once", &["Action"], "srcX");
+
+        // Not linked yet → None → enrol would proceed upstream.
+        assert!(
+            crate::catalog::find_source_series_by_key(&pool, "suwayomi", "4242")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
+        assert_eq!(r1.decision, "new");
+
+        // Now linked → resolvable by key alone (no source_id), matching the linkage the
+        // add produced → the enrol short-circuit fires with decision "existing".
+        let hit = crate::catalog::find_source_series_by_key(&pool, "suwayomi", "4242")
+            .await
+            .unwrap()
+            .expect("linked series resolves by key alone");
+        assert_eq!(hit.0, r1.source_series_id);
+        assert_eq!(hit.1, r1.work_id);
+
+        // A different (unlinked) manga id stays None — no false short-circuit.
+        assert!(
+            crate::catalog::find_source_series_by_key(&pool, "suwayomi", "9999")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

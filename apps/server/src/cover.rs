@@ -352,29 +352,43 @@ pub async fn crawl_uncached_covers(
     };
     let suw_total = suw_jobs.len();
     tracing::info!(total = suw_total, "cover crawl (suwayomi): starting");
-    let mut suw_saved = 0usize;
-    let mut suw_failed = 0usize;
-    for (work_id, thumb) in suw_jobs {
-        match suwayomi.cover_bytes(Some(&thumb)).await {
-            Some(bytes) => match process_cover(&bytes) {
-                Ok(webp) => match put_work_cover(main, covers, &work_id, &webp).await {
-                    Ok(()) => suw_saved += 1,
+    // OPT-9: run this pass with bounded concurrency instead of one-at-a-time, and move
+    // the CPU-bound `process_cover` (decode + WebP re-encode) off the reactor via
+    // spawn_blocking. A small fan-out overlaps the network waits without flooding the
+    // Suwayomi engine or contending hard with the DB writer during a seed. Each item
+    // yields (saved, failed) which we sum after the stream drains.
+    use futures::StreamExt as _;
+    const SUW_CRAWL_CONCURRENCY: usize = 5;
+    let (suw_saved, suw_failed) = futures::stream::iter(suw_jobs)
+        .map(|(work_id, thumb)| async move {
+            let bytes = match suwayomi.cover_bytes(Some(&thumb)).await {
+                Some(b) => b,
+                None => {
+                    tracing::warn!(work_id = %work_id, "cover crawl (suwayomi): upstream fetch failed");
+                    return (0usize, 1usize);
+                }
+            };
+            match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
+                Ok(Ok(webp)) => match put_work_cover(main, covers, &work_id, &webp).await {
+                    Ok(()) => (1, 0),
                     Err(e) => {
-                        suw_failed += 1;
                         tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): store failed");
+                        (0, 1)
                     }
                 },
-                Err(e) => {
-                    suw_failed += 1;
+                Ok(Err(e)) => {
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
+                    (0, 1)
                 }
-            },
-            None => {
-                suw_failed += 1;
-                tracing::warn!(work_id = %work_id, "cover crawl (suwayomi): upstream fetch failed");
+                Err(e) => {
+                    tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode task panicked");
+                    (0, 1)
+                }
             }
-        }
-    }
+        })
+        .buffer_unordered(SUW_CRAWL_CONCURRENCY)
+        .fold((0usize, 0usize), |(s, f), (ds, df)| async move { (s + ds, f + df) })
+        .await;
     tracing::info!(
         saved = suw_saved,
         failed = suw_failed,

@@ -227,6 +227,84 @@ pub async fn load_match_data(pool: &SqlitePool, work_id: &str) -> Result<Option<
     }))
 }
 
+/// Batch variant of [`load_match_data`]: loads the corroboration fields + normalized
+/// aliases for many works in exactly two queries (one `work` scan + one `work_alias`
+/// scan, both `IN (...)`) instead of `2·N` sequential round-trips. The dedup matcher
+/// (`resolve_ex`) scores every blocked candidate, so on a full reconcile this collapses
+/// up to ~300 round-trips per item into two. Returns a map keyed by `work_id`; ids with
+/// no `work` row are simply absent (mirrors `load_match_data` returning `None`).
+///
+/// `work_ids` is bounded by the fuzzy-block limits (a few hundred), well under SQLite's
+/// bound-parameter ceiling, so the `IN (...)` list is not chunked.
+pub async fn load_match_data_batch(
+    pool: &SqlitePool,
+    work_ids: &[String],
+) -> Result<std::collections::HashMap<String, WorkMatchData>> {
+    let mut out: std::collections::HashMap<String, WorkMatchData> =
+        std::collections::HashMap::new();
+    if work_ids.is_empty() {
+        return Ok(out);
+    }
+    // Dedup to keep the placeholder list tight (a HashSet of candidates may already be
+    // distinct, but callers aren't required to guarantee it).
+    let mut ids: Vec<&String> = work_ids.iter().collect();
+    ids.sort();
+    ids.dedup();
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        primary_title: Option<String>,
+        description: Option<String>,
+        author: Option<String>,
+        year: Option<i64>,
+        original_language: Option<String>,
+        cover_phash: Option<String>,
+    }
+    let work_sql = format!(
+        "SELECT id, primary_title, description, author, year, original_language, cover_phash \
+         FROM work WHERE id IN ({placeholders})"
+    );
+    let mut q = sqlx::query_as::<_, Row>(&work_sql);
+    for id in &ids {
+        q = q.bind(*id);
+    }
+    for row in q.fetch_all(pool).await? {
+        out.insert(
+            row.id.clone(),
+            WorkMatchData {
+                work_id: row.id,
+                primary_title: row.primary_title,
+                description: row.description,
+                author: row.author,
+                year: row.year,
+                original_language: row.original_language,
+                cover_phash: row.cover_phash,
+                aliases_norm: Vec::new(),
+            },
+        );
+    }
+
+    let alias_sql = format!(
+        "SELECT work_id, normalized_title FROM work_alias WHERE work_id IN ({placeholders})"
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(&alias_sql);
+    for id in &ids {
+        q = q.bind(*id);
+    }
+    for (work_id, normalized_title) in q.fetch_all(pool).await? {
+        // Only attach aliases to works that had a `work` row (mirror per-item semantics).
+        if let Some(md) = out.get_mut(&work_id) {
+            md.aliases_norm.push(normalized_title);
+        }
+    }
+    Ok(out)
+}
+
 /// A canonical work resolved for reader browse/read (CATALOGUE.md §6). Carries the
 /// MangaDex anchor id + cover fileName so the reader can build cover URLs and reach
 /// pages via MangaDex@Home. `mangadex_id` is `None` for a first-class non-MangaDex
@@ -1331,6 +1409,27 @@ pub async fn find_source_series(
     Ok(row)
 }
 
+/// Resolve `(id, work_id)` of a linked source_series by `(source_type, source_key)`
+/// alone — no `source_id`. A Suwayomi manga id (the `source_key`) is a global
+/// autoincrement, unique across sources, so this is unambiguous for `suwayomi`. Lets
+/// the enrol path (OPT-6) pre-check linkage BEFORE fetching the manga (which is the
+/// only way it would otherwise learn the `source_id`), so a re-enrol of an
+/// already-linked series issues no upstream call.
+pub async fn find_source_series_by_key(
+    pool: &SqlitePool,
+    source_type: &str,
+    source_key: &str,
+) -> Result<Option<(String, String)>> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, work_id FROM source_series WHERE source_type = ? AND source_key = ?",
+    )
+    .bind(source_type)
+    .bind(source_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert one mirrored chapter under a source_series (idempotent on external id).
 pub async fn upsert_chapter(
     pool: &SqlitePool,
@@ -2318,6 +2417,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec![w]);
+    }
+
+    #[tokio::test]
+    async fn batch_match_data_equals_per_item() {
+        // OPT-7: load_match_data_batch must return exactly what N per-item
+        // load_match_data calls would, so the dedup scorer is unaffected.
+        let pool = pool().await;
+        let a = upsert_work_from_mangadex(&pool, "md-uuid-1", &slime_input())
+            .await
+            .unwrap();
+        let mut second = slime_input();
+        second.primary_title = Some("A Painter Who Draws Dungeons".into());
+        second.aliases = vec![Alias {
+            raw: "A Painter Who Draws Dungeons".into(),
+            lang: Some("en".into()),
+        }];
+        second.external_ids = vec![("al".into(), "999".into())];
+        let b = upsert_work_from_mangadex(&pool, "md-uuid-2", &second)
+            .await
+            .unwrap();
+
+        // Include a bogus id to confirm it's simply absent (like None per-item).
+        let ids = vec![a.clone(), b.clone(), "w_does_not_exist".into()];
+        let batch = load_match_data_batch(&pool, &ids).await.unwrap();
+        assert_eq!(batch.len(), 2, "missing ids are absent, not errors");
+        assert!(!batch.contains_key("w_does_not_exist"));
+
+        for id in [&a, &b] {
+            let per = load_match_data(&pool, id).await.unwrap().unwrap();
+            let bat = batch.get(id).expect("present in batch");
+            // aliases_norm order isn't guaranteed by either query; compare as sets.
+            let mut per_al = per.aliases_norm.clone();
+            let mut bat_al = bat.aliases_norm.clone();
+            per_al.sort();
+            bat_al.sort();
+            assert_eq!(per_al, bat_al, "aliases match for {id}");
+            assert_eq!(per.primary_title, bat.primary_title);
+            assert_eq!(per.description, bat.description);
+            assert_eq!(per.author, bat.author);
+            assert_eq!(per.year, bat.year);
+            assert_eq!(per.original_language, bat.original_language);
+            assert_eq!(per.cover_phash, bat.cover_phash);
+        }
+
+        // Empty input is a no-op, not a malformed `IN ()`.
+        assert!(load_match_data_batch(&pool, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
