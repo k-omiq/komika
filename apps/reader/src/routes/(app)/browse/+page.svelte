@@ -1,14 +1,40 @@
+<script module lang="ts">
+	import type { FederatedResultView } from '$lib/data/source';
+
+	type BrowseCacheEntry = {
+		rows: FederatedResultView[];
+		catalogPage: number;
+		hasNext: boolean;
+		totalCount: number | null;
+		rowsAreFederated: boolean;
+		scrollY: number;
+	};
+	// Back-nav restore (B1): keep the last few browse result sets in MODULE memory —
+	// it survives a component remount (series → back) but not a full reload — so
+	// returning to Browse rehydrates instantly with scroll intact instead of
+	// re-running the whole search. Keyed by a query+filters signature; small FIFO cap
+	// so it can't grow unbounded across a long session.
+	const browseCache = new Map<string, BrowseCacheEntry>();
+	const BROWSE_CACHE_MAX = 8;
+	function putBrowseCache(sig: string, entry: BrowseCacheEntry) {
+		browseCache.delete(sig); // re-insert so it becomes most-recent
+		browseCache.set(sig, entry);
+		while (browseCache.size > BROWSE_CACHE_MAX) {
+			const oldest = browseCache.keys().next().value as string;
+			browseCache.delete(oldest);
+		}
+	}
+</script>
+
 <script lang="ts">
 	import { page } from '$app/state';
+	import { beforeNavigate } from '$app/navigation';
+	import { tick } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import { FLAG, STATUS_META, type ComicType, type Status } from '$lib/data/types';
-	import {
-		getFederatedSearch,
-		getNativeSearch,
-		type FederatedResultView,
-	} from '$lib/data/source';
+	import { getFederatedSearch, getNativeSearch } from '$lib/data/source';
 	import { auth } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 
@@ -102,6 +128,16 @@
 		};
 	}
 
+	// Signature of the currently-displayed result set, for the back-nav cache. Native
+	// results depend on query + server filters (genres/rating); federated results
+	// depend only on the query (filters are applied client-side), so its signature
+	// deliberately omits the filters — mirroring the effect's reactive-dependency
+	// split so a federated filter change neither re-fetches nor invalidates the cache.
+	let lastSig: string | null = null;
+	// Consult the cache only on the FIRST effect run of a fresh mount (a back-nav),
+	// never on later user-driven filter/query changes.
+	let didInitFromCache = false;
+
 	$effect(() => {
 		const q = query.trim();
 		const loggedIn = !!auth.user;
@@ -111,6 +147,37 @@
 		// the effect depend on it → native re-fetches on filter change; the federated
 		// branch skips these reads so it re-fetches only on query/auth change.
 		const nativeFilters = isFederated ? null : serverFilters();
+		const sig = isFederated
+			? `fed:${q}`
+			: `nat:${JSON.stringify({
+					q,
+					g: [...nativeFilters!.genres].sort(),
+					mn: nativeFilters!.minRating ?? 0,
+					mx: nativeFilters!.maxRating ?? 10,
+				})}`;
+
+		// B1 back-nav restore: on remount, if we cached this exact result set, hydrate
+		// it and skip the fetch entirely, then restore the scroll position.
+		if (!didInitFromCache) {
+			didInitFromCache = true;
+			const cached = browseCache.get(sig);
+			if (cached) {
+				rows = cached.rows;
+				catalogPage = cached.catalogPage;
+				hasNext = cached.hasNext;
+				totalCount = cached.totalCount;
+				rowsAreFederated = cached.rowsAreFederated;
+				rowsError = false;
+				searchNotice = null;
+				rowsLoading = false;
+				lastSig = sig;
+				const y = cached.scrollY;
+				// Wait for the grid to paint, then jump back to where we were.
+				tick().then(() => requestAnimationFrame(() => window.scrollTo(0, y)));
+				return;
+			}
+		}
+
 		rowsLoading = true;
 		// A fresh query/filter run always restarts paging from page 1.
 		catalogPage = 1;
@@ -129,6 +196,7 @@
 						searchNotice = null;
 						// Federated live search returns a single deduped page (no server pager).
 						hasNext = false;
+						lastSig = sig;
 					} else if (outcome.kind === 'rateLimited') {
 						// Keep prior results; show a transient message, not "0 results".
 						searchNotice =
@@ -148,6 +216,7 @@
 							outcome.kind === 'error'
 								? 'Live search had a problem — showing catalogue results.'
 								: null;
+						lastSig = sig;
 					}
 				} else {
 					const r = await getNativeSearch(q, nativeFilters!);
@@ -158,6 +227,7 @@
 					hasNext = r.hasNext;
 					totalCount = r.total;
 					searchNotice = null;
+					lastSig = sig;
 				}
 			} finally {
 				if (!cancelled) rowsLoading = false;
@@ -167,6 +237,22 @@
 			cancelled = true;
 			clearTimeout(t);
 		};
+	});
+
+	// Snapshot the current result set + scroll into the module cache whenever we
+	// navigate away (e.g. into a series), so a back-nav can restore it. Keyed by the
+	// signature of what's actually on screen. loadMore keeps the same signature, so
+	// its appended pages + updated catalogPage are captured here too.
+	beforeNavigate(() => {
+		if (lastSig == null || typeof window === 'undefined') return;
+		putBrowseCache(lastSig, {
+			rows,
+			catalogPage,
+			hasNext,
+			totalCount,
+			rowsAreFederated,
+			scrollY: window.scrollY,
+		});
 	});
 
 	function retryRows() {
