@@ -202,3 +202,72 @@ curl -sI http://localhost:8080/covers/<workId>.webp
 # covers edge cache (after CF rule)
 curl -sI "https://api.komiq.cc/covers/<file>.webp" | grep -i cf-cache-status
 ```
+
+---
+
+## PROMPT 5 — Phase 4 / Tier-3: latency + CPU micro-optimizations (optional)
+
+(Prepend the SHARED CONTEXT above.) These are lower-blast-radius wins from the optimization
+audit. Each is independent — do any subset. Keep `cargo test --bin komika-server` green; add a
+unit test where a query/logic changes. Anchor on FUNCTION NAMES (line numbers drift). They ship
+on the next `docker compose build`.
+
+ALREADY DONE (do NOT redo): chapter composite index (migration 0042), `busy_timeout` 15s,
+`spawn_blocking` on argon2/cover/dhash, opt-level=3. OPT-9 (parallelize the Suwayomi cover
+crawl in `cover.rs::crawl_uncached_covers`) is handled in PROMPT 2 and has work-in-progress in
+the tree (the `futures = "0.3"` dep is already added) — coordinate, don't duplicate.
+
+### A. Collapse the per-series lazy resolvers (OPT-8a) — MED, best latency ROI
+Every `Series` `#[ComplexObject]` field fires its own queries per item in a feed; there is NO
+DataLoader anywhere. Cheap fixes:
+- **`views`** (`graphql/mod.rs` `async fn views`, ~L263 → `views::counts_for`, `views.rs` ~L116):
+  `counts_for` runs 4 sequential queries — `view_key`, `total`, then TWO `window_sum`s
+  (`views.rs` ~L103, the 24h and 7d at ~L128–129 are separate awaits). Fold the two windows
+  into ONE query: `SELECT SUM(count), SUM(CASE WHEN hour_ts > ?24h THEN count END), SUM(CASE
+  WHEN hour_ts > ?7d THEN count END) FROM series_views WHERE view_key = ?`. Cuts 4→2 (or 4→1 if
+  you fold `view_key`). Add/adjust the `views` test.
+- **`is_marked` / `library_status` / `is_favorite`** (`graphql/mod.rs` ~L275/L294/L311): three
+  resolvers, each a separate `SELECT ... FROM user_library WHERE user_id=? AND series_id=?` on
+  the SAME row. Merge into one per-request-cached lookup — `SELECT is_favorite, status FROM
+  user_library WHERE user_id=? AND series_id=?` — reusing the existing `RequestUserCache`
+  OnceCell pattern (grep `RequestUserCache` / `current_user`). 3N→N per feed.
+
+### B. DataLoader (OPT-8b) — bigger, optional, supersedes A for feeds
+Add async-graphql `DataLoader`s keyed by series_id for `user_library` (batch all viewer library
+rows in one `WHERE series_id IN (…)`) and for view-counts. This is the structural fix for the
+per-item N+1 on feeds. More work (register loaders on the schema, refactor the resolvers); do A
+first unless you're committing to this.
+
+### C. Ingest micro-wins (buffer_unordered; token bucket still caps 5/s)
+- **`enrich_works`** (`graphql/mod.rs` `pub(crate) async fn enrich_works`, ~L5867): metadata is
+  batched 100/req, but then `for m in &mangas { … st.mangadex.list_covers(&id, 100).await … }`
+  (~L5871/L5877) fetches `/cover` ONE work at a time. `buffer_unordered` those per-work fetches
+  — the shared `TokenBucket` still enforces 5/s; concurrency just hides RTT.
+- **`sync_catalogue` cover-pHash** (`mangadex.rs`, the `for m in &mangas` at ~L895, cover fetch
+  at ~L902): each work's cover is downloaded + `dhash`ed serially INSIDE the upsert loop. Only
+  runs when `cover_phash` is enabled (currently OFF). If enabling: pre-fetch the page's covers
+  with `buffer_unordered`, decode via `spawn_blocking`, then upsert.
+- **Home feed cold path** (`graphql/mod.rs` discovery, ~L1674/L1683): the two
+  `fetch_source(Popular/Latest)` calls are sequential — wrap in `tokio::join!`. LOW value: this
+  branch only runs pre-cache (fresh install); the catalogue is now populated so the feed serves
+  from `series_cache`. Skip unless trivial.
+
+### D. Dedup CPU — precompute candidate shingles once — LOW/MED
+`dedup.rs::score_candidate` (~L248) calls `catalog::similarity::description_similarity`
+(`similarity.rs` ~L19) and `title_similarity` (~L68) for EVERY candidate. `description_similarity`
+re-`shingles`es the candidate text each call (`shingles`, ~L24), and `title_similarity` builds
+char-3gram HashSets per (title, alias) pair — with MangaDex works carrying 20+ localized aliases
+× up to ~150 candidates this is real per-item CPU. Precompute the CANDIDATE's shingles / n-gram
+sets once before the candidate loop and pass them in (the exact-match short-circuits already
+handle the cheap path). Pure refactor — add a test that scores are unchanged.
+
+### E. Scan tick bounded concurrency — LOW (rate-limit caveat)
+`scanner.rs::tick` (~L333) walks the library serially (`for m in library`, ~L348); each
+`scan_series` (~L395) does a live `st.suwayomi.chapters()` fetch. On a cold-start/large-library
+tick everything is due → O(library) serial upstream fetches. Use a SMALL
+`buffer_unordered(3–4)` over the DUE series only. CAVEAT: Suwayomi proxies via FlareSolverr,
+which stalls (hence the 30s timeout) — keep concurrency modest so you don't hammer it.
+
+Priority order: A (feed latency) → C `enrich_works` (backfill speed) → D (reconcile CPU) → E →
+B (only if committing to DataLoaders). Reference: `docs/plans/optimisation-and-catalogue-plan.md`
+Tier 2/3/4.
