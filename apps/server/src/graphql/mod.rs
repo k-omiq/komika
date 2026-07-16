@@ -1640,6 +1640,46 @@ pub struct MergeCandidate {
     pub created_at: String,
 }
 
+/// A work whose cover the crawl couldn't process (admin "Bugs" panel). `reason` is
+/// a machine code (`too_large` / `unsupported` / `empty` / `encode` / `store`);
+/// `coverUrl` is the current best-effort fallback (may be empty for a Suwayomi-only
+/// work with no cached cover) so the admin can see what's there before replacing it.
+#[derive(SimpleObject)]
+pub struct CoverIssue {
+    pub work_id: ID,
+    pub title: Option<String>,
+    pub cover_url: String,
+    pub reason: String,
+    pub detail: Option<String>,
+    pub attempts: i32,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// A page of cover issues (mirrors the other admin `*Page` envelopes).
+#[derive(SimpleObject)]
+pub struct CoverIssuePage {
+    pub items: Vec<CoverIssue>,
+    pub page: i32,
+    pub has_next_page: bool,
+    pub total: Option<i32>,
+}
+
+/// Row shape for the cover-issue listing join (DB columns; `cover_url` is derived).
+#[derive(sqlx::FromRow)]
+struct CoverIssueRow {
+    work_id: String,
+    title: Option<String>,
+    reason: String,
+    detail: Option<String>,
+    attempts: i64,
+    first_seen: String,
+    last_seen: String,
+    cover_cached_version: Option<i64>,
+    mangadex_id: Option<String>,
+    cover_file_name: Option<String>,
+}
+
 // ---- Query -----------------------------------------------------------------
 
 pub struct QueryRoot;
@@ -2685,6 +2725,74 @@ impl QueryRoot {
         .await
         .map_err(gql_err)?;
         Ok(rows)
+    }
+
+    /// Admin "Bugs" panel: works whose cover the crawl could not process, most
+    /// recent first, paginated. Each carries the failure reason + a best-effort
+    /// current cover URL so the admin can retry or upload a replacement.
+    async fn cover_issues(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<CoverIssuePage> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let page = page.max(1);
+        const PER: i64 = 50;
+        let offset = (page as i64 - 1) * PER;
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
+            .fetch_one(&st.pool)
+            .await
+            .map_err(gql_err)?;
+
+        // Join the work for its title + the MangaDex anchor needed to build the
+        // fallback cover URL (one extra fetch per page is fine for an admin panel).
+        let rows = sqlx::query_as::<_, CoverIssueRow>(
+            "SELECT i.work_id, w.primary_title AS title, i.reason, i.detail, \
+                    i.attempts, i.first_seen, i.last_seen, w.cover_cached_version, \
+                    (SELECT ss.source_key FROM source_series ss \
+                     WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                     ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id, \
+                    w.cover_file_name \
+             FROM work_cover_issue i \
+             JOIN work w ON w.id = i.work_id \
+             ORDER BY i.last_seen DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(PER + 1) // fetch one extra to compute has_next_page
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+
+        let has_next_page = rows.len() as i64 > PER;
+        let items = rows
+            .into_iter()
+            .take(PER as usize)
+            .map(|r| CoverIssue {
+                cover_url: crate::cover::work_cover_url(
+                    &r.work_id,
+                    r.cover_cached_version,
+                    r.mangadex_id.as_deref(),
+                    r.cover_file_name.as_deref(),
+                ),
+                work_id: ID(r.work_id),
+                title: r.title,
+                reason: r.reason,
+                detail: r.detail,
+                attempts: r.attempts as i32,
+                first_seen: r.first_seen,
+                last_seen: r.last_seen,
+            })
+            .collect();
+
+        Ok(CoverIssuePage {
+            items,
+            page,
+            has_next_page,
+            total: Some(total as i32),
+        })
     }
 
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
@@ -4912,6 +5020,26 @@ impl MutationRoot {
             }
         }
         Ok(scanned)
+    }
+
+    /// Admin "Bugs" panel: re-attempt cover processing for ONE work (after fixing an
+    /// upstream image, or to re-check now that the size cap / codecs were widened).
+    /// Fetches the source cover, re-encodes, stores it, and clears the recorded
+    /// issue on success. Returns true if a cover was stored; false if the source
+    /// couldn't be fetched (transient — the issue is left in place). A deterministic
+    /// re-failure surfaces as an error (and refreshes the recorded reason).
+    async fn retry_cover(&self, ctx: &Context<'_>, work_id: ID) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        crate::cover::retry_one_cover(
+            &st.pool,
+            &st.cover_pool,
+            &st.mangadex,
+            &st.suwayomi,
+            &work_id.0,
+        )
+        .await
+        .map_err(gql_err)
     }
 
     /// Admin series-detail editor: soft-hide (reversible) or rename one chapter of a

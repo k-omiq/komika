@@ -95,6 +95,26 @@ pub(crate) fn encode_lossless(img: &RgbaImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode an RGBA buffer as LOSSY WebP (VP8) at `quality` (0–100) into a byte
+/// vector, via libwebp (bundled by `libwebp-sys2`, no system dependency). Used by
+/// the cover path to hit a tight byte budget while keeping detailed art sharp —
+/// the pure-Rust `image-webp` encoder is lossless-only, so it can't trade quality
+/// for size. libwebp premultiplies alpha internally; covers are opaque so this is
+/// moot, but we pass RGBA straight through for a general encoder.
+pub(crate) fn encode_webp_lossy(img: &RgbaImage, quality: f32) -> Result<Vec<u8>> {
+    if img.width() == 0 || img.height() == 0 {
+        bail!("cannot encode a zero-dimension image");
+    }
+    let encoder = webp::Encoder::from_rgba(img.as_raw(), img.width(), img.height());
+    // `encode` returns a WebPMemory (Deref<[u8]>); it allocates via libwebp and
+    // has no fallible path we can recover from here, so copy the bytes out.
+    let mem = encoder.encode(quality.clamp(1.0, 100.0));
+    if mem.is_empty() {
+        bail!("libwebp produced empty output");
+    }
+    Ok(mem.to_vec())
+}
+
 /// The public path stored on the user row for a saved avatar, cache-busted with
 /// `?v=<version>` so the browser refetches after a change. The `/avatars/{file}`
 /// route reads the bytes from the `user_avatars` table keyed by `<user_id>`.

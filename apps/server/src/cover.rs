@@ -20,25 +20,36 @@ use chrono::Utc;
 use image::{imageops, GenericImageView};
 use sqlx::SqlitePool;
 
-use crate::avatar::{decode_limited, encode_lossless};
+use crate::avatar::{decode_limited, encode_webp_lossy};
 use crate::mangadex::MangaDexClient;
 
 /// Reject raw source images larger than this before decoding (decode-bomb guard).
-pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+/// Raised from 8 MB: some source thumbnails (a handful of Suwayomi scanlator
+/// covers) ship 8–20 MB originals that decode fine and downscale to a tiny WebP —
+/// the old cap rejected them outright. The real bomb guard is `decode_limited`'s
+/// pixel-dimension + allocation ceiling, which still applies after this gate.
+pub const MAX_SOURCE_BYTES: usize = 24 * 1024 * 1024;
 
-/// Per-cover size budget for the stored WebP. Larger than the avatar budget
-/// because covers render at card AND detail-hero sizes and portrait art carries
-/// more detail — but still small enough to keep the replicated DB modest.
-pub const MAX_COVER_BYTES: usize = 200 * 1024;
+/// Per-cover size budget for the stored WebP — the "100–150 KB" target. Lossy
+/// encoding (below) keeps detailed art sharp at 512px while landing under this,
+/// so the DB blob store + its Litestream replication stay cheap. Down from the old
+/// 200 KB lossless budget.
+pub const MAX_COVER_BYTES: usize = 150 * 1024;
 
-/// Candidate longest-edge lengths (px), largest first. The first that encodes
-/// within [`MAX_COVER_BYTES`] wins; if none do, the smallest is used. Aspect
-/// ratio is preserved (covers are portrait), unlike the square avatar path.
-const CANDIDATE_EDGES: [u32; 5] = [512, 448, 384, 320, 256];
+/// Candidate longest-edge lengths (px), largest first — the portrait-preserving
+/// dimension bound. With LOSSY encoding the quality ladder does most of the size
+/// control, so the top edge (512) almost always wins; the smaller edges are a
+/// fallback for pathological sources that won't fit even at low quality.
+const CANDIDATE_EDGES: [u32; 3] = [512, 448, 384];
 
-/// Decode an upstream cover, downscale (aspect-preserving) to a bounded longest
-/// edge, and re-encode as lossless WebP within [`MAX_COVER_BYTES`]. Never
-/// upscales a smaller source.
+/// Lossy WebP quality ladder (libwebp scale, 0–100), highest first. The first
+/// (edge, quality) pair encoding within [`MAX_COVER_BYTES`] wins, so sharpness is
+/// preserved by trying high quality before stepping down.
+const COVER_QUALITY_LADDER: [f32; 5] = [82.0, 74.0, 66.0, 58.0, 50.0];
+
+/// Decode an upstream cover, downscale (aspect-preserving, never upscaling) to a
+/// bounded longest edge, and re-encode as LOSSY WebP within [`MAX_COVER_BYTES`].
+/// Tries each edge at descending quality and returns the first result under budget.
 pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.is_empty() {
         bail!("empty cover source");
@@ -51,21 +62,33 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     let img = decode_limited(bytes)?;
     let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        bail!("cover has a zero dimension");
+    }
     let long = w.max(h).max(1);
+    let rgba = img.to_rgba8();
 
     let mut smallest: Option<Vec<u8>> = None;
     for edge in CANDIDATE_EDGES {
         // Downscale only — a source already smaller than the candidate keeps its
         // size (scale clamped to 1.0) instead of being blurrily enlarged.
         let scale = (edge as f32 / long as f32).min(1.0);
-        let tw = ((w as f32 * scale).round() as u32).max(1);
-        let th = ((h as f32 * scale).round() as u32).max(1);
-        let resized = imageops::resize(&img, tw, th, imageops::FilterType::Lanczos3);
-        let encoded = encode_lossless(&resized)?;
-        if encoded.len() <= MAX_COVER_BYTES {
-            return Ok(encoded);
+        let resized = if scale >= 1.0 {
+            rgba.clone()
+        } else {
+            let tw = ((w as f32 * scale).round() as u32).max(1);
+            let th = ((h as f32 * scale).round() as u32).max(1);
+            imageops::resize(&rgba, tw, th, imageops::FilterType::Lanczos3)
+        };
+        for &quality in &COVER_QUALITY_LADDER {
+            let encoded = encode_webp_lossy(&resized, quality)?;
+            if encoded.len() <= MAX_COVER_BYTES {
+                return Ok(encoded);
+            }
+            // Keep the smallest produced (smallest edge, lowest quality) as the
+            // last-resort fallback if nothing fits the budget.
+            smallest = Some(encoded);
         }
-        smallest = Some(encoded); // keep the last (smallest edge) as the fallback
     }
     smallest.ok_or_else(|| anyhow!("no candidate cover size produced"))
 }
@@ -221,12 +244,136 @@ pub async fn pending_cover_count(pool: &SqlitePool) -> Result<i64> {
     Ok(n)
 }
 
+/// Map a `process_cover` / store error to a stable machine reason code for
+/// `work_cover_issue.reason` (surfaced in the admin panel).
+pub fn classify_cover_error(err: &anyhow::Error) -> &'static str {
+    let s = err.to_string().to_ascii_lowercase();
+    if s.contains("source too large") {
+        "too_large"
+    } else if s.contains("unsupported") || s.contains("corrupt") || s.contains("zero dimension") {
+        "unsupported"
+    } else if s.contains("empty") {
+        "empty"
+    } else {
+        "encode"
+    }
+}
+
+/// Record (or refresh) a cover-processing failure so the crawl stops re-attempting
+/// a deterministically-unprocessable work every tick. Best-effort — a failure to
+/// write the marker only means we retry next tick, never breaks the crawl.
+pub async fn record_cover_issue(pool: &SqlitePool, work_id: &str, reason: &str, detail: &str) {
+    let now = Utc::now().to_rfc3339();
+    // Truncate an over-long error so a pathological message can't bloat the row.
+    let detail: String = detail.chars().take(500).collect();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO work_cover_issue (work_id, reason, detail, attempts, first_seen, last_seen) \
+         VALUES (?, ?, ?, 1, ?, ?) \
+         ON CONFLICT(work_id) DO UPDATE SET \
+           reason = excluded.reason, detail = excluded.detail, \
+           attempts = work_cover_issue.attempts + 1, last_seen = excluded.last_seen",
+    )
+    .bind(work_id)
+    .bind(reason)
+    .bind(&detail)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(work_id, error = %e, "cover issue: failed to record");
+    }
+}
+
+/// Clear a work's recorded cover issue (a later attempt — auto or manual — succeeded,
+/// so it should re-enter the normal cached/uncached flow). Best-effort.
+pub async fn clear_cover_issue(pool: &SqlitePool, work_id: &str) {
+    if let Err(e) = sqlx::query("DELETE FROM work_cover_issue WHERE work_id = ?")
+        .bind(work_id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(work_id, error = %e, "cover issue: failed to clear");
+    }
+}
+
+/// Attempt to materialize ONE work's cover on demand (admin "retry" action). Tries
+/// the MangaDex anchor first, then the Suwayomi thumbnail. Clears the issue on
+/// success; re-records it (refreshed reason) on a deterministic failure; leaves it
+/// untouched on a transient upstream-fetch failure. Returns Ok(true) when a cover
+/// was stored, Ok(false) when neither source yielded processable bytes.
+pub async fn retry_one_cover(
+    main: &SqlitePool,
+    covers: &SqlitePool,
+    mangadex: &MangaDexClient,
+    suwayomi: &crate::suwayomi::SuwayomiClient,
+    work_id: &str,
+) -> Result<bool> {
+    // MangaDex anchor (oldest source_series) + cover file name, mirroring the crawl.
+    let md = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT (SELECT ss.source_key FROM source_series ss \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1), \
+                w.cover_file_name \
+         FROM work w WHERE w.id = ?",
+    )
+    .bind(work_id)
+    .fetch_optional(main)
+    .await?;
+
+    // Collect candidate source byte-fetches in priority order.
+    let mut source_bytes: Option<Vec<u8>> = None;
+    if let Some((Some(mangadex_id), Some(file_name))) = &md {
+        if !mangadex_id.is_empty() {
+            source_bytes = mangadex.cover_thumb_bytes(mangadex_id, file_name).await;
+        }
+    }
+    if source_bytes.is_none() {
+        // Fall back to the Suwayomi thumbnail anchor.
+        let thumb = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT s.thumbnail_url FROM source_series ss \
+             JOIN suwayomi_series s ON CAST(s.id AS TEXT) = ss.source_key \
+             WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' \
+             ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
+        )
+        .bind(work_id)
+        .fetch_optional(main)
+        .await?
+        .flatten();
+        if let Some(t) = thumb.filter(|t| !t.is_empty()) {
+            source_bytes = suwayomi.cover_bytes(Some(&t)).await;
+        }
+    }
+
+    let Some(bytes) = source_bytes else {
+        // Transient — couldn't fetch a source. Leave any existing issue as-is.
+        return Ok(false);
+    };
+
+    let work_id_owned = work_id.to_string();
+    match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
+        Ok(Ok(webp)) => {
+            put_work_cover(main, covers, work_id, &webp).await?;
+            clear_cover_issue(main, work_id).await;
+            Ok(true)
+        }
+        Ok(Err(e)) => {
+            record_cover_issue(main, work_id, classify_cover_error(&e), &e.to_string()).await;
+            Err(anyhow!("cover processing failed: {e}"))
+        }
+        Err(e) => {
+            let _ = work_id_owned;
+            Err(anyhow!("cover processing task failed: {e}"))
+        }
+    }
+}
+
 /// Fetch + store covers for EVERY canonical work that still lacks one (bounded by
 /// the MangaDex rate limiter inside `cover_thumb_bytes`, so this is a polite,
 /// slow background crawl). Idempotent and resumable: it only ever selects works
-/// with `cover_cached_version IS NULL`, so a re-run drains whatever remains (e.g.
-/// works whose upstream fetch failed last time). Best-effort per work — one
-/// failure never aborts the crawl.
+/// with `cover_cached_version IS NULL` (and no recorded `work_cover_issue`), so a
+/// re-run drains whatever remains (e.g. works whose upstream fetch failed last
+/// time). Best-effort per work — one failure never aborts the crawl.
 pub async fn crawl_uncached_covers(
     main: &SqlitePool,
     covers: &SqlitePool,
@@ -244,7 +391,8 @@ pub async fn crawl_uncached_covers(
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id, \
                 w.cover_file_name \
          FROM work w \
-         WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL";
+         WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
+           AND w.id NOT IN (SELECT work_id FROM work_cover_issue)";
     let loaded = match limit {
         Some(n) => {
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&format!(
@@ -291,17 +439,27 @@ pub async fn crawl_uncached_covers(
         {
             Some(bytes) => match process_cover(&bytes) {
                 Ok(webp) => match put_work_cover(main, covers, &job.work_id, &webp).await {
-                    Ok(()) => saved += 1,
+                    Ok(()) => {
+                        saved += 1;
+                        clear_cover_issue(main, &job.work_id).await;
+                    }
                     Err(e) => {
                         failed += 1;
                         tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: store failed");
+                        record_cover_issue(main, &job.work_id, "store", &e.to_string()).await;
                     }
                 },
+                // Deterministic decode/encode/size failure — record it so the crawl
+                // stops re-attempting this work every tick (it would fail identically).
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
+                    record_cover_issue(main, &job.work_id, classify_cover_error(&e), &e.to_string())
+                        .await;
                 }
             },
+            // Upstream fetch failure is TRANSIENT (rate limit / network) — do NOT
+            // record an issue, so the next tick retries it.
             None => {
                 failed += 1;
                 tracing::warn!(work_id = %job.work_id, "cover crawl: upstream fetch failed");
@@ -323,6 +481,7 @@ pub async fn crawl_uncached_covers(
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
+           AND w.id NOT IN (SELECT work_id FROM work_cover_issue) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                        AND ss.source_type = 'suwayomi')";
     let suw_loaded = match limit {
@@ -370,17 +529,25 @@ pub async fn crawl_uncached_covers(
             };
             match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
                 Ok(Ok(webp)) => match put_work_cover(main, covers, &work_id, &webp).await {
-                    Ok(()) => (1, 0),
+                    Ok(()) => {
+                        clear_cover_issue(main, &work_id).await;
+                        (1, 0)
+                    }
                     Err(e) => {
                         tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): store failed");
+                        record_cover_issue(main, &work_id, "store", &e.to_string()).await;
                         (0, 1)
                     }
                 },
+                // Deterministic — record so we stop re-attempting an unprocessable source.
                 Ok(Err(e)) => {
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
+                    record_cover_issue(main, &work_id, classify_cover_error(&e), &e.to_string()).await;
                     (0, 1)
                 }
                 Err(e) => {
+                    // A spawn_blocking JoinError (panic) is not necessarily deterministic;
+                    // don't permanently skip on it — let a later tick retry.
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode task panicked");
                     (0, 1)
                 }
@@ -560,6 +727,100 @@ mod tests {
     fn rejects_empty_and_non_image() {
         assert!(process_cover(&[]).is_err());
         assert!(process_cover(b"not an image").is_err());
+    }
+
+    #[test]
+    fn lossy_cover_is_sharp_and_well_under_budget() {
+        // A realistic portrait cover already within the 512 longest-edge cap (360x512),
+        // smooth gradient — what real art resembles, vs. adversarial pure noise. Lossy
+        // must keep its FULL native dimensions (not shrink) AND land under the 150 KB
+        // budget, decoding back to a valid image. (Pure noise legitimately shrinks
+        // instead — covered by preserves_aspect_ratio_within_budget.)
+        let mut img = RgbImage::new(360, 512);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            // Smooth full-range gradient (no wrap discontinuity) — compresses well
+            // with lossy, so it stays at native size under budget.
+            let r = (x * 255 / 359) as u8;
+            let g = (y * 255 / 511) as u8;
+            let b = ((x + y) * 255 / (359 + 511)) as u8;
+            *px = image::Rgb([r, g, b]);
+        }
+        let mut src = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut src), image::ImageFormat::Png)
+            .unwrap();
+        let webp = process_cover(&src).expect("processes");
+        assert!(
+            webp.len() <= MAX_COVER_BYTES,
+            "lossy cover {} bytes over budget {}",
+            webp.len(),
+            MAX_COVER_BYTES
+        );
+        let (w, h) = image::load_from_memory(&webp).unwrap().dimensions();
+        assert_eq!((w, h), (360, 512), "kept native dimensions via lossy, not shrunk");
+    }
+
+    #[test]
+    fn gif_source_decodes_and_processes() {
+        // A GIF source (previously "unsupported") must now decode + process to WebP.
+        let img = RgbImage::from_pixel(300, 420, image::Rgb([180, 40, 90]));
+        let mut gif = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut gif), image::ImageFormat::Gif)
+            .expect("encode gif");
+        let webp = process_cover(&gif).expect("gif cover processes");
+        image::load_from_memory(&webp).expect("valid webp from gif source");
+    }
+
+    #[test]
+    fn classify_cover_error_maps_reasons() {
+        assert_eq!(
+            classify_cover_error(&anyhow!("cover source too large (max 24 MB)")),
+            "too_large"
+        );
+        assert_eq!(
+            classify_cover_error(&anyhow!("image too large or unsupported")),
+            "unsupported"
+        );
+        assert_eq!(classify_cover_error(&anyhow!("empty cover source")), "empty");
+        assert_eq!(classify_cover_error(&anyhow!("libwebp exploded")), "encode");
+    }
+
+    #[tokio::test]
+    async fn cover_issue_record_increments_then_clears() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work (id, created_at, updated_at) \
+             VALUES ('w_iss', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+
+        record_cover_issue(&main, "w_iss", "unsupported", "boom").await;
+        record_cover_issue(&main, "w_iss", "too_large", "again").await;
+        let (reason, attempts): (String, i64) =
+            sqlx::query_as("SELECT reason, attempts FROM work_cover_issue WHERE work_id = ?")
+                .bind("w_iss")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 2, "second record increments attempts");
+        assert_eq!(reason, "too_large", "reason refreshed to the latest");
+
+        clear_cover_issue(&main, "w_iss").await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue WHERE work_id = ?")
+            .bind("w_iss")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "clear removes the issue row");
     }
 
     #[test]

@@ -329,6 +329,114 @@ async fn upload_avatar(
     Json(serde_json::json!({ "avatarUrl": url })).into_response()
 }
 
+/// `POST /admin/cover/{work_id}` — ADMIN multipart cover upload. Decodes the image,
+/// re-encodes it as a budgeted lossy WebP (`cover::process_cover`), stores it in
+/// `work_cover_blob`, flips `work.cover_cached_version`, and clears any recorded
+/// `work_cover_issue`. The manual-recovery path for covers the crawl can't process.
+/// Returns `{ "coverUrl": "/covers/<work_id>.webp?v=<version>" }`.
+async fn upload_cover(
+    State(app): State<Arc<graphql::AppState>>,
+    State(limiter): State<Arc<RateLimiter>>,
+    UrlPath(work_id): UrlPath<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    let Some(tok) = bearer(&headers) else {
+        return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    let user = match auth::user_for_token(&app.pool, &tok).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
+        Err(e) => {
+            tracing::warn!(error = %e, "cover upload: token lookup failed");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    if user.is_admin == 0 {
+        return avatar_error(StatusCode::FORBIDDEN, "Admin only");
+    }
+    if limiter.check(&format!("upload:{}", user.id)).is_err() {
+        return avatar_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many uploads — please slow down",
+        );
+    }
+    // Guard against an unknown work id (the FK would also reject, but a clear 404 is
+    // friendlier and avoids processing an image we can't attach).
+    match sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
+        .bind(&work_id)
+        .fetch_optional(&app.pool)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return avatar_error(StatusCode::NOT_FOUND, "No such work"),
+        Err(e) => {
+            tracing::warn!(error = %e, "cover upload: work lookup failed");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    }
+
+    let mut data: Option<Vec<u8>> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let is_file = field.name() == Some("cover") || field.file_name().is_some();
+                if is_file {
+                    match field.bytes().await {
+                        Ok(b) => {
+                            data = Some(b.to_vec());
+                            break;
+                        }
+                        Err(_) => {
+                            return avatar_error(
+                                StatusCode::BAD_REQUEST,
+                                "Upload too large or could not be read",
+                            )
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return avatar_error(StatusCode::BAD_REQUEST, "Malformed upload"),
+        }
+    }
+    let Some(bytes) = data else {
+        return avatar_error(StatusCode::BAD_REQUEST, "No image file provided");
+    };
+
+    let webp = match tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "cover processing task panicked");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not process image");
+        }
+    };
+
+    if let Err(e) = cover::put_work_cover(&app.pool, &app.cover_pool, &work_id, &webp).await {
+        tracing::error!(error = %e, work_id = %work_id, "cover upload: store failed");
+        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save cover");
+    }
+    cover::clear_cover_issue(&app.pool, &work_id).await;
+
+    // Report the freshly-versioned URL so the admin UI can show the new cover
+    // immediately (cache-busted by the stored version).
+    let version = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT cover_cached_version FROM work WHERE id = ?",
+    )
+    .bind(&work_id)
+    .fetch_optional(&app.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    let url = match version {
+        Some(v) => cover::cover_path(&work_id, v),
+        None => format!("/covers/{work_id}.webp"),
+    };
+    Json(serde_json::json!({ "coverUrl": url })).into_response()
+}
+
 /// `GET /avatars/{file}` — serve a stored avatar from `user_avatars`. Immutable +
 /// long-cache; the stored `avatar_url` carries a `?v=<ts>` so a new upload busts
 /// the cache. `{file}` is `<user_id>.webp`; the id is looked up as a bind param
@@ -930,6 +1038,14 @@ async fn main() -> anyhow::Result<()> {
         // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
         // (admin `materializeCatalogueCovers`).
         .route("/covers/{file}", get(serve_cover))
+        // Admin: replace ONE work's cover from an uploaded image (the "Bugs" panel's
+        // manual-upload action for covers the crawl can't process). Same multipart
+        // model as avatars; body limit raised above the raw-image cap.
+        .route(
+            "/admin/cover/{work_id}",
+            post(upload_cover)
+                .layer(DefaultBodyLimit::max(cover::MAX_SOURCE_BYTES + 1024 * 1024)),
+        )
         // Public proxy for Suwayomi-source cover thumbnails + chapter pages. Suwayomi
         // is loopback-only, so its image endpoints are unreachable from the browser;
         // these URLs point HERE (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and we fetch

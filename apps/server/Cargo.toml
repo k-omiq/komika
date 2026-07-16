@@ -26,7 +26,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # (apps/server/src/avatar.rs): decode JPEG/PNG/WebP uploads and re-encode avatars
 # as lossless WebP (pure-Rust — no libwebp/C dependency). Only the codecs we use,
 # to keep the dependency surface + binary small.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Lossy WebP ENCODE for covers (image-webp is lossless-only). The `webp` crate wraps
+# libwebp, which libwebp-sys2 builds from bundled C sources via cc — no system libwebp
+# needed. Covers use this to hit the ~150 KB budget while staying sharp at 512px;
+# avatars/comment images stay on the pure-Rust lossless path.
+webp = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
