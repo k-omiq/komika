@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	CoverIssue,
 	AggregatedChapter,
 	BulkAddResult,
 	CanonicalUpdate,
@@ -350,6 +351,37 @@ export class GraphQLBackend implements Backend {
 			suwayomiMangaId,
 		});
 		return d.addSourceSeries;
+	}
+
+	// --- admin cover issues / "Bugs" panel ---
+	async coverIssues(page = 1): Promise<Paginated<CoverIssue>> {
+		const d = await this.gql<{ coverIssues: Paginated<CoverIssue> }>(ops.COVER_ISSUES, { page });
+		return d.coverIssues;
+	}
+
+	async retryCover(workId: Id): Promise<boolean> {
+		const d = await this.gql<{ retryCover: boolean }>(ops.RETRY_COVER, { workId });
+		return d.retryCover;
+	}
+
+	async uploadCover(workId: Id, file: Blob): Promise<string> {
+		const doFetch = this.config.fetch ?? fetch;
+		const base = this.config.endpoint.replace(/\/graphql\/?$/, '');
+		const url = `${base}/admin/cover/${encodeURIComponent(workId)}`;
+		const form = new FormData();
+		form.append('cover', file);
+		const res = await doFetch(url, {
+			method: 'POST',
+			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			body: form,
+		});
+		const json = (await res.json().catch(() => null)) as {
+			coverUrl?: string;
+			message?: string;
+		} | null;
+		if (!res.ok) throw new Error(json?.message ?? `Upload failed (${res.status})`);
+		if (!json?.coverUrl) throw new Error('Upload returned no cover URL');
+		return json.coverUrl;
 	}
 
 	async mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {

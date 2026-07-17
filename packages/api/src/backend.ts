@@ -1,5 +1,6 @@
 import type {
 	AdminUser,
+	CoverIssue,
 	AggregatedChapter,
 	BulkAddResult,
 	CanonicalUpdate,
@@ -265,6 +266,18 @@ export interface Backend {
 	 * survives as canonical. Irreversible. Optional: only the unified Komika API
 	 * implements it. */
 	mergeWorks?(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult>;
+
+	// --- admin cover issues / "Bugs" panel (requires an admin session) ---
+	/** Paginated works whose cover the crawl couldn't process, most recent first.
+	 * Optional: only the unified Komika API implements it. */
+	coverIssues?(page?: number): Promise<Paginated<CoverIssue>>;
+	/** Re-attempt cover processing for one work (after fixing an upstream image, or
+	 * to re-check now the codecs/size cap widened). Returns true if a cover was
+	 * stored. Optional: only the unified Komika API implements it. */
+	retryCover?(workId: Id): Promise<boolean>;
+	/** Replace one work's cover from an uploaded image (multipart POST /admin/cover).
+	 * Returns the new cover URL. Optional: only the unified Komika API implements it. */
+	uploadCover?(workId: Id, file: Blob): Promise<string>;
 
 	// --- admin sources & extensions (requires an admin session; EXT-1/EXT-2) ---
 	/** Every Keiyoushi/Mihon extension known to the Suwayomi engine, installed or

@@ -33,6 +33,7 @@
 		{ href: '/review', label: 'Review' },
 		{ href: '/updates', label: 'Updates' },
 		{ href: '/users', label: 'Users' },
+		{ href: '/bugs', label: 'Bugs' },
 	];
 </script>
 

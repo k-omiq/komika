@@ -604,6 +604,32 @@ export const MERGE_QUEUE = /* GraphQL */ `
 	}
 `;
 
+export const COVER_ISSUES = /* GraphQL */ `
+	query CoverIssues($page: Int) {
+		coverIssues(page: $page) {
+			items {
+				workId
+				title
+				coverUrl
+				reason
+				detail
+				attempts
+				firstSeen
+				lastSeen
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
+export const RETRY_COVER = /* GraphQL */ `
+	mutation RetryCover($workId: ID!) {
+		retryCover(workId: $workId)
+	}
+`;
+
 export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
 		resolveMergeCandidate(id: $id, accept: $accept)

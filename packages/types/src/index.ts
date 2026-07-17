@@ -86,6 +86,24 @@ export interface MergeCandidate {
 }
 
 /**
+ * A work whose cover the crawl could not process (admin "Bugs" panel). The crawl
+ * records these so it stops re-attempting deterministically-unprocessable sources.
+ */
+export interface CoverIssue {
+	workId: Id;
+	title: string | null;
+	/** Best-effort current cover URL (may be empty for a Suwayomi-only work). */
+	coverUrl: string;
+	/** Machine code: `too_large` | `unsupported` | `empty` | `encode` | `store`. */
+	reason: string;
+	/** Human-readable error from the most recent attempt. */
+	detail: string | null;
+	attempts: number;
+	firstSeen: string;
+	lastSeen: string;
+}
+
+/**
  * The result of the Tier-2 `addSourceSeries` dedup add flow: what the matcher
  * decided for the added source series and which canonical work it resolved to.
  */

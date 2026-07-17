@@ -4,6 +4,7 @@
  */
 import type {
 	AdminUser,
+	CoverIssue,
 	BulkAddResult,
 	CanonicalUpdate,
 	ExtensionInfo,
@@ -87,6 +88,24 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
 	if (!backend.resolveMergeCandidate)
 		throw new Error('Dedup review is unavailable on this backend.');
 	return backend.resolveMergeCandidate(id, accept);
+}
+
+/** Cover "Bugs" panel: works whose cover the crawl couldn't process, paginated. */
+export async function loadCoverIssues(page = 1): Promise<Paginated<CoverIssue>> {
+	if (!backend.coverIssues) throw new Error('Cover issues are unavailable on this backend.');
+	return backend.coverIssues(page);
+}
+
+/** Re-attempt cover processing for one work. Returns true if a cover was stored. */
+export async function retryCover(workId: string): Promise<boolean> {
+	if (!backend.retryCover) throw new Error('Cover retry is unavailable on this backend.');
+	return backend.retryCover(workId);
+}
+
+/** Replace one work's cover from an uploaded image. Returns the new cover URL. */
+export async function uploadCover(workId: string, file: Blob): Promise<string> {
+	if (!backend.uploadCover) throw new Error('Cover upload is unavailable on this backend.');
+	return backend.uploadCover(workId, file);
 }
 
 /**
