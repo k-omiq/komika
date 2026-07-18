@@ -350,7 +350,8 @@ pub async fn retry_one_cover(
         return Ok(false);
     };
 
-    let work_id_owned = work_id.to_string();
+    // `bytes` is moved into the blocking task; `work_id` (a &str) stays borrowable
+    // across the await for the DB writes below.
     match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
         Ok(Ok(webp)) => {
             put_work_cover(main, covers, work_id, &webp).await?;
@@ -361,10 +362,9 @@ pub async fn retry_one_cover(
             record_cover_issue(main, work_id, classify_cover_error(&e), &e.to_string()).await;
             Err(anyhow!("cover processing failed: {e}"))
         }
-        Err(e) => {
-            let _ = work_id_owned;
-            Err(anyhow!("cover processing task failed: {e}"))
-        }
+        // A spawn_blocking JoinError (panic) is not necessarily deterministic — surface
+        // it as an error but do NOT record an issue, so a later attempt can retry.
+        Err(e) => Err(anyhow!("cover processing task failed: {e}")),
     }
 }
 

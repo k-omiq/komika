@@ -147,9 +147,17 @@
 		// the effect depend on it → native re-fetches on filter change; the federated
 		// branch skips these reads so it re-fetches only on query/auth change.
 		const nativeFilters = isFederated ? null : serverFilters();
+		// The cache key must capture EVERY input that changes the result set across a
+		// remount, or a back-nav could serve one identity's results to another. Federated
+		// results are per-authenticated-user; native results are server-filtered by the
+		// viewer's NSFW preference. Both the cache and auth state survive login/logout
+		// (SPA state, no reload), so fold the user id + NSFW posture into the signature.
+		// (Filters still stay out of the FEDERATED sig — they're applied client-side there
+		// — so a federated filter change neither re-fetches nor invalidates the cache.)
+		const idTag = `${auth.user?.id ?? 'anon'}:${auth.user?.showNsfw ? 1 : 0}`;
 		const sig = isFederated
-			? `fed:${q}`
-			: `nat:${JSON.stringify({
+			? `fed:${idTag}:${q}`
+			: `nat:${idTag}:${JSON.stringify({
 					q,
 					g: [...nativeFilters!.genres].sort(),
 					mn: nativeFilters!.minRating ?? 0,
@@ -244,7 +252,12 @@
 	// signature of what's actually on screen. loadMore keeps the same signature, so
 	// its appended pages + updated catalogPage are captured here too.
 	beforeNavigate(() => {
-		if (lastSig == null || typeof window === 'undefined') return;
+		// Skip while a fetch is in flight: a new run resets catalogPage/hasNext/totalCount
+		// synchronously but leaves lastSig + rows on the PREVIOUS result set until the
+		// fetch lands, so snapshotting now would cache a page-1/no-pager view of a
+		// multi-page result. During loading the grid shows a skeleton anyway, so there's
+		// nothing on screen worth preserving — a back-nav simply re-runs the search.
+		if (lastSig == null || rowsLoading || typeof window === 'undefined') return;
 		putBrowseCache(lastSig, {
 			rows,
 			catalogPage,

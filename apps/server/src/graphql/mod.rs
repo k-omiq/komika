@@ -5870,10 +5870,16 @@ pub(crate) async fn ingest_source_series(
     // (`addSourceSeries`) — one extra chapters fetch per item. Best-effort: a scan
     // hiccup only logs and leaves the scheduler to retry; it never fails the enrol.
     if let Err(e) = scan_series(st, &m, Utc::now()).await {
+        // `scan_series` only caches series metadata AFTER its (fallible) chapter fetch,
+        // so on a scan hiccup the `suwayomi_series` row (thumbnail_url etc.) never got
+        // written — leaving the cover crawl with no thumbnail to materialize until the
+        // next scheduler tick. Persist the metadata here as a best-effort fallback so
+        // that window is closed (no double on the success path, which OPT-6 dropped).
+        let _ = crate::series_cache::put_series(&st.pool, &m).await;
         tracing::warn!(
             series_id = m.id,
             error = %e,
-            "immediate scan after bulk enrol failed; will retry on next tick"
+            "immediate scan after bulk enrol failed; cached metadata, will retry scan on next tick"
         );
     }
     Ok(result)

@@ -60,6 +60,16 @@
 		return Number.isNaN(t) ? '—' : new Date(t).toLocaleString();
 	}
 
+	// After an optimistic removal empties the current page while issues still exist
+	// elsewhere, reload so we don't show the "all clean 🎉" message (and hide the pager)
+	// on a page that only looks empty. Stay on the page if more are queued ahead
+	// (server backfills from the next page), else step back a page.
+	async function settleAfterFix(): Promise<void> {
+		if (issues.length === 0 && total != null && total > 0) {
+			await refresh(hasNext ? page : Math.max(1, page - 1));
+		}
+	}
+
 	async function retry(w: CoverIssue): Promise<void> {
 		if (busy) return;
 		busy = w.workId;
@@ -70,6 +80,7 @@
 				// Fixed — drop it from the list.
 				issues = issues.filter((x) => x.workId !== w.workId);
 				if (total != null) total -= 1;
+				await settleAfterFix();
 			} else {
 				actionError = `Couldn't fetch a source image for “${w.title ?? w.workId}” — try again later or upload one.`;
 			}
@@ -94,6 +105,7 @@
 			await uploadCover(w.workId, file);
 			issues = issues.filter((x) => x.workId !== w.workId);
 			if (total != null) total -= 1;
+			await settleAfterFix();
 		} catch (err) {
 			actionError = err instanceof Error ? err.message : 'Upload failed.';
 		} finally {

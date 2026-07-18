@@ -517,6 +517,11 @@ async fn serve_cover(
         Ok(Ok(webp)) => {
             if let Err(e) = cover::put_work_cover(&app.pool, &pool, work_id, &webp).await {
                 tracing::warn!(error = %e, work_id, "lazy cover cache store failed");
+            } else {
+                // This lazy materialization is an "auto success": if the crawl had
+                // recorded a cover issue for this work, clear it so it drops out of the
+                // admin Bugs panel and stops being excluded from the drainer's SELECTs.
+                cover::clear_cover_issue(&app.pool, work_id).await;
             }
             webp_cover_response(webp)
         }
