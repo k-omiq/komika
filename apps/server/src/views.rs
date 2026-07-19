@@ -99,34 +99,39 @@ pub async fn record(pool: &SqlitePool, series_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sum the hourly buckets for one key since (exclusive) `since_hour`.
-async fn window_sum(pool: &SqlitePool, key: &str, since_hour: i64) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(SUM(views), 0) FROM series_view_bucket \
-         WHERE series_key = ? AND hour_ts > ?",
-    )
-    .bind(key)
-    .bind(since_hour)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0)
-}
-
 /// Load the all-time / 7-day / 24-hour view counts for one series (resolves its key).
+///
+/// One aggregate query folds the all-time `total` (from `series_views`) with both hourly
+/// windows (from `series_view_bucket`): the 24h and 7d sums come from the same scan, gated
+/// by per-row `CASE`s. Since 7d ⊇ 24h, the row filter bounds to the 7d cutoff and the 24h
+/// `CASE` narrows within it. This is 2 awaits (`view_key` + this) instead of the former 4 —
+/// every `Series.views` resolver in a feed pays the difference per item.
 pub async fn counts_for(pool: &SqlitePool, series_id: &str) -> ViewCounts {
     let key = view_key(pool, series_id).await;
-    let total = sqlx::query_scalar::<_, i64>("SELECT total FROM series_views WHERE series_key = ?")
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
     let hour = current_hour();
+    let since24h = hour - 24;
+    let since7d = hour - BUCKET_RETENTION_HOURS;
+    // An aggregate with no GROUP BY always yields exactly one row, even with zero buckets
+    // (the SUMs come back NULL → 0, the scalar subquery → 0), so `fetch_one` is safe.
+    let row = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT \
+           (SELECT COALESCE(total, 0) FROM series_views WHERE series_key = ?), \
+           COALESCE(SUM(CASE WHEN hour_ts > ? THEN views END), 0), \
+           COALESCE(SUM(views), 0) \
+         FROM series_view_bucket \
+         WHERE series_key = ? AND hour_ts > ?",
+    )
+    .bind(&key)
+    .bind(since24h)
+    .bind(&key)
+    .bind(since7d)
+    .fetch_one(pool)
+    .await
+    .unwrap_or((0, 0, 0));
     ViewCounts {
-        total,
-        last24h: window_sum(pool, &key, hour - 24).await,
-        last7d: window_sum(pool, &key, hour - BUCKET_RETENTION_HOURS).await,
+        total: row.0,
+        last24h: row.1,
+        last7d: row.2,
     }
 }
 

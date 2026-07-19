@@ -345,6 +345,10 @@ async fn tick(state: &AppState) -> (usize, usize) {
     let now = Utc::now();
     let mut overdue_seen = 0usize;
 
+    // Gate serially (these are cheap local DB reads), collecting only the series that
+    // actually need a live upstream fetch. The `bool` marks a paused-baseline scan so its
+    // failure keeps its distinct log line. Nothing here touches Suwayomi.
+    let mut to_scan: Vec<(SuwayomiManga, bool)> = Vec::new();
     for m in library {
         let series_id = m.id.to_string();
         let admin = scan_admin(&state.pool, &series_id).await;
@@ -357,9 +361,7 @@ async fn tick(state: &AppState) -> (usize, usize) {
             // series that enters the library already COMPLETED/HIATUS (auto-pause)
             // was skipped forever and showed 0 chapters indefinitely.
             if prior_state.is_none() {
-                if let Err(e) = scan_series(state, &m, now).await {
-                    tracing::warn!(series_id, error = %e, "scan: paused baseline scan failed; skipping");
-                }
+                to_scan.push((m, true));
             }
             continue;
         }
@@ -375,11 +377,29 @@ async fn tick(state: &AppState) -> (usize, usize) {
             continue;
         }
         overdue_seen += 1;
-
-        if let Err(e) = scan_series(state, &m, now).await {
-            tracing::warn!(series_id, error = %e, "scan: series scan failed; skipping");
-        }
+        to_scan.push((m, false));
     }
+
+    // Fetch the due series with SMALL bounded concurrency. Each `scan_series` is a live
+    // Suwayomi `chapters()` fetch proxied through FlareSolverr (which stalls — hence the
+    // 30s timeout), so on a cold-start/large-library tick everything is due and this was
+    // O(library) serial upstream round-trips. Concurrency stays modest so overlapping RTT
+    // doesn't hammer the proxy; distinct series touch distinct DB rows so the concurrent
+    // record-scan writes don't collide (SQLite's single writer + busy_timeout serialize).
+    use futures::StreamExt as _;
+    const SCAN_CONCURRENCY: usize = 3;
+    futures::stream::iter(to_scan)
+        .for_each_concurrent(SCAN_CONCURRENCY, |(m, baseline)| async move {
+            let series_id = m.id.to_string();
+            if let Err(e) = scan_series(state, &m, now).await {
+                if baseline {
+                    tracing::warn!(series_id, error = %e, "scan: paused baseline scan failed; skipping");
+                } else {
+                    tracing::warn!(series_id, error = %e, "scan: series scan failed; skipping");
+                }
+            }
+        })
+        .await;
 
     (library_size, overdue_seen)
 }

@@ -41,7 +41,7 @@ use tracing::Level;
 use config::Config;
 use graphql::{
     build_schema, ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth,
-    RequestUserCache, ScanHealth,
+    RequestLibraryCache, RequestUserCache, ScanHealth,
 };
 use suwayomi::SuwayomiClient;
 
@@ -208,11 +208,19 @@ async fn graphql_handler(
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
-    // Fresh per-request cache so `current_user` does at most one session lookup
-    // even when many resolvers ask (one per feed item).
+    // Fresh per-request caches so `current_user` does at most one session lookup and each
+    // series' `user_library` row is read at most once, even when many resolvers ask (one
+    // per feed item).
     let user_cache = RequestUserCache::default();
+    let library_cache = RequestLibraryCache::default();
     schema
-        .execute(req.into_inner().data(auth).data(ip).data(user_cache))
+        .execute(
+            req.into_inner()
+                .data(auth)
+                .data(ip)
+                .data(user_cache)
+                .data(library_cache),
+        )
         .await
         .into()
 }

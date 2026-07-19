@@ -178,6 +178,29 @@ pub struct ClientIp(pub Option<String>);
 #[derive(Clone, Default)]
 pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Option<User>>>);
 
+/// One viewer's `user_library` row for a series — the shared payload behind the
+/// `is_marked` / `library_status` / `is_favorite` resolvers.
+#[derive(Clone)]
+pub struct LibraryRow {
+    pub is_favorite: bool,
+    pub status: Option<String>,
+}
+
+/// Per-request memoization of the viewer's `user_library` row, keyed by `series_id`.
+/// The three per-item resolvers (`is_marked` / `library_status` / `is_favorite`) each read
+/// the SAME row, and async-graphql resolves an object's fields concurrently, so without this
+/// a single feed does 3 SELECTs per item on the same row. A per-key `OnceCell` (guarded by a
+/// short std-Mutex critical section that only swaps `Arc`s, never awaits) dedupes even the
+/// concurrent reads down to one query per series. A fresh map is attached per HTTP request.
+#[derive(Clone, Default)]
+pub struct RequestLibraryCache(
+    pub  std::sync::Arc<
+        std::sync::Mutex<
+            HashMap<String, std::sync::Arc<tokio::sync::OnceCell<Option<LibraryRow>>>>,
+        >,
+    >,
+);
+
 /// Upper bound on password length accepted by `login`/`register`, enforced
 /// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
 const MAX_PASSWORD_LEN: usize = 1024;
@@ -273,18 +296,7 @@ impl Series {
     /// Per-viewer, resolved dynamically so every feed reflects the caller's own
     /// library; `false` for anonymous viewers (no made-up membership).
     async fn is_marked(&self, ctx: &Context<'_>) -> Result<bool> {
-        let Some(user) = current_user(ctx).await else {
-            return Ok(false);
-        };
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM user_library WHERE user_id = ? AND series_id = ?)",
-        )
-        .bind(&user.id)
-        .bind(&self.id.0)
-        .fetch_one(&state(ctx).pool)
-        .await
-        .map_err(gql_err)?;
-        Ok(exists != 0)
+        Ok(viewer_library_row(ctx, &self.id.0).await.is_some())
     }
 
     /// The shelf the viewer has explicitly filed this series under
@@ -292,35 +304,18 @@ impl Series {
     /// case the client derives the shelf from read progress. Per-viewer; null for
     /// anonymous viewers and series not in the viewer's library.
     async fn library_status(&self, ctx: &Context<'_>) -> Result<Option<String>> {
-        let Some(user) = current_user(ctx).await else {
-            return Ok(None);
-        };
-        let row: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT status FROM user_library WHERE user_id = ? AND series_id = ?",
-        )
-        .bind(&user.id)
-        .bind(&self.id.0)
-        .fetch_optional(&state(ctx).pool)
-        .await
-        .map_err(gql_err)?;
-        Ok(row.flatten())
+        Ok(viewer_library_row(ctx, &self.id.0)
+            .await
+            .and_then(|r| r.status))
     }
 
     /// Whether the viewer has favourited this series. Per-viewer; false for
     /// anonymous viewers and series not in the viewer's library.
     async fn is_favorite(&self, ctx: &Context<'_>) -> Result<bool> {
-        let Some(user) = current_user(ctx).await else {
-            return Ok(false);
-        };
-        let fav: Option<i64> = sqlx::query_scalar(
-            "SELECT is_favorite FROM user_library WHERE user_id = ? AND series_id = ?",
-        )
-        .bind(&user.id)
-        .bind(&self.id.0)
-        .fetch_optional(&state(ctx).pool)
-        .await
-        .map_err(gql_err)?;
-        Ok(fav.unwrap_or(0) != 0)
+        Ok(viewer_library_row(ctx, &self.id.0)
+            .await
+            .map(|r| r.is_favorite)
+            .unwrap_or(false))
     }
 
     /// Every localized description of this work (all languages MangaDex carries),
@@ -428,6 +423,52 @@ async fn current_user(ctx: &Context<'_>) -> Option<User> {
         .await
         .ok()
         .flatten()
+}
+
+/// Fetch the viewer's `user_library` row for one series in a single SELECT. `None` when
+/// the row doesn't exist (series not in the viewer's library); a transient DB error is
+/// also folded to `None` so a feed degrades to "not in library" rather than erroring the
+/// whole response (matching how anonymous viewers already resolve these flags to false).
+async fn fetch_library_row(
+    pool: &SqlitePool,
+    user_id: &str,
+    series_id: &str,
+) -> Option<LibraryRow> {
+    sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT is_favorite, status FROM user_library WHERE user_id = ? AND series_id = ?",
+    )
+    .bind(user_id)
+    .bind(series_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|(fav, status)| LibraryRow {
+        is_favorite: fav != 0,
+        status,
+    })
+}
+
+/// Resolve (and per-request memoize) the viewer's `user_library` row for `series_id`.
+/// `None` for anonymous viewers or a series not in the viewer's library. Backs all three
+/// of `is_marked` / `library_status` / `is_favorite` so they share one query per series
+/// (see [`RequestLibraryCache`]).
+async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Option<LibraryRow> {
+    let user = current_user(ctx).await?;
+    let cell = match ctx.data_opt::<RequestLibraryCache>() {
+        Some(cache) => cache
+            .0
+            .lock()
+            .unwrap()
+            .entry(series_id.to_string())
+            .or_default()
+            .clone(),
+        // No cache attached (bare request) — fall back to a direct fetch.
+        None => return fetch_library_row(&state(ctx).pool, &user.id, series_id).await,
+    };
+    cell.get_or_init(|| fetch_library_row(&state(ctx).pool, &user.id, series_id))
+        .await
+        .clone()
 }
 
 /// Resolve the authenticated user or fail — for mutations that require sign-in.
@@ -1709,21 +1750,18 @@ impl QueryRoot {
                 .map_err(gql_err)?;
             (lib, Vec::new(), recent)
         } else {
-            let popular = st
-                .suwayomi
-                .fetch_source(FetchType::Popular, 1, None)
-                .await
-                .map_err(gql_err)?
-                .1;
+            // Cold path (pre-cache, fresh install only): overlap the two independent
+            // source fetches — Popular still propagates its error via `?`, Latest stays
+            // best-effort. The catalogue is normally populated, so this branch is rare.
+            let (popular_res, latest_res) = tokio::join!(
+                st.suwayomi.fetch_source(FetchType::Popular, 1, None),
+                st.suwayomi.fetch_source(FetchType::Latest, 1, None),
+            );
+            let popular = popular_res.map_err(gql_err)?.1;
             for m in &popular {
                 let _ = crate::series_cache::put_series(&st.pool, m).await;
             }
-            let latest = st
-                .suwayomi
-                .fetch_source(FetchType::Latest, 1, None)
-                .await
-                .map(|r| r.1)
-                .unwrap_or_default();
+            let latest = latest_res.map(|r| r.1).unwrap_or_default();
             // Pre-cache (fresh install) there's no catalogue-insertion history yet;
             // the source "Latest" is the best available proxy for "newly added".
             let recent = latest.clone();
@@ -5999,23 +6037,50 @@ pub fn spawn_metadata_backfill(
 /// is marked (even if MangaDex returns nothing) so the drain terminates. Returns
 /// how many works were upserted.
 pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
+    use futures::StreamExt as _;
+    // Overlap the per-work /cover fetches: metadata is already batched 100/req, but each
+    // work's cover set is a separate round-trip. The shared TokenBucket still caps the
+    // MangaDex request rate (5/s), so buffer_unordered only hides RTT — it never raises the
+    // upstream load. Kept modest to stay well under the burst budget.
+    const COVER_FETCH_CONCURRENCY: usize = 6;
     let mut refreshed = 0i32;
     for chunk in ids.chunks(100) {
         let mangas = st.mangadex.get_manga_by_ids(chunk).await.map_err(gql_err)?;
-        for m in &mangas {
-            let (id, mut input) = crate::mangadex::to_work_input(m);
-            // F2: fetch the full per-volume cover set and mark the primary (the one
-            // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
-            // failure just leaves the sweep's primary cover.
-            let primary = crate::mangadex::cover_file_name(m);
-            match st.mangadex.list_covers(&id, 100).await {
-                Ok(fetched) if !fetched.is_empty() => {
-                    input.covers = crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
+        // Map to owned upsert inputs synchronously (no network) so the cover-fetch stream
+        // owns its items — streaming over `mangas.iter()` borrows would trip an HRTB
+        // lifetime error on the async closure.
+        let base: Vec<(String, catalog::WorkInput, Option<String>)> = mangas
+            .iter()
+            .map(|m| {
+                let (id, input) = crate::mangadex::to_work_input(m);
+                (id, input, crate::mangadex::cover_file_name(m))
+            })
+            .collect();
+        // Fetch every work's full cover set concurrently, yielding upsert-ready inputs.
+        let prepared: Vec<(String, catalog::WorkInput)> = futures::stream::iter(base)
+            .map(|(id, mut input, primary)| async move {
+                // F2: fetch the full per-volume cover set and mark the primary (the one
+                // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
+                // failure just leaves the sweep's primary cover.
+                match st.mangadex.list_covers(&id, 100).await {
+                    Ok(fetched) if !fetched.is_empty() => {
+                        input.covers =
+                            crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed")
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed"),
-            }
-            match catalog::upsert_work_from_mangadex(&st.pool, &id, &input).await {
+                (id, input)
+            })
+            .buffer_unordered(COVER_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        // Upserts stay serial — SQLite has a single writer, so concurrency there buys
+        // nothing and only contends on the busy-timeout.
+        for (id, input) in &prepared {
+            match catalog::upsert_work_from_mangadex(&st.pool, id, input).await {
                 Ok(_) => refreshed += 1,
                 Err(e) => tracing::warn!(manga = %id, error = %e, "enrich: upsert failed"),
             }
@@ -6973,7 +7038,8 @@ mod tests {
         let req = async_graphql::Request::new(query)
             .data(RequestAuth(token.map(|t| t.to_string())))
             .data(ClientIp(Some(ip.to_string())))
-            .data(RequestUserCache::default());
+            .data(RequestUserCache::default())
+            .data(RequestLibraryCache::default());
         schema.execute(req).await
     }
 
@@ -8115,6 +8181,61 @@ mod tests {
             r.errors
         );
         assert!(data_json(&r).contains("Anchored Work"));
+    }
+
+    #[tokio::test]
+    async fn library_flags_share_one_row_lookup() {
+        // The three per-viewer library flags (`isMarked` / `isFavorite` / `libraryStatus`)
+        // are now backed by ONE per-request-cached `user_library` row lookup instead of a
+        // SELECT each. Selecting all three in one query must still reflect the same row, and
+        // an anonymous viewer must see the empty defaults.
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-flags",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Flag Work".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-flags'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // Favourite + shelf the work as bob (favouriting implies membership).
+        let fav = format!(
+            r#"mutation {{ setFavorite(seriesId: "{work_id}", favorite: true) {{ id }} }}"#
+        );
+        let r = exec(&s, &fav, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "setFavorite failed: {:?}", r.errors);
+        let status = format!(
+            r#"mutation {{ setLibraryStatus(seriesId: "{work_id}", status: "reading") {{ id }} }}"#
+        );
+        let r = exec(&s, &status, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "setLibraryStatus failed: {:?}", r.errors);
+
+        let q = format!(
+            r#"{{ canonicalSeries(workId: "{work_id}") {{ isMarked isFavorite libraryStatus }} }}"#
+        );
+        // Bob: all three reflect the single row.
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        let d = r.data.into_json().unwrap();
+        let cs = &d["canonicalSeries"];
+        assert_eq!(cs["isMarked"], serde_json::json!(true));
+        assert_eq!(cs["isFavorite"], serde_json::json!(true));
+        assert_eq!(cs["libraryStatus"], serde_json::json!("reading"));
+
+        // Anonymous viewer: no membership, no favourite, no shelf.
+        let r = exec(&s, &q, None, "1.1.1.1").await;
+        let d = r.data.into_json().unwrap();
+        let cs = &d["canonicalSeries"];
+        assert_eq!(cs["isMarked"], serde_json::json!(false));
+        assert_eq!(cs["isFavorite"], serde_json::json!(false));
+        assert_eq!(cs["libraryStatus"], serde_json::json!(null));
     }
 
     #[tokio::test]

@@ -22,7 +22,10 @@ use sqlx::SqlitePool;
 use crate::catalog::{
     self,
     normalize::normalize_title,
-    similarity::{description_similarity, phash_similarity, title_similarity},
+    similarity::{
+        description_shingles, description_similarity_pre, phash_similarity, title_shingles,
+        title_similarity_pre, DescShingles, TitleShingles,
+    },
     WorkMatchData,
 };
 
@@ -175,12 +178,19 @@ pub async fn resolve_ex(
     // 2 round-trips per candidate — up to ~300 candidates on a reconcile.
     let candidate_id_list: Vec<String> = candidate_ids.iter().cloned().collect();
     let match_data = catalog::load_match_data_batch(pool, &candidate_id_list).await?;
+    // Precompute the CANDIDATE's shingle sets once — they're compared against every
+    // candidate work's aliases (works carry 20+ localized aliases) and description, so
+    // shingling them per comparison inside the loop was the reconcile CPU hot spot (OPT-D).
+    let cand_title_shingles: Vec<TitleShingles> =
+        norm_titles.iter().map(|t| title_shingles(t)).collect();
+    let cand_desc_shingles: Option<DescShingles> =
+        cand.description.as_deref().map(description_shingles);
     let mut best: Option<(Scored, String)> = None;
     for wid in &candidate_ids {
         let Some(md) = match_data.get(wid) else {
             continue;
         };
-        let scored = score_candidate(cand, &norm_titles, md);
+        let scored = score_candidate(cand, &cand_title_shingles, cand_desc_shingles.as_ref(), md);
         let replace = match best.as_ref() {
             None => true,
             Some((s, w)) => scored.score > s.score || (scored.score == s.score && wid < w),
@@ -245,19 +255,28 @@ struct Scored {
 /// Confidence in [0,1]: `0.6*title + 0.4*corroboration`, plus small author/year
 /// boosters. Title alone (no description/cover overlap) tops out at ~0.6 → Review,
 /// so auto-merge needs corroboration on top of the title.
-fn score_candidate(cand: &Candidate, norm_titles: &[String], md: &WorkMatchData) -> Scored {
-    let title_sim = norm_titles
+fn score_candidate(
+    cand: &Candidate,
+    cand_titles: &[TitleShingles],
+    cand_desc: Option<&DescShingles>,
+    md: &WorkMatchData,
+) -> Scored {
+    // Shingle this candidate work's aliases once, then do cheap set comparisons against
+    // the pre-shingled candidate titles (T+K shinglings instead of the former T×K).
+    let alias_shingles: Vec<TitleShingles> =
+        md.aliases_norm.iter().map(|al| title_shingles(al)).collect();
+    let title_sim = cand_titles
         .iter()
         .flat_map(|nt| {
-            md.aliases_norm
+            alias_shingles
                 .iter()
-                .map(move |al| title_similarity(nt, al))
+                .map(move |al| title_similarity_pre(nt, al))
         })
         .fold(0.0_f64, f64::max);
 
     let mut corrob = 0.0_f64;
-    if let (Some(a), Some(b)) = (&cand.description, &md.description) {
-        corrob = corrob.max(description_similarity(a, b));
+    if let (Some(a), Some(b)) = (cand_desc, &md.description) {
+        corrob = corrob.max(description_similarity_pre(a, &description_shingles(b)));
     }
     let phash_sim = phash_similarity(cand.cover_phash.as_deref(), md.cover_phash.as_deref());
     if let Some(p) = phash_sim {
