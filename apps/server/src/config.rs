@@ -50,8 +50,14 @@ pub struct Config {
     /// Email for the primary provisioned admin account. Others get a synthesized
     /// `<username>@admin.local`. Only used when creating a missing admin account.
     pub admin_email: Option<String>,
-    /// How often the background scan scheduler wakes to re-evaluate the library.
+    /// How often the background scan scheduler wakes to re-evaluate the library
+    /// (default 1h). Per-series cadence is still adaptive via each series' `next_scan_at`.
     pub scan_tick_seconds: u64,
+    /// How often the source-sync scheduler re-walks subscribed extensions to discover
+    /// new series and reconcile library membership (default 1 day).
+    pub source_sync_interval_seconds: u64,
+    /// Max LATEST pages walked per source per sync pass (bounds a capped/looping walk).
+    pub source_sync_max_pages: i64,
     /// Max failed login/register attempts per key within the rate-limit window
     /// before further attempts are rejected.
     pub auth_rate_limit_max: u32,
@@ -156,11 +162,28 @@ impl Config {
         let admin_email = env::var("KOMIKA_ADMIN_EMAIL")
             .ok()
             .filter(|s| !s.is_empty());
+        // 1 hour (3600s). The scheduler wakes this often to re-evaluate the library;
+        // each series still has its own adaptive `next_scan_at`, so it's only re-fetched
+        // when actually due. Hourly (vs the old 5-minute default) keeps the per-tick
+        // O(library) sweep light on large libraries (100k+ series).
         let scan_tick_seconds = env::var("SCAN_TICK_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(300);
+            .unwrap_or(3600);
+        // 1 day (86400s). Discovery of newly-added source series is far less time-
+        // sensitive than chapter updates and each pass browses upstream, so a daily
+        // cadence keeps it cheap even with many subscribed extensions.
+        let source_sync_interval_seconds = env::var("SOURCE_SYNC_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(86400);
+        let source_sync_max_pages = env::var("SOURCE_SYNC_MAX_PAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(10);
         let auth_rate_limit_max = env::var("AUTH_RATE_LIMIT_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -273,6 +296,8 @@ impl Config {
             admin_password,
             admin_email,
             scan_tick_seconds,
+            source_sync_interval_seconds,
+            source_sync_max_pages,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,
             federated_rate_limit_max,

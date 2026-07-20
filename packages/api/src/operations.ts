@@ -671,6 +671,7 @@ const EXTENSION_FIELDS = /* GraphQL */ `
 		isNsfw
 		iconUrl
 		repo
+		subscribed
 	}
 `;
 
@@ -1009,6 +1010,12 @@ export const CANCEL_EXTENSION_INGEST = /* GraphQL */ `
 		cancelExtensionIngest(pkgName: $pkgName) {
 			...SourceIngestJobFields
 		}
+	}
+`;
+
+export const SET_EXTENSION_SUBSCRIPTION = /* GraphQL */ `
+	mutation SetExtensionSubscription($pkgName: ID!, $subscribed: Boolean!) {
+		setExtensionSubscription(pkgName: $pkgName, subscribed: $subscribed)
 	}
 `;
 

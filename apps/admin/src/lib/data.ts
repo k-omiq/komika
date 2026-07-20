@@ -275,6 +275,18 @@ export async function cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJo
 }
 
 /**
+ * Subscribe/unsubscribe an extension for background source-sync: while subscribed, the
+ * server periodically re-walks the extension's sources to auto-discover newly-added
+ * series and keep enrolled series in the library (so they keep updating). Enabling
+ * kicks an immediate sync pass server-side. Returns the new subscribed state.
+ */
+export async function setExtensionSubscription(pkgName: Id, subscribed: boolean): Promise<boolean> {
+	if (!backend.setExtensionSubscription)
+		throw new Error('Extension sync is unavailable on this backend.');
+	return backend.setExtensionSubscription(pkgName, subscribed);
+}
+
+/**
  * Maintenance: materialize the whole Suwayomi library into the DB read-cache.
  * Series metadata is written synchronously (the returned count); per-series
  * chapter lists fill in a server-side background task. Admin-gated server-side.

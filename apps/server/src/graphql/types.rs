@@ -373,6 +373,14 @@ pub struct ScanStatus {
     pub last_tick_at: Option<String>,
     /// Earliest upcoming `next_scan_at` across the library, if known.
     pub next_due_at: Option<String>,
+    /// Series that scanned successfully on the last tick.
+    pub scanned_ok: i32,
+    /// Series whose scan errored (and were backed off) on the last tick.
+    pub scanned_failed: i32,
+    /// ISO 8601 timestamp of the last tick that made real progress, if any.
+    pub last_success_at: Option<String>,
+    /// Consecutive full batches that advanced nothing — a "stuck" signal (0 = healthy).
+    pub stuck_ticks: i32,
 }
 
 /// A user as seen in the admin user-management console.
@@ -557,6 +565,10 @@ pub struct ExtensionInfo {
     pub icon_url: Option<String>,
     /// The store/repo the extension came from, when reported.
     pub repo: Option<String>,
+    /// Whether this extension is subscribed for background source-sync (auto-discovery
+    /// of new series). Set by the resolver from `extension_subscription`; the `From`
+    /// impl defaults it to false.
+    pub subscribed: bool,
 }
 
 impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
@@ -571,6 +583,7 @@ impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
             is_nsfw: e.is_nsfw,
             icon_url: e.icon_url,
             repo: e.repo,
+            subscribed: false,
         }
     }
 }

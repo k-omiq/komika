@@ -1579,6 +1579,177 @@ pub async fn reset_sync_state(pool: &SqlitePool, job: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Extension-level sync subscriptions (source-sync §3) ──────────────────────────
+
+/// Enable/disable an extension's sync subscription. Enabling is an idempotent upsert
+/// (a re-enable keeps the original `created_at` and prior sync stats); disabling drops
+/// the row so it's no longer walked by the background source-sync job.
+pub async fn set_extension_subscription(
+    pool: &SqlitePool,
+    pkg_name: &str,
+    subscribed: bool,
+) -> Result<()> {
+    if subscribed {
+        sqlx::query(
+            "INSERT INTO extension_subscription (pkg_name, created_at) VALUES (?, ?) \
+             ON CONFLICT(pkg_name) DO NOTHING",
+        )
+        .bind(pkg_name)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM extension_subscription WHERE pkg_name = ?")
+            .bind(pkg_name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Every subscribed extension's package id — the work-list for one source-sync pass.
+pub async fn subscribed_extensions(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT pkg_name FROM extension_subscription ORDER BY pkg_name")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}
+
+/// The subscribed package ids as a set, for badging the admin `extensions` listing
+/// with `subscribed` in one query instead of a per-row lookup.
+pub async fn subscribed_extension_set(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(subscribed_extensions(pool).await?.into_iter().collect())
+}
+
+/// Record the outcome of one sync pass for an extension (best-effort telemetry for the
+/// admin surface). `error` is `None` on a clean pass.
+pub async fn mark_subscription_synced(
+    pool: &SqlitePool,
+    pkg_name: &str,
+    added: i64,
+    error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE extension_subscription \
+         SET last_synced_at = ?, last_added = ?, last_error = ? WHERE pkg_name = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(added)
+    .bind(error)
+    .bind(pkg_name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every enrolled Suwayomi manga id (the `source_key`), for the library-reconcile pass
+/// that re-asserts `inLibrary=true` upstream so drifted/single-added series keep being
+/// scanned. Manga ids are globally unique across sources, so the source_id is not needed.
+pub async fn suwayomi_source_keys(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT source_key FROM source_series WHERE source_type = 'suwayomi'")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
+/// Backfill a "due now" scan-state row for every enrolled Suwayomi series that lacks one,
+/// so the DB-driven scanner (which selects work from `series_scan_state`) picks up series
+/// enrolled by paths that don't scan-on-enrol (federated search) or predate scan-state.
+/// One set-based INSERT…SELECT (no per-row round-trips); returns how many rows it added.
+pub async fn backfill_pending_scan_states(pool: &SqlitePool) -> Result<u64> {
+    // `ON CONFLICT DO NOTHING` in addition to the `NOT EXISTS` guard: a concurrent
+    // `ensure_pending` (federated ingest) can insert the same series_id between this
+    // statement's NOT-EXISTS check and its insert; without the conflict clause that race
+    // raises a UNIQUE violation that rolls back the ENTIRE multi-row backfill (audit LOW).
+    // `next_scan_at = DUE_NOW_SENTINEL` (not NULL): the due-query is a bounded `<= ?` range,
+    // so a NULL row would never be selected and the series would silently never scan.
+    let res = sqlx::query(
+        "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
+         SELECT ss.source_key, ?, ? FROM source_series ss \
+         WHERE ss.source_type = 'suwayomi' \
+           AND NOT EXISTS (SELECT 1 FROM series_scan_state sst WHERE sst.series_id = ss.source_key) \
+         ON CONFLICT(series_id) DO NOTHING",
+    )
+    .bind(crate::scanner::DUE_NOW_SENTINEL)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Which of `keys` are already enrolled for `source_type` — one set-based query instead
+/// of a per-key round-trip (audit #10, the source-sync LATEST walk). Returns the subset
+/// of `keys` that exist; unknown keys are the caller's "new" set.
+pub async fn existing_source_keys(
+    pool: &SqlitePool,
+    source_type: &str,
+    keys: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    // Chunk so the `IN (?, ?, …)` bind count can't approach SQLite's
+    // SQLITE_MAX_VARIABLE_NUMBER, even if a caller ever passes a very large key set (the
+    // LATEST-walk caller only passes one browse page, but keep the helper generally safe).
+    const CHUNK: usize = 500;
+    let mut found = std::collections::HashSet::new();
+    for chunk in keys.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_key FROM source_series \
+             WHERE source_type = ? AND source_key IN ({placeholders})"
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(source_type);
+        for k in chunk {
+            q = q.bind(k);
+        }
+        found.extend(q.fetch_all(pool).await?);
+    }
+    Ok(found)
+}
+
+/// Record that a full source-sync pass just completed, for restart-throttling
+/// (`source_sync_due`). Singleton row keyed on id=1.
+pub async fn mark_source_sync_pass(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?) \
+         ON CONFLICT(id) DO UPDATE SET last_full_pass_at = excluded.last_full_pass_at",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a full source-sync pass is due — true when none has ever run, or the last one
+/// completed at least ~90% of `interval_seconds` ago. Lets the scheduler skip the redundant
+/// immediate pass that `tokio::time::interval` fires on every restart (audit #3).
+///
+/// The 90% threshold (not a full interval) is deliberate: a scheduled tick fires exactly
+/// one interval after the previous tick *start*, but the pass is only stamped when it
+/// *completes* — a duration `T` later. Comparing against a full interval would make every
+/// scheduled tick see `interval - T < interval` and skip, silently halving the cadence to
+/// ~2 intervals. The 10% slack absorbs any pass shorter than `0.1 * interval` (e.g. ~2.4h
+/// at the 1-day default) so scheduled ticks run on time while restart ticks are still
+/// skipped when a pass ran recently.
+pub async fn source_sync_due(pool: &SqlitePool, interval_seconds: u64) -> bool {
+    let last: Option<String> =
+        sqlx::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let threshold = (interval_seconds as i64) * 9 / 10;
+    match last.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()) {
+        None => true,
+        Some(t) => (Utc::now() - t.with_timezone(&Utc)).num_seconds() >= threshold,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1734,7 +1905,13 @@ mod tests {
         mark_seed_done(&pool, "catalogue", "2026-07-12T00:00:00")
             .await
             .unwrap();
-        assert!(get_sync_state(&pool, "catalogue").await.unwrap().unwrap().seed_done);
+        assert!(
+            get_sync_state(&pool, "catalogue")
+                .await
+                .unwrap()
+                .unwrap()
+                .seed_done
+        );
 
         // resyncCatalogue clears the row entirely → next cycle sees None → fresh seed.
         reset_sync_state(&pool, "catalogue").await.unwrap();
@@ -2538,6 +2715,87 @@ mod tests {
         // Deleting the target cascades its token rows away entirely.
         delete_work_cascade(&pool, &target).await.unwrap();
         assert!(candidate_work_ids_by_token(&pool, "leveling", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_sync_due_throttles_against_recent_pass() {
+        // audit #3: a pass is due when none has run; after one is stamped it's NOT due
+        // again within the interval (so a restart's immediate tick is skipped), but IS
+        // due once the interval has elapsed (simulated with a 0s interval).
+        let pool = pool().await;
+        assert!(source_sync_due(&pool, 86_400).await, "due when never run");
+        mark_source_sync_pass(&pool).await.unwrap();
+        assert!(
+            !source_sync_due(&pool, 86_400).await,
+            "not due right after a pass (skip the restart tick)"
+        );
+        assert!(
+            source_sync_due(&pool, 0).await,
+            "due again once the interval has elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_sync_due_runs_scheduled_tick_despite_pass_duration() {
+        // Regression (verify pass): a scheduled tick fires one interval after the previous
+        // tick START, but the pass is stamped at COMPLETION (T later). With interval=1000s,
+        // a pass that completed 960s ago (a ~40s pass in the prior window) must be DUE — a
+        // full-interval threshold would see 960 < 1000 and wrongly skip, halving the cadence.
+        let pool = pool().await;
+        let ts = (Utc::now() - chrono::Duration::seconds(960)).to_rfc3339();
+        sqlx::query("INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?)")
+            .bind(&ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            source_sync_due(&pool, 1000).await,
+            "scheduled tick must run despite pass duration (90% threshold)"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_source_keys_returns_only_enrolled_suwayomi_keys() {
+        // audit #10: the batched lookup returns exactly the enrolled subset for the given
+        // source_type, so the LATEST walk's "new" set is the complement.
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO work (id, created_at, updated_at) \
+             VALUES ('w', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (key, ty) in [
+            ("100", "suwayomi"),
+            ("200", "suwayomi"),
+            ("300", "mangadex"),
+        ] {
+            sqlx::query(
+                "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+                 VALUES (?, 'w', ?, ?, '2024-01-01T00:00:00Z')",
+            )
+            .bind(format!("ss_{ty}_{key}"))
+            .bind(ty)
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let got = existing_source_keys(
+            &pool,
+            "suwayomi",
+            &["100".into(), "300".into(), "999".into()],
+        )
+        .await
+        .unwrap();
+        // 100 is enrolled suwayomi; 300 is mangadex (wrong type); 999 is unknown.
+        assert_eq!(got, std::collections::HashSet::from(["100".to_string()]));
+        // Empty input short-circuits to an empty set (no query).
+        assert!(existing_source_keys(&pool, "suwayomi", &[])
             .await
             .unwrap()
             .is_empty());

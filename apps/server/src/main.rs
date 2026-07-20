@@ -15,6 +15,7 @@ mod phash;
 mod scanner;
 mod series_cache;
 mod suwayomi;
+mod sync;
 mod views;
 
 use std::sync::Arc;
@@ -429,15 +430,14 @@ async fn upload_cover(
 
     // Report the freshly-versioned URL so the admin UI can show the new cover
     // immediately (cache-busted by the stored version).
-    let version = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT cover_cached_version FROM work WHERE id = ?",
-    )
-    .bind(&work_id)
-    .fetch_optional(&app.pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
+    let version =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT cover_cached_version FROM work WHERE id = ?")
+            .bind(&work_id)
+            .fetch_optional(&app.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
     let url = match version {
         Some(v) => cover::cover_path(&work_id, v),
         None => format!("/covers/{work_id}.webp"),
@@ -516,7 +516,11 @@ async fn serve_cover(
         return StatusCode::NOT_FOUND.into_response();
     };
     let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
-    let Some(bytes) = app.mangadex.cover_thumb_bytes(&mangadex_id, &file_name).await else {
+    let Some(bytes) = app
+        .mangadex
+        .cover_thumb_bytes(&mangadex_id, &file_name)
+        .await
+    else {
         return axum::response::Redirect::temporary(&cdn_fallback).into_response();
     };
     // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
@@ -955,6 +959,18 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
 
+    // Extension-level source-sync scheduler: re-walks *subscribed* extensions (LATEST)
+    // to auto-discover newly-added series, and (independently of subscriptions) reconciles
+    // library membership + backfills scan-state rows once per interval. Discovery is a
+    // no-op with nothing subscribed, but the reconcile still runs — throttled to once per
+    // interval so restarts don't re-trigger it (see `sync::run_loop`).
+    sync::spawn(
+        state.clone(),
+        cfg.source_sync_interval_seconds,
+        cfg.source_sync_max_pages,
+        shutdown_tx.subscribe(),
+    );
+
     // Hourly garbage collection of orphaned staged comment-media uploads (rows the
     // uploader never attached to a comment), so the BLOB store can't grow unbounded.
     gc::spawn(pool.clone(), shutdown_tx.subscribe());
@@ -1056,8 +1072,7 @@ async fn main() -> anyhow::Result<()> {
         // model as avatars; body limit raised above the raw-image cap.
         .route(
             "/admin/cover/{work_id}",
-            post(upload_cover)
-                .layer(DefaultBodyLimit::max(cover::MAX_SOURCE_BYTES + 1024 * 1024)),
+            post(upload_cover).layer(DefaultBodyLimit::max(cover::MAX_SOURCE_BYTES + 1024 * 1024)),
         )
         // Public proxy for Suwayomi-source cover thumbnails + chapter pages. Suwayomi
         // is loopback-only, so its image endpoints are unreachable from the browser;

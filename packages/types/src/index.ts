@@ -171,6 +171,8 @@ export interface ExtensionInfo {
 	iconUrl: string | null;
 	/** The store/repo the extension came from, when reported. */
 	repo: string | null;
+	/** Subscribed for background source-sync (auto-discovery of new series). */
+	subscribed: boolean;
 }
 
 /** One installed Suwayomi source — the admin picker feeding `sourceBrowse`. */

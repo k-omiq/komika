@@ -482,6 +482,43 @@ impl SuwayomiClient {
         }
     }
 
+    /// Fetch fresh manga detail AND its chapter list in ONE upstream round-trip
+    /// (`fetchMangaAndChapters` with both flags). The DB-driven scanner uses this so a
+    /// due series costs a single engine call for current status (pause re-check) + the
+    /// chapter list, instead of two. Falls back to the separate `series` + `chapters`
+    /// calls if the combined mutation fails (older engine / partial support).
+    pub async fn series_and_chapters(
+        &self,
+        id: i64,
+    ) -> Result<(SuwayomiManga, Vec<SuwayomiChapter>)> {
+        let doc = format!(
+            "{MANGA_FIELDS}\n{CHAPTER_FIELDS}\n\
+             mutation MC($id: Int!) {{ fetchMangaAndChapters(input: {{ id: $id, fetchManga: true, fetchChapters: true }}) {{ manga {{ ...MangaFields }} chapters {{ ...ChapterFields }} }} }}"
+        );
+        #[derive(Deserialize)]
+        struct Payload {
+            manga: SuwayomiManga,
+            chapters: Option<Vec<Value>>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            #[serde(rename = "fetchMangaAndChapters")]
+            f: Payload,
+        }
+        match self.gql::<Data>(&doc, json!({ "id": id })).await {
+            Ok(d) => Ok((
+                d.f.manga,
+                parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
+            )),
+            Err(_) => {
+                // Fallback: two calls (each carries its own older-engine fallback).
+                let m = self.series(id).await?;
+                let chapters = self.chapters(id).await?;
+                Ok((m, chapters))
+            }
+        }
+    }
+
     pub async fn pages(&self, chapter_id: i64) -> Result<Vec<String>> {
         let doc =
             "mutation P($id: Int!) { fetchChapterPages(input: { chapterId: $id }) { pages } }";
@@ -526,7 +563,105 @@ impl SuwayomiClient {
         Ok(d.chapters.nodes.first().map(|n| n.manga_id))
     }
 
+    /// Page size for the paginated library walk. The in-library set can be 100k+, so a
+    /// single unpaginated `mangas` query returns one enormous response; page it instead.
+    const LIBRARY_PAGE_SIZE: i64 = 500;
+    /// Safety bound on the library walk so a mis-behaving `hasNextPage` (never false)
+    /// can't loop forever. 4000 pages × 500 = 2M series, far above any real library.
+    const LIBRARY_MAX_PAGES: i64 = 4000;
+
+    /// The full in-library set, fetched in bounded pages. Falls back to a single
+    /// unpaginated query if the engine rejects the pagination args (older Suwayomi),
+    /// so a working deployment can't regress.
     pub async fn library(&self) -> Result<Vec<SuwayomiManga>> {
+        let mut out: Vec<SuwayomiManga> = Vec::new();
+        let mut offset = 0i64;
+        for _ in 0..Self::LIBRARY_MAX_PAGES {
+            let (has_next, mut page) = match self.library_page(offset).await {
+                Ok(p) => p,
+                Err(e) if offset == 0 => {
+                    tracing::warn!(error = %e, "library: paginated fetch failed on first page; falling back to unpaginated");
+                    return self.library_unpaginated().await;
+                }
+                Err(e) => return Err(e),
+            };
+            let n = page.len();
+            out.append(&mut page);
+            if !has_next || n == 0 {
+                break;
+            }
+            offset += Self::LIBRARY_PAGE_SIZE;
+        }
+        Ok(out)
+    }
+
+    /// Just the in-library manga ids (as strings), paginated — the low-memory path the
+    /// daily reconcile needs (it never uses the full manga records). Same fallback as
+    /// `library()`.
+    pub async fn library_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0i64;
+        for _ in 0..Self::LIBRARY_MAX_PAGES {
+            let (has_next, page) = match self.library_page(offset).await {
+                Ok(p) => p,
+                Err(e) if offset == 0 => {
+                    tracing::warn!(error = %e, "library_ids: paginated fetch failed on first page; falling back to unpaginated");
+                    return Ok(self
+                        .library_unpaginated()
+                        .await?
+                        .into_iter()
+                        .map(|m| m.id.to_string())
+                        .collect());
+                }
+                Err(e) => return Err(e),
+            };
+            let n = page.len();
+            ids.extend(page.into_iter().map(|m| m.id.to_string()));
+            if !has_next || n == 0 {
+                break;
+            }
+            offset += Self::LIBRARY_PAGE_SIZE;
+        }
+        Ok(ids)
+    }
+
+    /// One page of the in-library set. Returns `(hasNextPage, mangas)`.
+    async fn library_page(&self, offset: i64) -> Result<(bool, Vec<SuwayomiManga>)> {
+        let doc = format!(
+            "{MANGA_FIELDS}\nquery L($first: Int!, $offset: Int!) {{ \
+               mangas(condition: {{ inLibrary: true }}, first: $first, offset: $offset) {{ \
+                 pageInfo {{ hasNextPage }} nodes {{ ...MangaFields }} }} }}"
+        );
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Nodes {
+            page_info: PageInfo,
+            nodes: Vec<Value>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            mangas: Nodes,
+        }
+        let d: Data = self
+            .gql(
+                &doc,
+                json!({ "first": Self::LIBRARY_PAGE_SIZE, "offset": offset }),
+            )
+            .await?;
+        Ok((
+            d.mangas.page_info.has_next_page,
+            parse_records::<SuwayomiManga>(d.mangas.nodes, "library"),
+        ))
+    }
+
+    /// The original single-shot library query, kept as a fallback for engines that don't
+    /// support `first`/`offset` pagination on `mangas`.
+    async fn library_unpaginated(&self) -> Result<Vec<SuwayomiManga>> {
         let doc = format!(
             "{MANGA_FIELDS}\nquery L {{ mangas(condition: {{ inLibrary: true }}) {{ nodes {{ ...MangaFields }} }} }}"
         );

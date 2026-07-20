@@ -341,6 +341,10 @@ export interface Backend {
 	/** Cancel every running ingest job for an extension's sources; returns the
 	 * cancelled jobs (empty if none were running). Optional. */
 	cancelExtensionIngest?(pkgName: Id): Promise<SourceIngestJob[]>;
+	/** Subscribe/unsubscribe an extension for background source-sync (auto-discover
+	 * new series + reconcile library membership). Enabling kicks an immediate sync
+	 * pass server-side. Returns the new subscribed state. Optional. */
+	setExtensionSubscription?(pkgName: Id, subscribed: boolean): Promise<boolean>;
 
 	// --- admin maintenance (requires an admin session) ---
 	/** Materialize the whole Suwayomi library into the DB read-cache: series

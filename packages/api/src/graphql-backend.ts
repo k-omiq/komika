@@ -504,6 +504,14 @@ export class GraphQLBackend implements Backend {
 		return d.cancelExtensionIngest;
 	}
 
+	async setExtensionSubscription(pkgName: Id, subscribed: boolean): Promise<boolean> {
+		const d = await this.gql<{ setExtensionSubscription: boolean }>(
+			ops.SET_EXTENSION_SUBSCRIPTION,
+			{ pkgName, subscribed },
+		);
+		return d.setExtensionSubscription;
+	}
+
 	// --- admin maintenance ---
 	async persistCatalogue(): Promise<number> {
 		const d = await this.gql<{ persistCatalogue: number }>(ops.PERSIST_CATALOGUE);

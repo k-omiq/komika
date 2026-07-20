@@ -22,6 +22,16 @@ pub struct ScanHealth {
     pub library_size: usize,
     pub overdue_count: usize,
     pub last_tick_at: Option<String>,
+    /// Series that scanned successfully on the last tick.
+    pub scanned_ok: usize,
+    /// Series whose scan errored (and were backed off) on the last tick.
+    pub scanned_failed: usize,
+    /// ISO 8601 timestamp of the last tick that made real progress (>=1 success).
+    pub last_success_at: Option<String>,
+    /// Consecutive full batches that advanced nothing — a "stuck" signal (upstream
+    /// outage or a wall of dead ids). 0 = healthy. Lets the admin console tell a live
+    /// scanner from one that's looping without progress.
+    pub consecutive_stuck_ticks: usize,
 }
 
 /// A dependency-light sliding-window rate limiter, keyed by an arbitrary string
@@ -672,7 +682,12 @@ fn assemble_series(
                 .as_ref()
                 .and_then(|s| s.last_scanned_at.clone())
                 .or_else(|| to_iso(m.last_fetched_at.as_deref())),
-            next_scan_at: scan.as_ref().and_then(|s| s.next_scan_at.clone()),
+            // Coerce the internal "due now" sentinel back to null for display — a
+            // never-scanned/freshly-enrolled series shows "due now", not a 1970 timestamp.
+            next_scan_at: scan
+                .as_ref()
+                .and_then(|s| s.next_scan_at.clone())
+                .filter(|t| t != crate::scanner::DUE_NOW_SENTINEL),
         },
         r#type: resolve_comic_type(
             ov_meta.content_type_override.as_deref(),
@@ -2682,19 +2697,34 @@ impl QueryRoot {
     async fn scan_status(&self, ctx: &Context<'_>) -> Result<ScanStatus> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let (library_size, overdue_count, last_tick_at) = {
+        let (
+            library_size,
+            overdue_count,
+            last_tick_at,
+            scanned_ok,
+            scanned_failed,
+            last_success_at,
+            stuck_ticks,
+        ) = {
             // Recover from a poisoned lock rather than propagating the panic.
             let h = st.scan_health.lock().unwrap_or_else(|e| e.into_inner());
             (
                 h.library_size as i32,
                 h.overdue_count as i32,
                 h.last_tick_at.clone(),
+                h.scanned_ok as i32,
+                h.scanned_failed as i32,
+                h.last_success_at.clone(),
+                h.consecutive_stuck_ticks as i32,
             )
         };
-        // Earliest upcoming next_scan_at across all tracked series.
+        // Earliest FUTURE next_scan_at across all tracked series. Restricting to `> now`
+        // excludes already-due rows (the far-past DUE_NOW_SENTINEL and any overdue), so
+        // this reports the next *upcoming* scan rather than the 1970 sentinel.
         let next_due_at: Option<String> = sqlx::query_scalar(
-            "SELECT MIN(next_scan_at) FROM series_scan_state WHERE next_scan_at IS NOT NULL",
+            "SELECT MIN(next_scan_at) FROM series_scan_state WHERE next_scan_at > ?",
         )
+        .bind(Utc::now().to_rfc3339())
         .fetch_optional(&st.pool)
         .await
         .ok()
@@ -2704,6 +2734,10 @@ impl QueryRoot {
             overdue_count,
             last_tick_at,
             next_due_at,
+            scanned_ok,
+            scanned_failed,
+            last_success_at,
+            stuck_ticks,
         })
     }
 
@@ -2974,10 +3008,19 @@ impl QueryRoot {
         // for safe browsing would hide the very sources they administer. Explicit
         // filtering is still available via the `nsfw` argument. (The reader's public
         // browse/search stays gated by the viewer's `show_nsfw`.)
+        // One query for the subscribed set, then badge each row — cheaper than a
+        // per-extension lookup and keeps the map pure.
+        let subscribed = catalog::subscribed_extension_set(&st.pool)
+            .await
+            .map_err(gql_err)?;
         Ok(
             filter_extensions(list, installed_only, lang.as_deref(), nsfw, true)
                 .into_iter()
-                .map(|e| map_extension_info(st, e))
+                .map(|e| {
+                    let mut info = map_extension_info(st, e);
+                    info.subscribed = subscribed.contains(&info.pkg_name);
+                    info
+                })
                 .collect(),
         )
     }
@@ -4715,6 +4758,24 @@ impl MutationRoot {
 
         let n = input.series_id.0.parse::<i64>().map_err(gql_err)?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
+        // Make the change take effect promptly WITHOUT stranding or thrashing the series.
+        // Re-scan directly (like unpause / triggerScan) rather than nulling `next_scan_at`:
+        // nulling forced the series due-now, which the next tick reads as "overdue with no
+        // new chapter" and wrongly flips it into the accelerated awaiting poll — and NULLs
+        // sort ahead of every genuinely-due row, so a burst of admin edits jumps the queue
+        // (audit #7). A direct scan reschedules off fresh data and leaves `awaiting` alone
+        // (the scan isn't "due"), and un-parks a previously-paused series. If the scan
+        // hiccups, fall back to due-now so a parked series still can't be stranded by a
+        // cleared/loosened override.
+        if let Err(e) = scan_series(st, &m, Utc::now()).await {
+            tracing::warn!(series_id = n, error = %e, "updateSeriesAdmin: re-scan failed; marking due-now");
+            let _ =
+                sqlx::query("UPDATE series_scan_state SET next_scan_at = ? WHERE series_id = ?")
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(&input.series_id.0)
+                    .execute(&st.pool)
+                    .await;
+        }
         Ok(map_series(st, m).await)
     }
 
@@ -5307,13 +5368,39 @@ impl MutationRoot {
         let result = add_source_series_core(&st.pool, &m, cover_phash)
             .await
             .map_err(gql_err)?;
+        // Register a "due now" scan-state row FIRST, independent of the scan-on-enrol
+        // below. The DB-driven scanner selects work only from `series_scan_state`, so
+        // without a row a single-add whose enrol-time scan hiccups (network / FlareSolverr
+        // stall) would be invisible to the scheduler until the daily reconcile backfill —
+        // the exact "single-added series never updated" bug this feature exists to fix.
+        // `ensure_pending` is an idempotent `ON CONFLICT DO NOTHING`, so a successful scan
+        // right after cleanly overwrites the schedule (mirrors `federated_ingest`).
+        if let Err(e) = crate::scanner::ensure_pending(&st.pool, &mid.to_string()).await {
+            tracing::warn!(
+                series_id = m.id,
+                error = %e,
+                "ensure_pending after enrol failed; reconcile backfill will retry"
+            );
+        }
+        // Enrol the manga in the Suwayomi library so it stays in-library upstream (the
+        // reconcile pass re-asserts this). NOTE: scan eligibility is driven by the
+        // `series_scan_state` row above, not library membership — the DB-driven scanner
+        // no longer iterates `suwayomi.library()`. Best-effort: a hiccup here must not fail
+        // an otherwise-successful enrol.
+        if let Err(e) = st.suwayomi.set_in_library(mid, true).await {
+            tracing::warn!(
+                series_id = m.id,
+                error = %e,
+                "set_in_library after enrol failed; reconcile will retry"
+            );
+        }
         // Populate this series' chapters + scan state NOW, so its chapters (and the
         // chapter count / updates feed derived from scan state) surface immediately
         // instead of waiting for the next adaptive scan tick (SCAN_TICK_SECONDS).
-        // Best-effort: a scan hiccup must never fail an otherwise-successful enrol —
-        // the scheduler retries on its next pass. Idempotent (record_scan is a
-        // read-modify-write keyed on the series) and rate-limit-safe (a single
-        // chapters fetch for this one series).
+        // Best-effort: a scan hiccup must never fail an otherwise-successful enrol — the
+        // scheduler retries on its next pass via the `ensure_pending` row above.
+        // Idempotent (record_scan is a read-modify-write keyed on the series) and
+        // rate-limit-safe (a single chapters fetch for this one series).
         if let Err(e) = scan_series(st, &m, Utc::now()).await {
             tracing::warn!(
                 series_id = m.id,
@@ -5501,6 +5588,12 @@ impl MutationRoot {
             .uninstall_extension(&pkg_name)
             .await
             .map_err(gql_err)?;
+        // Clear any sync subscription for the now-removed extension so it doesn't linger as
+        // invisible state (the Sync toggle only renders for installed extensions) and
+        // silently resume syncing on a later reinstall (audit LOW). Best-effort.
+        if let Err(err) = catalog::set_extension_subscription(&st.pool, &pkg_name, false).await {
+            tracing::warn!(pkg = %pkg_name, error = %err, "failed to clear subscription on uninstall");
+        }
         Ok(map_extension_info(st, e))
     }
 
@@ -5632,7 +5725,14 @@ impl MutationRoot {
             .await
             .map_err(gql_err)? as i32;
         tokio::spawn(async move {
-            crate::cover::crawl_uncached_covers(&st.pool, &st.cover_pool, &st.mangadex, &st.suwayomi, None).await;
+            crate::cover::crawl_uncached_covers(
+                &st.pool,
+                &st.cover_pool,
+                &st.mangadex,
+                &st.suwayomi,
+                None,
+            )
+            .await;
             st.cover_crawl_running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         });
@@ -5821,6 +5921,29 @@ impl MutationRoot {
             .await
             .map_err(gql_err)?;
         Ok(cancelled.into_iter().map(Into::into).collect())
+    }
+
+    /// Admin: subscribe/unsubscribe an extension for background source-sync. While
+    /// subscribed, the sync job periodically re-walks the extension's sources (LATEST)
+    /// to auto-enrol newly-appeared series and reconcile library membership, so new
+    /// series show up (and keep updating) without a manual add. Enabling kicks an
+    /// immediate sync pass in the background so the admin doesn't wait for the interval;
+    /// this does NOT backfill the whole catalogue — use `startExtensionIngest` for that.
+    async fn set_extension_subscription(
+        &self,
+        ctx: &Context<'_>,
+        pkg_name: ID,
+        subscribed: bool,
+    ) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        catalog::set_extension_subscription(&st_arc.pool, &pkg_name.0, subscribed)
+            .await
+            .map_err(gql_err)?;
+        if subscribed {
+            crate::sync::spawn_extension_sync(st_arc, pkg_name.0.clone());
+        }
+        Ok(subscribed)
     }
 
     /// Admin bulk catalogue ingest (EXT-1): for each Suwayomi manga id, ensure
@@ -6109,6 +6232,10 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
     m.in_library = true;
     // S1: cache series METADATA (chapters fill on scan / first read — not per item).
     let _ = crate::series_cache::put_series(&st.pool, &m).await;
+    // This path deliberately does NOT scan-on-enrol (chapters fill lazily), so register
+    // a "due now" scan-state row explicitly — otherwise the DB-driven scanner, which
+    // selects work from `series_scan_state`, would never pick this series up.
+    let _ = crate::scanner::ensure_pending(&st.pool, &mid.to_string()).await;
     let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
         // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
         // runtime. Best-effort: a task panic just drops the signal.
@@ -6151,8 +6278,7 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
 }
 
 /// Single-flight guard for the catalogue reconcile (process-global; single replica).
-static RECONCILE_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// SQL predicate for a work that still needs reconciling: it has a Suwayomi source,
 /// no MangaDex source, and no pending merge_candidate yet.
@@ -6324,14 +6450,13 @@ async fn add_source_series_core_ex(
     // per-series tags don't include an explicit adult genre: that gap ingested whole
     // adult sources (e.g. omegascans) as SFW and leaked them to the home page.
     // CATALOGUE.md §2.
-    let source_ext_nsfw = sqlx::query_scalar::<_, i64>(
-        "SELECT is_nsfw FROM source_extension WHERE source_id = ?",
-    )
-    .bind(&m.source_id)
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or(0)
-        != 0;
+    let source_ext_nsfw =
+        sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
+            .bind(&m.source_id)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(0)
+            != 0;
     let source_nsfw = genre_is_nsfw(&m.genre) || source_ext_nsfw;
 
     // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
@@ -6858,7 +6983,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(works, 1, "no provisional minted — merged into the existing work");
+        assert_eq!(
+            works, 1,
+            "no provisional minted — merged into the existing work"
+        );
         let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
@@ -6871,7 +6999,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(linked, r.work_id);
-        assert_eq!(linked, existing, "the mapping resolves to the existing work");
+        assert_eq!(
+            linked, existing,
+            "the mapping resolves to the existing work"
+        );
     }
 
     #[tokio::test]
@@ -6901,9 +7032,11 @@ mod tests {
         .unwrap();
         // A real spine work carries a MangaDex source_series (upsert_work_from_mangadex
         // links one) — so it's not itself "provisional".
-        crate::catalog::upsert_source_series(&pool, &spine, "mangadex", "md-src", "md-key", None, false)
-            .await
-            .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &spine, "mangadex", "md-src", "md-key", None, false,
+        )
+        .await
+        .unwrap();
 
         // 3. Reconcile: the provisional folds into the spine work (exact title).
         let (merged, queued, skipped) = reconcile_provisional_works(&pool).await.unwrap();
@@ -7831,10 +7964,7 @@ mod tests {
         assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
         let json = data_json(&r);
         assert!(json.contains("Readable Work"), "{json}");
-        assert!(
-            json.contains(&format!("/covers/{work_id}.webp")),
-            "{json}"
-        );
+        assert!(json.contains(&format!("/covers/{work_id}.webp")), "{json}");
         assert!(json.contains("\"chapterCount\":2"), "{json}");
 
         // canonicalChapters returns ordered chapters keyed by MangaDex uuid.
@@ -8216,7 +8346,11 @@ mod tests {
             r#"mutation {{ setLibraryStatus(seriesId: "{work_id}", status: "reading") {{ id }} }}"#
         );
         let r = exec(&s, &status, Some("bobtok"), "1.1.1.1").await;
-        assert!(r.errors.is_empty(), "setLibraryStatus failed: {:?}", r.errors);
+        assert!(
+            r.errors.is_empty(),
+            "setLibraryStatus failed: {:?}",
+            r.errors
+        );
 
         let q = format!(
             r#"{{ canonicalSeries(workId: "{work_id}") {{ isMarked isFavorite libraryStatus }} }}"#
@@ -9565,17 +9699,15 @@ mod tests {
         assert_eq!(nsfw_of(&pool, "w_srcflag").await, 1, "adult source → NSFW");
         assert_eq!(nsfw_of(&pool, "w_sfw").await, 0, "SFW work stays SFW");
         // Non-admin refused.
-        assert!(
-            !exec(
-                &s,
-                r#"mutation { rederiveSuwayomiNsfw }"#,
-                Some("bobtok"),
-                "1.1.1.1"
-            )
-            .await
-            .errors
-            .is_empty()
-        );
+        assert!(!exec(
+            &s,
+            r#"mutation { rederiveSuwayomiNsfw }"#,
+            Some("bobtok"),
+            "1.1.1.1"
+        )
+        .await
+        .errors
+        .is_empty());
     }
 
     /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a

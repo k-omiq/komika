@@ -1,8 +1,12 @@
 //! Adaptive scan scheduler.
 //!
 //! A background tokio task that keeps the federated library catalog fresh. Every
-//! `SCAN_TICK_SECONDS` it walks the Suwayomi library and re-scans each series that
-//! has reached its persisted `next_scan_at`. That schedule is adaptive:
+//! `SCAN_TICK_SECONDS` it selects — straight from the DB, indexed on `next_scan_at` —
+//! only the series that have reached their persisted `next_scan_at` and re-scans those.
+//! It does NOT fetch the whole Suwayomi library per tick, so tick cost scales with the
+//! DUE set, not the catalogue size (which matters at 100k+ series). Enrolment and the
+//! daily source-sync reconcile (`crate::sync`) guarantee every enrolled series has a
+//! `series_scan_state` row for this query to find. That schedule is adaptive:
 //!
 //!   steady_interval = admin override_interval_hours  (if set)
 //!                     else rolling avg gap between chapter uploads
@@ -28,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use rand_core::RngCore;
 use sqlx::SqlitePool;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -81,9 +86,10 @@ fn resolve_interval(override_interval_hours: Option<f64>, inferred_avg: f64) -> 
 const DEFAULT_POLL_MINUTES: f64 = 30.0;
 
 /// Floor on the accelerated re-poll cadence. The scan loop itself ticks every
-/// `SCAN_TICK_SECONDS` (300s default), so a `poll_every_minutes` below the tick
-/// cadence can't actually poll faster than the tick anyway; 15min is a gentle
-/// floor that keeps overdue re-checks frequent without hammering upstreams.
+/// `SCAN_TICK_SECONDS` (3600s / 1h default), so a `poll_every_minutes` below the tick
+/// cadence can't actually poll faster than the tick anyway — with the hourly default,
+/// the tick is the effective floor for overdue re-checks; 15min stays a gentle floor
+/// for deployments that lower the tick.
 const MIN_POLL_MINUTES: f64 = 15.0;
 
 /// Absolute ceiling on how long a series stays in the accelerated poll cadence
@@ -142,7 +148,10 @@ const SCAN_STATE_SELECT: &str =
      last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, known_chapter_ids \
      FROM series_scan_state WHERE series_id = ?";
 
-/// Read the persisted scan state for a series, if any.
+/// Read the persisted scan state for a series, if any. The DB-driven scheduler selects
+/// due ids directly and `record_scan` re-reads state in its own transaction, so this
+/// standalone pooled read is now only used by tests.
+#[cfg(test)]
 pub async fn scan_state(pool: &SqlitePool, series_id: &str) -> Option<ScanState> {
     sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
         .bind(series_id)
@@ -296,8 +305,10 @@ fn is_paused(status: SeriesStatus, admin: &ScanAdmin) -> bool {
 /// (§2.1), so a native device can install the exact extension a `source_series` came
 /// from. Runs once per tick and is fully non-fatal — any failure (Suwayomi down, an
 /// upstream schema mismatch, a write error) is logged and swallowed so it never
-/// affects the scan. Additive: it only writes `source_extension` rows.
-async fn record_source_extensions(state: &AppState) {
+/// affects the scan. Additive: it only writes `source_extension` rows. Called from the
+/// daily source-sync reconcile (extensions change rarely, so a per-scan-tick refresh was
+/// wasteful once the scan tick stopped touching Suwayomi).
+pub(crate) async fn record_source_extensions(state: &AppState) {
     let extensions = match state.suwayomi.fetch_extensions().await {
         Ok(e) => e,
         Err(e) => {
@@ -328,108 +339,314 @@ async fn record_source_extensions(state: &AppState) {
     }
 }
 
-/// Run one scan tick over the whole library. Returns `(library_size, overdue_seen)`
-/// for aggregate health reporting. Per-series errors are logged and skipped.
-async fn tick(state: &AppState) -> (usize, usize) {
-    // Refresh extension coordinates first (§2.1); non-fatal, never affects the scan.
-    record_source_extensions(state).await;
+/// Max due series scanned in a single tick — bounds a cold-start/backlog tick so it
+/// can't run unbounded; the remainder drains on later ticks (ordered oldest-due first,
+/// so nothing starves).
+const DUE_BATCH_LIMIT: i64 = 5000;
+/// Short breather between back-to-back drain batches, so a continuous backlog drain
+/// doesn't peg the CPU/DB in a tight loop between 5k-series batches.
+const DRAIN_BATCH_DELAY_MS: u64 = 250;
+/// How far out a paused (COMPLETED/HIATUS/CANCELLED or admin-paused) series is parked so
+/// it drops out of the frequent due-set — the whole point of pause. It's still
+/// re-evaluated this often, so an upstream status flip / cleared override eventually
+/// heals on its own without a full-library sweep. (Admin unpause resets `next_scan_at`
+/// for promptness — see `set_series_paused` / `update_series_admin`.)
+const PAUSED_PARK_HOURS: i64 = 24 * 14; // 14 days
 
-    let library = match state.suwayomi.library().await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, "scan tick: failed to list Suwayomi library");
-            return (0, 0);
-        }
-    };
-    let library_size = library.len();
+/// Base delay (minutes) for the first failed scan's error-backoff. Subsequent
+/// consecutive failures double this (30m, 1h, 2h, …) up to `ERROR_BACKOFF_MAX_HOURS`,
+/// so a permanently-failing series (deleted upstream, 404) leaves the hot front of the
+/// due-set instead of being retried every tick and starving healthy series (audit #4).
+const ERROR_BACKOFF_BASE_MINUTES: i64 = 30;
+/// Cap on the error-backoff so a permanently-failing series stops growing its delay and
+/// settles into a daily re-check (it might come back). Independent of `PAUSED_PARK_HOURS`:
+/// a dead/erroring id is retried ~daily, more often than a genuinely paused series' 14-day
+/// park, because a fetch error (unlike a clean paused status) may be transient.
+const ERROR_BACKOFF_MAX_HOURS: i64 = 24;
+
+/// "Due now" sentinel for `next_scan_at`. A never-scanned / freshly-enrolled series is
+/// stored with this far-past timestamp instead of NULL so the due-query can be a single
+/// bounded `next_scan_at <= ?` range seek (index-early-terminating, O(due)) rather than an
+/// `IS NULL OR <=` full index scan. It sorts before every real timestamp (RFC3339 string
+/// order) so due-now rows come first. COMPLETENESS INVARIANT: every enrolled series must
+/// have a NON-NULL `next_scan_at` — a stray NULL would never match `<= ?` and the series
+/// would silently never scan. Every writer here (and `catalog::backfill_pending_scan_states`)
+/// therefore writes a real time or this sentinel; migration 0048 backfilled legacy NULLs.
+pub const DUE_NOW_SENTINEL: &str = "1970-01-01T00:00:00+00:00";
+
+/// Outcome of one `tick`: enough to drive the drain loop and honest health reporting.
+struct TickOutcome {
+    /// Total tracked series (`series_scan_state` row count) — health "library size".
+    tracked: usize,
+    /// Rows the due-query selected this batch (== `DUE_BATCH_LIMIT` ⇒ likely more waiting).
+    due: usize,
+    /// Scans that completed and advanced `next_scan_at` (progress signal for the drain).
+    ok: usize,
+    /// Scans that errored and were backed off.
+    failed: usize,
+}
+
+/// Run one scheduler pass, DB-driven: pull ONLY the series whose `next_scan_at` is due
+/// (or NULL = never scanned / freshly enrolled) straight from `series_scan_state` — no
+/// full-library fetch, no O(library) per-tick sweep — and scan them with small bounded
+/// concurrency. Paused series park themselves far out (see `scan_due`), so they fall out
+/// of the due-set naturally.
+async fn tick(state: &AppState, shutdown: &tokio::sync::watch::Receiver<bool>) -> TickOutcome {
     let now = Utc::now();
-    let mut overdue_seen = 0usize;
+    let due = due_series_ids(&state.pool, &now.to_rfc3339(), DUE_BATCH_LIMIT).await;
+    let due_count = due.len();
 
-    // Gate serially (these are cheap local DB reads), collecting only the series that
-    // actually need a live upstream fetch. The `bool` marks a paused-baseline scan so its
-    // failure keeps its distinct log line. Nothing here touches Suwayomi.
-    let mut to_scan: Vec<(SuwayomiManga, bool)> = Vec::new();
-    for m in library {
-        let series_id = m.id.to_string();
-        let admin = scan_admin(&state.pool, &series_id).await;
-        let status = effective_status(&m, &admin);
-        let prior_state = scan_state(&state.pool, &series_id).await;
-        if is_paused(status, &admin) {
-            // Paused skips *polling* — but a never-observed series still gets ONE
-            // baseline scan so its chapter list is fetched into the engine and its
-            // chapter count / cadence exist for the console. Without this, a
-            // series that enters the library already COMPLETED/HIATUS (auto-pause)
-            // was skipped forever and showed 0 chapters indefinitely.
-            if prior_state.is_none() {
-                to_scan.push((m, true));
-            }
-            continue;
-        }
-
-        let prior = prior_state.unwrap_or_default();
-
-        // Gate on the persisted `next_scan_at`, which `scan_series` schedules from
-        // the steady cadence normally and from the accelerated poll cadence while a
-        // series is awaiting an overdue chapter (SC1). Gating and the admin
-        // console's "next due" now read the same stored value, so they agree (SC7).
-        // A brand-new series has no `next_scan_at` and is scanned promptly.
-        if !is_due(prior.next_scan_at.as_deref(), now) {
-            continue;
-        }
-        overdue_seen += 1;
-        to_scan.push((m, false));
-    }
-
-    // Fetch the due series with SMALL bounded concurrency. Each `scan_series` is a live
-    // Suwayomi `chapters()` fetch proxied through FlareSolverr (which stalls — hence the
-    // 30s timeout), so on a cold-start/large-library tick everything is due and this was
-    // O(library) serial upstream round-trips. Concurrency stays modest so overlapping RTT
-    // doesn't hammer the proxy; distinct series touch distinct DB rows so the concurrent
-    // record-scan writes don't collide (SQLite's single writer + busy_timeout serialize).
+    // SMALL bounded concurrency: each scan is a live upstream fetch through FlareSolverr
+    // (which stalls — hence the 30s timeout), so overlap stays modest; distinct series
+    // touch distinct DB rows so the concurrent writes don't collide (SQLite's single
+    // writer + busy_timeout serialize).
     use futures::StreamExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     const SCAN_CONCURRENCY: usize = 3;
-    futures::stream::iter(to_scan)
-        .for_each_concurrent(SCAN_CONCURRENCY, |(m, baseline)| async move {
-            let series_id = m.id.to_string();
-            if let Err(e) = scan_series(state, &m, now).await {
-                if baseline {
-                    tracing::warn!(series_id, error = %e, "scan: paused baseline scan failed; skipping");
-                } else {
-                    tracing::warn!(series_id, error = %e, "scan: series scan failed; skipping");
+    let ok = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    futures::stream::iter(due)
+        .for_each_concurrent(SCAN_CONCURRENCY, |series_id| {
+            let ok = &ok;
+            let failed = &failed;
+            async move {
+                // Honor shutdown mid-batch: a full DUE_BATCH_LIMIT batch at concurrency 3
+                // can run a long time, so stop starting new scans the moment shutdown fires
+                // instead of blocking a graceful stop for the whole batch (audit LOW).
+                if *shutdown.borrow() {
+                    return;
+                }
+                match scan_due(state, &series_id, now).await {
+                    Ok(_) => {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(series_id, error = %e, "scan: series scan failed; backed off");
+                    }
                 }
             }
         })
         .await;
 
-    (library_size, overdue_seen)
+    let tracked = scan_state_count(&state.pool).await;
+    TickOutcome {
+        tracked,
+        due: due_count,
+        ok: ok.into_inner(),
+        failed: failed.into_inner(),
+    }
+}
+
+/// Due series ids from the DB (uses `idx_scan_state_next_scan`). A single bounded
+/// `next_scan_at <= ?` range seek: the index supplies the order (`ORDER BY next_scan_at
+/// ASC`, no temp-b-tree sort) AND terminates the scan at the first future-dated row, so
+/// future rows are never visited — cost is O(due), not O(catalogue). Never-scanned /
+/// freshly-enrolled rows carry the far-past `DUE_NOW_SENTINEL` (not NULL), so they sort
+/// first as due-now, then oldest-scheduled first — a cold-start backlog drains fairly
+/// across ticks. See `DUE_NOW_SENTINEL` for the completeness invariant this relies on.
+async fn due_series_ids(pool: &SqlitePool, now_iso: &str, limit: i64) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT series_id FROM series_scan_state \
+         WHERE next_scan_at <= ? \
+         ORDER BY next_scan_at ASC LIMIT ?",
+    )
+    .bind(now_iso)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "scan: due-series query failed");
+        Vec::new()
+    })
+}
+
+/// Count of tracked series — the health snapshot's "library size".
+async fn scan_state_count(pool: &SqlitePool) -> usize {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM series_scan_state")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize
+}
+
+/// Scheduler entry point: scan ONE due series by id.
+///
+/// A single combined upstream fetch (fresh status + chapters), then record the scan —
+/// *unconditionally*, even for a paused series. Scanning first is deliberate: it
+/// baselines a never-observed series so even a COMPLETED/HIATUS series gets a real
+/// chapter count (a paused series that had never been scanned otherwise shows 0 chapters
+/// forever), and it refreshes status so an upstream *reopen* (COMPLETED → ONGOING)
+/// auto-resumes scanning without waiting for an admin. If the series is *still* paused
+/// afterwards, it is PARKED far out — overriding the steady next-scan `record_scan` just
+/// set — so it leaves the frequent due-set. Net cost of a steady paused series is thus
+/// one fetch per park window (~14d), which also catches the rare late chapter on a
+/// "completed" series. (Zero-cost "never fetch paused" was rejected: it reintroduces the
+/// 0-chapter bug and loses reopen detection the old live-`library()` sweep had.)
+async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
+    let Ok(id) = series_id.parse::<i64>() else {
+        // A non-numeric id can't be a Suwayomi series; park it so it stops recurring.
+        park_paused(&state.pool, series_id, now).await?;
+        return Ok(false);
+    };
+    let admin = scan_admin(&state.pool, series_id).await;
+    // ONE combined fetch for fresh status + chapters (falls back to two calls internally
+    // on an older engine). On failure, back the series off (exponential, capped) so a
+    // deleted/404'ing id or a transient outage doesn't leave it pinned at the front of
+    // the due-ordering, re-tried every tick and starving healthy series (audit #1/#4).
+    let (m, chapters) = match state.suwayomi.series_and_chapters(id).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(be) = record_scan_failure(&state.pool, series_id, now).await {
+                tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
+            }
+            return Err(e);
+        }
+    };
+    let found = match persist_scan(state, &m, &chapters, &admin, now).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(be) = record_scan_failure(&state.pool, series_id, now).await {
+                tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
+            }
+            return Err(e);
+        }
+    };
+    // Park AFTER the scan (overriding the steady cadence `record_scan` set) so a paused
+    // series drops out of the frequent due-set but was still baselined + status-checked.
+    if is_paused(effective_status(&m, &admin), &admin) {
+        park_paused(&state.pool, series_id, now).await?;
+    }
+    Ok(found)
+}
+
+/// Record a failed scan: bump `consecutive_failures` and push `next_scan_at` out with an
+/// exponential, capped backoff (30m, 1h, 2h, … up to `ERROR_BACKOFF_MAX_HOURS`). Upsert so
+/// a never-scanned series with no row yet is still backed off. A successful `record_scan`
+/// resets `consecutive_failures` to 0. This is what keeps a permanently-failing series from
+/// starving every healthy series behind it in the due-ordering (audit #1/#4).
+async fn record_scan_failure(
+    pool: &SqlitePool,
+    series_id: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let prior: i64 = sqlx::query_scalar(
+        "SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?",
+    )
+    .bind(series_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0);
+    let failures = prior.saturating_add(1);
+    // base * 2^(failures-1), capped. `checked_shl` guards the shift; the `.min` caps it
+    // well below any overflow, so a huge streak just pins at the cap.
+    let shift = (failures - 1).clamp(0, 40) as u32;
+    let backoff_minutes = ERROR_BACKOFF_BASE_MINUTES
+        .saturating_mul(1i64.checked_shl(shift).unwrap_or(i64::MAX))
+        .min(ERROR_BACKOFF_MAX_HOURS * 60);
+    let next = (now + chrono::Duration::minutes(backoff_minutes)).to_rfc3339();
+    let now_iso = now.to_rfc3339();
+    sqlx::query(
+        "INSERT INTO series_scan_state (series_id, next_scan_at, consecutive_failures, updated_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(series_id) DO UPDATE SET \
+           next_scan_at = excluded.next_scan_at, \
+           consecutive_failures = excluded.consecutive_failures, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(series_id)
+    .bind(&next)
+    .bind(failures)
+    .bind(&now_iso)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Park a paused series' next scan far out so it drops out of the frequent due-set,
+/// leaving its other scan-state fields intact. Upsert so a never-scanned paused series
+/// (a pending row, or none yet) is parked too.
+async fn park_paused(pool: &SqlitePool, series_id: &str, now: DateTime<Utc>) -> anyhow::Result<()> {
+    // Jitter the park window by ±(PAUSED_PARK_HOURS/10) so a cold-start cohort parked in
+    // the same drain doesn't all come back due in the same window 14 days later and
+    // re-cluster into a thundering herd (audit #9).
+    let spread = (PAUSED_PARK_HOURS / 5).max(1);
+    let jitter = (rand_core::OsRng.next_u64() % spread as u64) as i64 - spread / 2;
+    let next = (now + chrono::Duration::hours(PAUSED_PARK_HOURS + jitter)).to_rfc3339();
+    let now_iso = now.to_rfc3339();
+    // Also clear any stale `awaiting_since` (a paused series is not "awaiting a late
+    // chapter") and reset the failure counter — the fetch that led here succeeded.
+    sqlx::query(
+        "INSERT INTO series_scan_state (series_id, next_scan_at, awaiting_since, consecutive_failures, updated_at) \
+         VALUES (?, ?, NULL, 0, ?) \
+         ON CONFLICT(series_id) DO UPDATE SET \
+           next_scan_at = excluded.next_scan_at, \
+           awaiting_since = NULL, \
+           consecutive_failures = 0, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(series_id)
+    .bind(&next)
+    .bind(&now_iso)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Ensure a series has a scan-state row so the DB-driven scheduler will pick it up.
+/// Inserts a minimal "due now" row (`next_scan_at = DUE_NOW_SENTINEL`) without disturbing
+/// an existing one. Used by enrol paths that DON'T scan-on-enrol (federated search) and by
+/// the daily reconcile to backfill any pre-existing enrolled series that lacks a row. The
+/// sentinel (not NULL) is required by the due-query's `<= ?` completeness invariant.
+pub async fn ensure_pending(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(series_id) DO NOTHING",
+    )
+    .bind(series_id)
+    .bind(DUE_NOW_SENTINEL)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Re-fetch one series' chapters, detect new ones, and persist its scan state
 /// (rolling avg, chapter count, `last_scanned_at`, next `next_scan_at`). Returns
 /// whether new chapters were found.
 ///
-/// Shared by the scheduler `tick` (which gates on pause/overdue first) and the
-/// admin `triggerScan` mutation (which forces a scan regardless of gating). It
-/// re-reads the admin override so it's self-contained for both callers; the
-/// fetch + detection + persist is delegated to `record_scan`.
+/// The enrol paths (`add_source_series`, `ingest_source_series`) and the admin
+/// `triggerScan` / unpause mutations call this with a manga they already hold; the
+/// scheduler uses `scan_due` (which fetches manga + chapters together). It re-reads the
+/// admin override so it's self-contained; fetch + persist is delegated to `persist_scan`.
 pub async fn scan_series(
     state: &AppState,
     m: &SuwayomiManga,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let series_id = m.id.to_string();
-    let admin = scan_admin(&state.pool, &series_id).await;
+    let admin = scan_admin(&state.pool, &m.id.to_string()).await;
     let chapters = state.suwayomi.chapters(m.id).await?;
-    // S1: persist the series metadata + chapter list to the DB cache so reader
-    // requests serve from SQLite instead of live-fetching. Best-effort — a cache
-    // write must never fail the scan.
+    persist_scan(state, m, &chapters, &admin, now).await
+}
+
+/// Persist a scan from an ALREADY-FETCHED manga + chapters: refresh the DB caches (S1 —
+/// so reader requests serve from SQLite instead of live-fetching), then detect new
+/// chapters + schedule the next scan (`record_scan`). Cache writes are best-effort — a
+/// cache hiccup must never fail the scan. Shared by `scan_series` and `scan_due`.
+async fn persist_scan(
+    state: &AppState,
+    m: &SuwayomiManga,
+    chapters: &[SuwayomiChapter],
+    admin: &ScanAdmin,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let series_id = m.id.to_string();
     if let Err(e) = crate::series_cache::put_series(&state.pool, m).await {
         tracing::warn!(series_id, error = %e, "scan: series cache write failed");
     }
-    if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, &chapters).await {
+    if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, chapters).await {
         tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
     }
-    record_scan(&state.pool, &series_id, &m.title, &admin, &chapters, now).await
+    record_scan(&state.pool, &series_id, &m.title, admin, chapters, now).await
 }
 
 /// Detect new chapters from a freshly-fetched chapter list and persist the
@@ -509,9 +726,15 @@ async fn record_scan(
     // and found no new chapter, so the expected chapter is late (SC1). We gate on
     // due-ness — not merely "a scan found nothing" — so an admin `triggerScan` that
     // force-scans a series *before* its cadence doesn't wrongly flip it into the
-    // accelerated poll. First observation just recorded a baseline — not awaiting.
+    // accelerated poll. We also require a prior chapter SNAPSHOT: the FIRST real scan of
+    // a series is a baseline, not a late chapter — even when a `series_scan_state` row
+    // already exists from `ensure_pending`/backfill (which pre-seeds a row with a due-now
+    // sentinel `next_scan_at` but NO `known_chapter_ids`), so `first_observation` alone
+    // isn't enough to recognise a baseline. Without this, every newly-enrolled and
+    // federated-ingested series would wrongly enter the 30-min accelerated poll on its
+    // first scheduler scan.
     let due_now = is_due(prior.next_scan_at.as_deref(), now);
-    let awaiting = due_now && !new_found && !first_observation;
+    let awaiting = due_now && !new_found && !first_observation && have_prior_snapshot;
     // Stamp when the awaiting streak began (preserve the original start across
     // repeated polls); clear it as soon as a chapter lands or we're not awaiting.
     let awaiting_since = if awaiting {
@@ -568,8 +791,8 @@ async fn record_scan(
         "INSERT INTO series_scan_state \
            (series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
             last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, \
-            known_chapter_ids, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            known_chapter_ids, consecutive_failures, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) \
          ON CONFLICT(series_id) DO UPDATE SET \
            avg_interval_hours = excluded.avg_interval_hours, \
            known_chapter_count = excluded.known_chapter_count, \
@@ -579,6 +802,7 @@ async fn record_scan(
            last_new_chapter_at = excluded.last_new_chapter_at, \
            awaiting_since = excluded.awaiting_since, \
            known_chapter_ids = excluded.known_chapter_ids, \
+           consecutive_failures = 0, \
            updated_at = excluded.updated_at",
     )
     .bind(series_id)
@@ -641,17 +865,65 @@ async fn run_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let started = Utc::now();
-                let (size, overdue) = tick(&state).await;
-                {
-                    // Recover from a poisoned lock rather than propagating the panic
-                    // (which would kill the scheduler task) — a stale health snapshot
-                    // is harmless compared with a dead scan loop.
-                    let mut h = state.scan_health.lock().unwrap_or_else(|e| e.into_inner());
-                    h.library_size = size;
-                    h.overdue_count = overdue;
-                    h.last_tick_at = Some(started.to_rfc3339());
+                // Accumulate across the whole drain pass so health reports total work
+                // done this pass, not just the last batch's counts.
+                let mut drain_ok = 0usize;
+                let mut drain_failed = 0usize;
+                // Drain: a tick processes at most DUE_BATCH_LIMIT series. When it comes
+                // back full there's almost certainly more due (a cold-start backlog, or
+                // catch-up after downtime), so keep draining immediately instead of
+                // idling a whole interval between 5k-series batches — then settle back
+                // to the steady cadence once a batch comes back short (caught up).
+                loop {
+                    let out = tick(&state, &shutdown).await;
+                    drain_ok += out.ok;
+                    drain_failed += out.failed;
+                    {
+                        // Recover from a poisoned lock rather than propagating the panic
+                        // (which would kill the scheduler task) — a stale health snapshot
+                        // is harmless compared with a dead scan loop.
+                        let mut h = state.scan_health.lock().unwrap_or_else(|e| e.into_inner());
+                        h.library_size = out.tracked;
+                        h.overdue_count = out.due;
+                        h.last_tick_at = Some(started.to_rfc3339());
+                        h.scanned_ok = drain_ok;
+                        h.scanned_failed = drain_failed;
+                        if out.ok > 0 {
+                            h.last_success_at = Some(Utc::now().to_rfc3339());
+                        }
+                        // "Stuck" = a batch that ATTEMPTED work but advanced nothing
+                        // (upstream outage, or a wall of dead ids) — gated on failures-with-
+                        // no-success, NOT on batch size, so a normal-scale outage (a small
+                        // due-set, all failing) trips it too, not only a >=DUE_BATCH_LIMIT
+                        // backlog. An idle tick (nothing due, no failures) resets it.
+                        if out.failed > 0 && out.ok == 0 {
+                            h.consecutive_stuck_ticks = h.consecutive_stuck_ticks.saturating_add(1);
+                        } else {
+                            h.consecutive_stuck_ticks = 0;
+                        }
+                    }
+                    tracing::info!(
+                        library_size = out.tracked,
+                        overdue = out.due,
+                        ok = out.ok,
+                        failed = out.failed,
+                        "scan tick complete"
+                    );
+                    // Keep draining ONLY while a full batch is still making real progress.
+                    // A full batch that scanned nothing successfully (total upstream outage)
+                    // must NOT tight-loop — break to the interval so we back off instead of
+                    // hammering a dead upstream; the per-series error-backoff has already
+                    // pushed those rows out of the hot front (audit #1).
+                    let more_due = out.due >= DUE_BATCH_LIMIT as usize;
+                    if !more_due || out.ok == 0 || *shutdown.borrow() {
+                        break;
+                    }
+                    // Gentle breather between continuous drain batches.
+                    tokio::time::sleep(Duration::from_millis(DRAIN_BATCH_DELAY_MS)).await;
+                    if *shutdown.borrow() {
+                        break;
+                    }
                 }
-                tracing::info!(library_size = size, overdue = overdue, "scan tick complete");
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -1083,6 +1355,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_real_scan_of_preregistered_series_is_not_awaiting() {
+        // Regression (verify pass): enrol paths (add_source_series/federated_ingest) and
+        // the reconcile backfill now pre-seed a due-now `series_scan_state` row via
+        // ensure_pending — which has NO chapter snapshot. The first REAL scan must still be
+        // treated as a baseline (steady cadence, not awaiting), even though a row already
+        // exists (so `first_observation` is false). Without gating awaiting on
+        // `have_prior_snapshot`, every newly-enrolled series would flip into the 30-min
+        // accelerated poll for up to 48h on its first scan.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            override_interval_hours: Some(168.0),
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+        // Pre-register with a due-now sentinel row + no snapshot (what ensure_pending does).
+        ensure_pending(&pool, "1").await.unwrap();
+        let t0 = at("2026-01-01T00:00:00Z");
+        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
+            .await
+            .unwrap();
+        assert!(
+            !new_found,
+            "first real scan is a baseline, not new chapters"
+        );
+        assert!(
+            (hours_until_next_scan(&pool, "1", t0).await - 168.0).abs() < 0.01,
+            "a pre-registered series' first scan schedules the STEADY interval, not the poll cadence"
+        );
+        assert!(
+            persisted(&pool, "1").await.awaiting_since.is_none(),
+            "a pre-registered series' first scan must not enter awaiting"
+        );
+    }
+
+    #[tokio::test]
     async fn awaiting_backs_off_to_steady_after_window() {
         // SC1: a series that stays overdue past the awaiting window stops polling
         // aggressively and falls back to the steady cadence, so it can't poll
@@ -1278,6 +1585,316 @@ mod tests {
         assert!(
             row.awaiting_since.is_none(),
             "a landed chapter is not awaiting"
+        );
+    }
+
+    // ── DB-driven work-selection ─────────────────────────────────────────────────
+
+    /// Insert a scan-state row. `None` models a "due now" series — stored as the
+    /// `DUE_NOW_SENTINEL` (the real representation), NOT a raw NULL, so it matches the
+    /// bounded `next_scan_at <= ?` due-query like a real freshly-enrolled row.
+    async fn put_state(pool: &SqlitePool, id: &str, next_scan_at: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind(id)
+        .bind(next_scan_at.unwrap_or(DUE_NOW_SENTINEL))
+        .bind("2024-01-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn next_scan_of(pool: &SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn due_query_takes_null_and_past_orders_nulls_first_and_limits() {
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+        put_state(&pool, "sentinel", None).await; // never scanned (sentinel) -> due now
+        put_state(&pool, "past", Some("2023-12-31T00:00:00Z")).await; // overdue
+        put_state(&pool, "future", Some("2024-02-01T00:00:00Z")).await; // not due
+
+        let due = due_series_ids(&pool, &now.to_rfc3339(), 10).await;
+        assert_eq!(
+            due,
+            vec!["sentinel".to_string(), "past".to_string()],
+            "sentinel (due-now) sorts first, then overdue; future is excluded"
+        );
+
+        let capped = due_series_ids(&pool, &now.to_rfc3339(), 1).await;
+        assert_eq!(capped, vec!["sentinel".to_string()], "LIMIT is honored");
+    }
+
+    #[tokio::test]
+    async fn ensure_pending_is_due_now_and_never_clobbers() {
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+
+        // Fresh row is due now — stored as the sentinel (never NULL) and selected by the
+        // bounded due-query.
+        ensure_pending(&pool, "42").await.unwrap();
+        assert_eq!(
+            next_scan_of(&pool, "42").await.as_deref(),
+            Some(DUE_NOW_SENTINEL)
+        );
+        assert!(
+            due_series_ids(&pool, &now.to_rfc3339(), 10)
+                .await
+                .contains(&"42".to_string()),
+            "a sentinel row is due now"
+        );
+
+        // Park it, then re-run ensure_pending: the parked schedule must survive.
+        park_paused(&pool, "42", now).await.unwrap();
+        let parked = next_scan_of(&pool, "42").await;
+        assert!(parked.is_some());
+        ensure_pending(&pool, "42").await.unwrap();
+        assert_eq!(
+            next_scan_of(&pool, "42").await,
+            parked,
+            "ensure_pending must not disturb an existing row"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_pushes_next_scan_out_and_drops_from_due_set() {
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+        put_state(&pool, "done", None).await; // starts due
+        park_paused(&pool, "done", now).await.unwrap();
+
+        let next = next_scan_of(&pool, "done").await.unwrap();
+        let hours = (at(&next) - now).num_hours();
+        // Parked ~PAUSED_PARK_HOURS out, but jittered by ±(PAUSED_PARK_HOURS/10) to avoid a
+        // cold-start cohort re-clustering into a thundering herd 14 days later (audit #9).
+        let spread = PAUSED_PARK_HOURS / 5;
+        assert!(
+            (hours - PAUSED_PARK_HOURS).abs() <= spread,
+            "parked ~{PAUSED_PARK_HOURS}h out (±{spread}), got {hours}h"
+        );
+
+        let due = due_series_ids(&pool, &now.to_rfc3339(), 10).await;
+        assert!(
+            !due.contains(&"done".to_string()),
+            "parked series isn't due"
+        );
+    }
+
+    async fn failures_of(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn record_scan_failure_backs_off_exponentially_then_resets_on_success() {
+        // audit #1/#4: a failing scan must push next_scan_at out (growing) and bump the
+        // failure counter, and a later success must clear the counter.
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+        put_state(&pool, "dead", None).await; // due now
+
+        record_scan_failure(&pool, "dead", now).await.unwrap();
+        let after1 = (at(&next_scan_of(&pool, "dead").await.unwrap()) - now).num_minutes();
+        assert_eq!(failures_of(&pool, "dead").await, 1);
+        assert_eq!(
+            after1, ERROR_BACKOFF_BASE_MINUTES,
+            "first failure backs off base"
+        );
+
+        record_scan_failure(&pool, "dead", now).await.unwrap();
+        let after2 = (at(&next_scan_of(&pool, "dead").await.unwrap()) - now).num_minutes();
+        assert_eq!(failures_of(&pool, "dead").await, 2);
+        assert_eq!(
+            after2,
+            ERROR_BACKOFF_BASE_MINUTES * 2,
+            "second failure doubles"
+        );
+
+        // A successful scan resets the counter to 0.
+        record_scan(&pool, "dead", "S", &ScanAdmin::default(), &chaps(3), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            failures_of(&pool, "dead").await,
+            0,
+            "a success clears the failure streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn backed_off_failure_no_longer_starves_a_healthy_overdue_series() {
+        // audit #4: after a failure backs a dead series off into the future, a genuinely
+        // overdue healthy series sorts AHEAD of it in the due-ordering (no starvation).
+        let pool = migrated_pool().await;
+        let now = at("2024-02-01T00:00:00Z");
+        put_state(&pool, "dead", None).await; // was pinned due-now
+        record_scan_failure(&pool, "dead", now).await.unwrap(); // now backed off ~30m out
+        put_state(&pool, "healthy", Some("2024-01-31T00:00:00Z")).await; // overdue (past)
+
+        let due = due_series_ids(&pool, &now.to_rfc3339(), 10).await;
+        assert_eq!(
+            due.first().map(String::as_str),
+            Some("healthy"),
+            "an overdue healthy series is no longer stuck behind the backed-off dead id"
+        );
+        assert!(
+            !due.contains(&"dead".to_string()),
+            "the backed-off dead id has left the current due-set"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_clears_awaiting_and_failures() {
+        // audit #5(low)/#9: parking a paused series must clear a stale awaiting streak and
+        // reset the failure counter (the fetch that led to the park succeeded).
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+        sqlx::query(
+            "INSERT INTO series_scan_state \
+               (series_id, next_scan_at, awaiting_since, consecutive_failures, updated_at) \
+             VALUES ('p', NULL, '2023-12-01T00:00:00Z', 3, '2024-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        park_paused(&pool, "p", now).await.unwrap();
+
+        let row = scan_state(&pool, "p").await.unwrap();
+        assert!(row.awaiting_since.is_none(), "park clears awaiting_since");
+        assert_eq!(failures_of(&pool, "p").await, 0, "park resets failures");
+    }
+
+    #[tokio::test]
+    async fn backfill_covers_only_untracked_suwayomi_series() {
+        let pool = migrated_pool().await;
+        // A work for the source_series FK (foreign keys are enforced).
+        sqlx::query(
+            "INSERT INTO work (id, created_at, updated_at) \
+             VALUES ('w', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ins_ss = |key: &str, ty: &str| {
+            let pool = pool.clone();
+            let key = key.to_string();
+            let ty = ty.to_string();
+            async move {
+                sqlx::query(
+                    "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+                     VALUES (?, 'w', ?, ?, '2024-01-01T00:00:00Z')",
+                )
+                .bind(format!("ss_{ty}_{key}"))
+                .bind(&ty)
+                .bind(&key)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        ins_ss("100", "suwayomi").await; // untracked suwayomi -> should be backfilled
+        ins_ss("200", "suwayomi").await; // already tracked (below) -> left alone
+        ins_ss("300", "mangadex").await; // not suwayomi -> ignored
+        park_paused(&pool, "200", at("2024-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let parked_200 = next_scan_of(&pool, "200").await;
+
+        let added = crate::catalog::backfill_pending_scan_states(&pool)
+            .await
+            .unwrap();
+        assert_eq!(added, 1, "only the untracked suwayomi series is backfilled");
+        assert_eq!(
+            next_scan_of(&pool, "100").await.as_deref(),
+            Some(DUE_NOW_SENTINEL),
+            "backfilled row is due now (sentinel, never NULL)"
+        );
+        assert_eq!(
+            next_scan_of(&pool, "200").await,
+            parked_200,
+            "already-tracked series is untouched"
+        );
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM series_scan_state WHERE series_id = '300'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                == 0,
+            "non-suwayomi series is never tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrol_paths_never_leave_null_next_scan_at() {
+        // COMPLETENESS INVARIANT (audit #6): the due-query is a bounded `next_scan_at <= ?`,
+        // so a NULL row can never match and would silently never scan. Assert the enrol
+        // paths write the sentinel, never NULL, and that such rows are due now.
+        let pool = migrated_pool().await;
+        let now = at("2024-01-01T00:00:00Z");
+        ensure_pending(&pool, "1").await.unwrap();
+        ensure_pending(&pool, "2").await.unwrap();
+        let nulls: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(nulls, 0, "no enrolled row may have a NULL next_scan_at");
+        let due = due_series_ids(&pool, &now.to_rfc3339(), 10).await;
+        assert!(
+            due.contains(&"1".to_string()) && due.contains(&"2".to_string()),
+            "sentinel rows are due now"
+        );
+    }
+
+    // Locks the due-query plan: it must use the next_scan_at index, take its ordering from
+    // the index (no temp-b-tree sort), and be a bounded SEARCH (range seek) — NOT a full
+    // SCAN. The bounded SEARCH is what makes the query O(due): with "due now" stored as the
+    // far-past sentinel (not NULL), the `next_scan_at <= ?` range early-terminates at the
+    // first future row, so future-dated rows are never visited (audit #6).
+    #[tokio::test]
+    async fn due_query_is_index_backed_bounded_and_unsorted() {
+        use sqlx::Row as _;
+        let pool = migrated_pool().await;
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT series_id FROM series_scan_state \
+             WHERE next_scan_at <= ? ORDER BY next_scan_at ASC LIMIT ?",
+        )
+        .bind("2024-01-01T00:00:00Z")
+        .bind(DUE_BATCH_LIMIT)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("detail"))
+        .collect();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_scan_state_next_scan"),
+            "due-query must use the next_scan_at index, got: {joined}"
+        );
+        assert!(
+            !joined.to_uppercase().contains("TEMP B-TREE"),
+            "due-query ordering must come from the index, not a sort, got: {joined}"
+        );
+        // A bounded range seek reports as SEARCH … (next_scan_at<?); a full walk reports as
+        // SCAN. The `<= ?` sentinel design must yield the former (early-terminating).
+        let upper = joined.to_uppercase();
+        assert!(
+            upper.contains("SEARCH") && !upper.contains("SCAN SERIES_SCAN_STATE"),
+            "due-query must be a bounded SEARCH (range seek), not a full SCAN, got: {joined}"
         );
     }
 }

@@ -578,6 +578,9 @@ export class CompositeBackend implements Backend {
 	cancelExtensionIngest(pkgName: Id): Promise<SourceIngestJob[]> {
 		return this.opts.hosted.cancelExtensionIngest!(pkgName);
 	}
+	setExtensionSubscription(pkgName: Id, subscribed: boolean): Promise<boolean> {
+		return this.opts.hosted.setExtensionSubscription!(pkgName, subscribed);
+	}
 
 	// --- admin maintenance ---
 	persistCatalogue(): Promise<number> {

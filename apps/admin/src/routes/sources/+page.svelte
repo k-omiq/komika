@@ -20,6 +20,7 @@
 		loadSources,
 		materializeCatalogueCovers,
 		persistCatalogue,
+		setExtensionSubscription,
 		startExtensionIngest,
 		startSourceIngest,
 		uninstallExtension,
@@ -180,6 +181,34 @@
 			rowMsg = {
 				...rowMsg,
 				[e.pkgName]: err instanceof Error ? err.message : `Failed to ${verb}.`,
+			};
+		} finally {
+			busyPkg = null;
+		}
+	}
+
+	/**
+	 * Toggle background source-sync for an extension. Subscribing makes the server
+	 * periodically re-walk this extension's sources to auto-discover newly-added series
+	 * (and keep enrolled series in the library so they keep updating); enabling also
+	 * kicks an immediate pass server-side. Reuses `busyPkg` so a row runs one action.
+	 */
+	async function toggleSync(e: ExtensionInfo): Promise<void> {
+		if (busyPkg) return;
+		busyPkg = e.pkgName;
+		const { [e.pkgName]: _drop, ...rest } = rowMsg;
+		rowMsg = rest;
+		try {
+			const next = await setExtensionSubscription(e.pkgName, !e.subscribed);
+			exts = exts.map((x) => (x.pkgName === e.pkgName ? { ...x, subscribed: next } : x));
+			rowMsg = {
+				...rowMsg,
+				[e.pkgName]: next ? 'Syncing new series from now on.' : 'Sync off.',
+			};
+		} catch (err) {
+			rowMsg = {
+				...rowMsg,
+				[e.pkgName]: err instanceof Error ? err.message : 'Failed to change sync.',
 			};
 		} finally {
 			busyPkg = null;
@@ -1044,6 +1073,18 @@
 									{/if}
 									<button
 										class="act"
+										class:primary={e.subscribed}
+										disabled={busyPkg !== null}
+										onclick={() => toggleSync(e)}
+										title="Auto-discover new series from this extension and keep them updating"
+										>{busyPkg === e.pkgName
+											? 'Working…'
+											: e.subscribed
+												? 'Sync: on'
+												: 'Sync: off'}</button
+									>
+									<button
+										class="act"
 										disabled={busyPkg !== null}
 										onclick={() => extAction(e, 'uninstall')}
 										>{busyPkg === e.pkgName ? 'Working…' : 'Uninstall'}</button
@@ -1071,8 +1112,7 @@
 		{:else if sources.length === 0}
 			<div class="notice">
 				No installed sources are visible. Install an extension in the Extensions tab first — and
-				every installed source (including NSFW ones like MangaDex) is listed here for
-				management.
+				every installed source (including NSFW ones like MangaDex) is listed here for management.
 			</div>
 		{:else}
 			{#if extScope}

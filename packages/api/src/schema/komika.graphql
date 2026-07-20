@@ -96,6 +96,7 @@ type Mutation {
 	cancelSourceIngest(jobId: ID!): SourceIngestJob! # [komika] request cancellation of a running ingest job; preserves progress (requires isAdmin)
 	startExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: start an ingest job for EVERY installed source of an extension (e.g. MangaDex's per-language sources); skips NSFW sources for opted-out admin + sources with a job already running (returns their existing job); errors only if no source matches (requires isAdmin)
 	cancelExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: cancel all running ingest jobs for an extension's sources; returns the cancelled jobs (requires isAdmin)
+	setExtensionSubscription(pkgName: ID!, subscribed: Boolean!): Boolean! # [komika] subscribe/unsubscribe an extension for background source-sync (auto-discover new series + reconcile library); enabling kicks an immediate sync pass (requires isAdmin)
 	backfillMangadexMetadata(limit: Int = 200): Int! # [komika] S2 enrichment backfill — processes up to `limit` un-enriched MangaDex-anchored works (all-language alt titles/descriptions + full credits); returns count processed; call until it returns 0 to drain (requires isAdmin)
 	persistCatalogue: Int! # [komika] S1 "save everything to DB" — materialize the whole Suwayomi library (metadata + chapter lists) into the DB cache so reader loads serve from SQLite; returns series persisted; prod maintenance action gated by isAdmin (no extra flag)
 	materializeCatalogueCovers: Int! # [komika] S1 materialize every canonical work's cover into work_cover_blob so the web reader serves covers from /covers/{id}.webp (off the CF image Worker); polite background crawl bounded by the MangaDex limiter, single-flighted + resumable; returns works queued (still uncached) at kick-off; gated by isAdmin
@@ -570,6 +571,7 @@ type ExtensionInfo {
 	isNsfw: Boolean!
 	iconUrl: String
 	repo: String
+	subscribed: Boolean!
 }
 
 # [komika] One installed Suwayomi source — the admin picker feeding sourceBrowse.
