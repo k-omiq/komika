@@ -336,11 +336,6 @@
 
 {#if loading}
 	<!-- LOADING -->
-	<section class="backdrop">
-		<span class="kv-tag">KEY VISUAL · 2400×1350</span>
-		<div class="fade-top"></div>
-		<div class="fade-left"></div>
-	</section>
 	<div class="hero k-gutter">
 		<div class="hero-row">
 			<div class="poster k-skeleton"></div>
@@ -354,13 +349,6 @@
 		</div>
 	</div>
 {:else if detail && seriesDetail}
-	<!-- backdrop -->
-	<section class="backdrop">
-		<span class="kv-tag">KEY VISUAL · 2400×1350</span>
-		<div class="fade-top"></div>
-		<div class="fade-left"></div>
-	</section>
-
 	<!-- hero info -->
 	<div class="hero k-gutter">
 		<div class="hero-row">
@@ -686,50 +674,18 @@
 		color: var(--k-text-bright);
 		margin: 0 0 20px;
 	}
-	.backdrop {
-		position: relative;
-		height: 380px;
-		overflow: hidden;
-		background: #111112;
-		background-image: repeating-linear-gradient(
-			135deg,
-			rgba(255, 255, 255, 0.03) 0 2px,
-			transparent 2px 13px
-		);
-	}
-	.kv-tag {
-		position: absolute;
-		left: var(--k-gutter);
-		top: 26px;
-		font-family: var(--k-font-mono);
-		font-size: 10.5px;
-		letter-spacing: 0.16em;
-		color: rgba(255, 255, 255, 0.22);
-	}
-	.fade-top {
-		position: absolute;
-		inset: 0;
-		background: linear-gradient(
-			to top,
-			#0c0c0d 4%,
-			rgba(12, 12, 13, 0.72) 40%,
-			rgba(12, 12, 13, 0.25) 100%
-		);
-	}
-	.fade-left {
-		position: absolute;
-		inset: 0;
-		background: linear-gradient(to right, rgba(12, 12, 13, 0.7) 0%, transparent 55%);
-	}
 	.hero {
 		position: relative;
-		margin-top: -172px;
+		padding-top: 48px;
 		z-index: 5;
 	}
+	/* Centred stacked hero: cover on top, metadata column beneath it. */
 	.hero-row {
 		display: flex;
-		gap: 40px;
-		align-items: flex-end;
+		flex-direction: column;
+		align-items: center;
+		gap: 28px;
+		text-align: center;
 	}
 	.poster {
 		position: relative;
@@ -742,9 +698,9 @@
 		box-shadow: 0 26px 60px rgba(0, 0, 0, 0.6);
 	}
 	.info {
-		flex: 1;
+		width: 100%;
+		max-width: 720px;
 		min-width: 0;
-		padding-bottom: 8px;
 	}
 	/* loading skeleton */
 	.poster.k-skeleton {
@@ -753,6 +709,7 @@
 	.skel-info {
 		display: flex;
 		flex-direction: column;
+		align-items: center;
 		gap: 16px;
 	}
 	.skel-info .k-skeleton {
@@ -849,6 +806,7 @@
 	.badges {
 		display: flex;
 		align-items: center;
+		justify-content: center;
 		gap: 10px;
 		margin-bottom: 16px;
 	}
@@ -899,6 +857,7 @@
 		margin-bottom: 22px;
 		display: flex;
 		align-items: center;
+		justify-content: center;
 		gap: 8px;
 		flex-wrap: wrap;
 	}
@@ -947,6 +906,7 @@
 	.facts {
 		display: flex;
 		align-items: center;
+		justify-content: center;
 		gap: 22px;
 		flex-wrap: wrap;
 		margin-bottom: 24px;
@@ -977,7 +937,9 @@
 	.cta {
 		display: flex;
 		align-items: center;
+		justify-content: center;
 		gap: 12px;
+		flex-wrap: wrap;
 	}
 	.read {
 		height: 50px;
@@ -1551,17 +1513,11 @@
 		padding-bottom: 4px;
 	}
 	@media (max-width: 640px) {
-		/* Shorter backdrop + matching hero pull-up so the fold isn't dominated by art. */
-		.backdrop {
-			height: 260px;
-		}
 		.hero {
-			margin-top: -120px;
+			padding-top: 28px;
 		}
-		/* Stack the cover above full-width metadata so badges/title/facts never clip. */
+		/* Keep the centred stack; just tighten spacing and shrink the cover. */
 		.hero-row {
-			flex-direction: column;
-			align-items: flex-start;
 			gap: 18px;
 		}
 		.poster {
@@ -1570,7 +1526,6 @@
 		}
 		.info {
 			width: 100%;
-			padding-bottom: 0;
 		}
 		.badges {
 			flex-wrap: wrap;

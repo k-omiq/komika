@@ -263,8 +263,11 @@ fn score_candidate(
 ) -> Scored {
     // Shingle this candidate work's aliases once, then do cheap set comparisons against
     // the pre-shingled candidate titles (T+K shinglings instead of the former T×K).
-    let alias_shingles: Vec<TitleShingles> =
-        md.aliases_norm.iter().map(|al| title_shingles(al)).collect();
+    let alias_shingles: Vec<TitleShingles> = md
+        .aliases_norm
+        .iter()
+        .map(|al| title_shingles(al))
+        .collect();
     let title_sim = cand_titles
         .iter()
         .flat_map(|nt| {
@@ -438,7 +441,9 @@ mod tests {
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
-            Decision::AutoMerge { work_id, method, .. } => {
+            Decision::AutoMerge {
+                work_id, method, ..
+            } => {
                 assert_eq!(work_id, w);
                 assert_eq!(method, "title_exact");
             }

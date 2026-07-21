@@ -877,13 +877,16 @@ pub async fn sync_catalogue(
                     if empty_retries < EMPTY_PAGE_RETRIES {
                         empty_retries += 1;
                         tracing::warn!(
-                            offset, total, empty_retries,
+                            offset,
+                            total,
+                            empty_retries,
                             "mangadex: empty catalogue page before reaching total — retrying"
                         );
                         continue; // transient blip: re-fetch the same offset
                     }
                     tracing::error!(
-                        offset, total,
+                        offset,
+                        total,
                         "mangadex: repeated empty catalogue page before total — ending window"
                     );
                     done = true;
@@ -1148,7 +1151,11 @@ async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phas
 /// caller can surface "busy, retry" — the single-flight lock is acquired up front and
 /// held for the whole re-seed so a recurring tick can't interleave its own cursor write
 /// between the reset and the seed.
-pub fn spawn_resync(pool: sqlx::SqlitePool, client: Arc<MangaDexClient>, cover_phash: bool) -> bool {
+pub fn spawn_resync(
+    pool: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    cover_phash: bool,
+) -> bool {
     if CATALOGUE_SYNC_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()

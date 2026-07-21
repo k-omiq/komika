@@ -454,8 +454,13 @@ pub async fn crawl_uncached_covers(
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
-                    record_cover_issue(main, &job.work_id, classify_cover_error(&e), &e.to_string())
-                        .await;
+                    record_cover_issue(
+                        main,
+                        &job.work_id,
+                        classify_cover_error(&e),
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             },
             // Upstream fetch failure is TRANSIENT (rate limit / network) — do NOT
@@ -500,9 +505,7 @@ pub async fn crawl_uncached_covers(
     let suw_jobs: Vec<(String, String)> = match suw_loaded {
         Ok(rows) => rows
             .into_iter()
-            .filter_map(|(work_id, thumb)| {
-                thumb.filter(|t| !t.is_empty()).map(|t| (work_id, t))
-            })
+            .filter_map(|(work_id, thumb)| thumb.filter(|t| !t.is_empty()).map(|t| (work_id, t)))
             .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "cover crawl (suwayomi): failed to load pending works");
@@ -757,7 +760,11 @@ mod tests {
             MAX_COVER_BYTES
         );
         let (w, h) = image::load_from_memory(&webp).unwrap().dimensions();
-        assert_eq!((w, h), (360, 512), "kept native dimensions via lossy, not shrunk");
+        assert_eq!(
+            (w, h),
+            (360, 512),
+            "kept native dimensions via lossy, not shrunk"
+        );
     }
 
     #[test]
@@ -782,7 +789,10 @@ mod tests {
             classify_cover_error(&anyhow!("image too large or unsupported")),
             "unsupported"
         );
-        assert_eq!(classify_cover_error(&anyhow!("empty cover source")), "empty");
+        assert_eq!(
+            classify_cover_error(&anyhow!("empty cover source")),
+            "empty"
+        );
         assert_eq!(classify_cover_error(&anyhow!("libwebp exploded")), "encode");
     }
 

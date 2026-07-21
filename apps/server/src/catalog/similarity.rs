@@ -116,8 +116,7 @@ pub fn title_similarity_pre(a: &TitleShingles, b: &TitleShingles) -> f64 {
     let token = if a.tokens.is_empty() || b.tokens.is_empty() {
         0.0
     } else {
-        a.tokens.intersection(&b.tokens).count() as f64
-            / a.tokens.union(&b.tokens).count() as f64
+        a.tokens.intersection(&b.tokens).count() as f64 / a.tokens.union(&b.tokens).count() as f64
     };
     token.max(jaccard(&a.ngrams, &b.ngrams))
 }
