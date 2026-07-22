@@ -595,34 +595,94 @@ impl SuwayomiClient {
         Ok(out)
     }
 
-    /// Just the in-library manga ids (as strings), paginated — the low-memory path the
-    /// daily reconcile needs (it never uses the full manga records). Same fallback as
-    /// `library()`.
+    /// Just the in-library manga ids (as strings), via a LIGHTWEIGHT id-only paginated
+    /// query — the membership set the daily reconcile needs. This deliberately avoids the
+    /// full `MANGA_FIELDS` selection: its per-manga `chapters { totalCount }` + `source
+    /// { lang }` is an N+1 in Suwayomi that makes a full-record fetch of a ~13k library
+    /// take ~50s (blowing the 30s client timeout on the whole set). An `id`-only walk is
+    /// near-instant. Falls back to an id-only unpaginated query if the engine rejects the
+    /// pagination args.
     pub async fn library_ids(&self) -> Result<std::collections::HashSet<String>> {
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut offset = 0i64;
         for _ in 0..Self::LIBRARY_MAX_PAGES {
-            let (has_next, page) = match self.library_page(offset).await {
+            let (has_next, page) = match self.library_id_page(offset).await {
                 Ok(p) => p,
                 Err(e) if offset == 0 => {
-                    tracing::warn!(error = %e, "library_ids: paginated fetch failed on first page; falling back to unpaginated");
+                    tracing::warn!(error = %e, "library_ids: paginated id fetch failed on first page; falling back to unpaginated");
                     return Ok(self
-                        .library_unpaginated()
+                        .library_ids_unpaginated()
                         .await?
                         .into_iter()
-                        .map(|m| m.id.to_string())
+                        .map(|id| id.to_string())
                         .collect());
                 }
                 Err(e) => return Err(e),
             };
             let n = page.len();
-            ids.extend(page.into_iter().map(|m| m.id.to_string()));
+            ids.extend(page.into_iter().map(|id| id.to_string()));
             if !has_next || n == 0 {
                 break;
             }
             offset += Self::LIBRARY_PAGE_SIZE;
         }
         Ok(ids)
+    }
+
+    /// One page of in-library manga IDS ONLY (no `MANGA_FIELDS`, so no per-manga N+1).
+    /// Returns `(hasNextPage, ids)`.
+    async fn library_id_page(&self, offset: i64) -> Result<(bool, Vec<i64>)> {
+        let doc = "query L($first: Int!, $offset: Int!) { \
+             mangas(condition: { inLibrary: true }, first: $first, offset: $offset) { \
+               pageInfo { hasNextPage } nodes { id } } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
+        }
+        #[derive(Deserialize)]
+        struct Node {
+            id: i64,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Nodes {
+            page_info: PageInfo,
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            mangas: Nodes,
+        }
+        let d: Data = self
+            .gql(
+                doc,
+                json!({ "first": Self::LIBRARY_PAGE_SIZE, "offset": offset }),
+            )
+            .await?;
+        Ok((
+            d.mangas.page_info.has_next_page,
+            d.mangas.nodes.into_iter().map(|n| n.id).collect(),
+        ))
+    }
+
+    /// id-only single-shot query — fallback for engines without `first`/`offset` paging.
+    async fn library_ids_unpaginated(&self) -> Result<Vec<i64>> {
+        let doc = "query L { mangas(condition: { inLibrary: true }) { nodes { id } } }";
+        #[derive(Deserialize)]
+        struct Node {
+            id: i64,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            mangas: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.mangas.nodes.into_iter().map(|n| n.id).collect())
     }
 
     /// One page of the in-library set. Returns `(hasNextPage, mangas)`.
