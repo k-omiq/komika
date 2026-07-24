@@ -86,7 +86,10 @@ impl Progress {
         self.succeeded += 1;
         match decision {
             "new" => self.new_works += 1,
-            "auto_merge" => self.auto_merged += 1,
+            // Exact MangaDex-UUID consolidation is an auto-merge onto the canonical
+            // work — bucket it with auto_merge so category totals reconcile with
+            // `succeeded` (else UUID consolidations vanish from the ingest summary).
+            "auto_merge" | "mangadex_id" => self.auto_merged += 1,
             // Both the bare review path and the consolidated-review path (a candidate
             // corroborated onto an existing work but held for a human) land in the
             // review bucket, so the category totals reconcile with `succeeded`.

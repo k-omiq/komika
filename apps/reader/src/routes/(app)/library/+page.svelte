@@ -1,20 +1,39 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
 	import Cover from '$lib/components/Cover.svelte';
+	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
+	import FlagBadge from '$lib/components/FlagBadge.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
-	import { setLibraryStatus, setFavorite, type LibraryRowView } from '$lib/data/source';
-	import { SHELF_META, slug, type Shelf } from '$lib/data/types';
+	import {
+		setLibraryStatus,
+		setFavorite,
+		type ContinueRowView,
+		type LibraryRowView,
+	} from '$lib/data/source';
+	import { slug, type Shelf } from '$lib/data/types';
 
 	let { data } = $props();
-	// `data.library` is resolved in `load` (this is a static SPA — streamed promises
-	// don't resolve in the component, which is what left the page stuck loading), so
-	// it's a ready value here. Copy the catalogue into local state so shelf/favourite
-	// edits reflect immediately (optimistic), re-syncing whenever `load` re-runs.
+	// `data.library` is a PROMISE (see +page.ts): awaiting it in `load` blocked the
+	// navigation with zero feedback. Copy the catalogue into local state once it
+	// lands, so shelf/favourite edits reflect immediately (optimistic) and re-sync
+	// whenever `load` re-runs.
 	let rows = $state<LibraryRowView[]>([]);
+	let continueRow = $state<ContinueRowView[]>([]);
+	let loading = $state(true);
 	$effect(() => {
-		rows = data.library.libraryCatalog.map((r) => ({ ...r }));
+		const p = data.library;
+		loading = true;
+		let cancelled = false;
+		p.then((lib) => {
+			if (cancelled) return;
+			rows = lib.libraryCatalog.map((r) => ({ ...r }));
+			continueRow = lib.continueRow;
+			loading = false;
+		});
+		return () => {
+			cancelled = true;
+		};
 	});
-	const continueRow = $derived(data.library.continueRow);
 
 	let shelf = $state<'all' | Shelf | 'favorites'>('all');
 	let sort = $state<'recent' | 'alpha'>('recent');
@@ -37,7 +56,6 @@
 					: rows.filter((c) => c.shelf === shelf);
 		if (sort === 'alpha') list = [...list].sort((a, b) => a.title.localeCompare(b.title));
 		return list.map((c) => {
-			const m = SHELF_META[c.shelf];
 			const progress = c.total ? Math.round((c.read / c.total) * 100) : 0;
 			let sub: string;
 			if (c.shelf === 'completed') sub = `Completed · ${c.total} ch`;
@@ -45,7 +63,6 @@
 			else sub = `Ch. ${c.read} / ${c.total}`;
 			return {
 				...c,
-				meta: m,
 				progress,
 				sub,
 				showBar: c.shelf === 'reading' || c.shelf === 'onhold',
@@ -62,32 +79,67 @@
 		{ key: 'favorites', label: 'Favorites' },
 	] as const;
 
-	// Optimistically re-shelve / (un)favourite, persisting via the backend. On a
-	// persisted failure the source layer resolves to the optimistic value, so the
-	// UI stays consistent; a genuine desync corrects on the next load.
+	// Optimistically re-shelve / (un)favourite, persisting via the backend. A FAILED
+	// write now rolls the card back and says why — the data layer used to resolve to
+	// the optimistic value, so an expired session silently did nothing.
+	//
+	// `busy` is a per-series in-flight guard. Without it a double-click fired two
+	// mutations whose completion order — not the reader's last click — decided the
+	// stored shelf. (The series page already guarded this; the library didn't.)
+	let busy = $state<Record<string, boolean>>({});
+	let writeError = $state('');
+
 	async function changeShelf(id: string | undefined, next: Shelf): Promise<void> {
-		if (!id) return;
+		if (!id || busy[id]) return;
 		const row = rows.find((r) => r.id === id);
 		if (!row || row.shelf === next) return;
-		row.shelf = next;
-		const result = await setLibraryStatus(id, next);
-		if (result) row.shelf = result;
+		const prev = row.shelf;
+		row.shelf = next; // optimistic
+		busy = { ...busy, [id]: true };
+		writeError = '';
+		try {
+			const r = await setLibraryStatus(id, next, prev);
+			row.shelf = r.value ?? prev;
+			if (!r.ok) writeError = r.error ?? '';
+		} finally {
+			busy = { ...busy, [id]: false };
+		}
 	}
+
 	async function toggleFavorite(id: string | undefined, current: boolean): Promise<void> {
-		if (!id) return;
+		if (!id || busy[id]) return;
 		const row = rows.find((r) => r.id === id);
 		if (!row) return;
-		row.favorite = !current;
-		row.favorite = await setFavorite(id, !current);
+		row.favorite = !current; // optimistic
+		busy = { ...busy, [id]: true };
+		writeError = '';
+		try {
+			const r = await setFavorite(id, !current, current);
+			row.favorite = r.value;
+			if (!r.ok) writeError = r.error ?? '';
+		} finally {
+			busy = { ...busy, [id]: false };
+		}
 	}
 </script>
 
 <div class="head k-gutter">
 	<div>
 		<h1>Your Library</h1>
-		<div class="subtitle">{counts.all} series · {counts.reading} in progress</div>
+		<div class="subtitle">
+			{#if loading}Loading your shelves…{:else}{counts.all} series · {counts.reading} in progress{/if}
+		</div>
 	</div>
 </div>
+
+{#if writeError}
+	<div class="k-gutter">
+		<div class="write-error" role="alert">
+			<Icon name="alert" size={15} />
+			<span>{writeError}</span>
+		</div>
+	</div>
+{/if}
 
 {#if continueRow.length}
 	<section class="continue k-gutter">
@@ -135,19 +187,20 @@
 </div>
 
 <div class="grid-wrap k-gutter">
-	{#if items.length}
+	{#if loading}
+		<CardGridSkeleton count={12} />
+	{:else if items.length}
 		<div class="grid">
-			{#each items as item (item.id ?? item.title + item.shelf)}
+			<!-- The fallback key must NOT contain `shelf`: it's mutable, so re-shelving a
+			     card changed its key, destroying and recreating the whole card — including
+			     the <img> — which visibly re-flashed the cover on every shelf change. -->
+			{#each items as item (item.id ?? item.title)}
 				{@const href = `/series/${item.id ?? slug(item.title)}`}
 				<div class="lib-card">
 					<div class="cover k-cover">
 						<Cover src={item.cover} alt={item.title} loading="lazy" />
 						<a class="cover-link" {href} aria-label={item.title}></a>
-						<span
-							class="badge"
-							style="color:{item.meta.color};background:{item.meta.bg};border-color:{item.meta
-								.border}">{item.meta.label}</span
-						>
+						<span class="flag-svg"><FlagBadge type={item.type} /></span>
 						<span class="rating"
 							><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
 						>
@@ -157,12 +210,17 @@
 							aria-pressed={item.favorite}
 							aria-label={item.favorite ? 'Remove from favourites' : 'Add to favourites'}
 							title={item.favorite ? 'Favourited' : 'Add to favourites'}
+							disabled={!!(item.id && busy[item.id])}
 							onclick={() => toggleFavorite(item.id, item.favorite)}
 						>
 							<Icon name="heart" size={14} fill={item.favorite ? 'currentColor' : 'none'} />
 						</button>
 						<div class="status-slot">
-							<StatusMenu status={item.shelf} onchange={(s) => changeShelf(item.id, s)} />
+							<StatusMenu
+								status={item.shelf}
+								disabled={!!(item.id && busy[item.id])}
+								onchange={(s) => changeShelf(item.id, s)}
+							/>
 						</div>
 						{#if item.showBar}
 							<div class="progressbar"><div class="fill" style="width:{item.progress}%"></div></div>
@@ -437,6 +495,12 @@
 		border-radius: 8px;
 		transition: opacity 0.15s;
 	}
+	/* The `.k-cover` utility sets `overflow: hidden`, which clips the StatusMenu
+	   dropdown that opens outside the cover box. Re-allow overflow here — the cover
+	   art is rounded on the <img> itself, so nothing else needs the clip. */
+	.cover.k-cover {
+		overflow: visible;
+	}
 	/* Stretched navigation target — fills the cover, sits under the controls. */
 	.cover-link {
 		position: absolute;
@@ -465,9 +529,26 @@
 		backdrop-filter: blur(3px);
 		transition: all 0.12s;
 	}
-	.fav-chip:hover {
+	.fav-chip:hover:not(:disabled) {
 		color: #e96e6e;
 		border-color: rgba(233, 110, 110, 0.5);
+	}
+	.fav-chip:disabled {
+		opacity: 0.55;
+		cursor: default;
+	}
+	.write-error {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 20px;
+		padding: 10px 14px;
+		border-radius: 8px;
+		background: rgba(246, 183, 60, 0.1);
+		border: 1px solid rgba(246, 183, 60, 0.34);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 600;
 	}
 	.fav-chip.on {
 		color: #e96e6e;
@@ -483,17 +564,13 @@
 	.lib-title {
 		text-decoration: none;
 	}
-	.badge {
+	.flag-svg {
 		position: absolute;
 		z-index: 2;
 		top: 9px;
 		left: 9px;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.04em;
-		border: 1px solid;
-		border-radius: 5px;
-		padding: 3px 8px;
+		width: 30px;
+		height: 20px;
 	}
 	.rating {
 		position: absolute;

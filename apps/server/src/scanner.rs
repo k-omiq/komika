@@ -10,15 +10,30 @@
 //!
 //!   steady_interval = admin override_interval_hours  (if set)
 //!                     else rolling avg gap between chapter uploads
-//!                     (clamped into a sane `[MIN, MAX]` range)
+//!                     (clamped into `[MIN_INTERVAL_HOURS, ACTIVE_MAX_INTERVAL_HOURS]`)
+//!
+//! POLL CADENCE IS NOT PUBLICATION CADENCE. The scheduler used to poll a series at
+//! its own rolling upload gap, which guarantees an average detection lag on the order
+//! of that gap: a fortnightly series was polled fortnightly, so its chapter was found,
+//! on average, a week late. Production measured a p50 discovery lag of 28.8h against a
+//! 300s tick that was nowhere near saturated. The inferred average is now used ONLY to
+//! judge *lateness*; the poll cadence of a non-paused series is capped at
+//! `ACTIVE_MAX_INTERVAL_HOURS`, which bounds worst-case discovery lag by construction.
+//! Paused series still park at `PAUSED_PARK_HOURS` (see `park_paused`).
 //!
 //! After a scan finds a new chapter (or on first observation) the next scan is
-//! scheduled a full `steady_interval` out. But once a series comes due and finds
-//! *no* new chapter — the expected chapter is late — it enters an "awaiting" state
-//! and is re-polled at the (clamped) admin `poll_every_minutes` cadence until the
-//! chapter lands, then reverts to steady. The accelerated poll is bounded to a
-//! window past the due time (`min(steady_interval, AWAITING_MAX_HOURS)`), so a
-//! stalled series doesn't poll forever.
+//! scheduled a full `steady_interval` out. A series whose next chapter is GENUINELY
+//! late — its newest upload is older than `LATE_FACTOR x` its own trustworthy
+//! publication cadence, but not so old that the series has plainly died
+//! (`LATE_BAND_MAX x`) — enters an "awaiting" state and is re-polled at the (clamped)
+//! admin `poll_every_minutes` cadence. The accelerated poll runs for
+//! `min(publication_interval, AWAITING_MAX_HOURS)` and then falls back to the steady
+//! (<= 12h) cadence; the streak start is retained as a cool-down marker so the window
+//! cannot immediately re-open, and is re-armed after `AWAITING_REARM_HOURS`.
+//!
+//! Lateness is deliberately NOT "a scheduled scan found nothing": `due_series_ids`
+//! only ever returns rows that are already due, so that test is true by construction
+//! and used to route ~73% of the fetch budget to a few hundred series.
 //!
 //! Due series get their chapters re-fetched; new chapters (detected by chapter
 //! count OR max chapter number vs. the last known values) are logged. All derived
@@ -43,11 +58,60 @@ use crate::suwayomi::{SuwayomiChapter, SuwayomiManga};
 /// Fallback cadence when no interval can be inferred yet (e.g. a series with
 /// fewer than two dated chapters). Without this, the steady interval would be 0.0
 /// and the series would be re-scheduled for immediate re-fetch on every tick.
-const DEFAULT_INTERVAL_HOURS: f64 = 24.0;
+///
+/// Equal to `ACTIVE_MAX_INTERVAL_HOURS`: with the poll cadence decoupled from the
+/// publication cadence there is no reason to poll a cadence-less series (3,257 of
+/// 13,789 live rows carry `avg_interval_hours = 0`) any slower than the ceiling
+/// everything else is capped at.
+const DEFAULT_INTERVAL_HOURS: f64 = ACTIVE_MAX_INTERVAL_HOURS;
 
-/// Upper bound on any effective interval, so an absurd admin override can't
-/// overflow the `chrono::Duration` math when computing `next_scan_at`.
-const MAX_INTERVAL_HOURS: f64 = 100.0 * 365.0 * 24.0; // ~100 years
+/// Upper bound on any effective interval.
+///
+/// This was ~100 years, which was only ever meant as an overflow guard for the
+/// `chrono::Duration` math — but `resolve_interval` also clamps the INFERRED rolling
+/// average with it, so a series whose sparse history implies a multi-year gap was
+/// legitimately parked beyond any horizon we care about. In production that left 217
+/// rows scheduled past 2027 and one series parked until 2033-03-14, i.e. never
+/// rescanned again. 14 days matches `PAUSED_PARK_HOURS`: if a deliberately PAUSED
+/// series is still worth re-checking fortnightly, an active one certainly is.
+const MAX_INTERVAL_HOURS: f64 = PAUSED_PARK_HOURS as f64; // 14 days
+
+/// HARD ceiling on the steady poll cadence of a NON-paused series, independent of
+/// whatever cadence its uploads imply.
+///
+/// `MAX_INTERVAL_HOURS` is an overflow/absurdity guard, not a scheduling policy. Using
+/// it as the steady ceiling meant the poll cadence tracked the *publication* cadence all
+/// the way out to 14 days, which sets a floor under the discovery lag: production had
+/// 5,242 series pinned at the 14-day ceiling, 1,840 at 7–14d, and 51% of ONGOING series
+/// (3,189 of 6,255) scheduled more than a week apart — with a measured p50 discovery lag
+/// of 28.8h and a p90 of 11.4 days.
+///
+/// 12h is chosen against the measured throughput budget. The STEADY floor is 6,392
+/// non-paused series at 12h = 12,784 fetches/day, plus ~528/day for the 7,397 paused
+/// series on their 14-day park — about 46 per 300s tick. That floor is NOT the whole
+/// bill: the accelerated `awaiting` poll below (30 min for up to `AWAITING_MAX_HOURS`,
+/// re-armable every `AWAITING_REARM_HOURS`) rides on top of it. Replaying the live
+/// `suwayomi_chapter` upload history through this module's own scheduling maths for 20
+/// simulated days puts 724 of the 6,392 inside the lateness band at any moment and lands
+/// the real bill at:
+///
+///   steady state   ~16-21k scans/day  (p50 65/tick, p99 168/tick)
+///   post-0057 peak  ~45k scans/day    (194 scans in the worst single tick, during the
+///                                      48h after migration 0057 pulls the whole active
+///                                      set onto one 12h window)
+///
+/// versus the ~105/tick (30,119/day) the scheduler was already spending and a
+/// demonstrated capacity of ~295/tick (a 766-series drain tick completed in ~778s at
+/// `SCAN_CONCURRENCY = 3`). So it still costs less than the status quo in steady state
+/// and stays inside capacity at the peak — but the headroom at the peak is ~1.5x, not the
+/// ~6x the 46/tick figure alone suggests. Tighten this constant only against the ~194
+/// number, not the 46 one.
+///
+/// (The 240h re-arm is an un-jittered absolute offset from `awaiting_since`, so a cohort
+/// that entered `awaiting` together re-arms together — visible in the replay as a
+/// 60 -> 105/tick bump around day 10-12 that decays over subsequent cycles. Bounded and
+/// self-dispersing, so it is left alone; jittering it would be the lever if it ever bites.)
+const ACTIVE_MAX_INTERVAL_HOURS: f64 = 12.0;
 
 /// Floor on an *inferred* (rolling-avg) interval. A same-day upload burst yields
 /// sub-hour gaps, which would make the series overdue on essentially every 300s
@@ -62,11 +126,19 @@ const MIN_INTERVAL_HOURS: f64 = 6.0;
 /// hammer typo'd into the console.
 const HARD_MIN_INTERVAL_HOURS: f64 = 1.0;
 
-/// Resolve the steady effective interval (hours) from an optional admin override
-/// and the inferred rolling average, clamping into a sane range (SC5):
-///   - an explicit override wins and is clamped to `[HARD_MIN, MAX]`;
+/// Resolve the steady effective POLL interval (hours) from an optional admin override
+/// and the inferred rolling average (SC5):
+///   - an explicit override wins and is clamped to `[HARD_MIN, MAX]` — a human who
+///     deliberately parks a series for a week gets a week;
 ///   - otherwise the inferred avg (or the default when none) is clamped to
-///     `[MIN, MAX]`, so a burst series isn't refetched every tick.
+///     `[MIN, ACTIVE_MAX]`, so a burst series isn't refetched every tick AND a
+///     slow-publishing series is still *checked* twice a day.
+///
+/// The upper bound is `ACTIVE_MAX_INTERVAL_HOURS`, NOT `MAX_INTERVAL_HOURS`: polling at
+/// the publication rate guarantees an average detection lag on the order of the
+/// publication interval, which is the single largest contributor to the observed 28.8h
+/// median discovery lag. The long 14-day ceiling is reserved for the deliberate
+/// `park_paused` path.
 fn resolve_interval(override_interval_hours: Option<f64>, inferred_avg: f64) -> f64 {
     match override_interval_hours.filter(|v| *v > 0.0) {
         Some(o) => o.clamp(HARD_MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS),
@@ -76,9 +148,42 @@ fn resolve_interval(override_interval_hours: Option<f64>, inferred_avg: f64) -> 
             } else {
                 DEFAULT_INTERVAL_HOURS
             };
-            base.clamp(MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS)
+            base.clamp(MIN_INTERVAL_HOURS, ACTIVE_MAX_INTERVAL_HOURS)
         }
     }
+}
+
+/// Spread applied to every scheduled `next_scan_at`, as a fraction of the interval.
+const SCHEDULE_JITTER_FRACTION: f64 = 0.10;
+
+/// Apply ±`SCHEDULE_JITTER_FRACTION` of random spread to a scheduling interval.
+///
+/// Without this, `next_scan_at = now + interval` is fully deterministic, so any set
+/// of series that once became due together stays together forever: they are scanned
+/// in the same batch, rescheduled by the same delta, and re-cluster on the next
+/// cycle. Production showed exactly that — a self-sustaining cohort of ~745 series
+/// arriving every 35 minutes (01:51 → 02:26 → 03:01 → 03:35 → …), which drove the
+/// scanner to a 43% duty cycle and Suwayomi to 154 GB of egress, while the long tail
+/// of the catalogue got whatever capacity was left.
+///
+/// The park path already jittered for this reason (audit #9); the far more frequent
+/// steady and awaiting paths did not. Randomising each reschedule lets a cohort decay
+/// into a smooth arrival rate over a few cycles.
+fn jitter_interval_hours(hours: f64) -> f64 {
+    if hours <= 0.0 {
+        return hours;
+    }
+    // Off by default under test so the scheduling tests can assert exact cadences
+    // (several of them advance the clock to precisely `now + interval` to make a
+    // series due, which a +10% spread would silently push past). `jitter_interval_hours`
+    // itself is covered by `jitter_stays_within_band_and_varies`, which opts in.
+    #[cfg(test)]
+    if !tests::jitter_enabled() {
+        return hours;
+    }
+    // Uniform in [-1.0, 1.0), scaled by the jitter fraction.
+    let unit = (rand_core::OsRng.next_u64() as f64 / u64::MAX as f64) * 2.0 - 1.0;
+    (hours * (1.0 + unit * SCHEDULE_JITTER_FRACTION)).max(0.0)
 }
 
 /// Default accelerated re-poll cadence (minutes) when the admin hasn't set
@@ -93,14 +198,56 @@ const DEFAULT_POLL_MINUTES: f64 = 30.0;
 const MIN_POLL_MINUTES: f64 = 15.0;
 
 /// Absolute ceiling on how long a series stays in the accelerated poll cadence
-/// past its due time before falling back to the steady cadence (SC1). Without a
-/// bound, a stalled-but-ONGOING series (never auto-paused) — or one whose inferred
-/// interval underestimates its true cadence — would poll every `poll_every_minutes`
+/// before falling back to the steady cadence (SC1). Without a bound, a
+/// stalled-but-ONGOING series (never auto-paused) — or one whose inferred interval
+/// underestimates its true cadence — would poll every `poll_every_minutes`
 /// indefinitely. A chapter that's actually coming almost always lands within a
 /// couple of days of its cadence; past that the series is treated as steady again.
-/// The effective window is `min(steady_interval, this)`, so short-cadence series
-/// don't poll aggressively for many multiples of their own interval.
+/// The effective window is `clamp(publication_interval, MIN_INTERVAL_HOURS, this)`
+/// — sized on the series' own PUBLICATION cadence, so a fast series doesn't poll
+/// aggressively for many multiples of its own interval. (It used to be sized on the
+/// steady *poll* interval, which now caps at 12h and would have collapsed every
+/// window to 12h.)
 const AWAITING_MAX_HOURS: f64 = 48.0;
+
+/// Cool-down before a closed awaiting streak may re-open a fresh accelerated window.
+///
+/// `awaiting_since` used to be pinned to the ORIGINAL streak start forever — only an
+/// actual new chapter cleared it — so once the window expired the series could never
+/// re-accelerate. Live: 2,201 series awaiting, 1,679 (76%) awaiting for more than 48h
+/// and therefore permanently de-accelerated. But simply clearing the field when the
+/// window closes is worse: the very next steady scan finds the series still late,
+/// re-opens the window, and the duty cycle becomes ~80% — several thousand series at a
+/// 30-minute poll, which is exactly the runaway this scheduler already suffered from.
+///
+/// So the field is retained as a cool-down marker: accelerate for
+/// `min(publication_interval, AWAITING_MAX_HOURS)`, run at the steady (<= 12h) cadence
+/// for the remainder of `AWAITING_REARM_HOURS`, then re-arm. With 48h windows that is a
+/// 20% duty cycle. The harm the old behaviour caused — "poll hard for 2 days, then go
+/// blind for 2 weeks" — is gone regardless, because the post-window cadence is now
+/// bounded by `ACTIVE_MAX_INTERVAL_HOURS` rather than by the publication gap.
+const AWAITING_REARM_HOURS: f64 = 240.0; // 10 days
+
+/// How far past its own publication cadence a series' newest upload must be before the
+/// next chapter counts as genuinely LATE (and the accelerated poll is worth paying for).
+const LATE_FACTOR: f64 = 1.25;
+
+/// Upper edge of the lateness band, as a multiple of the publication cadence. Past this
+/// the series has not "got a late chapter", it has stopped publishing — accelerating it
+/// buys nothing and it is left on the steady cadence (where a resumption is still picked
+/// up within `ACTIVE_MAX_INTERVAL_HOURS`). Without this bound every dead-but-ONGOING
+/// series in the catalogue would sit in the accelerated poll forever.
+const LATE_BAND_MAX: f64 = 3.0;
+
+/// Minimum number of inter-upload GAPS (i.e. dated chapters minus one) before the
+/// inferred rolling average is trusted to judge lateness.
+///
+/// This is the root cause of the absurd stored averages: a series with 2–5 cached
+/// chapters whose upload dates span years yields an "average" of 58,309 hours (6.6
+/// years) — which parked "The Skeleton Soldier Failed to Defend the Dungeon" until
+/// 2033-03-14. Four gaps is cheap to satisfy for a real series and excludes the sparse
+/// histories entirely. 4,881 of the 6,392 live non-paused series clear it.
+const MIN_TRUSTED_GAPS: usize = 4;
 
 /// Resolve the accelerated re-poll cadence (minutes) for an *awaiting* series —
 /// one that's overdue for a new chapter that hasn't landed yet (SC1). Clamped to
@@ -187,13 +334,16 @@ async fn scan_admin(pool: &SqlitePool, series_id: &str) -> ScanAdmin {
 }
 
 /// Coerce a Suwayomi epoch timestamp (seconds or millis, as a string) to millis.
-/// Mirrors the guard logic in `types::to_iso`.
+///
+/// Delegates to `series_cache::normalize_epoch_millis` so the scheduler reads
+/// `upload_date` through exactly the same lens that `latest_chapter_at` is derived
+/// with — one definition of "what this dirty column means", rather than two that can
+/// drift. Concretely this adds the far-future guard the local copy lacked: one live
+/// chapter row carries `57766321270698` (~year 3800), and feeding that to
+/// `upload_cadence` yields a `latest_upload` in the far future, so
+/// `is_genuinely_late` sees a negative age and the series can never be flagged late.
 fn epoch_millis(v: Option<&str>) -> Option<i64> {
-    let n: i64 = v?.trim().parse().ok()?;
-    if n <= 0 {
-        return None;
-    }
-    Some(if n > 1_000_000_000_000 { n } else { n * 1000 })
+    crate::series_cache::normalize_epoch_millis(v?)
 }
 
 /// Compute the rolling average interval (hours) between chapter uploads.
@@ -201,7 +351,28 @@ fn epoch_millis(v: Option<&str>) -> Option<i64> {
 /// Sorts upload timestamps descending, diffs consecutive pairs, and averages them.
 /// Garbage/missing timestamps are dropped. Returns `None` when fewer than two usable
 /// timestamps exist (no cadence can be inferred).
+/// Now a thin projection of `upload_cadence`, which the scheduler uses directly (it also
+/// needs the gap count and the newest upload). Kept for the cadence assertions.
+#[cfg(test)]
 pub fn avg_interval_hours(chapters: &[SuwayomiChapter]) -> Option<f64> {
+    upload_cadence(chapters).map(|c| c.avg_hours)
+}
+
+/// What a chapter list says about a series' publication rhythm: the rolling average
+/// gap, how many usable gaps it was averaged over, and when the newest chapter landed.
+///
+/// The gap COUNT is the part the scheduler cares about beyond the average itself — an
+/// "average" derived from one or two gaps spanning years is noise, and treating it as a
+/// cadence is what produced multi-year `avg_interval_hours` values in production.
+struct UploadCadence {
+    avg_hours: f64,
+    gaps: usize,
+    latest_upload: DateTime<Utc>,
+}
+
+/// Compute `UploadCadence` from a chapter list, or `None` when fewer than two usable
+/// upload timestamps exist (no rhythm can be inferred).
+fn upload_cadence(chapters: &[SuwayomiChapter]) -> Option<UploadCadence> {
     let mut ts: Vec<i64> = chapters
         .iter()
         .filter_map(|c| epoch_millis(c.upload_date.as_deref()))
@@ -211,7 +382,7 @@ pub fn avg_interval_hours(chapters: &[SuwayomiChapter]) -> Option<f64> {
     }
     ts.sort_unstable_by(|a, b| b.cmp(a)); // desc
     let mut total_ms: i64 = 0;
-    let mut gaps: i64 = 0;
+    let mut gaps: usize = 0;
     for pair in ts.windows(2) {
         let diff = pair[0] - pair[1]; // newer - older >= 0
         if diff > 0 {
@@ -223,7 +394,25 @@ pub fn avg_interval_hours(chapters: &[SuwayomiChapter]) -> Option<f64> {
         return None;
     }
     let avg_ms = total_ms as f64 / gaps as f64;
-    Some(avg_ms / 3_600_000.0)
+    Some(UploadCadence {
+        avg_hours: avg_ms / 3_600_000.0,
+        gaps,
+        latest_upload: DateTime::from_timestamp_millis(ts[0])?,
+    })
+}
+
+/// Is the next chapter genuinely LATE?
+///
+/// True only inside the band `(LATE_FACTOR, LATE_BAND_MAX] x publication_interval` past
+/// the newest upload: below it the chapter isn't due yet, above it the series has
+/// stopped publishing rather than slipped. This replaces the old test, which was
+/// `is_due(next_scan_at, now)` — always true for a scheduler-driven scan, since
+/// `due_series_ids` only returns rows that are already due — so "awaiting" meant nothing
+/// more than "a scheduled scan found nothing new", the ordinary case for 2,009 of the
+/// 2,127 series scanned in a live 24h window.
+fn is_genuinely_late(publication_hours: f64, hours_since_latest_upload: f64) -> bool {
+    hours_since_latest_upload > publication_hours * LATE_FACTOR
+        && hours_since_latest_upload <= publication_hours * LATE_BAND_MAX
 }
 
 /// The latest (highest) chapter number seen, or `None` for an empty list.
@@ -342,7 +531,30 @@ pub(crate) async fn record_source_extensions(state: &AppState) {
 /// Max due series scanned in a single tick — bounds a cold-start/backlog tick so it
 /// can't run unbounded; the remainder drains on later ticks (ordered oldest-due first,
 /// so nothing starves).
-const DUE_BATCH_LIMIT: i64 = 5000;
+///
+/// Lowered from 5,000 (P1-2): at the measured ~90–300 scans per 300s tick a 5,000-row
+/// batch runs for hours, and every series in it was being rescheduled off the SINGLE
+/// `Utc::now()` captured when the batch was selected — so anything processed more than
+/// its own interval after the batch started got a `next_scan_at` already in the past,
+/// was immediately re-selected, and the drain never converged. `scan_due` now takes its
+/// own timestamp (see `tick`), and a smaller batch keeps the due-ordering fresh so the
+/// oldest-due rows genuinely go first after downtime.
+const DUE_BATCH_LIMIT: i64 = 1000;
+
+/// Anything scheduled further out than this could not have been written by this module:
+/// a non-paused series caps at `ACTIVE_MAX_INTERVAL_HOURS` (+10% jitter) and a paused one
+/// at `PAUSED_PARK_HOURS` (+`PAUSED_PARK_HOURS/10` jitter, i.e. <= 369h). Rows beyond it
+/// are legacy, written under the old ~100-year ceiling before `MAX_INTERVAL_HOURS`
+/// landed; they can never satisfy `next_scan_at <= now` and are permanently invisible to
+/// `due_series_ids`. Migration 0057 clamps the existing ones; this horizon is the
+/// read-side net that keeps the class extinct without another migration.
+const ABSURD_HORIZON_HOURS: i64 = 16 * 24; // 16 days
+
+/// How many absurd-horizon rows to reclaim per tick. Deliberately small: reclaiming is
+/// pure upside but it adds unscheduled work, so it trickles (25/tick x 288 ticks/day
+/// clears the live 3,578-row backlog in about half a day) instead of dumping thousands
+/// of series into one due-set.
+const ABSURD_RECLAIM_PER_TICK: i64 = 25;
 /// Short breather between back-to-back drain batches, so a continuous backlog drain
 /// doesn't peg the CPU/DB in a tight loop between 5k-series batches.
 const DRAIN_BATCH_DELAY_MS: u64 = 250;
@@ -358,6 +570,11 @@ const PAUSED_PARK_HOURS: i64 = 24 * 14; // 14 days
 /// so a permanently-failing series (deleted upstream, 404) leaves the hot front of the
 /// due-set instead of being retried every tick and starving healthy series (audit #4).
 const ERROR_BACKOFF_BASE_MINUTES: i64 = 30;
+
+/// How many times to re-run the whole `record_scan` transaction when it fails with a
+/// transient SQLite lock. Mirrors `mangadex::UPSERT_LOCK_RETRIES` — the same
+/// contention, from the other side of the single writer.
+const SCAN_LOCK_RETRIES: u32 = 4;
 /// Cap on the error-backoff so a permanently-failing series stops growing its delay and
 /// settles into a daily re-check (it might come back). Independent of `PAUSED_PARK_HOURS`:
 /// a dead/erroring id is retried ~daily, more often than a genuinely paused series' 14-day
@@ -393,6 +610,9 @@ struct TickOutcome {
 /// of the due-set naturally.
 async fn tick(state: &AppState, shutdown: &tokio::sync::watch::Receiver<bool>) -> TickOutcome {
     let now = Utc::now();
+    // Belt-and-braces against the legacy far-future schedules migration 0057 clamps —
+    // cheap, bounded, and a no-op once the tail is drained.
+    reclaim_absurd_schedules(&state.pool, now).await;
     let due = due_series_ids(&state.pool, &now.to_rfc3339(), DUE_BATCH_LIMIT).await;
     let due_count = due.len();
 
@@ -416,13 +636,28 @@ async fn tick(state: &AppState, shutdown: &tokio::sync::watch::Receiver<bool>) -
                 if *shutdown.borrow() {
                     return;
                 }
-                match scan_due(state, &series_id, now).await {
+                // Timestamp the scan HERE, not from the batch's `now` (P1-2). The batch
+                // `now` is the due-comparison instant; a backlog batch can take much
+                // longer than a series' interval to work through, and reusing that stale
+                // instant to compute `next_scan_at` scheduled every series after the
+                // first few minutes into the PAST — instantly re-due, so the drain loop
+                // could never converge. Invisible while due-sets are ~90 rows; it is
+                // exactly the state a redeploy-after-downtime produces.
+                match scan_due(state, &series_id, Utc::now()).await {
                     Ok(_) => {
                         ok.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(series_id, error = %e, "scan: series scan failed; backed off");
+                        // A lock error was NOT backed off (2A: it's our own write
+                        // contention, not an upstream failure) — the schedule is intact
+                        // and the next tick retries at cadence. Log the two cases
+                        // distinctly so the backoff message isn't misleading.
+                        if crate::db::is_locked_error(&e) {
+                            tracing::warn!(series_id, error = %e, "scan: skipped this tick on write contention (not backed off)");
+                        } else {
+                            tracing::warn!(series_id, error = %e, "scan: series scan failed; backed off");
+                        }
                     }
                 }
             }
@@ -459,6 +694,49 @@ async fn due_series_ids(pool: &SqlitePool, now_iso: &str, limit: i64) -> Vec<Str
         tracing::warn!(error = %e, "scan: due-series query failed");
         Vec::new()
     })
+}
+
+/// Pull a few rows scheduled past `ABSURD_HORIZON_HOURS` back into the next hour.
+///
+/// No writer in this module can produce such a row (see `ABSURD_HORIZON_HOURS`), so any
+/// that exist are legacy rows parked years out and permanently invisible to the
+/// due-query — production had 3,578 of them, 1,676 on ONGOING series, with a maximum of
+/// 2033-03-14. Bounded by `ABSURD_RECLAIM_PER_TICK`, index-backed (a `next_scan_at > ?`
+/// range seek off `idx_scan_state_next_scan`), and self-extinguishing: once the tail is
+/// drained the subselect matches nothing and this is a no-op. Non-fatal — a failure is
+/// logged and the tick proceeds. Returns how many rows were reclaimed.
+async fn reclaim_absurd_schedules(pool: &SqlitePool, now: DateTime<Utc>) -> u64 {
+    let horizon = (now + chrono::Duration::hours(ABSURD_HORIZON_HOURS)).to_rfc3339();
+    // Spread over the next hour so a reclaimed cohort doesn't arrive as one herd.
+    let res = sqlx::query(
+        "UPDATE series_scan_state \
+            SET next_scan_at = strftime('%Y-%m-%dT%H:%M:%S', 'now', '+' || (ABS(RANDOM()) % 60) || ' minutes') || '+00:00', \
+                updated_at   = strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' \
+          WHERE series_id IN ( \
+            SELECT series_id FROM series_scan_state \
+             WHERE next_scan_at > ? ORDER BY next_scan_at DESC LIMIT ?)",
+    )
+    .bind(&horizon)
+    .bind(ABSURD_RECLAIM_PER_TICK)
+    .execute(pool)
+    .await;
+    match res {
+        Ok(r) => {
+            let n = r.rows_affected();
+            if n > 0 {
+                tracing::info!(
+                    reclaimed = n,
+                    horizon_hours = ABSURD_HORIZON_HOURS,
+                    "scan: pulled legacy far-future schedules back into the due-set"
+                );
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "scan: absurd-schedule reclaim failed");
+            0
+        }
+    }
 }
 
 /// Count of tracked series — the health snapshot's "library size".
@@ -505,6 +783,21 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
     let found = match persist_scan(state, &m, &chapters, &admin, now).await {
         Ok(v) => v,
         Err(e) => {
+            // A LOCAL write-lock failure is not an upstream failure. Routing it into
+            // `record_scan_failure` bumped `consecutive_failures` and pushed
+            // `next_scan_at` out 30m → 1h → 2h, punishing a perfectly healthy series
+            // for losing a race against our own background writers. Observed on
+            // series 207 and 284, which sat at consecutive_failures = 1 purely from
+            // lock contention. The fetch above already succeeded, so leave the
+            // schedule untouched and let the next tick retry at the normal cadence.
+            if crate::db::is_locked_error(&e) {
+                tracing::warn!(
+                    series_id,
+                    error = %e,
+                    "scan: persist lost the write race after retries; NOT counting as an upstream failure"
+                );
+                return Err(e);
+            }
             if let Err(be) = record_scan_failure(&state.pool, series_id, now).await {
                 tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
             }
@@ -524,16 +817,50 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
 /// a never-scanned series with no row yet is still backed off. A successful `record_scan`
 /// resets `consecutive_failures` to 0. This is what keeps a permanently-failing series from
 /// starving every healthy series behind it in the due-ordering (audit #1/#4).
+///
+/// Read-modify-write, so it runs inside `BEGIN IMMEDIATE` with the same whole-transaction
+/// retry as `record_scan` (P2-1). It was the one scan-state writer left on a bare pooled
+/// read + upsert: harmless in practice (an interleaved writer could only lose a failure
+/// increment), but there is no reason for it to be the odd one out, and the IMMEDIATE
+/// lock is what lets `busy_timeout` absorb contention instead of returning BUSY_SNAPSHOT.
 async fn record_scan_failure(
     pool: &SqlitePool,
     series_id: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    let mut delay_ms = 50_u64;
+    for attempt in 0..=SCAN_LOCK_RETRIES {
+        match record_scan_failure_once(pool, series_id, now).await {
+            Ok(()) => return Ok(()),
+            Err(e) if crate::db::is_locked_error(&e) && attempt < SCAN_LOCK_RETRIES => {
+                tracing::debug!(
+                    series_id,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    "scan: backoff write lock contention; retrying transaction"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let spread = (rand_core::OsRng.next_u64() % (delay_ms / 2).max(1)) as u64;
+                delay_ms = (delay_ms * 2 + spread).min(2_000);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
+}
+
+/// One attempt at the failure-backoff read-modify-write. See `record_scan_failure`.
+async fn record_scan_failure_once(
+    pool: &SqlitePool,
+    series_id: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let prior: i64 = sqlx::query_scalar(
         "SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?",
     )
     .bind(series_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .unwrap_or(0);
     let failures = prior.saturating_add(1);
@@ -557,8 +884,9 @@ async fn record_scan_failure(
     .bind(&next)
     .bind(failures)
     .bind(&now_iso)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -646,7 +974,251 @@ async fn persist_scan(
     if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, chapters).await {
         tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
     }
-    record_scan(&state.pool, &series_id, &m.title, admin, chapters, now).await
+    let new_found = record_scan(&state.pool, &series_id, &m.title, admin, chapters, now).await?;
+    // Both columns the merged Updates feed reads for this series are now written —
+    // `suwayomi_series.latest_chapter_at` (by `put_chapters`, above) and
+    // `series_scan_state.last_new_chapter_at` (by `record_scan`) — so fold the
+    // detection straight into the feed instead of waiting for the next rebuild.
+    touch_feed_series_update(&state.pool, &series_id, new_found).await;
+    Ok(new_found)
+}
+
+/// Incrementally refresh ONE series' row in the materialized merged Updates feed
+/// (`feed_series_updates`, migration 0064) after a scan, so a chapter we just detected
+/// is visible in `/updates` immediately.
+///
+/// WHY THIS EXISTS. That table is rebuilt wholesale by
+/// `catalog::refresh_feed_series_updates`, which runs at boot and after each catalogue
+/// sync. That cadence is right for its MangaDex mirror half (canonical chapters only
+/// change then) but not for its SCANNER half, which is exactly this module's output and
+/// changes continuously: without this call a series we detect a chapter for does not
+/// appear in — or move up — the feed until the next refresh, up to a full sync interval
+/// late. The previous resolver read `suwayomi_series` live and had no such lag, so
+/// skipping this would be a freshness REGRESSION against the behaviour the feed
+/// replaced — and late chapters are the complaint the whole scan-cadence effort exists
+/// to fix.
+///
+/// GATED ON `new_found`, not on "a scan happened". `persist_scan` runs on every scan
+/// (~475+/hr in steady state) but only a detection can change anything this feed sorts
+/// or labels by: `released_at` comes from `suwayomi_series.latest_chapter_at`, which
+/// `series_cache::derive_latest_chapter_at` only advances when a chapter appears, and
+/// `detected_at` is `series_scan_state.last_new_chapter_at`, which `record_scan` only
+/// stamps on a detection. So an unchanged scan has nothing worth a write — this turns
+/// ~475 writes/hr into a handful.
+///
+/// WHAT THE GATE MISSES, exhaustively. Each is bounded by the next rebuild, and none of
+/// them is worse than the rebuild-only behaviour this call was added to:
+///
+/// * an upstream edit to an EXISTING chapter's `upload_date`. The max-merge below would
+///   refuse to move the row backwards for a correction anyway;
+/// * a pure upstream DELETION. It lowers `suwayomi_series.chapter_count` without
+///   producing a detection, and that column IS a label for a scanner-only card (the
+///   reader renders `Ch. {latest_chapter ?? chapter_count}`), so such a card can read one
+///   chapter high until the rebuild — the same single stale number it would have read for
+///   the whole interval without this call;
+/// * display metadata the periodic rebuild owns outright (`title`, `reader_id`,
+///   `latest_chapter`), which the conflict clause never rewrites in any case.
+///
+/// BEST-EFFORT, like the cache writes above: logged and swallowed, never propagated. A
+/// feed row is a pure cache and the periodic rebuild reconstructs it; failing a scan
+/// (and with it the scan-state write and the reschedule) over one would be strictly
+/// worse than being one refresh stale.
+async fn touch_feed_series_update(pool: &SqlitePool, series_id: &str, new_found: bool) {
+    if !new_found {
+        return;
+    }
+    if let Err(e) = upsert_feed_series_update(pool, series_id).await {
+        tracing::warn!(series_id, error = %e, "scan: updates-feed row upsert failed");
+    }
+}
+
+/// The one-row UPSERT behind [`touch_feed_series_update`]. Keyed by the feed's primary
+/// key, so it is a single indexed write.
+///
+/// The field mapping MIRRORS the scanner half of `catalog::refresh_feed_series_updates`
+/// statement-for-statement — same joins, same guards, same `GROUP BY ss.work_id` (a work
+/// can have several Suwayomi sources; SQLite's bare-columns-with-one-MAX rule then takes
+/// every column from the work's NEWEST-RELEASING source, not smeared across sources), and
+/// the same `ON CONFLICT` merge. Divergence would be a latent bug where a row's contents
+/// depend on which writer touched it last, so the agreement is PROVEN rather than
+/// asserted: `incremental_write_converges_with_the_periodic_rebuild` drives this path and
+/// then runs the real `catalog::refresh_feed_series_updates` over the result and demands a
+/// byte-identical row. (That test therefore also pins this function to the rebuild's
+/// current text — if the rebuild's field mapping is edited, it fails here.)
+///
+/// The agreement covers every column this feed SORTS or LABELS by. It does NOT cover the
+/// display metadata the conflict clause deliberately never rewrites — `title`,
+/// `reader_id`, `latest_chapter`, and a `cover_url` whose `?v=` has since been bumped: on
+/// a row THIS path created, those stay frozen at the first write until the next rebuild.
+/// That is the same staleness the rebuild-only behaviour had (nothing here makes a column
+/// worse than not running at all), and it is the price of the mirror-wins rule below —
+/// this statement cannot tell "the existing row is the mirror half" from "the existing row
+/// is my own earlier write", and clobbering a mirror row's title would be the worse bug.
+///
+/// The only narrowing is the `IN (SELECT …)`, which restricts the rebuild's query to the
+/// work this series maps to. Load-bearing details, all inherited:
+///
+/// * `released_at` is INTEGER EPOCH-MILLIS, never TEXT. The two halves' clocks are stored
+///   in incompatible text encodings (ISO-8601 vs 13-digit millis) and under BINARY
+///   collation every `'2…'` sorts above every `'1…'`, so a TEXT key would silently sort
+///   the entire mirror half above the entire scanner half. See migration 0064.
+/// * `MAX(existing, excluded)` on `released_at`: an incremental write may only move a row
+///   FORWARD in time, and can never pull it back below a fresher mirror-half value.
+/// * `reader_id` is the numeric Suwayomi id on INSERT and is left untouched on CONFLICT,
+///   which preserves an existing canonical `w_…` id — a mangadex-anchored work must keep
+///   navigating to its canonical page.
+/// * rows with no release time are excluded (`latest_chapter_at IS NOT NULL`) rather than
+///   inserted with a NULL into a NOT NULL column.
+///
+/// Two conflict-clause assignments are stated in the *converged* direction rather than
+/// copied verbatim, because the rebuild's clause is written for a table whose only
+/// pre-existing row is the mirror half inserted moments earlier in the same transaction,
+/// and here the pre-existing row may be an older SCANNER row:
+///
+/// * `chapter_count` takes `excluded` when we have one — and we ALWAYS have one, because
+///   `suwayomi_series.chapter_count` is `INTEGER NOT NULL DEFAULT 0` (migration 0022), so
+///   the fallback arm is dead and this is unconditionally the current Suwayomi count. In
+///   the rebuild the existing value at conflict time is always the mirror half's literal
+///   NULL (the table is DELETEd first, and the mirror insert writes NULL into this
+///   column), so `COALESCE(existing, excluded)` there lands that same count. The two
+///   writers therefore converge exactly. Copying it literally would instead pin the count at whatever
+///   the first incremental write saw, and the reader renders
+///   `Ch. {latest_chapter ?? chapter_count}` — a scanner-only card would announce a new
+///   chapter while still printing the old number.
+/// * `comic_type` is filled ONLY when missing (below), never changed. The rebuild's
+///   `fill_feed_series_updates_types` pass owns it; but that pass cannot see a row that
+///   did not exist when it ran, and a NULL type is invisible to the reader's format
+///   filter — so a series whose FIRST-ever detection lands here would appear in the
+///   unfiltered feed and vanish from every format tab until the next rebuild.
+async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow::Result<u64> {
+    let n = sqlx::query(
+        "INSERT INTO feed_series_updates \
+             (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
+              latest_chapter, latest_chapter_title, chapter_count, released_at, \
+              detected_at, is_nsfw) \
+         SELECT ss.work_id, CAST(sy.id AS TEXT), \
+                COALESCE(w.title_override, w.primary_title, sy.title), \
+                CASE WHEN w.cover_cached_version IS NOT NULL \
+                     THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
+                     END, \
+                sy.thumbnail_url, NULL, \
+                NULL, NULL, sy.chapter_count, \
+                MAX(CAST(sy.latest_chapter_at AS INTEGER)), \
+                sss.last_new_chapter_at, \
+                COALESCE(w.is_nsfw_override, w.is_nsfw) \
+         FROM source_series ss \
+         JOIN work w ON w.id = ss.work_id \
+         JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+         JOIN series_scan_state sss ON sss.series_id = ss.source_key \
+         WHERE ss.source_type = 'suwayomi' AND sy.in_library = 1 \
+           AND sy.latest_chapter_at IS NOT NULL \
+           AND sss.last_new_chapter_at IS NOT NULL \
+           AND ss.work_id IN (SELECT work_id FROM source_series \
+                              WHERE source_type = 'suwayomi' AND source_key = ?) \
+         GROUP BY ss.work_id \
+         ON CONFLICT(work_id) DO UPDATE SET \
+             released_at = MAX(feed_series_updates.released_at, excluded.released_at), \
+             detected_at = COALESCE(excluded.detected_at, feed_series_updates.detected_at), \
+             chapter_count = COALESCE(excluded.chapter_count, feed_series_updates.chapter_count), \
+             cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
+             suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
+             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw)",
+    )
+    .bind(series_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n > 0 {
+        fill_missing_feed_comic_type(pool, series_id).await?;
+    }
+    Ok(n)
+}
+
+/// Give a feed row this scan just CREATED the `comic_type` the rebuild's
+/// `fill_feed_series_updates_types` pass would have given it.
+///
+/// Runs the real [`crate::graphql::types::resolve_comic_type`] over the same inputs, in
+/// the same precedence (curated `work_tag` wins outright over source genres), and stores
+/// the same COLLAPSED word (`WEBTOON → MANHWA`, `COMIC → MANGA`) the reader's `toViewType`
+/// uses — a SQL approximation would disagree with every other format badge.
+///
+/// Scoped by `comic_type IS NULL`, so it costs one scalar read on the overwhelmingly
+/// common path (the row already existed and already has a type) and never overwrites a
+/// type the rebuild computed. The rebuild derives the type from the FEED row's title,
+/// which on conflict stays the mirror half's; leaving an existing type alone keeps this
+/// path from disagreeing with it.
+async fn fill_missing_feed_comic_type(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+    let Some((work_id, title, override_word, original_language)) =
+        sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+            "SELECT f.work_id, f.title, w.content_type_override, w.original_language \
+             FROM feed_series_updates f JOIN work w ON w.id = f.work_id \
+             WHERE f.comic_type IS NULL \
+               AND f.work_id IN (SELECT work_id FROM source_series \
+                                 WHERE source_type = 'suwayomi' AND source_key = ?)",
+        )
+        .bind(series_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let curated = sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag",
+    )
+    .bind(&work_id)
+    .fetch_all(pool)
+    .await?;
+    let genres = if curated.is_empty() {
+        // Source genres, deduped in source order. The CAST is on `ss.source_key`
+        // (unindexed TEXT), never on `sw.id` — casting the indexed side makes the join
+        // opaque to the planner (see `work_effective_genres`).
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for json in sqlx::query_scalar::<_, String>(
+            "SELECT sw.genre FROM source_series ss \
+             JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
+             WHERE ss.source_type = 'suwayomi' AND ss.work_id = ? AND sw.genre IS NOT NULL \
+             ORDER BY ss.id",
+        )
+        .bind(&work_id)
+        .fetch_all(pool)
+        .await?
+        {
+            let Ok(list) = serde_json::from_str::<Vec<String>>(&json) else {
+                continue;
+            };
+            for g in list {
+                let g = g.trim().to_string();
+                if !g.is_empty() && seen.insert(g.clone()) {
+                    out.push(g);
+                }
+            }
+        }
+        out
+    } else {
+        curated
+    };
+
+    use crate::graphql::types::ComicType;
+    let word = match crate::graphql::types::resolve_comic_type(
+        override_word.as_deref(),
+        original_language.as_deref(),
+        &genres,
+        &title,
+    ) {
+        ComicType::Manhwa | ComicType::Webtoon => "MANHWA",
+        ComicType::Manhua => "MANHUA",
+        ComicType::Manga | ComicType::Comic => "MANGA",
+    };
+    sqlx::query(
+        "UPDATE feed_series_updates SET comic_type = ? WHERE work_id = ? AND comic_type IS NULL",
+    )
+    .bind(word)
+    .bind(&work_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Detect new chapters from a freshly-fetched chapter list and persist the
@@ -660,11 +1232,10 @@ async fn persist_scan(
 ///
 /// The prior read and the upsert run in one transaction [SC6]: an admin
 /// `triggerScan` overlapping a scheduler tick can no longer interleave their
-/// read-modify-write and double-count or clobber `known_chapter_count`. The slow
-/// chapter fetch already happened in `scan_series`, so the tx spans only the two
-/// DB ops; under WAL a losing concurrent writer gets `SQLITE_BUSY_SNAPSHOT` and
-/// this scan errors out (logged + skipped by the tick, retried next interval)
-/// rather than committing a stale write.
+/// read-modify-write and double-count or clobber `known_chapter_count`.
+///
+/// The transaction is `BEGIN IMMEDIATE`, not the default DEFERRED, and the whole
+/// thing is retried on a lock error — see `record_scan` below for why.
 async fn record_scan(
     pool: &SqlitePool,
     series_id: &str,
@@ -673,7 +1244,51 @@ async fn record_scan(
     chapters: &[SuwayomiChapter],
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await?;
+    // Retry the ENTIRE transaction on a transient lock. A DEFERRED transaction that
+    // read first and then upgraded to a write was returning SQLITE_BUSY_SNAPSHOT
+    // (code 517) whenever another writer committed in between — 25 times in a 11.5h
+    // window in production. `busy_timeout` cannot help there: the read snapshot is
+    // already stale, so waiting changes nothing and only re-running the read can
+    // recover. `BEGIN IMMEDIATE` (below) takes the write lock up front, which lets
+    // `busy_timeout` do its job and makes 517 rare; this loop covers the remainder
+    // plus plain BUSY (code 5) when the 15s timeout is exhausted.
+    let mut delay_ms = 50_u64;
+    for attempt in 0..=SCAN_LOCK_RETRIES {
+        match record_scan_once(pool, series_id, title, admin, chapters, now).await {
+            Ok(found) => return Ok(found),
+            Err(e) if crate::db::is_locked_error(&e) && attempt < SCAN_LOCK_RETRIES => {
+                tracing::debug!(
+                    series_id,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    "scan: write lock contention; retrying transaction"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                // Exponential with a small jittered spread, so several scan workers
+                // that collided do not line up and collide again on the same beat.
+                let spread = (rand_core::OsRng.next_u64() % (delay_ms / 2).max(1)) as u64;
+                delay_ms = (delay_ms * 2 + spread).min(2_000);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
+}
+
+/// One attempt at the scan-state read-modify-write. See `record_scan` for retries.
+async fn record_scan_once(
+    pool: &SqlitePool,
+    series_id: &str,
+    title: &str,
+    admin: &ScanAdmin,
+    chapters: &[SuwayomiChapter],
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    // BEGIN IMMEDIATE, not the default DEFERRED: take the write lock at the start of
+    // the transaction rather than upgrading to it after the read. That converts the
+    // unretryable-by-timeout SQLITE_BUSY_SNAPSHOT into ordinary BUSY, which
+    // `busy_timeout` (15s, see db::init) absorbs.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let prior_opt = sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
         .bind(series_id)
         .fetch_optional(&mut *tx)
@@ -682,7 +1297,17 @@ async fn record_scan(
     let prior = prior_opt.unwrap_or_default();
 
     let count = chapters.len() as i64;
-    let computed_avg = avg_interval_hours(chapters).unwrap_or(prior.avg_interval_hours);
+    let cadence = upload_cadence(chapters);
+    // Clamp the inferred average at WRITE time, not only where it is turned into a
+    // schedule (P0-2). A sparse history spanning years used to persist an average of
+    // 58,309 hours; the schedule-time clamp kept the NEXT scan sane but the absurd value
+    // stayed in the row, was surfaced by the API, and is the number every downstream
+    // heuristic reads. Nothing above `MAX_INTERVAL_HOURS` is a cadence.
+    let computed_avg = cadence
+        .as_ref()
+        .map(|c| c.avg_hours)
+        .unwrap_or(prior.avg_interval_hours)
+        .clamp(0.0, MAX_INTERVAL_HOURS);
     // `known_max` is derived from the CURRENT list (sentinels dropped) so it heals
     // downward once garbage disappears upstream, instead of being pinned forever by
     // a single bad number. Falls back to the prior value only when the current list
@@ -722,33 +1347,61 @@ async fn record_scan(
     // Steady cadence from fresh data (admin override wins), clamped into
     // `[MIN|HARD_MIN, MAX]` (SC5).
     let steady_interval = resolve_interval(admin.override_interval_hours, computed_avg);
-    // "Awaiting" = the series was *genuinely due* (past its persisted `next_scan_at`)
-    // and found no new chapter, so the expected chapter is late (SC1). We gate on
-    // due-ness — not merely "a scan found nothing" — so an admin `triggerScan` that
-    // force-scans a series *before* its cadence doesn't wrongly flip it into the
-    // accelerated poll. We also require a prior chapter SNAPSHOT: the FIRST real scan of
-    // a series is a baseline, not a late chapter — even when a `series_scan_state` row
-    // already exists from `ensure_pending`/backfill (which pre-seeds a row with a due-now
-    // sentinel `next_scan_at` but NO `known_chapter_ids`), so `first_observation` alone
-    // isn't enough to recognise a baseline. Without this, every newly-enrolled and
-    // federated-ingested series would wrongly enter the 30-min accelerated poll on its
-    // first scheduler scan.
-    let due_now = is_due(prior.next_scan_at.as_deref(), now);
-    let awaiting = due_now && !new_found && !first_observation && have_prior_snapshot;
-    // Stamp when the awaiting streak began (preserve the original start across
-    // repeated polls); clear it as soon as a chapter lands or we're not awaiting.
-    let awaiting_since = if awaiting {
-        prior
-            .awaiting_since
-            .clone()
-            .or_else(|| Some(now_iso.clone()))
-    } else {
-        None
+
+    // ── awaiting: accelerate only a genuinely-late series ────────────────────────
+    //
+    // A baseline scan is never "late": the FIRST real scan of a series records a
+    // starting point, not a missed chapter. That needs the prior chapter SNAPSHOT, not
+    // just `first_observation` — `ensure_pending`/backfill pre-seed a row (due-now
+    // sentinel, no `known_chapter_ids`), so a row can exist before any real scan.
+    let baseline = first_observation || !have_prior_snapshot;
+    // The publication cadence is trustworthy only when it was averaged over enough real
+    // gaps; 3,257 live rows carry no cadence at all and would otherwise be judged
+    // against a fabricated one.
+    let publication_hours = cadence
+        .as_ref()
+        .filter(|c| c.gaps >= MIN_TRUSTED_GAPS)
+        .map(|_| computed_avg)
+        .filter(|h| *h > 0.0);
+    // Lateness is measured against the newest UPLOAD — upstream's own clock — not
+    // against our `next_scan_at` (which is due by construction here) nor against
+    // `last_new_chapter_at` (which is NULL for 12,797 of 13,789 live rows because it
+    // only records detections we happened to make).
+    let genuinely_late = match (publication_hours, cadence.as_ref()) {
+        (Some(pub_hours), Some(c)) => {
+            let since = (now - c.latest_upload).num_seconds() as f64 / 3600.0;
+            is_genuinely_late(pub_hours, since)
+        }
+        _ => false,
     };
-    // Re-poll fast only within a bounded window past the due time; beyond it the
-    // series is treated as steady again so a stalled/underestimated series doesn't
-    // poll forever (SC1). The window scales with the cadence but is capped.
-    let awaiting_window_hours = steady_interval.min(AWAITING_MAX_HOURS);
+    // Due-ness is retained as a guard (not as the signal): it is true by construction for
+    // every scheduler-driven scan, but it still stops an admin `triggerScan` fired well
+    // before a series' cadence from flipping it into the accelerated poll.
+    let due_now = is_due(prior.next_scan_at.as_deref(), now);
+    let awaiting = due_now && genuinely_late && !new_found && !baseline;
+    // The streak start doubles as the cool-down marker (see `AWAITING_REARM_HOURS`):
+    // preserved while the cool-down runs so the accelerated window can't immediately
+    // re-open, re-armed once it elapses, and cleared outright by a landed chapter or by
+    // the series leaving the lateness band.
+    let prior_streak_hours = parse_iso(prior.awaiting_since.as_deref())
+        .map(|start| (now - start).num_seconds() as f64 / 3600.0);
+    let awaiting_since = if !awaiting {
+        None
+    } else {
+        match prior_streak_hours {
+            None => Some(now_iso.clone()),
+            Some(h) if h < AWAITING_REARM_HOURS => prior.awaiting_since.clone(),
+            Some(_) => Some(now_iso.clone()),
+        }
+    };
+    // Re-poll fast only within a bounded window from the streak start; beyond it the
+    // series drops back to the steady cadence (SC1) — which is now itself capped at
+    // `ACTIVE_MAX_INTERVAL_HOURS`, so "falling back" costs at most 12h of latency
+    // instead of the 7–14 days it used to. The window is sized on the PUBLICATION
+    // cadence, floored so a fast series still gets a usable one.
+    let awaiting_window_hours = publication_hours
+        .unwrap_or(MIN_INTERVAL_HOURS)
+        .clamp(MIN_INTERVAL_HOURS, AWAITING_MAX_HOURS);
     let awaited_hours = parse_iso(awaiting_since.as_deref())
         .map(|start| (now - start).num_seconds() as f64 / 3600.0)
         .unwrap_or(0.0);
@@ -757,8 +1410,13 @@ async fn record_scan(
     } else {
         steady_interval
     };
+    // Jittered so a batch scanned together does not come due together again — see
+    // `jitter_interval_hours`. This is the steady/awaiting path, which is where the
+    // overwhelming majority of reschedules happen.
     let next_scan_at = (now
-        + chrono::Duration::milliseconds((next_interval_hours * 3_600_000.0) as i64))
+        + chrono::Duration::milliseconds(
+            (jitter_interval_hours(next_interval_hours) * 3_600_000.0) as i64,
+        ))
     .to_rfc3339();
     let last_new_chapter_at = if new_found {
         Some(now_iso.clone())
@@ -858,6 +1516,13 @@ async fn run_loop(
     tick_seconds: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Phase offset so the five background loops don't all fire their first tick in
+    // the same instant. `tokio::time::interval` fires tick #1 immediately, and
+    // main.rs spawns scanner/source-sync/gc/mangadex/cover back-to-back — production
+    // timestamps showed all five starting within 336µs of each other, which is what
+    // produced the boot-time burst of `database is locked` warnings. The scanner is
+    // the primary consumer, so it keeps offset 0 and the others stagger behind it.
+    // See `startup_offset` docs in each sibling loop.
     let mut ticker = interval(Duration::from_secs(tick_seconds));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tracing::info!(tick_seconds, "scan scheduler started");
@@ -940,6 +1605,38 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    thread_local! {
+        /// Schedule jitter is OFF by default in tests — see `jitter_interval_hours`.
+        static JITTER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn jitter_enabled() -> bool {
+        JITTER_ENABLED.with(|c| c.get())
+    }
+
+    /// The jitter itself: bounded to ±`SCHEDULE_JITTER_FRACTION` and genuinely random,
+    /// which is what breaks up the self-sustaining scan cohort in production.
+    #[test]
+    fn jitter_stays_within_band_and_varies() {
+        JITTER_ENABLED.with(|c| c.set(true));
+        let base = 100.0_f64;
+        let lo = base * (1.0 - SCHEDULE_JITTER_FRACTION);
+        let hi = base * (1.0 + SCHEDULE_JITTER_FRACTION);
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let v = jitter_interval_hours(base);
+            assert!(v >= lo && v <= hi, "jittered {v} outside [{lo}, {hi}]");
+            distinct.insert((v * 1_000_000.0) as i64);
+        }
+        JITTER_ENABLED.with(|c| c.set(false));
+        assert!(
+            distinct.len() > 400,
+            "jitter must actually vary (got {} distinct of 500)",
+            distinct.len()
+        );
+        assert_eq!(jitter_interval_hours(0.0), 0.0, "zero stays zero");
+    }
+
     fn at(iso: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(iso)
             .unwrap()
@@ -969,6 +1666,23 @@ mod tests {
     /// N chapters numbered 1..=N, undated (count-only fixtures).
     fn chaps(n: i64) -> Vec<SuwayomiChapter> {
         (1..=n).map(|i| chap_n(i, i as f64, None)).collect()
+    }
+
+    /// N chapters on a regular `gap_hours` cadence, the newest uploaded at
+    /// `latest`. Dated fixtures are what the lateness gate needs: the accelerated
+    /// poll now requires a cadence averaged over at least `MIN_TRUSTED_GAPS` real
+    /// upload gaps plus a newest-upload timestamp to measure lateness against.
+    fn dated_chaps(n: i64, gap_hours: i64, latest: DateTime<Utc>) -> Vec<SuwayomiChapter> {
+        (0..n)
+            .map(|i| {
+                let ts = latest - chrono::Duration::hours(gap_hours * i);
+                chap_n(
+                    n - i,
+                    (n - i) as f64,
+                    Some(&ts.timestamp_millis().to_string()),
+                )
+            })
+            .collect()
     }
 
     async fn migrated_pool() -> SqlitePool {
@@ -1040,10 +1754,58 @@ mod tests {
     fn inferred_interval_clamps_up_to_min() {
         // A same-day burst (avg 0.2h) must be floored to MIN, not left sub-hour.
         assert_eq!(resolve_interval(None, 0.2), MIN_INTERVAL_HOURS);
-        // A normal weekly avg passes straight through.
-        assert_eq!(resolve_interval(None, 168.0), 168.0);
-        // No inferable cadence -> default (which is itself >= MIN).
+        // No inferable cadence -> default (which is itself within [MIN, ACTIVE_MAX]).
         assert_eq!(resolve_interval(None, 0.0), DEFAULT_INTERVAL_HOURS);
+    }
+
+    /// P0-1: the steady POLL cadence must not track the PUBLICATION cadence. A weekly
+    /// or fortnightly series is still *checked* at the active ceiling — polling at the
+    /// upload rate is what put the median discovery lag at 28.8h with a p90 of 11 days.
+    #[test]
+    fn steady_cadence_is_capped_below_the_publication_cadence() {
+        for avg in [24.0, 168.0, 336.0, 58_309.0] {
+            assert_eq!(
+                resolve_interval(None, avg),
+                ACTIVE_MAX_INTERVAL_HOURS,
+                "an inferred {avg}h cadence must still be polled at the active ceiling"
+            );
+        }
+        // Below the ceiling the inferred cadence is still honoured (down to MIN).
+        assert_eq!(resolve_interval(None, 8.0), 8.0);
+        // The long ceiling stays reachable for a DELIBERATE admin override only.
+        assert_eq!(resolve_interval(Some(336.0), 6.0), 336.0);
+        assert!(ACTIVE_MAX_INTERVAL_HOURS < MAX_INTERVAL_HOURS);
+    }
+
+    /// P1-1: "awaiting" must mean genuinely late, not merely "a scheduled scan found
+    /// nothing" — the latter was true by construction for every scheduler-driven scan.
+    #[test]
+    fn lateness_band_excludes_on_time_and_dead_series() {
+        let weekly = 168.0;
+        assert!(!is_genuinely_late(weekly, 100.0), "not due yet");
+        assert!(
+            !is_genuinely_late(weekly, weekly * LATE_FACTOR),
+            "exactly at the late threshold is not yet late"
+        );
+        assert!(is_genuinely_late(weekly, weekly * 2.0), "slipping: late");
+        assert!(
+            !is_genuinely_late(weekly, weekly * LATE_BAND_MAX + 1.0),
+            "past the band the series has stopped publishing, not slipped"
+        );
+    }
+
+    /// P0-2 root cause: a sparse history spanning years must not be trusted as a cadence.
+    #[test]
+    fn sparse_history_is_not_a_trustworthy_cadence() {
+        let now = at("2026-01-01T00:00:00Z");
+        // Two chapters six years apart: a 6.6-year "average", which is what parked a
+        // live ONGOING series until 2033-03-14.
+        let sparse = dated_chaps(2, 6 * 365 * 24, now);
+        let c = upload_cadence(&sparse).unwrap();
+        assert!(c.gaps < MIN_TRUSTED_GAPS, "one gap is not a cadence");
+        // Five dated chapters on a real weekly rhythm are trusted.
+        let real = dated_chaps(5, 168, now);
+        assert!(upload_cadence(&real).unwrap().gaps >= MIN_TRUSTED_GAPS);
     }
 
     #[test]
@@ -1275,9 +2037,10 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_series_repolls_at_poll_cadence_then_reverts() {
-        // SC1: a weekly series (override 168h) that comes due and finds no new
-        // chapter re-polls at poll_every_minutes (30m), not a full week; once a
-        // chapter lands it reverts to the steady 168h cadence.
+        // SC1 (re-stated for the P1-1 policy): a weekly series whose chapter is
+        // GENUINELY late — newest upload older than 1.25 weeks — re-polls at
+        // poll_every_minutes (30m). Once a chapter lands it reverts to the steady
+        // cadence and the streak is cleared.
         let pool = migrated_pool().await;
         let admin = ScanAdmin {
             override_interval_hours: Some(168.0),
@@ -1285,9 +2048,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Baseline (first observation): steady cadence, not awaiting.
+        // Baseline: 6 weekly chapters, newest uploaded right now -> on schedule.
         let t0 = at("2026-01-01T00:00:00Z");
-        record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
+        let base = dated_chaps(6, 168, t0);
+        record_scan(&pool, "1", "S", &admin, &base, t0)
             .await
             .unwrap();
         assert!(
@@ -1295,20 +2059,23 @@ mod tests {
             "first observation schedules the steady interval"
         );
 
-        // Came due, no new chapter -> awaiting -> accelerated 30m poll.
-        let t1 = at("2026-01-08T00:00:00Z");
-        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(5), t1)
+        // Nine days on with no new upload: 216h since the newest chapter against a
+        // 168h cadence is 1.29x — inside the lateness band -> accelerated 30m poll.
+        let t1 = at("2026-01-10T00:00:00Z");
+        let new_found = record_scan(&pool, "1", "S", &admin, &base, t1)
             .await
             .unwrap();
         assert!(!new_found);
         assert!(
             (hours_until_next_scan(&pool, "1", t1).await - 0.5).abs() < 0.01,
-            "awaiting series re-polls at the 30-minute poll cadence"
+            "a genuinely late series re-polls at the 30-minute poll cadence"
         );
+        assert!(persisted(&pool, "1").await.awaiting_since.is_some());
 
         // Chapter finally lands -> revert to the steady interval.
-        let t2 = at("2026-01-08T00:30:00Z");
-        let new_found = record_scan(&pool, "1", "S", &admin, &chaps(6), t2)
+        let t2 = at("2026-01-10T00:30:00Z");
+        let landed = dated_chaps(7, 168, t2);
+        let new_found = record_scan(&pool, "1", "S", &admin, &landed, t2)
             .await
             .unwrap();
         assert!(new_found);
@@ -1319,6 +2086,80 @@ mod tests {
         assert!(
             persisted(&pool, "1").await.awaiting_since.is_none(),
             "awaiting_since is cleared once a chapter lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_time_and_dead_series_never_enter_the_accelerated_poll() {
+        // P1-1: `due_series_ids` only ever returns rows that are already due, so
+        // "came due and found nothing" was true for EVERY scheduler scan and routed
+        // ~73% of the fetch budget to a few hundred series. Neither an on-schedule
+        // series nor a long-dead one may accelerate.
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            override_interval_hours: Some(168.0),
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+        let t0 = at("2026-01-01T00:00:00Z");
+
+        // (a) On schedule: the scan comes due at 170h but the newest upload is only
+        // 170h old against a 168h cadence (1.01x) — the chapter isn't late yet.
+        let fresh = dated_chaps(6, 168, t0);
+        record_scan(&pool, "on_time", "S", &admin, &fresh, t0)
+            .await
+            .unwrap();
+        let t1 = t0 + chrono::Duration::hours(170); // due, still nothing new
+        record_scan(&pool, "on_time", "S", &admin, &fresh, t1)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "on_time", t1).await - 168.0).abs() < 0.01,
+            "an on-schedule series stays on the steady cadence"
+        );
+        assert!(persisted(&pool, "on_time").await.awaiting_since.is_none());
+
+        // (b) Dead: newest upload 10 weeks ago against a weekly cadence (10x, well
+        // past LATE_BAND_MAX). It has stopped publishing, not slipped.
+        let stale = dated_chaps(6, 168, t0 - chrono::Duration::hours(168 * 10));
+        record_scan(&pool, "dead", "S", &admin, &stale, t0)
+            .await
+            .unwrap();
+        let t2 = t0 + chrono::Duration::hours(200);
+        record_scan(&pool, "dead", "S", &admin, &stale, t2)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "dead", t2).await - 168.0).abs() < 0.01,
+            "a series past the lateness band is not accelerated"
+        );
+        assert!(persisted(&pool, "dead").await.awaiting_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn absurd_avg_interval_is_clamped_at_write_time() {
+        // P0-2: the multi-year "averages" that parked live rows in 2031–2033 came from
+        // sparse histories. Clamp them where they are WRITTEN, not only where they are
+        // turned into a schedule, so the stored value (and everything reading it) is
+        // sane too.
+        let pool = migrated_pool().await;
+        let now = at("2026-01-01T00:00:00Z");
+        // Two chapters 6 years apart -> a ~58,000h raw average.
+        let sparse = dated_chaps(2, 6 * 365 * 24, now);
+        record_scan(&pool, "1", "S", &ScanAdmin::default(), &sparse, now)
+            .await
+            .unwrap();
+        let row = persisted(&pool, "1").await;
+        assert!(
+            row.avg_interval_hours <= MAX_INTERVAL_HOURS,
+            "stored avg must be clamped, got {}",
+            row.avg_interval_hours
+        );
+        // ...and the schedule it produced stays inside the active ceiling.
+        let hours = hours_until_next_scan(&pool, "1", now).await;
+        assert!(
+            hours <= ACTIVE_MAX_INTERVAL_HOURS + 0.01,
+            "sparse history must not park the series, got {hours}h"
         );
     }
 
@@ -1390,49 +2231,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awaiting_backs_off_to_steady_after_window() {
-        // SC1: a series that stays overdue past the awaiting window stops polling
-        // aggressively and falls back to the steady cadence, so it can't poll
-        // forever. Window = min(steady 168h, AWAITING_MAX_HOURS 48h) = 48h.
+    async fn awaiting_backs_off_after_window_then_re_arms_after_the_cooldown() {
+        // SC1 + P0-3. A late series accelerates for `min(publication, 48h)`, then falls
+        // back to the steady cadence — but unlike before, the streak is not pinned
+        // forever: once `AWAITING_REARM_HOURS` elapses a fresh window may open. Live,
+        // 1,679 of 2,201 awaiting series had been awaiting for more than 48h and could
+        // never re-accelerate again.
         let pool = migrated_pool().await;
+        // No override: the steady cadence is the ACTIVE ceiling, which is the shape a
+        // real series now has.
         let admin = ScanAdmin {
-            override_interval_hours: Some(168.0),
             poll_every_minutes: Some(30),
             ..Default::default()
         };
 
+        // Baseline: 6 chapters on a 168h rhythm, newest at t0.
         let t0 = at("2026-01-01T00:00:00Z");
-        record_scan(&pool, "1", "S", &admin, &chaps(5), t0)
-            .await
-            .unwrap();
-
-        // First due-empty scan -> awaiting starts, accelerated poll.
-        let t1 = at("2026-01-08T00:00:00Z");
-        record_scan(&pool, "1", "S", &admin, &chaps(5), t1)
-            .await
-            .unwrap();
-        let awaiting_since = persisted(&pool, "1").await.awaiting_since;
-        assert_eq!(
-            awaiting_since.as_deref(),
-            Some(t1.to_rfc3339()).as_deref(),
-            "awaiting streak starts at the first due-empty scan"
-        );
-
-        // Still empty 50h later (> 48h window) -> back off to steady, but the
-        // awaiting streak start is preserved (not reset).
-        let t2 = at("2026-01-10T02:00:00Z");
-        record_scan(&pool, "1", "S", &admin, &chaps(5), t2)
+        let base = dated_chaps(6, 168, t0);
+        record_scan(&pool, "1", "S", &admin, &base, t0)
             .await
             .unwrap();
         assert!(
-            (hours_until_next_scan(&pool, "1", t2).await - 168.0).abs() < 0.01,
+            (hours_until_next_scan(&pool, "1", t0).await - ACTIVE_MAX_INTERVAL_HOURS).abs() < 0.01,
+            "the steady cadence is the active ceiling, NOT the 168h publication gap"
+        );
+
+        // 216h in (1.29x cadence) the chapter is late -> awaiting opens, 30m poll.
+        let t1 = t0 + chrono::Duration::hours(216);
+        record_scan(&pool, "1", "S", &admin, &base, t1)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted(&pool, "1").await.awaiting_since.as_deref(),
+            Some(t1.to_rfc3339()).as_deref(),
+            "the awaiting streak starts at the first genuinely-late scan"
+        );
+        assert!((hours_until_next_scan(&pool, "1", t1).await - 0.5).abs() < 0.01);
+
+        // 50h later (> the 48h window) -> back to the steady cadence, streak preserved
+        // as the cool-down marker.
+        let t2 = t1 + chrono::Duration::hours(50);
+        record_scan(&pool, "1", "S", &admin, &base, t2)
+            .await
+            .unwrap();
+        assert!(
+            (hours_until_next_scan(&pool, "1", t2).await - ACTIVE_MAX_INTERVAL_HOURS).abs() < 0.01,
             "past the awaiting window the series reverts to the steady cadence"
         );
         assert_eq!(
             persisted(&pool, "1").await.awaiting_since.as_deref(),
             Some(t1.to_rfc3339()).as_deref(),
-            "awaiting_since is preserved across the back-off"
+            "the streak start is held as the cool-down marker, not re-stamped every scan"
         );
+
+        // Past the cool-down (and still inside the lateness band: 457h/168h = 2.7x) the
+        // window re-arms with a FRESH start, so acceleration is not lost forever.
+        let t3 = t1 + chrono::Duration::hours(AWAITING_REARM_HOURS as i64 + 1);
+        record_scan(&pool, "1", "S", &admin, &base, t3)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted(&pool, "1").await.awaiting_since.as_deref(),
+            Some(t3.to_rfc3339()).as_deref(),
+            "the streak re-arms once the cool-down has elapsed"
+        );
+        assert!(
+            (hours_until_next_scan(&pool, "1", t3).await - 0.5).abs() < 0.01,
+            "a re-armed window polls at the accelerated cadence again"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_pulls_legacy_far_future_rows_back_into_the_due_set() {
+        // P0-2 read-side net: rows parked beyond ABSURD_HORIZON_HOURS can never satisfy
+        // `next_scan_at <= now` and are invisible to the scheduler forever. Production
+        // had 3,578 such rows, the furthest scheduled for 2033-03-14.
+        let pool = migrated_pool().await;
+        let now = Utc::now();
+        let far = (now + chrono::Duration::days(2500)).to_rfc3339();
+        let ok = (now + chrono::Duration::hours(6)).to_rfc3339();
+        put_state(&pool, "parked_in_2033", Some(&far)).await;
+        put_state(&pool, "normal", Some(&ok)).await;
+
+        let n = reclaim_absurd_schedules(&pool, now).await;
+        assert_eq!(n, 1, "only the absurd row is reclaimed");
+        let reclaimed = next_scan_of(&pool, "parked_in_2033").await.unwrap();
+        assert!(
+            reclaimed < (now + chrono::Duration::hours(2)).to_rfc3339(),
+            "reclaimed row is scheduled within the hour, got {reclaimed}"
+        );
+        assert_eq!(
+            next_scan_of(&pool, "normal").await.as_deref(),
+            Some(ok.as_str()),
+            "a normally-scheduled row is untouched"
+        );
+        // Idempotent: the tail is drained, so a second pass is a no-op.
+        assert_eq!(reclaim_absurd_schedules(&pool, now).await, 0);
     }
 
     #[tokio::test]
@@ -1896,5 +2790,721 @@ mod tests {
             upper.contains("SEARCH") && !upper.contains("SCAN SERIES_SCAN_STATE"),
             "due-query must be a bounded SEARCH (range seek), not a full SCAN, got: {joined}"
         );
+    }
+
+    /// A `SuwayomiManga` carrying nothing but an id + upstream status — all
+    /// `effective_status` reads.
+    fn manga_with_status(id: i64, status: &str) -> SuwayomiManga {
+        SuwayomiManga {
+            id,
+            title: format!("S{id}"),
+            url: None,
+            thumbnail_url: None,
+            author: None,
+            artist: None,
+            description: None,
+            genre: Vec::new(),
+            status: status.to_string(),
+            in_library: true,
+            in_library_at: None,
+            last_fetched_at: None,
+            latest_chapter_at: None,
+            source_id: "1".into(),
+            source: None,
+            chapters: None,
+        }
+    }
+
+    /// Migration 0057's statement 1 hand-writes the pause rule in SQL, duplicating
+    /// `is_paused` + `effective_status`. A mismatch is silent and expensive in BOTH
+    /// directions: classifying a paused series as active drags it onto the 12h sweep
+    /// (7,397 live paused rows — roughly a doubling of the scan budget), and
+    /// classifying an active one as paused strands it at whatever legacy multi-year
+    /// `next_scan_at` it already carries.
+    ///
+    /// This runs the REAL migration file against a seeded matrix and compares, row by
+    /// row, against the Rust predicate — so the two cannot drift without a red test.
+    #[tokio::test]
+    async fn migration_0057_pause_predicate_matches_rust() {
+        let pool = migrated_pool().await;
+        let now = Utc::now();
+        // Far enough out that statement 1 matches it (> now + 14h), but inside the
+        // absurd horizon so statement 2 leaves it alone — the row therefore moves if
+        // and only if statement 1 considers it NON-paused.
+        let parked = (now + chrono::Duration::hours(300)).to_rfc3339();
+
+        // Every upstream status `status_from` distinguishes, plus a word it doesn't.
+        let statuses = [
+            "ONGOING",
+            "COMPLETED",
+            "PUBLISHING_FINISHED",
+            "LICENSED",
+            "CANCELLED",
+            "ON_HIATUS",
+            "UNKNOWN",
+            "SOMETHING_NEW",
+        ];
+        // NULL = no override; 0 = an explicit "keep scanning" (what
+        // `setSeriesPaused(false)` writes); 1 = forced pause.
+        let pauses = [None, Some(0i64), Some(1i64)];
+        // NULL = none; the five `komika_status` words; and one it rejects.
+        let overrides = [
+            None,
+            Some("ONGOING"),
+            Some("COMPLETED"),
+            Some("HIATUS"),
+            Some("CANCELLED"),
+            Some("UNKNOWN"),
+            Some("NOT_A_STATUS"),
+        ];
+
+        let mut expected: Vec<(String, bool)> = Vec::new(); // (id, rust says paused)
+        let mut id = 1i64;
+        for status in statuses {
+            for paused_override in pauses {
+                for status_override in overrides {
+                    let sid = id.to_string();
+                    sqlx::query(
+                        "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) \
+                         VALUES (?, ?, ?, '1', ?)",
+                    )
+                    .bind(id)
+                    .bind(format!("S{id}"))
+                    .bind(status)
+                    .bind(now.to_rfc3339())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    if paused_override.is_some() || status_override.is_some() {
+                        sqlx::query(
+                            "INSERT INTO series_admin \
+                               (series_id, paused_override, status_override, updated_at) \
+                             VALUES (?, ?, ?, ?)",
+                        )
+                        .bind(&sid)
+                        .bind(paused_override)
+                        .bind(status_override)
+                        .bind(now.to_rfc3339())
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    }
+                    put_state(&pool, &sid, Some(&parked)).await;
+
+                    let admin = ScanAdmin {
+                        paused_override,
+                        status_override: status_override.map(|s| s.to_string()),
+                        ..Default::default()
+                    };
+                    let m = manga_with_status(id, status);
+                    expected.push((sid, is_paused(effective_status(&m, &admin), &admin)));
+                    id += 1;
+                }
+            }
+        }
+
+        // Run the migration itself, not a copy of it.
+        sqlx::raw_sql(include_str!(
+            "../migrations/0057_clamp_legacy_next_scan_at.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cutoff = (now + chrono::Duration::hours(14)).to_rfc3339();
+        for (sid, rust_paused) in &expected {
+            let stored = next_scan_of(&pool, sid).await.unwrap();
+            let moved = stored < cutoff;
+            assert_eq!(
+                moved, !rust_paused,
+                "series {sid}: migration moved={moved} but scanner::is_paused={rust_paused} \
+                 (stored {stored})"
+            );
+        }
+        // Sanity: the matrix actually exercises both outcomes.
+        assert!(expected.iter().any(|(_, p)| *p) && expected.iter().any(|(_, p)| !*p));
+    }
+
+    /// Statement 1 must be idempotent — re-running it can neither move a row it already
+    /// placed inside the 12h window nor pick up a paused row it deliberately skipped.
+    #[tokio::test]
+    async fn migration_0057_is_idempotent() {
+        let pool = migrated_pool().await;
+        let now = Utc::now();
+        let sql = include_str!("../migrations/0057_clamp_legacy_next_scan_at.sql");
+        // One active row parked in 2033, one paused row on a legal 300h park.
+        for (id, status) in [(1i64, "ONGOING"), (2, "COMPLETED")] {
+            sqlx::query(
+                "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) \
+                 VALUES (?, ?, ?, '1', ?)",
+            )
+            .bind(id)
+            .bind(format!("S{id}"))
+            .bind(status)
+            .bind(now.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        put_state(&pool, "1", Some("2033-03-14T03:12:41+00:00")).await;
+        let paused_at = (now + chrono::Duration::hours(300)).to_rfc3339();
+        put_state(&pool, "2", Some(&paused_at)).await;
+        sqlx::query("UPDATE series_scan_state SET avg_interval_hours = 58309.0")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        let after_first = next_scan_of(&pool, "1").await.unwrap();
+        assert!(
+            after_first < (now + chrono::Duration::hours(13)).to_rfc3339(),
+            "the active row lands inside the 12h window, got {after_first}"
+        );
+        assert_eq!(
+            next_scan_of(&pool, "2").await.as_deref(),
+            Some(paused_at.as_str()),
+            "a paused row on a legal park is left alone"
+        );
+        let avg: f64 = sqlx::query_scalar("SELECT MAX(avg_interval_hours) FROM series_scan_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            (avg - MAX_INTERVAL_HOURS).abs() < 0.001,
+            "absurd stored averages are retired to the clamp, got {avg}"
+        );
+
+        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        assert_eq!(
+            next_scan_of(&pool, "1").await.as_deref(),
+            Some(after_first.as_str()),
+            "a second run must not re-roll a row it already placed"
+        );
+        assert_eq!(
+            next_scan_of(&pool, "2").await.as_deref(),
+            Some(paused_at.as_str()),
+            "a second run must not pick up the paused row either"
+        );
+    }
+
+    /// Nothing this module writes may land outside `(now, now + ABSURD_HORIZON_HOURS]`.
+    ///
+    /// The upper half is what makes `reclaim_absurd_schedules` safe to run every tick:
+    /// if a legitimate writer could exceed the horizon, the reclaim would fight it and
+    /// yank healthy series back into the due-set forever. The lower half is the
+    /// non-convergence bug in another disguise — a `next_scan_at` at or before `now` is
+    /// instantly re-due. Swept with jitter ON, across pathological cadences and admin
+    /// overrides (including NaN/inf, which reach `clamp`).
+    #[tokio::test]
+    async fn scheduled_next_scan_never_escapes_the_reclaim_horizon() {
+        let pool = migrated_pool().await;
+        JITTER_ENABLED.with(|c| c.set(true));
+        let now = at("2026-01-01T00:00:00Z");
+        let floor = now.to_rfc3339();
+        let horizon = (now + chrono::Duration::hours(ABSURD_HORIZON_HOURS)).to_rfc3339();
+
+        let overrides = [
+            None,
+            Some(0.0),
+            Some(-5.0),
+            Some(0.0001),
+            Some(1.0),
+            Some(MAX_INTERVAL_HOURS),
+            Some(58_309.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+        ];
+        let polls = [None, Some(-1i64), Some(1), Some(30), Some(100_000)];
+        // Cadences: none, a same-day burst, weekly, the absurd sparse-history case, and
+        // a list whose uploads all share one timestamp (zero gaps -> no cadence at all).
+        let lists: Vec<Vec<SuwayomiChapter>> = vec![
+            Vec::new(),
+            chaps(3),
+            dated_chaps(8, 1, now - chrono::Duration::hours(1)),
+            dated_chaps(8, 168, now - chrono::Duration::hours(400)),
+            dated_chaps(8, 20_000, now - chrono::Duration::hours(100_000)),
+            vec![
+                chap_n(1, 1.0, Some("1700000000000")),
+                chap_n(2, 2.0, Some("1700000000000")),
+            ],
+        ];
+
+        let mut id = 0;
+        for over in overrides {
+            for poll in polls {
+                for list in &lists {
+                    id += 1;
+                    let sid = id.to_string();
+                    let admin = ScanAdmin {
+                        override_interval_hours: over,
+                        poll_every_minutes: poll,
+                        ..Default::default()
+                    };
+                    // Twice: the second call has a prior snapshot, so it can reach the
+                    // awaiting/accelerated branch the first (baseline) one cannot.
+                    for _ in 0..2 {
+                        record_scan(&pool, &sid, "S", &admin, list, now)
+                            .await
+                            .unwrap();
+                        let next = next_scan_of(&pool, &sid).await.unwrap();
+                        assert!(
+                            next > floor,
+                            "over={over:?} poll={poll:?}: scheduled {next} at or before now"
+                        );
+                        assert!(
+                            next <= horizon,
+                            "over={over:?} poll={poll:?}: scheduled {next} past the \
+                             {ABSURD_HORIZON_HOURS}h reclaim horizon"
+                        );
+                    }
+                }
+            }
+        }
+        JITTER_ENABLED.with(|c| c.set(false));
+    }
+
+    /// The awaiting state machine must TERMINATE and stay bounded.
+    ///
+    /// `awaiting_since` is both the accelerated-window start and the re-arm cool-down
+    /// marker, and the accelerated cadence (30m) is 24x the steady one — so a series
+    /// that can never leave the awaiting state is a 24x load multiplier that no
+    /// constant in this file bounds. Drive a series that STOPS publishing through its
+    /// own schedule for 120 simulated days (following whatever `next_scan_at` it
+    /// writes, exactly as the scheduler would) and assert it converges: the streak
+    /// clears, the final cadence is the steady one, and the total fetch count stays
+    /// near the analytic bound rather than the once-every-30-minutes runaway.
+    #[tokio::test]
+    async fn a_series_that_stops_publishing_leaves_the_accelerated_poll() {
+        let pool = migrated_pool().await;
+        let admin = ScanAdmin {
+            poll_every_minutes: Some(30),
+            ..Default::default()
+        };
+        // 8 chapters on a weekly rhythm; the newest lands at t0 and none ever follow.
+        let t0 = at("2026-01-01T00:00:00Z");
+        let chapters = dated_chaps(8, 168, t0);
+        record_scan(&pool, "1", "S", &admin, &chapters, t0)
+            .await
+            .unwrap();
+
+        let deadline = t0 + chrono::Duration::days(120);
+        let mut clock = t0;
+        let mut scans = 0usize;
+        let mut accelerated = 0usize;
+        loop {
+            let next = parse_iso(next_scan_of(&pool, "1").await.as_deref()).unwrap();
+            assert!(next > clock, "schedule must advance; got {next} at {clock}");
+            if next > deadline {
+                break;
+            }
+            clock = next;
+            scans += 1;
+            assert!(scans < 20_000, "scheduler did not converge within 120 days");
+            record_scan(&pool, "1", "S", &admin, &chapters, clock)
+                .await
+                .unwrap();
+            let after = parse_iso(next_scan_of(&pool, "1").await.as_deref()).unwrap();
+            if (after - clock).num_minutes() <= 60 {
+                accelerated += 1;
+            }
+        }
+
+        assert!(
+            persisted(&pool, "1").await.awaiting_since.is_none(),
+            "a series past the lateness band must not still be marked awaiting"
+        );
+        // 120d at the 12h ceiling = 240 scans. The lateness band for a 168h cadence is
+        // (210h, 504h] past the newest upload = 294h wide, which is longer than the
+        // 240h re-arm, so exactly two 48h accelerated windows are reachable: 2 x 96
+        // extra fetches. Anything beyond that means a window failed to close.
+        assert!(
+            accelerated <= 2 * 96 + 4,
+            "accelerated polling ran away: {accelerated} fast re-polls of {scans} scans"
+        );
+        assert!(
+            scans < 500,
+            "120 days of a dead series cost {scans} fetches; the steady ceiling plus two \
+             accelerated windows is ~430"
+        );
+        assert!(
+            accelerated > 0,
+            "the fixture must actually exercise the accelerated poll"
+        );
+    }
+
+    // ── the merged Updates feed's incremental (scanner-half) refresh ──────────────────
+
+    /// Everything `upsert_feed_series_update` joins: a work, its Suwayomi
+    /// `source_series` mapping, and the cached `suwayomi_series` row carrying the
+    /// release clock. `latest_chapter_at` is 13-digit epoch-millis TEXT, exactly as
+    /// `series_cache::derive_latest_chapter_at` stores it.
+    async fn seed_feed_fixture(pool: &SqlitePool, latest_chapter_at: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, original_language, created_at, updated_at) \
+             VALUES ('w1', 'Canonical Title', 'ko', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss1', 'w1', 'suwayomi', '7', '2026-01-01T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_series \
+                 (id, title, thumbnail_url, status, in_library, source_id, chapter_count, \
+                  latest_chapter_at, updated_at) \
+             VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', 1, '1', 13, ?, \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .bind(latest_chapter_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The feed row for the fixture's work, as (reader_id, released_at, typeof, title,
+    /// comic_type, chapter_count, detected_at).
+    #[allow(clippy::type_complexity)]
+    async fn feed_row(
+        pool: &SqlitePool,
+    ) -> Option<(
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> {
+        sqlx::query_as(
+            "SELECT reader_id, released_at, typeof(released_at), title, comic_type, \
+                    chapter_count, detected_at \
+             FROM feed_series_updates WHERE work_id = 'w1'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Every column of the fixture's feed row plus the sort key's STORAGE CLASS, as one
+    /// comparable string. `~` stands in for NULL so a NULL never swallows the whole
+    /// concatenation.
+    async fn feed_digest(pool: &SqlitePool) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT work_id || '|' || reader_id || '|' || title \
+                 || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
+                 || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(latest_chapter, '~') \
+                 || '|' || COALESCE(latest_chapter_title, '~') \
+                 || '|' || COALESCE(chapter_count, '~') \
+                 || '|' || released_at || '|' || typeof(released_at) \
+                 || '|' || COALESCE(detected_at, '~') || '|' || is_nsfw \
+             FROM feed_series_updates WHERE work_id = 'w1'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// THE convergence proof for `upsert_feed_series_update`: drive the incremental path
+    /// twice, then hand the table to the REAL periodic rebuild and demand a byte-identical
+    /// row. A writer-dependent row — one whose contents depend on which of the two touched
+    /// it last — is the whole risk of maintaining a materialized table from two places.
+    ///
+    /// The second detection deliberately moves the SOURCE's `chapter_count` (13 → 14)
+    /// between writes, because that is the single interleaving the rebuild's literal
+    /// `COALESCE(feed_series_updates.chapter_count, excluded.chapter_count)` gets wrong:
+    /// copied verbatim it would pin the count at 13 forever, and a scanner-only card
+    /// renders `Ch. {latest_chapter ?? chapter_count}` — announcing a new chapter while
+    /// still printing the old number. Stating that one clause in the converged direction
+    /// is what this asserts.
+    ///
+    /// This test spans a file another owner maintains: if `refresh_feed_series_updates`'
+    /// field mapping is edited, this fails rather than letting the two writers drift.
+    #[tokio::test]
+    async fn incremental_write_converges_with_the_periodic_rebuild() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let first = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        touch_feed_series_update(&pool, "7", first).await;
+
+        // The source moves on — a newer release AND a higher count — exactly as
+        // `series_cache::put_chapters` would have written them before the next scan.
+        sqlx::query(
+            "UPDATE suwayomi_series SET chapter_count = 14, latest_chapter_at = '1785671625000' \
+             WHERE id = 7",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(14),
+            at("2026-01-15T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(second);
+        touch_feed_series_update(&pool, "7", second).await;
+
+        let incremental = feed_digest(&pool)
+            .await
+            .expect("two detections must publish");
+        let (_, released_at, typ, .., chapter_count, _) = feed_row(&pool).await.unwrap();
+        assert_eq!(
+            chapter_count,
+            Some(14),
+            "the count must follow the source, not the first incremental write"
+        );
+        // The ON CONFLICT branch's `MAX(existing, excluded)` must also land an INTEGER —
+        // `detected_chapter_upserts_the_updates_feed_row` only covers the INSERT branch,
+        // and a TEXT sort key sorts the whole mirror half above the whole scanner half.
+        assert_eq!(
+            typ, "integer",
+            "the conflict branch must keep released_at INTEGER"
+        );
+        assert_eq!(released_at, 1_785_671_625_000, "and must move forward");
+
+        // Hand the table to the periodic rebuild, which owns it from scratch.
+        crate::catalog::refresh_feed_series_updates(&pool)
+            .await
+            .unwrap();
+        let rebuilt = feed_digest(&pool)
+            .await
+            .expect("the rebuild must produce the row too");
+        assert_eq!(
+            incremental, rebuilt,
+            "the incremental writer and the periodic rebuild must not disagree about any column"
+        );
+    }
+
+    /// A detection publishes the series into the merged Updates feed immediately,
+    /// without waiting for `catalog::refresh_feed_series_updates`.
+    #[tokio::test]
+    async fn detected_chapter_upserts_the_updates_feed_row() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let admin = ScanAdmin::default();
+
+        // Baseline first: a first observation is not a detection (SC3).
+        let baseline = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        touch_feed_series_update(&pool, "7", baseline).await;
+        assert!(feed_row(&pool).await.is_none(), "baseline is not an update");
+
+        let then = at("2026-01-08T00:00:00Z");
+        let new_found = record_scan(&pool, "7", "S", &admin, &chaps(13), then)
+            .await
+            .unwrap();
+        assert!(new_found);
+        touch_feed_series_update(&pool, "7", new_found).await;
+
+        let (reader_id, released_at, typ, title, comic_type, chapter_count, detected_at) =
+            feed_row(&pool).await.expect("detection must publish a row");
+        // THE load-bearing assertion: the sort key is stored as INTEGER epoch-millis, not
+        // as text. A TEXT key sorts every ISO '2…' mirror row above every millis '1…'
+        // scanner row under BINARY collation — see migration 0064.
+        assert_eq!(typ, "integer", "released_at must be an INTEGER, not TEXT");
+        assert_eq!(released_at, 1_785_071_625_000);
+        // A Suwayomi-only work has no MangaDex anchor, so the card must navigate by the
+        // numeric Suwayomi id, not by `w_…`.
+        assert_eq!(reader_id, "7");
+        assert_eq!(title, "Canonical Title");
+        assert_eq!(chapter_count, Some(13));
+        assert_eq!(detected_at.as_deref(), Some(then.to_rfc3339()).as_deref());
+        // A brand-new row must not land type-less: `comic_type IS NULL` is invisible to
+        // the reader's format tabs. 'ko' -> MANHWA, via the real `resolve_comic_type`.
+        assert_eq!(comic_type.as_deref(), Some("MANHWA"));
+    }
+
+    /// The incremental write max-merges: it may move a row forward in time, never
+    /// backwards, and never clobbers the mirror half's identity/display fields.
+    #[tokio::test]
+    async fn feed_upsert_never_moves_a_row_backwards() {
+        let pool = migrated_pool().await;
+        // The Suwayomi source is OLDER than what the mirror half already published.
+        seed_feed_fixture(&pool, Some("1700000000000")).await;
+        sqlx::query(
+            "INSERT INTO feed_series_updates \
+                 (work_id, reader_id, title, comic_type, latest_chapter, released_at, is_nsfw) \
+             VALUES ('w1', 'w1', 'Mirror Title', 'MANGA', '99', 1785071625000, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let new_found = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(new_found);
+        touch_feed_series_update(&pool, "7", new_found).await;
+
+        let (reader_id, released_at, _, title, comic_type, ..) = feed_row(&pool).await.unwrap();
+        assert_eq!(
+            released_at, 1_785_071_625_000,
+            "an older scanner clock must not pull the row backwards"
+        );
+        // `reader_id` precedence: an existing canonical `w_…` id survives, so a
+        // mangadex-anchored work keeps navigating to its canonical page.
+        assert_eq!(reader_id, "w1");
+        assert_eq!(
+            title, "Mirror Title",
+            "display fields stay on the mirror half"
+        );
+        assert_eq!(
+            comic_type.as_deref(),
+            Some("MANGA"),
+            "type is never rewritten"
+        );
+    }
+
+    /// Write amplification: `persist_scan` runs on every scan (~475+/hr), so a scan that
+    /// detected nothing must not touch the feed at all. Proven with a fixture that WOULD
+    /// produce a row — the series has already had a detection, so the periodic rebuild's
+    /// guards all pass — leaving the `new_found` gate as the only thing holding it back.
+    #[tokio::test]
+    async fn unchanged_scan_does_not_write_the_feed() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let new_found = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        touch_feed_series_update(&pool, "7", new_found).await;
+        assert!(feed_row(&pool).await.is_some());
+        sqlx::query("DELETE FROM feed_series_updates")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Same chapter list again: no detection, so no write.
+        let new_found = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-09T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(!new_found, "an identical list is not a detection");
+        touch_feed_series_update(&pool, "7", new_found).await;
+        assert!(
+            feed_row(&pool).await.is_none(),
+            "an unchanged scan must not write the feed"
+        );
+    }
+
+    /// `released_at` is NOT NULL and a work with no dated chapter is not an "update":
+    /// such a series is EXCLUDED, exactly as the periodic rebuild excludes it — never
+    /// inserted with a NULL sort key (which would fail the write) nor with a fabricated
+    /// one from our own clock.
+    #[tokio::test]
+    async fn series_without_a_release_time_produces_no_feed_row() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, None).await;
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let new_found = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(new_found);
+        touch_feed_series_update(&pool, "7", new_found).await;
+
+        assert!(feed_row(&pool).await.is_none());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "an undated series is not an update");
     }
 }

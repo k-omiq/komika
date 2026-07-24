@@ -140,7 +140,13 @@ pub struct Series {
     pub rating: RatingSummary,
     pub scan: ScanPolicy,
     pub created_at: String,
+    /// Last metadata touch. Do NOT use as "recently updated" — it moves on every poll
+    /// and cover/metadata refresh. For chapter recency use `latest_chapter_at`.
     pub updated_at: String,
+    /// Real newest-chapter time (ISO), from the actual chapter publish/upload date.
+    /// Empty when the series has no dated chapter cached yet. This is the field feeds
+    /// and the reader's "· 4h" label should use.
+    pub latest_chapter_at: String,
 }
 
 /// Per-series read progress for the whole library, returned by `libraryProgress`

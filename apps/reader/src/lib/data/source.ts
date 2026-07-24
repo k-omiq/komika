@@ -17,10 +17,11 @@ import type {
 	SeriesProgress,
 	SeriesStatus,
 	Translator,
+	UpdateFeedRow,
 	WorkSource,
 } from '@komika/types';
 import { backend, images } from '$lib/context';
-import { getPreferredTranslator } from './translator-pref.svelte';
+import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
 import { config } from '$lib/config';
 import * as content from './content';
 import { FLAG, FORMAT_CARDS } from './types';
@@ -66,20 +67,142 @@ async function liveResult<T>(fn: () => Promise<T>, empty: T): Promise<{ data: T;
 	}
 }
 
-/** Coarse "N ago" relative time for the activity feed. */
-function relTimeAgo(iso: string | null | undefined): string {
-	if (!iso) return 'just now';
+/**
+ * THE relative-time formatter. Every "3h" / "3h ago" label in the reader goes
+ * through this one function so the thresholds, rounding and — critically — the
+ * >30d overflow behave identically everywhere. (There used to be two copies:
+ * the card one had no branch above 24h, so a two-year-old chapter rendered as
+ * "730d" while the profile feed correctly said "March 2023".)
+ *
+ * `suffix` is the only intended difference between callers: cards are terse
+ * ("Ch. 12 · 4h"), the activity feed reads as a sentence ("Reviewed X · 4h ago").
+ * `empty` is what an absent/unparseable timestamp renders as.
+ */
+function formatRelative(
+	iso: string | null | undefined,
+	opts: { suffix?: boolean; empty: string },
+): string {
+	if (!iso) return opts.empty;
 	const then = Date.parse(iso);
-	if (Number.isNaN(then)) return 'just now';
+	if (Number.isNaN(then)) return opts.empty;
+	// `Date.now()` is unavailable in some sandboxes; guard it.
 	const now = typeof Date !== 'undefined' && Date.now ? Date.now() : then;
 	const mins = Math.max(0, Math.round((now - then) / 60000));
-	if (mins < 1) return 'just now';
-	if (mins < 60) return `${mins}m ago`;
+	const ago = opts.suffix ? ' ago' : '';
+	if (mins < 1) return opts.suffix ? 'just now' : 'now';
+	if (mins < 60) return `${mins}m${ago}`;
 	const hrs = Math.round(mins / 60);
-	if (hrs < 24) return `${hrs}h ago`;
+	if (hrs < 24) return `${hrs}h${ago}`;
 	const days = Math.round(hrs / 24);
-	if (days < 30) return `${days}d ago`;
+	// Past a month a duration stops being informative — show the actual date.
+	if (days < 30) return `${days}d${ago}`;
 	return monthYear(iso);
+}
+
+/**
+ * Coarse "N ago" relative time for the activity feed.
+ *
+ * An ABSENT/unparseable timestamp renders as '' (the same choice {@link relTime}
+ * makes), never as "just now": we don't know when it happened, and "just now" is
+ * an affirmative claim that it happened seconds ago. The one caller (the profile
+ * activity list) omits the time line entirely when this is empty, so the row still
+ * reads as a complete sentence ("Reviewed Berserk") instead of a lie.
+ */
+function relTimeAgo(iso: string | null | undefined): string {
+	return formatRelative(iso, { suffix: true, empty: '' });
+}
+
+/** Terse relative time for cards and the series header ("4h", "3d", "March 2023"). */
+function relTime(iso: string | null | undefined): string {
+	return formatRelative(iso, { empty: '' });
+}
+
+/**
+ * A timestamp as sortable epoch milliseconds, or `0` when it is absent or
+ * unparseable. Pairs with {@link relTime}: whatever instant a card LABELS with, it
+ * also SORTS by, so the two can never disagree.
+ *
+ * `0` rather than `NaN` or `-Infinity` because it has to survive a descending sort
+ * as "oldest/unknown, goes last" — `NaN` makes every comparison false and leaves
+ * the surrounding rows in arbitrary order.
+ */
+function epochMs(iso: string | null | undefined): number {
+	if (!iso) return 0;
+	const t = Date.parse(iso);
+	return Number.isNaN(t) ? 0 : t;
+}
+
+/**
+ * The timestamp a "recently updated" label must use: the real upstream publish
+ * time of the newest chapter, falling back to `updatedAt` only when the backend
+ * can't supply it.
+ *
+ * `updatedAt` is a metadata touch that moves on EVERY poll — the server documents
+ * it as unusable for recency — so labelling with it made the feed say "0h" for a
+ * series whose last chapter landed a week ago, while the series page (reading a
+ * different clock) said something else entirely. That contradiction is the bug
+ * this exists to close: every surface now reads the same clock.
+ */
+function chapterRecency(s: Series, chapters: readonly Chapter[] = []): string | null {
+	return firstDated(newestUploadAt(chapters), s.latestChapterAt, s.updatedAt);
+}
+
+/**
+ * The first candidate that is actually a usable date.
+ *
+ * A plain `a || b || c` only falls through on a FALSY value, so it handles a null
+ * or empty `latestChapterAt` but silently commits to a non-empty unparseable one —
+ * and then `formatRelative` renders '' with the good `updatedAt` never consulted.
+ * That distinction is about to matter: `latestChapterAt` is documented as "empty
+ * when no dated chapter is cached" and is being changed server-side to stop
+ * stamping a bogus `now` on a series' first touch, so an unscanned series will
+ * carry no chapter time at all. Validate each candidate instead of trusting
+ * truthiness, so the chain always lands on the newest timestamp that can really
+ * be formatted.
+ */
+function firstDated(...candidates: (string | null | undefined)[]): string | null {
+	for (const c of candidates) {
+		if (c && !Number.isNaN(Date.parse(c))) return c;
+	}
+	return null;
+}
+
+/**
+ * The newest `uploadedAt` in a chapter list, or null when none is dated.
+ *
+ * Preferred OVER `latestChapterAt` by {@link chapterRecency} whenever a caller holds
+ * the chapter list, because `latestChapterAt` is a denormalized copy of exactly this
+ * value that is wrong on a series' first view. Measured against the live API:
+ *
+ *  • Warm series — `latestChapterAt` and `max(chapters.uploadedAt)` are IDENTICAL
+ *    (ids 4140, 280, 16790, 1292, 9000, to the millisecond), so preferring the list
+ *    changes nothing where the column is trustworthy. On id 500 the column was two
+ *    weeks STALE (2026-06-27 vs the list's 2026-07-10), so the list is also better.
+ *  • Cold series — the server stamps `latest_chapter_at = now` on first touch and
+ *    only corrects it once chapters are cached. Probing ids 500/3000/9000/12345/
+ *    16796 cold returned `latestChapterAt == updatedAt == <the query's own clock>`;
+ *    a second probe returned their real historical dates. So the first GET of
+ *    /series/1292 rendered "Updated now" — with the tooltip asserting "Newest
+ *    chapter released now" — directly above a chapter list whose newest row read
+ *    "13d", and the next GET rendered "13d" correctly.
+ *
+ * A page contradicting itself one line down is worse than a coarse label, and the
+ * honest answer is already in hand: the very list we are about to render. Not read
+ * off the end of the array — a source orders by chapter NUMBER and upload times are
+ * not monotonic in it — so take the maximum.
+ */
+function newestUploadAt(chapters: readonly Chapter[]): string | null {
+	let best: string | null = null;
+	let bestT = -Infinity;
+	for (const c of chapters) {
+		if (!c.uploadedAt) continue;
+		const t = Date.parse(c.uploadedAt);
+		if (!Number.isNaN(t) && t > bestT) {
+			bestT = t;
+			best = c.uploadedAt;
+		}
+	}
+	return best;
 }
 
 /** "March 2023"-style month/year for the profile "joined" line. */
@@ -105,24 +228,18 @@ function toViewStatus(s: Series['status']): Status {
 	return 'ongoing';
 }
 
-function relTime(iso: string | null | undefined): string {
-	if (!iso) return '';
-	const then = Date.parse(iso);
-	if (Number.isNaN(then)) return '';
-	// `Date.now()` is unavailable in some sandboxes; guard it.
-	const now = typeof Date !== 'undefined' && Date.now ? Date.now() : then;
-	const mins = Math.max(0, Math.round((now - then) / 60000));
-	if (mins < 60) return `${mins}m`;
-	const hrs = Math.round(mins / 60);
-	if (hrs < 24) return `${hrs}h`;
-	return `${Math.round(hrs / 24)}d`;
-}
-
 function toCard(s: Series): Card {
+	const at = chapterRecency(s);
 	return {
 		title: s.title,
 		ch: `Ch. ${s.chapterCount}`,
-		time: relTime(s.updatedAt),
+		// The RELEASE time, not our poll time — see {@link chapterRecency}.
+		time: relTime(at),
+		timeAt: epochMs(at),
+		// Our discovery time, when the backend reports it. Rendered only as a
+		// hover title so the card design is unchanged but the two clocks are
+		// distinguishable ("released 7d · we found it 1h ago").
+		detected: relTime(s.detectedAt),
 		rating: s.rating.average.toFixed(1),
 		cover: s.coverUrl,
 		id: s.id,
@@ -131,21 +248,72 @@ function toCard(s: Series): Card {
 }
 
 /** Like {@link toCard} but the time is the CATALOGUE-ADD time (`createdAt`), not the
- *  last-update time — for the "Latest Added" row, so "Added 2d" is faithful. */
+ *  chapter-release time — for the "Latest Added" row, so "Added 2d" is faithful.
+ *  This row is deliberately on a different clock: it answers "when did this series
+ *  enter the catalogue", not "when did its last chapter ship". */
 function toAddedCard(s: Series): Card {
-	return { ...toCard(s), time: relTime(s.createdAt) };
+	// `timeAt` MUST be re-derived from `createdAt` alongside `time`. Spreading
+	// `toCard(s)` and overriding only `time` would leave the chapter-release clock
+	// behind in `timeAt`, so this row would sort by release time under a
+	// catalogue-add label — the exact label/order mismatch this pairing exists to
+	// prevent, just moved one field over.
+	return { ...toCard(s), time: relTime(s.createdAt), timeAt: epochMs(s.createdAt), detected: '' };
 }
 
 /** A canonical-updates row → home/updates Card, linking by its `w_` workId so the
- *  card opens the MangaDex-mirrored work through the canonical reader path. */
+ *  card opens the MangaDex-mirrored work through the canonical reader path.
+ *  `latestAt` is already the real publish time on this feed. */
 function toCanonicalCard(u: CanonicalUpdate): Card {
 	return {
 		title: u.title ?? 'Untitled',
 		ch: u.latestChapter ? `Ch. ${u.latestChapter}` : '',
 		time: relTime(u.latestAt),
+		timeAt: epochMs(u.latestAt),
+		detected: '',
 		rating: '',
 		cover: u.coverUrl ?? '',
 		id: u.workId,
+	};
+}
+
+/** A merged-Updates-feed row → Card. The server has already done the interleave, the
+ *  by-work dedupe and the paging, so this is a pure field mapping — no sorting, no
+ *  slicing, no title dedupe.
+ *
+ *  `ch` mirrors what each half of the feed showed BEFORE the merge: the mirror half
+ *  knows the newest chapter's NUMBER ("Ch. 10.5"), the scanner half only the series'
+ *  chapter COUNT ("Ch. 412"). They are different quantities and the server sends
+ *  whichever it has, so no card's label changes.
+ *
+ *  `rating` is '' when unrated rather than "0.0": the old scanner-half card ran
+ *  `RatingSummary::empty().average.toFixed(1)` and printed a 0.0 star on every unrated
+ *  series, which is the vast majority (the whole database holds a handful of reviews). */
+function toFeedCard(u: UpdateFeedRow): Card {
+	const ch =
+		u.latestChapter != null && u.latestChapter !== ''
+			? `Ch. ${u.latestChapter}`
+			: u.chapterCount != null
+				? `Ch. ${u.chapterCount}`
+				: '';
+	return {
+		title: u.title,
+		ch,
+		// The RELEASE clock, same as every other card — see {@link chapterRecency}.
+		time: relTime(u.releasedAt),
+		timeAt: epochMs(u.releasedAt),
+		// Our detection time, hover-only, and null on mirror-only rows.
+		detected: relTime(u.detectedAt),
+		rating: u.rating != null ? u.rating.toFixed(1) : '',
+		cover: u.coverUrl ?? '',
+		// `|| undefined`, not `u.id`. The grid keys its `{#each}` on `item.id ?? item.title`,
+		// and `''` is not nullish — so an id-less row would key on the empty string, and a
+		// SECOND id-less row would collide with it. That is not cosmetic: Svelte 5 throws
+		// `each_key_duplicate` in production and the page dies in the error boundary. The
+		// wire type says `ID!`, but the legacy fallback in `fetchUpdatesFeed` synthesizes
+		// `id: c.id ?? ''`, so the empty case is reachable from inside this module.
+		// Falling through to the title is safe: that list is title-deduped.
+		id: u.id || undefined,
+		type: u.type ? toViewType(u.type) : undefined,
 	};
 }
 
@@ -183,6 +351,34 @@ function dedupeCardsByTitle(cards: Card[]): Card[] {
 		}
 	}
 	return out;
+}
+
+/** A card's sort instant, defaulting to `0` (= "unknown, sorts last") when the card
+ *  carries no `timeAt`. See {@link Card.timeAt}. */
+function cardTimeAt(c: Card): number {
+	return c.timeAt ?? 0;
+}
+
+/**
+ * Interleave several card feeds into ONE list in true recency order, then dedupe.
+ *
+ * This exists because concatenating the feeds does not merge them. Two feeds that
+ * are each internally newest-first produce, back to back, a list that descends
+ * through the first feed's timestamps and then JUMPS BACK to "now" where the second
+ * feed starts — so the Updates grid read "3h, 5h, … 2d" for twenty cards and then
+ * "1h" again at card twenty-one. Every feed is on the same clock (a real upstream
+ * release time), so they are directly comparable and there is no reason to show them
+ * segregated.
+ *
+ * SORT BEFORE DEDUPE, deliberately: a series that appears on both feeds (once under
+ * its numeric Suwayomi identity, once as its `w_` mirror) should keep whichever row
+ * reports the FRESHER chapter, and only sorting first puts that row where the dedupe
+ * will be the one to keep it. `Array#sort` is specified as stable, so genuinely tied
+ * timestamps preserve the argument order of the feeds — i.e. earlier feeds still win
+ * ties, which is the old concatenation's one useful property.
+ */
+function mergeByRecency(...feeds: Card[][]): Card[] {
+	return dedupeCardsByTitle(feeds.flat().sort((a, b) => cardTimeAt(b) - cardTimeAt(a)));
 }
 
 /** Dedupe a series list by id, preserving first-seen order. */
@@ -341,6 +537,21 @@ interface ResolvedWork {
 	 *  carries S2 enrichment (credits + localized descriptions). Null for
 	 *  federation-only works with no MangaDex anchor. */
 	canonSeries: Series | null;
+	/**
+	 * The EFFECTIVE canonical `w_` id the backend resolved the request to.
+	 *
+	 * The server follows `work_redirect`: when a work has been merged away, the
+	 * canonical resolvers answer with the SURVIVOR's row (and its id), so a stale
+	 * bookmark still renders. That survivor id is the one every id-keyed thing
+	 * downstream must use — library/favourite/shelf writes, review posts, the
+	 * translator preference, chapter links — otherwise the page keeps writing to
+	 * a retired id forever and the URL never heals.
+	 *
+	 * Null when the work has no MangaDex anchor (federation-only): `canonicalSeries`
+	 * 404s there, so there is nothing to learn the survivor id from and the
+	 * requested id stands.
+	 */
+	canonicalId: string | null;
 	/** Whether `chapters` are already server-ordered (the canonical spine). */
 	preserveOrder: boolean;
 }
@@ -466,12 +677,21 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 		meta = await backend.series(selected.suwayomiMangaId).catch(() => null);
 	}
 
+	// Only ever adopt a CANONICAL id here: `canonSeries.id` is a `w_` work id, but
+	// guard the shape anyway so a numeric/source id could never leak onto the
+	// canonical path and route a later request to `backend.series()`.
+	const canonicalId =
+		canonSeries && isCanonicalId(canonSeries.id) && canonSeries.id !== workId
+			? canonSeries.id
+			: null;
+
 	return {
 		translators,
 		selected,
 		chapters: pick.chapters,
 		meta,
 		canonSeries,
+		canonicalId,
 		preserveOrder: selected.suwayomiMangaId === null,
 	};
 }
@@ -545,10 +765,15 @@ export async function getNativeSearch(
 	query: string,
 	filters: CatalogFilters = {},
 	page = 1,
-): Promise<{ items: FederatedResultView[]; error: boolean; hasNext: boolean; total: number | null }> {
-	// Captured from the server envelope so the Browse grid can drive a "Load more"
-	// pager off the server's own paging metadata (whole-catalogue pagination) rather
-	// than being capped at the first page.
+): Promise<{
+	items: FederatedResultView[];
+	error: boolean;
+	hasNext: boolean;
+	total: number | null;
+}> {
+	// Captured from the server envelope so the Browse grid can drive the page pager
+	// off the server's own paging metadata (whole-catalogue pagination) rather than
+	// being capped at the first page.
 	let hasNext = false;
 	let total: number | null = null;
 	const r = await liveResult(async () => {
@@ -620,13 +845,15 @@ export function getHome() {
 		const featured = (popular.length ? popular : (feeds[0]?.items ?? []))
 			.slice(0, 5)
 			.map(toFeatured);
-		// Scanner detections first (most authoritative "new chapter"), then the mirror's
-		// freshest, deduped by title so a series present in both doesn't appear twice,
-		// capped at the 10 the home row shows.
-		const latestUpdates = dedupeCardsByTitle([
-			...updates.items.map(toCard),
-			...canonical.map(toCanonicalCard),
-		]).slice(0, 10);
+		// The two feeds MERGED by release time, not concatenated — see
+		// {@link mergeByRecency}. Both carry a real upstream chapter-release timestamp,
+		// so the row is a single descending sequence; capped at the 10 the home row
+		// shows, which is now genuinely the 10 newest rather than "8 from one feed then
+		// 2 from the other".
+		const latestUpdates = mergeByRecency(
+			updates.items.map(toCard),
+			canonical.map(toCanonicalCard),
+		).slice(0, 10);
 		return {
 			featured,
 			latestUpdates,
@@ -654,43 +881,194 @@ export function getBrowseCatalog(filters: CatalogFilters = {}): Promise<CatalogR
 	return getNativeSearch('', filters);
 }
 
-export function getUpdates() {
-	const fallback = {
-		trendingGroups: [] as { label: string; items: Card[] }[],
-		newUpdates: [] as Card[],
-		hotUpdates: [] as Card[],
+/** Most cards the "Hot" grid will render in one pass. `Hot` is a curated top-N ranking
+ *  off the discovery TRENDING feed with no server pagination anywhere in the stack, so
+ *  paging it would be meaningless — the cap is what bounds it instead. The "New" list no
+ *  longer needs a cap: the server pages it at `FEED_PAGE_SIZE`. */
+const HOT_MAX = 60;
+
+/** What `getUpdates` returns — the two grids plus the "New" list's server pager state. */
+export interface UpdatesView {
+	trendingGroups: { label: string; items: Card[] }[];
+	newUpdates: Card[];
+	hotUpdates: Card[];
+	/** Echoed back from the server, never assumed from the click (the admin pager's
+	 *  invariant): an over-range page comes back as an empty list on the page asked for,
+	 *  which the screen repairs by navigating to the last real page. */
+	page: number;
+	hasNext: boolean;
+	total: number | null;
+	/**
+	 * True only when the "New" list's request genuinely FAILED — never for an honest
+	 * empty page, and never in mock mode (`live()` short-circuits to the fallback, which
+	 * sets this false; same doctrine as {@link liveResult}).
+	 *
+	 * Without it the screen cannot tell an outage from "no rows match", and it rendered
+	 * the empty state either way: "Nothing matches this filter right now — try another
+	 * format or tab", offering a remedy that cannot work while the backend is down. Browse
+	 * already separates the two (its `catalogError` branch); this is the same distinction.
+	 */
+	error: boolean;
+}
+
+/**
+ * The Updates screen's feeds. `page` / `type` page and filter the "New" list SERVER-SIDE.
+ *
+ * The "New" list used to be `mergeByRecency(page 1 of updates, page 1 of canonicalUpdates)`
+ * deduped by lowercased title and capped at 60. That could not be paginated: a page of
+ * the merged list is not page N of either feed (so a boundary either skips a row or emits
+ * it on both pages — and a duplicate key is fatal, Svelte 5 throws `each_key_duplicate` in
+ * production), and deduping after paging left short pages that made any `total` /
+ * `hasNext` the pager showed wrong. The server now takes the union once, keyed by
+ * canonical work (`updatesFeed`), so this function just maps rows.
+ *
+ * `tab` is here because "Hot" needs no `updatesFeed` request at all — it is a slice of the
+ * discovery TRENDING feed — and skipping it saves the whole paginated query on that tab.
+ */
+export function getUpdates(
+	opts: { page?: number; tab?: 'new' | 'hot'; type?: ComicType | null } = {},
+): Promise<UpdatesView> {
+	const page = Math.max(1, Math.trunc(opts.page ?? 1));
+	const tab = opts.tab ?? 'new';
+	const type = opts.type ?? null;
+	const fallback: UpdatesView = {
+		trendingGroups: [],
+		newUpdates: [],
+		hotUpdates: [],
+		page,
+		hasNext: false,
+		total: null,
+		error: false,
 	};
 	return live(async () => {
-		// "New" is the scanner-driven Updates feed (series with freshly-detected
-		// chapters, newest-first). "Trending"/"Hot" reuse the discovery Trending
-		// feed. Empty (no detections yet) renders the page's empty state.
 		// Each feed is caught independently (mirrors getHome): one outage — e.g. the
-		// scanner `updates` feed — must not collapse the whole screen (incl. Trending).
-		const [feeds, updates, canonical] = await Promise.all([
+		// merged updates feed — must not collapse the whole screen (incl. Trending).
+		const [feeds, feed] = await Promise.all([
 			backend.discovery().catch(() => [] as DiscoveryFeed[]),
-			backend.updates().catch(() => ({ items: [] as Series[] })),
-			// Canonical (MangaDex-mirrored) updates — openable via their `w_` workId
-			// through the canonical reader path. Optional method; empty on failure/off.
-			backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
-				Promise.resolve([] as CanonicalUpdate[]),
+			tab === 'hot' ? Promise.resolve(null) : fetchUpdatesFeed(page, type).catch(() => null),
 		]);
 		const byKind = (k: string) => feeds.find((f) => f.kind === k)?.items ?? [];
-		const trending = byKind('TRENDING').map(toCard);
-		const recent = updates.items.map(toCard);
-		const canonicalCards = canonical.map(toCanonicalCard);
+		// Trending still needs the title dedupe: the catalogue carries same-title rows
+		// (per-language sources, and a series under both its numeric and its `w_`
+		// identity), and this grid keys its {#each} on the id falling back to the title.
+		// The "New" list does NOT — the server deduped it by work identity, which is both
+		// stricter and the only version that keeps page fullness honest.
+		const trending = dedupeCardsByTitle(byKind('TRENDING').map(toCard));
 		return {
 			trendingGroups: trending.length ? [{ label: 'Trending Today', items: trending }] : [],
-			// Scanner detections first, then the MangaDex mirror's freshest works.
-			newUpdates: [...recent, ...canonicalCards],
-			hotUpdates: trending,
+			newUpdates: feed?.items.map(toFeedCard) ?? [],
+			hotUpdates: trending.slice(0, HOT_MAX),
+			// The server echoes the page it was asked for rather than clamping it.
+			page: feed?.page ?? page,
+			hasNext: feed?.hasNextPage ?? false,
+			total: feed?.total ?? null,
+			// `feed` is null for exactly two reasons: the request threw (the `.catch`
+			// above), or we never made one because this is the "Hot" tab. Only the first
+			// is an error — and `fetchUpdatesFeed` already absorbs a missing `updatesFeed`
+			// into the two-feed fallback, so reaching here with null means BOTH paths
+			// failed, not merely an old server.
+			error: tab !== 'hot' && feed === null,
 		};
 	}, fallback);
 }
+
+/**
+ * One page of the merged Updates feed, with a fallback for a server that predates it.
+ *
+ * DEPLOY-ORDER GUARD, and it has to be a `catch`, not just an `if`. `updatesFeed` is
+ * optional on the Backend interface, but the GraphQL backend always defines the METHOD —
+ * what a stale server lacks is the FIELD, and an unknown field fails document validation
+ * outright (unlike an unknown argument, which `stripUnsupported` removes). So checking
+ * `if (backend.updatesFeed)` alone would never fire on the deployment that actually
+ * breaks: the reader shipping ahead of the server. The request is therefore attempted and
+ * a failure falls through to the old two-feed merge — correct for page 1, and reporting
+ * `hasNextPage: false` so the pager stays hidden rather than offering pages nothing can
+ * serve. Server first, reader second, and this is the net under that ordering.
+ */
+async function fetchUpdatesFeed(
+	page: number,
+	type: ComicType | null,
+): Promise<{
+	items: UpdateFeedRow[];
+	page: number;
+	hasNextPage: boolean;
+	total: number | null;
+}> {
+	if (backend.updatesFeed) {
+		try {
+			return await backend.updatesFeed(
+				page,
+				type ? (VIEW_TO_DOMAIN_TYPE[type] as DomainComicType) : undefined,
+			);
+		} catch {
+			// Fall through. Deliberately silent: `live()` already reports backend failure
+			// to the screen, and this path is a successful degradation, not an error.
+		}
+	}
+	const [updates, canonical] = await Promise.all([
+		backend.updates().catch(() => ({ items: [] as Series[] })),
+		backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
+			Promise.resolve([] as CanonicalUpdate[]),
+	]);
+	// Legacy shape: merge by release time, dedupe by title, cap, and project onto the
+	// feed-row shape so `toFeedCard` stays the single card mapper. `workId` echoes `id`
+	// (it is only a dedupe key, which the server side already applied); `latestChapter`
+	// carries the old mapper's already-formatted `ch` with its "Ch. " prefix stripped,
+	// since `toFeedCard` re-adds it.
+	// FILTER, THEN slice. The other order capped first and filtered second, so
+	// `?type=Manhua` searched only the 60 newest rows of the merged feed and returned
+	// however few of those happened to be manhua — usually a near-empty grid — instead of
+	// the 60 newest manhua. The server path filters over the whole feed; this is the
+	// closest the fallback can get to the same answer.
+	const merged = mergeByRecency(updates.items.map(toCard), canonical.map(toCanonicalCard))
+		.filter((c) => type == null || c.type === type)
+		.slice(0, HOT_MAX);
+	const items: UpdateFeedRow[] = merged.map((c) => ({
+		id: c.id ?? '',
+		workId: c.id ?? '',
+		title: c.title,
+		coverUrl: c.cover ?? null,
+		type: c.type ? (VIEW_TO_DOMAIN_TYPE[c.type] as DomainComicType) : null,
+		latestChapter: c.ch ? c.ch.replace(/^Ch\.\s*/, '') : null,
+		latestChapterTitle: null,
+		chapterCount: null,
+		releasedAt: c.timeAt ? new Date(c.timeAt).toISOString() : '',
+		detectedAt: null,
+		// `Number(c.rating)`, then reject 0 — NOT `c.rating ? …`. `toCard` formats an
+		// unrated series as the STRING "0.0", which is truthy, so the truthiness test
+		// forwarded 0 and `toFeedCard` rendered it back as a "0.0" star on the vast
+		// majority of rows. That 0.0-on-everything star is exactly what the server path
+		// returns null to avoid; the fallback has to agree with it.
+		rating: unratedToNull(c.rating),
+		isNsfw: false,
+	}));
+	return { items, page: 1, hasNextPage: false, total: null };
+}
+
+/** A card's formatted rating string back to a number, with "unrated" preserved as null.
+ *  `toCard` prints `RatingSummary.average.toFixed(1)`, which is "0.0" for the (very
+ *  common) unrated series — indistinguishable from a real 0.0, and the server's own feed
+ *  reports both as null rather than showing a zero star. */
+function unratedToNull(rating: string): number | null {
+	const n = Number(rating);
+	return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Reader format label → the domain enum the API takes. Inverse of {@link toViewType},
+ *  which collapses WEBTOON→Manhwa and COMIC→Manga; the server applies the same collapse
+ *  to its materialized `comic_type`, so these three words round-trip exactly. */
+const VIEW_TO_DOMAIN_TYPE: Record<ComicType, string> = {
+	Manga: 'MANGA',
+	Manhwa: 'MANHWA',
+	Manhua: 'MANHUA',
+};
 
 export interface LibraryRowView {
 	id?: string;
 	title: string;
 	cover: string;
+	/** Format/country-of-origin, so the library card can show its flag badge. */
+	type: ComicType;
 	genre: string;
 	rating: string;
 	shelf: Shelf;
@@ -713,15 +1091,21 @@ export function getLibrary() {
 		continueRow: [] as ContinueRowView[],
 	};
 	return live<typeof fallback>(async () => {
-		const lib = await backend.library();
-		// Per-series read progress in ONE batched query, joined by id. This replaces
-		// a `chapters()` fetch per series — an N-round-trip fan-out that hung this
-		// page on a large library (hundreds of series). Series without cached
+		// Per-series read progress comes from ONE batched query, joined by id. This
+		// replaces a `chapters()` fetch per series — an N-round-trip fan-out that hung
+		// this page on a large library (hundreds of series). Series without cached
 		// progress fall back to their chapter count as unread. Backends that don't
 		// expose `libraryProgress` (Suwayomi/native) degrade to all-unread.
-		const progress = backend.libraryProgress
-			? await backend.libraryProgress().catch(() => [] as SeriesProgress[])
-			: [];
+		//
+		// The two queries are INDEPENDENT (progress is keyed by series id, not by the
+		// library response), so they go out together — serialising them doubled this
+		// screen's time-to-content for no reason.
+		const [lib, progress] = await Promise.all([
+			backend.library(),
+			backend.libraryProgress
+				? backend.libraryProgress().catch(() => [] as SeriesProgress[])
+				: Promise.resolve([] as SeriesProgress[]),
+		]);
 		const byId = new Map(progress.map((p) => [p.id, p]));
 		const rows = lib.map((s) => {
 			const p = byId.get(s.id);
@@ -733,6 +1117,7 @@ export function getLibrary() {
 			id: s.id,
 			title: s.title,
 			cover: s.coverUrl,
+			type: toViewType(s.type),
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
 			// An explicit shelf the viewer filed wins; otherwise derive from progress.
@@ -774,6 +1159,9 @@ export interface SeriesChapterView {
 export interface SeriesDetailView {
 	id: string;
 	title: string;
+	/** Alternative / localized titles for the work (S2), excluding the display title.
+	 *  Empty for a single-source or un-enriched work. */
+	altTitles: string[];
 	type: ComicType;
 	flag: string;
 	rating: string;
@@ -782,7 +1170,12 @@ export interface SeriesDetailView {
 	/** All-time view count (chapter opens) — the popularity stat shown on the page.
 	 *  0 until reads accrue or when the backend doesn't track views. */
 	viewsTotal: number;
+	/** Relative time since the newest chapter was RELEASED upstream (never our
+	 *  poll time — see `chapterRecency`). "recently" when unknown. */
 	updated: string;
+	/** Relative time since WE detected that chapter; '' when the backend doesn't
+	 *  report it. Shown as a hover title next to `updated`, not as its own line. */
+	detected: string;
 	statusLabel: string;
 	author: string;
 	artist: string;
@@ -936,13 +1329,21 @@ function mapSeriesView(
 		detail: {
 			id: s.id,
 			title: s.title,
+			// Dedupe defensively: a keyed {#each} on the title text throws on a repeat.
+			altTitles: [...new Set(s.altTitles ?? [])],
 			type,
 			flag: FLAG[type],
 			rating: s.rating.average.toFixed(1),
 			votes: String(s.rating.count),
 			totalCh: s.chapterCount || chs.length,
 			viewsTotal: s.views?.total ?? 0,
-			updated: relTime(s.updatedAt) || 'recently',
+			// Same clock as the cards (chapter release, not our poll) so the header and
+			// the feed that linked here can never disagree — see {@link chapterRecency}.
+			// `chs` is passed so a series the server hasn't cached chapters for yet
+			// still reads its release time off the list rendered below, instead of
+			// falling through to the poll clock and claiming "released now".
+			updated: relTime(chapterRecency(s, chs)) || 'recently',
+			detected: relTime(s.detectedAt),
 			statusLabel: STATUS_WORD[s.status],
 			author: s.author ?? '',
 			artist: s.artist ?? '',
@@ -1015,6 +1416,11 @@ function buildAggregatedChapters(
 			read = own.read;
 			date = relTime(own.uploadedAt);
 		} else {
+			// A chapter the selected translator doesn't carry. `AggregatedChapter`
+			// exposes no upload timestamp, so there is genuinely no honest date to
+			// show here — `date` stays '' and the row renders WITHOUT a date line
+			// (the series page guards on it). Emitting an empty <div> instead left
+			// blank gaps interleaved with dated rows on every multi-source work.
 			const chosen = pickSource(c.sources);
 			id = chosen?.chapterId;
 			src = chosen?.suwayomiMangaId ?? null;
@@ -1048,13 +1454,44 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 		// (the canonical spine appears as one translator). See {@link resolveWork}.
 		if (isCanonicalId(id)) {
 			const preferred = getPreferredTranslator(id);
+			// The multi-source aggregation only needs the WORK ID, so it goes out
+			// alongside the (much slower, multi-round-trip) translator resolution
+			// instead of waiting for it. Kicked off here, consumed below.
+			const aggP = backend.aggregatedChapters
+				? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+				: Promise.resolve([] as AggregatedChapter[]);
 			const resolved = await resolveWork(id, preferred);
-			if (!resolved || !resolved.meta) return null;
-			// The detail id must stay the canonical `w_` workId (even though metadata
+			if (!resolved || !resolved.meta) {
+				void aggP.catch(() => {});
+				return null;
+			}
+			// The detail id must stay a canonical `w_` workId (even though metadata
 			// comes from the selected translator's source series), so chapter links,
 			// the reader route and library marking all route through the canonical
 			// path — where the persisted translator preference is resolved again.
-			const metaForView: Series = { ...resolved.meta, id };
+			//
+			// It must NOT, however, be the REQUESTED id when the server resolved the
+			// request to a different work: `work_redirect` means a merged-away id
+			// answers with the SURVIVOR, and pinning the retired id back on made every
+			// downstream write (mark/favourite/shelf/review), every chapter link and
+			// the URL itself keep addressing a dead work forever. Prefer what the
+			// backend actually resolved; fall back to the requested id for
+			// federation-only works, where no canonical row is available to ask.
+			const effectiveId = resolved.canonicalId ?? id;
+			// The translator preference is keyed by work id, so a redirect would strand
+			// it under the retired key and silently reset the reader's chosen source on
+			// their next visit (which now uses the survivor's id). Carry it over — but
+			// only when the survivor can actually satisfy it, i.e. the resolver picked
+			// that very translator, so we never persist a key that doesn't resolve.
+			if (
+				resolved.canonicalId &&
+				preferred &&
+				resolved.selected.key === preferred &&
+				!getPreferredTranslator(effectiveId)
+			) {
+				setPreferredTranslator(effectiveId, preferred);
+			}
+			const metaForView: Series = { ...resolved.meta, id: effectiveId };
 			const view = mapSeriesView(
 				metaForView,
 				resolved.chapters,
@@ -1063,7 +1500,10 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 				{
 					translators: resolved.translators,
 					selectedTranslatorKey: resolved.selected.key,
-					workId: id,
+					// Survivor id too: a translator switch persists its preference under
+					// this key and refetches with it, so both sides of that round trip
+					// must agree on WHICH work is being read.
+					workId: effectiveId,
 				},
 				resolved.canonSeries,
 			);
@@ -1071,9 +1511,7 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			// spine has 0 chapters but another source has them, e.g. Solo Leveling →
 			// Asura's 201). Falls back to the single-translator list when aggregation
 			// is unavailable/empty.
-			const agg = backend.aggregatedChapters
-				? await backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
-				: [];
+			const agg = await aggP;
 			if (agg.length) {
 				const rows = buildAggregatedChapters(agg, resolved);
 				view.chapters = rows;
@@ -1102,59 +1540,99 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 }
 
 /**
- * Add/remove a series from the library. Returns the resulting marked state
- * (the backend's `isMarked`), or the optimistic value when offline/mock so the
- * UI toggle still responds.
+ * The outcome of an optimistic library write.
+ *
+ * These used to swallow the backend error and return the OPTIMISTIC argument, so a
+ * caller could not tell "saved" from "failed": with an expired token the button
+ * flipped to "In Library", stayed there, and a reload silently revealed nothing had
+ * been saved — no error shown at any point. `ok` makes that distinguishable and
+ * `value` is always the state the UI should actually display: the server's answer on
+ * success, the PRE-CLICK value on failure (i.e. the optimistic update rolled back).
  */
-export async function setLibraryMark(seriesId: string, marked: boolean): Promise<boolean> {
-	if (!LIVE) return marked;
+export interface WriteResult<T> {
+	ok: boolean;
+	value: T;
+	/** Viewer-facing message; only set when `ok` is false. */
+	error?: string;
+}
+
+/** Turn a backend rejection into something worth showing a reader. */
+function writeError(err: unknown, action: string): string {
+	const msg = err instanceof Error ? err.message : String(err);
+	if (/not authenticated|unauthenticated|unauthoriz/i.test(msg))
+		return 'Your session expired — sign in again to save this.';
+	return `Couldn’t ${action}. Check your connection and try again.`;
+}
+
+/**
+ * Add/remove a series from the library. `previous` is the state to roll back to on
+ * failure (defaults to the inverse, since this is a toggle). Mock/offline mode is
+ * NOT a failure — there's no server to disagree with, so it reports `ok`.
+ */
+export async function setLibraryMark(
+	seriesId: string,
+	marked: boolean,
+	previous: boolean = !marked,
+): Promise<WriteResult<boolean>> {
+	if (!LIVE) return { ok: true, value: marked };
 	// Both numeric Suwayomi ids and `w_` canonical ids persist: the server `mark`
 	// resolver routes on id shape (canonical → `canonical_library`) (CR6), so no
 	// client-side id-shape guard is needed here — do NOT early-return the optimistic
 	// value for `w_` ids, that would short-circuit canonical library persistence.
-	// The try/catch below is only the defensive fallback for offline/mock.
 	try {
 		const s = await backend.mark(seriesId, marked);
-		return s.isMarked;
+		return { ok: true, value: s.isMarked };
 	} catch (err) {
 		console.warn('[komika] mark failed:', err);
-		return marked;
+		return {
+			ok: false,
+			value: previous,
+			error: writeError(err, marked ? 'add this to your library' : 'remove this from your library'),
+		};
 	}
 }
 
 /**
  * File a series under an explicit shelf (`reading`/`completed`/`onhold`/`plan`), or
  * pass `null` to clear it back to progress-derived shelving. Adds the series to the
- * library if it isn't there yet. Returns the effective shelf the caller should show
- * (`null` when cleared → the UI falls back to its derived shelf), or the optimistic
- * value when offline/mock. No-op backends (Suwayomi/native) resolve optimistically.
+ * library if it isn't there yet. `previous` is the shelf to roll back to on failure.
+ * No-op backends (Suwayomi/native) resolve optimistically and report `ok`.
  */
 export async function setLibraryStatus(
 	seriesId: string,
 	status: Shelf | null,
-): Promise<Shelf | null> {
-	if (!LIVE || !backend.setLibraryStatus) return status;
+	previous: Shelf | null = null,
+): Promise<WriteResult<Shelf | null>> {
+	if (!LIVE || !backend.setLibraryStatus) return { ok: true, value: status };
 	try {
 		const s = await backend.setLibraryStatus(seriesId, status);
-		return (s.libraryStatus as Shelf | null) ?? null;
+		return { ok: true, value: (s.libraryStatus as Shelf | null) ?? null };
 	} catch (err) {
 		console.warn('[komika] setLibraryStatus failed:', err);
-		return status;
+		return { ok: false, value: previous, error: writeError(err, 'move this series') };
 	}
 }
 
 /**
  * Toggle the viewer's favourite flag on a series (adds it to the library if absent).
- * Returns the resulting favourite state, or the optimistic value when offline/mock.
+ * `previous` is the state to roll back to on failure (defaults to the inverse).
  */
-export async function setFavorite(seriesId: string, favorite: boolean): Promise<boolean> {
-	if (!LIVE || !backend.setFavorite) return favorite;
+export async function setFavorite(
+	seriesId: string,
+	favorite: boolean,
+	previous: boolean = !favorite,
+): Promise<WriteResult<boolean>> {
+	if (!LIVE || !backend.setFavorite) return { ok: true, value: favorite };
 	try {
 		const s = await backend.setFavorite(seriesId, favorite);
-		return s.isFavorite ?? favorite;
+		return { ok: true, value: s.isFavorite ?? favorite };
 	} catch (err) {
 		console.warn('[komika] setFavorite failed:', err);
-		return favorite;
+		return {
+			ok: false,
+			value: previous,
+			error: writeError(err, favorite ? 'favourite this series' : 'unfavourite this series'),
+		};
 	}
 }
 
@@ -1295,6 +1773,11 @@ export function getReaderChapter(
 			const preferred = getPreferredTranslator(seriesId);
 			const resolved = await resolveWork(seriesId, preferred);
 			if (!resolved) return emptyReader(seriesId);
+			// Same `work_redirect` healing as getSeries: a reader URL bookmarked before
+			// a merge resolves to the SURVIVOR, so the back-to-series link and the
+			// translator switch (which does a real `goto(/read/<workId>)`) address the
+			// live work instead of pinning the retired id.
+			const effectiveId = resolved.canonicalId ?? seriesId;
 			// S2: a chapter may be provided by a source OTHER than the preferred
 			// translator (per-chapter fallback from the aggregated list). When `src`
 			// names such a source, read from it (and highlight it in the switcher);
@@ -1307,14 +1790,14 @@ export function getReaderChapter(
 			const tmeta: TranslatorMeta = {
 				translators: resolved.translators,
 				selectedTranslatorKey: srcTranslator?.key ?? resolved.selected.key,
-				workId: seriesId,
+				workId: effectiveId,
 			};
 			const spine = readFromSrc ? false : resolved.selected.suwayomiMangaId === null;
 			const chs = readFromSrc
 				? await backend.chapters(srcParam as string).catch(() => [] as Chapter[])
 				: resolved.chapters;
 			if (!chs.length) {
-				const empty = emptyReader(seriesId, tmeta);
+				const empty = emptyReader(effectiveId, tmeta);
 				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 			}
 			const preserveOrder = readFromSrc ? false : resolved.preserveOrder;
@@ -1323,7 +1806,7 @@ export function getReaderChapter(
 			// A requested chapter not carried by this source degrades honestly to the
 			// no-pages state (don't silently open a different chapter).
 			if (chParam && !target) {
-				const empty = emptyReader(seriesId, tmeta);
+				const empty = emptyReader(effectiveId, tmeta);
 				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 			}
 			if (!target) target = asc.find((c) => !c.read) ?? asc[0];
@@ -1336,7 +1819,7 @@ export function getReaderChapter(
 				? (srcParam as string)
 				: (resolved.selected.suwayomiMangaId ?? null);
 			return buildReaderView(
-				seriesId,
+				effectiveId,
 				chs,
 				preserveOrder,
 				target,
@@ -1379,12 +1862,20 @@ export interface ProfileView {
 	/** Stored avatar path/URL, or null → render an initial. */
 	avatarUrl: string | null;
 	stats: { value: string; label: string }[];
-	reading: { id?: string; title: string; genre: string; ch: number; total: number }[];
+	reading: {
+		id?: string;
+		title: string;
+		cover: string;
+		genre: string;
+		ch: number;
+		total: number;
+	}[];
 	favGenres: { name: string; pct: number }[];
 	activity: { id: string; icon: string; iconBg: string; text: string; time: string }[];
 	shelves: {
 		id?: string;
 		title: string;
+		cover: string;
 		genre: string;
 		rating: string;
 		shelf: string;
@@ -1408,13 +1899,20 @@ export function getProfile(): Promise<ProfileView | null> {
 		const session = await backend.session();
 		if (!session) return null;
 		const user = session.user;
-		const lib = await backend.library().catch(() => [] as Series[]);
-		// Read progress via one batched query (not a chapters() fetch per series —
-		// the old N+1 that stalled this page for a signed-in user with a large
-		// library, leaving the profile stuck behind the sign-in state).
-		const progress = backend.libraryProgress
-			? await backend.libraryProgress().catch(() => [] as SeriesProgress[])
-			: [];
+		// Everything below depends only on the SESSION existing, never on each other:
+		// the library, its batched read progress and the activity log are three
+		// independent queries, so they go out together. (Read progress is one batched
+		// query, not a chapters() fetch per series — the old N+1 that stalled this
+		// page for a signed-in user with a large library.)
+		const [lib, progress, rawActivity] = await Promise.all([
+			backend.library().catch(() => [] as Series[]),
+			backend.libraryProgress
+				? backend.libraryProgress().catch(() => [] as SeriesProgress[])
+				: Promise.resolve([] as SeriesProgress[]),
+			backend.myActivity
+				? backend.myActivity(12).catch(() => [])
+				: Promise.resolve([] as Awaited<ReturnType<NonNullable<typeof backend.myActivity>>>),
+		]);
 		const byId = new Map(progress.map((p) => [p.id, p]));
 		const rows = lib.map((s) => {
 			const p = byId.get(s.id);
@@ -1438,6 +1936,7 @@ export function getProfile(): Promise<ProfileView | null> {
 		const reading = readingNow.slice(0, 6).map(({ s, read, total }) => ({
 			id: s.id,
 			title: s.title,
+			cover: s.coverUrl,
 			genre: s.genres[0] ?? '',
 			ch: read,
 			total,
@@ -1446,10 +1945,13 @@ export function getProfile(): Promise<ProfileView | null> {
 		const shelves = rows.map(({ s, read, total }) => ({
 			id: s.id,
 			title: s.title,
+			cover: s.coverUrl,
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
 			// Explicit shelf wins; else derive (completed when fully read, else reading).
-			shelf: (s.libraryStatus as string | null) ?? (total > 0 && read >= total ? 'completed' : 'reading'),
+			shelf:
+				(s.libraryStatus as string | null) ??
+				(total > 0 && read >= total ? 'completed' : 'reading'),
 			favorite: s.isFavorite ?? false,
 			ch: read,
 			total,
@@ -1459,7 +1961,6 @@ export function getProfile(): Promise<ProfileView | null> {
 		// display text via the library title index (falls back to a generic label
 		// when the target isn't in the library, e.g. a chapter comment).
 		const titleById = new Map(lib.map((s) => [s.id, s.title]));
-		const rawActivity = backend.myActivity ? await backend.myActivity(12).catch(() => []) : [];
 		const activity = rawActivity.map((a) => {
 			const title = a.targetId ? titleById.get(a.targetId) : undefined;
 			const on = title ?? (a.targetType === 'chapter' ? 'a chapter' : 'a series');

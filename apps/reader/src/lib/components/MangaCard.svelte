@@ -14,6 +14,7 @@
 	let {
 		title,
 		sub = '',
+		subTitle = '',
 		rating = '',
 		cover = '',
 		id = '',
@@ -23,9 +24,16 @@
 		fixed = false,
 		width = 150,
 		translators = [],
+		loading = 'lazy',
 	}: {
 		title: string;
 		sub?: string;
+		/**
+		 * Hover text for the `sub` line. Used to spell out a label that is necessarily
+		 * terse — e.g. "· 4h" is the chapter RELEASE time, and this can add when we
+		 * detected it — without adding a second visible line to the card.
+		 */
+		subTitle?: string;
 		rating?: string;
 		cover?: string;
 		id?: string;
@@ -35,6 +43,13 @@
 		fixed?: boolean;
 		width?: number;
 		translators?: Chip[];
+		/**
+		 * Native lazy-load hint for the cover. Defaults to 'lazy' so cards in grids
+		 * and horizontal rows only fetch their cover once scrolled near the viewport —
+		 * offscreen covers no longer keep the whole page in a loading state on slow
+		 * connections. Pass 'eager' for a known above-the-fold LCP card.
+		 */
+		loading?: 'eager' | 'lazy';
 	} = $props();
 
 	const href = $derived(`/series/${id || slug(title)}`);
@@ -42,7 +57,7 @@
 
 <a {href} class="card" class:fixed style={fixed ? `width:${width}px` : ''}>
 	<div class="cover" class:fixed style={fixed ? `height:${Math.round((width * 212) / 150)}px` : ''}>
-		<Cover src={cover} alt={title} />
+		<Cover src={cover} alt={title} {loading} />
 		{#if flagType}
 			<span class="flag-svg"><FlagBadge type={flagType} /></span>
 		{:else if flagEmoji}
@@ -59,7 +74,7 @@
 	</div>
 	<div class="meta">
 		<div class="title">{title}</div>
-		{#if sub}<div class="sub">{sub}</div>{/if}
+		{#if sub}<div class="sub" title={subTitle || undefined}>{sub}</div>{/if}
 		{#if translators.length}
 			<div class="tchips"><TranslatorChips chips={translators} size={18} max={4} /></div>
 		{/if}

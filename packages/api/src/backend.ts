@@ -31,6 +31,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -82,8 +83,19 @@ export interface Backend {
 	 * query hits the live source index. `filters` (genres / rating range) are applied
 	 * server-side (genres match ANY, case-insensitive). Both are honoured on the
 	 * unified Komika API. (S4)
+	 *
+	 * `includeNsfw` is the ADMIN CONSOLE escape hatch: it overrides the caller's own
+	 * `show_nsfw` for this request only, and the server honours it solely for an admin
+	 * (anonymous callers are forced to false before it is read; ordinary users fall
+	 * through to their stored preference), so it grants nothing to a non-admin. Reader
+	 * code paths must leave it undefined.
 	 */
-	search(query: string, page?: number, filters?: SearchFilters): Promise<Paginated<Series>>;
+	search(
+		query: string,
+		page?: number,
+		filters?: SearchFilters,
+		includeNsfw?: boolean,
+	): Promise<Paginated<Series>>;
 	/**
 	 * Federated multi-extension catalogue search (S3): fans the query out to every
 	 * installed source, dedupes to one canonical work per series, and returns each
@@ -147,9 +159,17 @@ export interface Backend {
 	// --- canonical catalogue (MangaDex mirror) ---
 	/** Recently-updated mirrored MangaDex works + their latest stored chapter, newest
 	 * first, NSFW-filtered by the viewer's preference (CATALOGUE.md §6). A data feed;
-	 * open one via {@link canonicalSeries} using its `workId`. Optional: only the
+	 * open one via {@link canonicalSeries} using its `workId`. `includeNsfw` is the
+	 * same admin-console-only override as on {@link search}. Optional: only the
 	 * unified Komika API implements it. */
-	canonicalUpdates?(page?: number): Promise<CanonicalUpdate[]>;
+	canonicalUpdates?(page?: number, includeNsfw?: boolean): Promise<CanonicalUpdate[]>;
+	/** The reader's merged Updates feed, paginated server-side: the union of
+	 * {@link updates} and {@link canonicalUpdates}, keyed by canonical work, newest real
+	 * upstream release first. `type` filters by format over the WHOLE feed, so `total`
+	 * and `hasNextPage` describe the filtered set. NSFW-gated by the viewer's own
+	 * preference. Optional: only the unified Komika API implements it, and the reader
+	 * falls back to merging the two feeds when it is absent (see `getUpdates`). */
+	updatesFeed?(page?: number, type?: ComicType): Promise<Paginated<UpdateFeedRow>>;
 	/** A MangaDex-mirrored canonical `work` as a {@link Series}, for reader browse/read
 	 * (CATALOGUE.md §6). `workId` is the `w_`-prefixed canonical id. NSFW-gated by the
 	 * viewer's preference. Optional: only the unified Komika API implements it. */
@@ -218,6 +238,14 @@ export interface Backend {
 	 * a value => set it. `tags` is a whole-list replace. Returns the recomputed
 	 * series. Optional: only the unified Komika API implements it. */
 	updateSeriesMetadata?(input: SeriesMetadataInput): Promise<Series>;
+	/** Add an alternative title to a work; if it exactly matches another work, those
+	 * works are auto-merged into this one. Returns the recomputed series. Optional. */
+	addSeriesAltTitle?(id: Id, title: string): Promise<Series>;
+	/** Remove an alternative title from a work. Returns the recomputed series. Optional. */
+	removeSeriesAltTitle?(id: Id, title: string): Promise<Series>;
+	/** Consolidate the backlog of duplicate works sharing an exact title, up to `limit`
+	 * clusters per call; returns how many works were merged away. Optional. */
+	consolidateExactDuplicates?(limit?: number): Promise<number>;
 	/** Raw metadata-override state of a series' canonical work (pinned vs derived),
 	 * for the series-detail editor. Optional. */
 	seriesAdminMeta?(seriesId: Id): Promise<SeriesAdminMeta>;
@@ -249,8 +277,11 @@ export interface Backend {
 
 	// --- admin dedup review (requires an admin session) ---
 	/** Pending mid-confidence dedup matches awaiting manual review
-	 * (CATALOGUE.md §4). Optional: only the unified Komika API implements it. */
-	mergeQueue?(): Promise<MergeCandidate[]>;
+	 * (CATALOGUE.md §4), highest score first, PAGINATED — the backlog runs to ~10k
+	 * rows now that refused auto-consolidation pairs land here, so there is no
+	 * unbounded form. `limit` is clamped server-side to 1..=200 (default 50).
+	 * Optional: only the unified Komika API implements it. */
+	mergeQueue?(page?: number, limit?: number): Promise<Paginated<MergeCandidate>>;
 	/** Resolve a pending match: `accept` merges the source series into the
 	 * candidate work; rejecting keeps it as a distinct first-class work. Returns
 	 * true when the row was closed. Optional: only the unified Komika API

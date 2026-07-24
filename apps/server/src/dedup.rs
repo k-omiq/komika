@@ -5,14 +5,16 @@
 //!   2. normalized-title exact      -> candidate
 //!   3. fuzzy title (token block)   -> candidate shortlist
 //!   4. corroborate (description / cover pHash / author / year) -> confidence score
-//!   5. decide: exact-title OR external-ID -> auto-merge; fuzzy high (cover-
-//!      corroborated) -> auto-merge; mid -> manual review queue; low -> new work
+//!   5. decide: external-ID OR unambiguous exact-title -> auto-merge; fuzzy high
+//!      (cover-corroborated) -> auto-merge; mid -> manual review queue; low -> new work
 //!
 //! Runs at add-time for Tier-2 series, where a human reviews the mid band. Operator
-//! policy: an EXACT normalized-title match auto-merges (identical titles = same work);
-//! a FUZZY (token-block) match reaches `AutoMerge` only when cover-corroborated at HIGH,
-//! else it lands in `Review` — so a shared common token can't silently merge distinct
-//! works (prequels/sequels/seasons carry distinct titles and stay separate).
+//! policy: an EXACT normalized-title match auto-merges (identical titles = same work)
+//! PROVIDED the title identifies exactly one work and is not a short common phrase
+//! (`EXACT_MERGE_MIN_TITLE_CHARS`); otherwise it drops to `Review`. A FUZZY
+//! (token-block) match reaches `AutoMerge` only when cover-corroborated at HIGH, else it
+//! lands in `Review` — so a shared common token can't silently merge distinct works
+//! (prequels/sequels/seasons carry distinct titles and stay separate).
 
 use std::collections::HashSet;
 
@@ -64,6 +66,14 @@ pub enum Decision {
 pub const HIGH: f64 = 0.85;
 pub const MID: f64 = 0.6;
 const FUZZY_BLOCK_LIMIT: i64 = 50;
+/// Minimum normalized-title length for an EXACT-title auto-merge. Mirrors
+/// `graphql::FEDERATED_MIN_TITLE_CHARS`, which guards the federated consolidation
+/// path for exactly this reason: below it a title is a common phrase rather than an
+/// identity. Live catalogue evidence — "first love" resolves to 18 distinct works,
+/// "love letter" 13, "change" 12, "confession" 12, and 1,624 works carry a colliding
+/// normalized title under 5 characters. Auto-merging on one of those physically
+/// DELETES an unrelated work, so they go to the review queue instead.
+const EXACT_MERGE_MIN_TITLE_CHARS: usize = 5;
 /// How many of the longest title tokens the fuzzy block keys on (DD4). Keying on
 /// only the single longest token missed a merge whenever the discriminating token
 /// wasn't the longest; unioning the top-N candidate sets closes that recall gap.
@@ -133,13 +143,23 @@ pub async fn resolve_ex(
         return Ok(Decision::New);
     }
 
-    // 2. Normalized-title exact -> candidate ids.
+    // 2. Normalized-title exact -> candidate ids. `exact_norm_hits` records WHICH
+    //    normalized titles hit, so the auto-merge guard below can reject a hit that
+    //    rests only on a too-short (common-phrase) title.
     let mut candidate_ids: HashSet<String> = HashSet::new();
     let mut exact_hit = false;
+    let mut exact_norm_hits: Vec<&str> = Vec::new();
     for nt in &norm_titles {
         let ids = catalog::find_works_by_alias(pool, nt).await?;
-        if !ids.is_empty() {
+        // Only a title that matched some work OTHER than the one being reconciled is
+        // evidence of a duplicate. Counting a self-match here let a distinctive title
+        // that hit ONLY the work itself satisfy the length guard below, while the actual
+        // link to the other work rested entirely on a short common phrase — precisely the
+        // auto-merge the guard exists to refuse. (`exact_hit` is corrected for the same
+        // reason a few lines down, once the excluded id has been removed from the set.)
+        if ids.iter().any(|id| Some(id.as_str()) != exclude_work_id) {
             exact_hit = true;
+            exact_norm_hits.push(nt.as_str());
         }
         candidate_ids.extend(ids);
     }
@@ -152,6 +172,10 @@ pub async fn resolve_ex(
             exact_hit = false;
         }
     }
+    // How many DISTINCT works the exact-title lookup returned. Captured here because
+    // `candidate_ids` is refilled from the fuzzy block below when it is empty; more
+    // than one means the title does not identify a single work.
+    let exact_candidates = candidate_ids.len();
 
     // 3. Fuzzy blocking when no exact hit: block on the top-N longest title tokens
     //    (union), so the discriminating token being shorter than a generic one
@@ -204,13 +228,13 @@ pub async fn resolve_ex(
     };
     let score = scored.score;
 
-    // 5. Decide. Operator policy (explicit): an EXACT normalized-title match
-    //    auto-merges outright — identical titles are treated as the same work (this is
-    //    what consolidates the existing Suwayomi catalogue into the MangaDex spine on
-    //    reconcile). A FUZZY (token-block) match is riskier — a shared common token can
-    //    span distinct works — so it still auto-merges ONLY with cover corroboration at
-    //    HIGH, otherwise it lands in Review. (Prequels/sequels/seasons carry distinct
-    //    titles, so they don't exact-match and stay separate / queued.)
+    // 5. Decide. Operator policy (explicit): an UNAMBIGUOUS exact normalized-title
+    //    match auto-merges outright — identical titles are treated as the same work
+    //    (this is what consolidates the existing Suwayomi catalogue into the MangaDex
+    //    spine on reconcile). A FUZZY (token-block) match is riskier — a shared common
+    //    token can span distinct works — so it still auto-merges ONLY with cover
+    //    corroboration at HIGH, otherwise it lands in Review. (Prequels/sequels/seasons
+    //    carry distinct titles, so they don't exact-match and stay separate / queued.)
     // `method` labels align to the documented `merge_candidate.method` enum
     // (migration 0005): external_id / title_exact / fuzzy / description / cover. The
     // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
@@ -227,7 +251,22 @@ pub async fn resolve_ex(
             .as_deref()
             .map(is_discriminative_phash)
             .unwrap_or(false);
-    Ok(if exact_hit || (score >= HIGH && cover_corroborated) {
+    // The exact-title rung auto-merges only when the title actually IDENTIFIES one
+    // work. Two guards, both of which the federated path already applies
+    // (`graphql::federated_consolidate_ok`) and this rung previously skipped entirely:
+    //   * exactly one candidate — `find_works_by_alias` routinely returns many ids for
+    //     a common phrase, and the tie-break above then picks the lowest work_id, i.e.
+    //     an arbitrary one of 18 unrelated "first love" works;
+    //   * a normalized title of at least `EXACT_MERGE_MIN_TITLE_CHARS`.
+    // Neither can be rescued by cover corroboration in production, where
+    // `COVER_PHASH=off` leaves `phash_sim` permanently `None`. A hit that fails either
+    // guard is DOWNGRADED to `Review` (an exact hit always scores >= MID) rather than
+    // irreversibly merged — a human resolves it from the queue.
+    let exact_title_long_enough = exact_norm_hits
+        .iter()
+        .any(|t| t.chars().count() >= EXACT_MERGE_MIN_TITLE_CHARS);
+    let exact_auto_merge = exact_hit && exact_candidates == 1 && exact_title_long_enough;
+    let decision = if exact_auto_merge || (score >= HIGH && cover_corroborated) {
         Decision::AutoMerge {
             work_id,
             score,
@@ -241,7 +280,8 @@ pub async fn resolve_ex(
         }
     } else {
         Decision::New
-    })
+    };
+    Ok(decision)
 }
 
 /// A candidate's confidence plus the cover-pHash signal that fed it (kept separate so
@@ -507,10 +547,11 @@ mod tests {
 
     #[tokio::test]
     async fn tied_exact_title_candidate_is_deterministic() {
-        // DD7: two distinct works share the exact normalized title with no
-        // corroboration → equal score → auto-merge (exact-title policy). The candidate
-        // set is a HashSet (nondeterministic order), so the merged-into work_id must be
-        // pinned by the lowest-work_id tiebreak and stable across repeated resolves.
+        // DD7 + the ambiguity guard: two distinct works share the exact normalized
+        // title with no corroboration. The exact rung must NOT auto-merge (which
+        // physically deletes one of them, chosen arbitrarily) — it drops to Review. The
+        // candidate set is a HashSet (nondeterministic order), so the surfaced work_id
+        // must still be pinned by the lowest-work_id tiebreak and stable across resolves.
         let pool = pool().await;
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -537,9 +578,127 @@ mod tests {
         };
         for _ in 0..3 {
             match resolve(&pool, &cand).await.unwrap() {
-                Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, expected),
-                other => panic!("expected auto-merge, got {other:?}"),
+                Decision::Review { work_id, .. } => assert_eq!(work_id, expected),
+                other => panic!("expected review (ambiguous exact title), got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn short_common_exact_title_does_not_auto_merge() {
+        // A normalized title under `EXACT_MERGE_MIN_TITLE_CHARS` is a common phrase, not
+        // an identity ("love", "hero", "change"). Even a SINGLE exact candidate must
+        // land in Review rather than irreversibly folding two unrelated works.
+        let pool = pool().await;
+        let existing = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Love".into()),
+                aliases: vec![Alias {
+                    raw: "Love".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cand = Candidate {
+            title: "Love".into(),
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
+            Decision::Review { work_id, .. } => assert_eq!(work_id, existing),
+            other => panic!("expected review (short exact title), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_self_matching_long_title_cannot_unlock_a_short_title_auto_merge() {
+        // The reconcile path excludes the work being re-matched, because its own title is
+        // one of its aliases. The length guard was measured over EVERY normalized title
+        // that hit anything — including titles that hit only the excluded work itself. So
+        // a provisional work with a distinctive primary title plus one generic alt title
+        // passed the guard on the distinctive title (which linked it to nothing but
+        // itself) while the actual cross-work link rested entirely on the 4-character
+        // "love" — exactly the irreversible merge of two unrelated works the guard exists
+        // to refuse.
+        let pool = pool().await;
+        let mine = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Distinctive Longtitle".into()),
+                aliases: vec![
+                    Alias {
+                        raw: "Distinctive Longtitle".into(),
+                        lang: None,
+                    },
+                    Alias {
+                        raw: "Love".into(),
+                        lang: None,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let other = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Love".into()),
+                aliases: vec![Alias {
+                    raw: "Love".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cand = Candidate {
+            title: "Distinctive Longtitle".into(),
+            alt_titles: vec!["Love".into()],
+            ..Default::default()
+        };
+        match resolve_ex(&pool, &cand, Some(&mine)).await.unwrap() {
+            Decision::Review { work_id, .. } => assert_eq!(work_id, other),
+            other => panic!("expected review (only a short title links the works), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_id_still_auto_merges_on_a_short_title() {
+        // The length/ambiguity guards are specific to the TITLE rung — an external-ID
+        // hit is an exact identity claim and must keep auto-merging regardless.
+        let pool = pool().await;
+        let existing = catalog::create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Love".into()),
+                aliases: vec![Alias {
+                    raw: "Love".into(),
+                    lang: None,
+                }],
+                external_ids: vec![("al".into(), "999".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let cand = Candidate {
+            title: "Love".into(),
+            external_ids: vec![("al".into(), "999".into())],
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
+            Decision::AutoMerge {
+                work_id, method, ..
+            } => {
+                assert_eq!(work_id, existing);
+                assert_eq!(method, "external_id");
+            }
+            other => panic!("expected external-id auto-merge, got {other:?}"),
         }
     }
 

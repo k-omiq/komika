@@ -28,12 +28,45 @@ const NOISE_TAIL: &[&str] = &[
     "uncensored",
 ];
 
+/// Fold a lowercased character to its diacritic-free base so romanization and accent
+/// variants of the same title collide in the alias index. Macron vowels are the
+/// high-value case for manga — MangaDex romaji uses `ō/ū/ā/ē/ī` ("Tōkyō") where an
+/// aggregator writes the bare vowel ("Tokyo") — alongside the common Latin accents.
+/// Non-Latin scripts (CJK, Cyrillic, …) pass through unchanged. Returns the char as-is
+/// when it carries no diacritic.
+fn fold_diacritic(c: char) -> char {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'ǎ' | 'ả' | 'ạ' => 'a',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' | 'ẹ' | 'ẻ' => 'e',
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ĭ' | 'į' | 'ı' | 'ǐ' | 'ị' => 'i',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'ǒ' | 'ơ' | 'ọ' | 'ỏ' => {
+            'o'
+        }
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' | 'ǔ' | 'ư' | 'ụ' => 'u',
+        'ñ' | 'ń' | 'ň' | 'ņ' => 'n',
+        'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => 'c',
+        'ý' | 'ÿ' | 'ỳ' | 'ỹ' => 'y',
+        'š' | 'ś' | 'ş' | 'ŝ' => 's',
+        'ž' | 'ź' | 'ż' => 'z',
+        'ğ' | 'ĝ' | 'ġ' | 'ģ' => 'g',
+        'ł' => 'l',
+        'đ' | 'ð' => 'd',
+        _ => c,
+    }
+}
+
 /// Normalize a raw title to its alias-index key. Returns `""` for input that has no
 /// alphanumeric content (which callers should skip rather than index).
 pub fn normalize_title(raw: &str) -> String {
-    let lowered = raw.to_lowercase();
+    // Spell out `&` (and its full-width form) before folding so "Fist of the North &
+    // South" and "…and South" share a key. Done pre-lowercase; the tokens are ASCII.
+    let expanded = raw.replace('&', " and ").replace('＆', " and ");
+    let lowered = expanded.to_lowercase();
     let spaced: String = lowered
         .chars()
+        // Fold diacritics/macrons FIRST, then keep alphanumerics, else space. A folded
+        // char is always alphanumeric, so folding before the alnum test is safe.
+        .map(fold_diacritic)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let mut tokens: Vec<&str> = spaced.split_whitespace().collect();
@@ -194,6 +227,31 @@ mod tests {
         // "civic" is no longer misread as a numeral, so nothing is stripped here
         // ("the" is only noise when trailing).
         assert_eq!(normalize_title("The Civic"), "the civic");
+    }
+
+    #[test]
+    fn folds_macrons_and_accents() {
+        // Romaji macron vs bare vowel — the high-value manga case.
+        assert_eq!(
+            normalize_title("Tōkyō Ghoul"),
+            normalize_title("Tokyo Ghoul")
+        );
+        assert_eq!(normalize_title("Jūjutsu"), "jujutsu");
+        assert_eq!(normalize_title("Pokémon"), "pokemon");
+        assert_eq!(normalize_title("Réincarnation"), "reincarnation");
+        assert_eq!(
+            normalize_title("Kaguya-sama wa Kokurasetai"),
+            "kaguya sama wa kokurasetai"
+        );
+    }
+
+    #[test]
+    fn expands_ampersand() {
+        assert_eq!(
+            normalize_title("Kaiju No.8 & Friends"),
+            normalize_title("Kaiju No.8 and Friends")
+        );
+        assert_eq!(normalize_title("A & B"), "a and b");
     }
 
     #[test]

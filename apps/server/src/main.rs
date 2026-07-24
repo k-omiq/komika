@@ -16,6 +16,7 @@ mod scanner;
 mod series_cache;
 mod suwayomi;
 mod sync;
+mod task;
 mod views;
 
 use std::sync::Arc;
@@ -118,20 +119,37 @@ fn parse_trusted_proxies(raw: &[String]) -> Vec<Cidr> {
         .collect()
 }
 
-/// Resolve the client IP for rate-limiting. Client-supplied forwarding headers
-/// (`X-Forwarded-For` leftmost hop, then `X-Real-IP`) are honored ONLY when the
-/// direct socket peer is a configured trusted proxy (`TRUSTED_PROXY_CIDRS`);
-/// otherwise the value is trivially spoofable, so we key on the socket peer. The
-/// default (empty allowlist) always uses the peer, matching the shipped compose
-/// that publishes `8080` directly with no proxy in front.
+/// Resolve the client IP for rate-limiting. Forwarding headers are honored ONLY
+/// when the direct socket peer is a configured trusted proxy
+/// (`TRUSTED_PROXY_CIDRS`); otherwise they are trivially spoofable, so we key on
+/// the socket peer. The default (empty allowlist) always uses the peer.
+///
+/// Header precedence, and why it is NOT the leftmost `X-Forwarded-For` hop:
+/// Cloudflare *appends* the true client address to whatever `X-Forwarded-For` the
+/// client sent, so a request carrying `X-Forwarded-For: 1.2.3.4` reaches this
+/// origin as `1.2.3.4, <real-ip>`. Trusting the leftmost hop would therefore let
+/// any caller pick their own rate-limit bucket and evade the auth limiter
+/// entirely. We prefer `CF-Connecting-IP`, which Cloudflare unconditionally
+/// overwrites with the true client address, then fall back to the *rightmost*
+/// `X-Forwarded-For` hop (the one our own edge appended, i.e. the only hop a
+/// client cannot forge), then `X-Real-IP`.
 fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) -> String {
     // Canonicalize v4-mapped v6 (e.g. `::ffff:127.0.0.1`) so a v4 CIDR matches a
     // dual-stack socket peer.
     let peer_ip = peer.ip().to_canonical();
     if trusted.iter().any(|c| c.contains(peer_ip)) {
+        if let Some(cf) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+        {
+            let ip = cf.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                let ip = first.trim();
+            if let Some(last) = xff.split(',').next_back() {
+                let ip = last.trim();
                 if !ip.is_empty() {
                     return ip.to_string();
                 }
@@ -622,38 +640,137 @@ async fn serve_suwayomi_cover(
         return webp_cover_response(webp);
     }
     let path = format!("/api/v1/manga/{manga_id}/thumbnail");
-    match app.suwayomi.fetch_image(&path).await {
-        Ok((bytes, content_type)) => {
-            // Decode + up to 5x Lanczos3 resize + lossless WebP encode is CPU-bound
-            // (~130ms even at opt-level=3): keep it off the async runtime like the
-            // avatar/comment handlers do. On failure the closure hands the original
-            // bytes back so the cover still renders raw.
-            let resized = tokio::task::spawn_blocking(move || {
-                cover::process_cover(&bytes).map_err(|e| (e.to_string(), bytes))
-            })
-            .await;
-            match resized {
-                Ok(Ok(webp)) => {
-                    if let Err(e) = cover::put_suwayomi_cover(covers, manga_id, &webp).await {
-                        tracing::warn!(error = %e, manga_id, "suwayomi cover cache store failed");
-                    }
-                    webp_cover_response(webp)
-                }
-                Ok(Err((err, bytes))) => {
-                    tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
-                    raw_image_response(content_type, bytes)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, manga_id, "suwayomi cover resize task panicked");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
+    // On a MISS the fetch goes through the BOUNDED cover pool (`fetch_cover_now`), which
+    // refuses rather than queues when saturated and uses an 8 s timeout instead of the
+    // scanner's 30 s. Before this, a cold cover grid opened ~30 unbounded fetches that
+    // queued inside Suwayomi behind the scanner's own traffic and each paid the full 30 s
+    // ceiling — measured p50 5.6 s / p90 22.0 s / max 29.0 s, with a 502 past the
+    // timeout. The browser renders a 20 s progressive JPEG as a half-loaded image, which
+    // is what "half broken covers" actually was.
+    let fetched = match app.suwayomi.fetch_cover_now(&path).await {
+        Ok(v) => v,
+        Err(crate::suwayomi::CoverFetchError::Busy) => {
+            // Saturated. Return IMMEDIATELY with a non-cacheable placeholder and
+            // materialize out-of-band, instead of adding another 20 s queued request to
+            // the pile that caused the saturation. The next load of this page gets the
+            // real bytes from the blob cache (and the background drainer's warmer is
+            // converging on full coverage regardless).
+            spawn_suwayomi_cover_materialize(app, covers, manga_id);
+            // `info`, not `debug`: once the warmer has converged this should be near-zero,
+            // so a stream of these lines is the operator's signal that cover demand is
+            // outrunning the cache (see the deploy note). It cannot be noisy in the steady
+            // state because a warm cover never reaches this branch at all.
+            tracing::info!(manga_id, "suwayomi cover: pool saturated, 503 warming");
+            return cover_warming_response();
+        }
+        Err(crate::suwayomi::CoverFetchError::Upstream(e)) => {
+            tracing::warn!(error = %e, path = %path, "suwayomi cover proxy failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let (bytes, content_type) = fetched;
+    // Decode + up to 5x Lanczos3 resize + lossless WebP encode is CPU-bound
+    // (~130ms even at opt-level=3): keep it off the async runtime like the
+    // avatar/comment handlers do. On failure the closure hands the original
+    // bytes back so the cover still renders raw.
+    let resized = tokio::task::spawn_blocking(move || {
+        cover::process_cover(&bytes).map_err(|e| (e.to_string(), bytes))
+    })
+    .await;
+    match resized {
+        Ok(Ok(webp)) => {
+            if let Err(e) = cover::put_suwayomi_cover(covers, manga_id, &webp).await {
+                tracing::warn!(error = %e, manga_id, "suwayomi cover cache store failed");
             }
+            webp_cover_response(webp)
+        }
+        Ok(Err((err, bytes))) => {
+            tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
+            raw_image_response(content_type, bytes)
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path, "suwayomi cover proxy failed");
-            StatusCode::BAD_GATEWAY.into_response()
+            tracing::error!(error = %e, manga_id, "suwayomi cover resize task panicked");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Materialize one Suwayomi cover into `suwayomi_cover_blob` OUT OF BAND, after the
+/// request that discovered the miss has already returned a placeholder.
+///
+/// Bounded twice over: it takes a slot from the client's small background pool (and does
+/// nothing if that pool is full), and the fetch itself waits on the shared cover-fetch
+/// semaphore. So a burst of misses spawns at most `BG_MATERIALIZE_CONCURRENCY` tasks, and
+/// those plus the warmer's share are what the on-demand headroom is computed against —
+/// see the accounting on `suwayomi::COVER_FETCH_CONCURRENCY`.
+///
+/// Deliberately un-deduplicated: N concurrent misses for the SAME cover can each spawn a
+/// task and fetch the same bytes. With the pool at 4 the waste is bounded and a
+/// single-flight map would need its own eviction; the second writer simply overwrites an
+/// identical blob.
+fn spawn_suwayomi_cover_materialize(
+    app: &graphql::AppState,
+    covers: &sqlx::SqlitePool,
+    manga_id: i64,
+) {
+    let Some(slot) = app.suwayomi.try_background_slot() else {
+        return; // background pool full — the drainer's warmer will get to it
+    };
+    let suwayomi = app.suwayomi.clone();
+    let covers = covers.clone();
+    tokio::spawn(async move {
+        let _slot = slot; // held for the task's lifetime: this is the fan-out bound
+        let path = format!("/api/v1/manga/{manga_id}/thumbnail");
+        let Ok((bytes, _ct)) = suwayomi.fetch_cover_background(&path).await else {
+            return;
+        };
+        if let Ok(Ok(webp)) =
+            tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await
+        {
+            if let Err(e) = cover::put_suwayomi_cover(&covers, manga_id, &webp).await {
+                tracing::warn!(error = %e, manga_id, "background suwayomi cover store failed");
+            }
+        }
+    });
+}
+
+/// Response for a cover that isn't materialized yet and can't be fetched right now
+/// because the bounded cover pool is saturated. Returns in milliseconds instead of
+/// queueing for up to 30 s; the bytes arrive out of band via
+/// [`spawn_suwayomi_cover_materialize`].
+///
+/// **A fast 5xx, not a 200 placeholder.** The obvious alternative — a transparent 1x1
+/// WebP with `no-store` — is worse on both counts:
+///
+/// * The reader is built for this exact signal. `Cover.svelte`'s `onerror` renders the
+///   themed `.cover-ph k-cover` block, and it treats a *sub-second* failure as
+///   authoritative and does NOT retry ("a saturated cover origin answers in
+///   milliseconds"), so there is no retry amplification to avoid. A 200 fires `onload`
+///   instead, and `MangaCard`'s `.cover` container has no background of its own, so the
+///   transparent pixel leaves a see-through hole where every other unloaded cover shows
+///   `var(--k-cover)`.
+/// * A 503 is visible as a 503 in the edge/origin status metrics. A 200 of a blank pixel
+///   is indistinguishable from a served cover.
+///
+/// `no-store` + `Retry-After` keep any intermediary from pinning this in place of the
+/// real bytes (Cloudflare does not cache `no-store`, and does not cache 503 by default
+/// either — belt and braces). `X-Cover-Status` is for operators reading a curl.
+fn cover_warming_response() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, must-revalidate"),
+            ),
+            (header::RETRY_AFTER, HeaderValue::from_static("2")),
+            (
+                header::HeaderName::from_static("x-cover-status"),
+                HeaderValue::from_static("warming"),
+            ),
+        ],
+    )
+        .into_response()
 }
 
 /// Immutable-cached response for a resized WebP cover.
@@ -845,6 +962,110 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Prometheus-format operational gauges, scraped on demand.
+///
+/// A first cut: these are all DERIVED FROM DB STATE at scrape time, so they need no
+/// request-path instrumentation. That deliberately omits request-latency histograms
+/// and error-rate counters, which would require threading a metric registry through
+/// the resolvers — a separate change. What's here is what the plan's verification
+/// steps actually need to read without grepping `docker logs`: scan-scheduler health
+/// (the herd/backoff signals), the subscription circuit breaker, and updates-feed
+/// freshness. NOTE: this shares the public 0.0.0.0:{port} router, so the cloudflared
+/// ingress MUST exclude `/metrics` (deploy step) to keep it off api.komiq.cc — it is
+/// not loopback-bound. Even leaked it discloses only aggregate counts, not user data.
+async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
+    // One helper so a single failed query degrades to a `-1` gauge rather than 500ing
+    // the whole scrape (a metrics endpoint that fails is worse than one with a hole).
+    async fn scalar(pool: &sqlx::SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(-1)
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let scan_total = scalar(&pool, "SELECT COUNT(*) FROM series_scan_state").await;
+    let scan_due = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at <= ?",
+    )
+    .bind(&now)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(-1);
+    let scan_failing = scalar(
+        &pool,
+        "SELECT COUNT(*) FROM series_scan_state WHERE consecutive_failures > 0",
+    )
+    .await;
+    let scan_awaiting = scalar(
+        &pool,
+        "SELECT COUNT(*) FROM series_scan_state WHERE awaiting_since IS NOT NULL",
+    )
+    .await;
+    // Herd detector: how many rows are bunched into the single busiest upcoming minute.
+    // A healthy, jittered schedule keeps this small; the pre-fix herd put ~740 here.
+    let scan_max_minute_cluster = scalar(
+        &pool,
+        "SELECT COALESCE(MAX(c), 0) FROM (SELECT COUNT(*) c FROM series_scan_state \
+         WHERE next_scan_at IS NOT NULL GROUP BY substr(next_scan_at, 1, 16))",
+    )
+    .await;
+    let subs_total = scalar(&pool, "SELECT COUNT(*) FROM extension_subscription").await;
+    let subs_disabled = scalar(
+        &pool,
+        "SELECT COUNT(*) FROM extension_subscription WHERE disabled_at IS NOT NULL",
+    )
+    .await;
+    let feed_rows = scalar(&pool, "SELECT COUNT(*) FROM feed_updates").await;
+    let feed_age_secs = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CAST((julianday('now') - julianday(MAX(latest_at))) * 86400 AS INTEGER) \
+         FROM feed_updates",
+    )
+    .fetch_one(&pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(-1);
+
+    let body = format!(
+        "# HELP komika_scan_state_total Series tracked by the scan scheduler\n\
+         # TYPE komika_scan_state_total gauge\n\
+         komika_scan_state_total {scan_total}\n\
+         # HELP komika_scan_due Series currently overdue for a scan\n\
+         # TYPE komika_scan_due gauge\n\
+         komika_scan_due {scan_due}\n\
+         # HELP komika_scan_failing Series with a non-zero consecutive-failure count\n\
+         # TYPE komika_scan_failing gauge\n\
+         komika_scan_failing {scan_failing}\n\
+         # HELP komika_scan_awaiting Series in the accelerated awaiting-chapter poll\n\
+         # TYPE komika_scan_awaiting gauge\n\
+         komika_scan_awaiting {scan_awaiting}\n\
+         # HELP komika_scan_max_minute_cluster Largest number of series scheduled in one minute (herd detector)\n\
+         # TYPE komika_scan_max_minute_cluster gauge\n\
+         komika_scan_max_minute_cluster {scan_max_minute_cluster}\n\
+         # HELP komika_subscriptions_total Extension sync subscriptions\n\
+         # TYPE komika_subscriptions_total gauge\n\
+         komika_subscriptions_total {subs_total}\n\
+         # HELP komika_subscriptions_disabled Subscriptions auto-disabled by the circuit breaker\n\
+         # TYPE komika_subscriptions_disabled gauge\n\
+         komika_subscriptions_disabled {subs_disabled}\n\
+         # HELP komika_feed_updates_rows Materialized updates-feed row count\n\
+         # TYPE komika_feed_updates_rows gauge\n\
+         komika_feed_updates_rows {feed_rows}\n\
+         # HELP komika_feed_updates_newest_age_seconds Age of the newest chapter in the feed\n\
+         # TYPE komika_feed_updates_newest_age_seconds gauge\n\
+         komika_feed_updates_newest_age_seconds {feed_age_secs}\n"
+    );
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
 /// Readiness: verifies the process can actually serve — i.e. the DB answers.
 /// For a load balancer / orchestrator readiness gate, not the liveness probe.
 async fn ready(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
@@ -955,6 +1176,31 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to sweep interrupted ingest jobs"),
     }
 
+    // Populate the materialized updates feed at boot (migration 0051), off the request
+    // path, so `canonicalUpdates` serves real rows immediately — even before the first
+    // catalogue-sync cycle, and even when CATALOGUE_SYNC is off. Spawned so a slow
+    // rebuild (it's a ~3s, ~47k-row DELETE+INSERT) doesn't delay the listener coming
+    // up. Delayed ~20s so this heavy writer doesn't land in the same instant as the
+    // scanner's immediate first tick — the scanner would absorb the contention via its
+    // lock-retry, but there's no reason to create it (mirrors the 2C boot stagger).
+    {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            match crate::catalog::refresh_feed_updates(&pool).await {
+                Ok(n) => tracing::info!(works = n, "feed_updates: initial build complete"),
+                Err(e) => tracing::warn!(error = %e, "feed_updates: initial build failed"),
+            }
+            // AD-5: build the full-text search index (migration 0052) alongside the
+            // updates feed — same background slot, same "fresh within a sync interval"
+            // contract. Without this, text search is empty until the first sync.
+            match crate::catalog::refresh_work_fts(&pool).await {
+                Ok(n) => tracing::info!(works = n, "work_fts: initial build complete"),
+                Err(e) => tracing::warn!(error = %e, "work_fts: initial build failed"),
+            }
+        });
+    }
+
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
@@ -971,9 +1217,17 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
     );
 
-    // Hourly garbage collection of orphaned staged comment-media uploads (rows the
-    // uploader never attached to a comment), so the BLOB store can't grow unbounded.
-    gc::spawn(pool.clone(), shutdown_tx.subscribe());
+    // Hourly garbage collection: orphaned staged comment-media uploads (rows the
+    // uploader never attached to a comment) plus cover blobs in the separate covers DB
+    // whose owning work/series no longer exists — nothing in the main DB can cascade
+    // across the file boundary, so 8,868 work blobs (1,464 MiB) had accumulated with no
+    // reclaimer. See `gc::sweep_cover_blobs` for the race-safety argument.
+    gc::spawn(pool.clone(), cover_pool.clone(), shutdown_tx.subscribe());
+
+    // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
+    // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
+    // an exact per-table ANALYZE rather than `PRAGMA optimize`.
+    db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
@@ -989,6 +1243,23 @@ async fn main() -> anyhow::Result<()> {
             mangadex.clone(),
             cfg.catalogue_cover_phash,
             cfg.catalogue_sync_interval_secs,
+            shutdown_tx.subscribe(),
+        );
+        // One-time top-up: fill catalogue series the original seed missed (the
+        // forward-only incremental never revisits them). Runs once (marker in
+        // maintenance_flag), only after the seed is complete, and holds the same
+        // single-flight lock as the recurring sync so it can't race it.
+        // The covers pool goes along so the dedup this backfill runs on completion can
+        // reclaim the merged-away works' cover blobs; without it that one-time fold
+        // leaked a blob per merge into the un-cascaded covers DB.
+        // The shutdown watch goes along because the pass schedule spans up to ~20h; a
+        // redeploy must be able to interrupt it rather than leave it sweeping MangaDex
+        // (and taking the catalogue single-flight lock) through the drain.
+        mangadex::spawn_backfill_if_needed(
+            pool.clone(),
+            cover_pool.clone(),
+            mangadex.clone(),
+            cfg.catalogue_cover_phash,
             shutdown_tx.subscribe(),
         );
     } else {
@@ -1052,6 +1323,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/graphql", graphql_route)
         .route("/health", get(health))
         .route("/health/ready", get(ready))
+        // Operational gauges for scraping (aggregate counts only — no series content,
+        // no user data). Intended to be scraped on the VPS via localhost:8080/metrics;
+        // the cloudflared ingress must exclude `/metrics` so it is not reachable at
+        // api.komiq.cc/metrics (deploy step). Even if leaked it discloses only row
+        // counts and ages, but it is not meant to be public.
+        .route("/metrics", get(metrics))
         // Authenticated avatar upload + public serve (VM data volume). The upload
         // route raises the body limit above the raw-image cap enforced in
         // `avatar::process_avatar` (axum's default is 2 MB).
@@ -1214,6 +1491,23 @@ mod tests {
         SocketAddr::new(ip.parse().unwrap(), 12345)
     }
 
+    /// The saturated-pool answer must be a FAST 5xx that no cache will keep. A 200
+    /// (the transparent-pixel placeholder this replaced) fires `Cover.svelte`'s
+    /// `onload`, leaving a see-through hole instead of the themed `.cover-ph` block,
+    /// and is invisible in status metrics.
+    #[test]
+    fn cover_warming_response_is_an_uncacheable_503() {
+        let res = cover_warming_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let cc = res.headers().get(header::CACHE_CONTROL).unwrap();
+        assert!(
+            cc.to_str().unwrap().contains("no-store"),
+            "a warming answer must never be cached in place of the real cover"
+        );
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "2");
+        assert_eq!(res.headers().get("x-cover-status").unwrap(), "warming");
+    }
+
     #[test]
     fn suwayomi_image_path_allows_only_cover_and_page() {
         // The two proxied image endpoints (tail after `/api/v1/manga/`).
@@ -1275,11 +1569,40 @@ mod tests {
     }
 
     #[test]
-    fn trusted_peer_honors_xff_leftmost() {
+    fn trusted_peer_honors_xff_rightmost() {
+        // The rightmost hop is the one our own edge appended; the leftmost is
+        // whatever the client sent and must never be trusted.
         let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
-        let h = hdrs(&[("x-forwarded-for", "1.2.3.4, 10.0.0.5")]);
+        let h = hdrs(&[("x-forwarded-for", "1.2.3.4, 203.0.113.7")]);
         let ip = resolve_client_ip(&h, peer("10.0.0.5"), &trusted);
-        assert_eq!(ip, "1.2.3.4");
+        assert_eq!(ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn cf_connecting_ip_wins_over_forged_xff() {
+        // Cloudflare overwrites CF-Connecting-IP with the true client address, so
+        // it must beat a client-supplied X-Forwarded-For prefix.
+        let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        let h = hdrs(&[
+            ("x-forwarded-for", "1.2.3.4"),
+            ("cf-connecting-ip", "203.0.113.7"),
+        ]);
+        let ip = resolve_client_ip(&h, peer("10.0.0.5"), &trusted);
+        assert_eq!(ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn spoofed_xff_cannot_pick_its_own_bucket() {
+        // Regression guard: a caller sending `X-Forwarded-For: <victim>` arrives at
+        // the origin as `<victim>, <real>` once the edge appends. The limiter must
+        // key on the appended hop, not the forged one.
+        let trusted = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        let attacker = hdrs(&[("x-forwarded-for", "9.9.9.9, 198.51.100.4")]);
+        let victim = hdrs(&[("x-forwarded-for", "9.9.9.9, 198.51.100.5")]);
+        let a = resolve_client_ip(&attacker, peer("10.0.0.5"), &trusted);
+        let v = resolve_client_ip(&victim, peer("10.0.0.5"), &trusted);
+        assert_ne!(a, v, "forged leftmost hop must not collapse two clients");
+        assert_eq!(a, "198.51.100.4");
     }
 
     #[test]

@@ -32,15 +32,57 @@ import type {
 import { backend } from './context';
 
 /**
+ * Fail a long admin mutation client-side after `ms` so a stalled connection can't pin
+ * the console on "Saving…" forever.
+ *
+ * This is a UI-level deadline only: the GraphQL client in `@komika/api` takes no
+ * `AbortSignal`, so the underlying request is NOT cancelled and the server-side work
+ * keeps running — the message says so. Real cancellation needs an `AbortSignal`
+ * plumbed through `createBackend`/`gql()` in packages/api.
+ */
+function withTimeout<T>(op: Promise<T>, ms: number, what: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout>;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(
+			() =>
+				reject(
+					new Error(
+						`${what} did not respond within ${Math.round(ms / 1000)}s. It may still be running on the server — refresh to check before retrying.`,
+					),
+				),
+			ms,
+		);
+	});
+	return Promise.race([op, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+/**
+ * The console asks for NSFW-inclusive results on EVERY catalogue read, regardless of
+ * the signed-in admin's own `show_nsfw`.
+ *
+ * It is a per-request override, not a preference: the server honours it only for an
+ * admin (anonymous callers are forced to false before it is consulted, ordinary users
+ * fall through to their stored preference), so it can't bypass the gate. Without it an
+ * opted-out admin's console silently omits every NSFW-flagged work — including the
+ * ~2.5k mainstream titles that are WRONGLY flagged, which are precisely the records
+ * this console exists to correct. The header's `NSFW on/off` pill still governs the
+ * account PREFERENCE (source browsing / extension install / ingest are gated on it
+ * server-side, and it is what the reader honours) — the two are deliberately separate.
+ */
+const ADMIN_INCLUDE_NSFW = true;
+
+/**
  * The catalog the console manages, ONE server page at a time. A text query hits the
  * live source index; an empty query serves the whole persisted catalogue — both
  * paginated SERVER-SIDE by {@link backend.search} (page/pageSize), so the console
  * never pulls the unbounded full library into memory. Returns the paginated envelope
  * (`items` + `page` + `hasNextPage` + `total`) so the caller can drive its pager off
  * the server's own paging metadata.
+ *
+ * Always NSFW-inclusive — see {@link ADMIN_INCLUDE_NSFW}.
  */
 export async function loadCatalog(query: string, page = 1): Promise<Paginated<Series>> {
-	return backend.search(query.trim(), page);
+	return backend.search(query.trim(), page, undefined, ADMIN_INCLUDE_NSFW);
 }
 
 /** Persist per-series overrides (whole-state) and return the recomputed series. */
@@ -73,10 +115,33 @@ export async function setUserAdmin(userId: string, isAdmin: boolean): Promise<Ad
 	return backend.setUserAdmin(userId, isAdmin);
 }
 
-/** Pending dedup matches awaiting manual review (CATALOGUE.md §4). */
-export async function loadMergeQueue(): Promise<MergeCandidate[]> {
+/**
+ * Set the signed-in admin's own NSFW visibility preference, returning the new value.
+ * This is not a cosmetic setting for the console: `sourceBrowse`, `installExtension`
+ * and `startSourceIngest` all REFUSE an opted-out admin. It no longer affects what the
+ * console LISTS, though — catalogue search and canonical updates are read with the
+ * {@link ADMIN_INCLUDE_NSFW} per-request override, so the records stay reachable
+ * either way.
+ */
+export async function setShowNsfw(value: boolean): Promise<boolean> {
+	if (!backend.setShowNsfw) throw new Error('NSFW preference is unavailable on this backend.');
+	return backend.setShowNsfw(value);
+}
+
+/** Rows per {@link loadMergeQueue} page (the server's own default; max 200). */
+export const MERGE_QUEUE_PAGE_SIZE = 50;
+
+/**
+ * Pending dedup matches awaiting manual review (CATALOGUE.md §4), ONE server page at
+ * a time — the backlog runs to ~10k rows now that refused auto-consolidation pairs are
+ * routed here, so it is never pulled whole. `limit` is clamped server-side to 1..=200.
+ */
+export async function loadMergeQueue(
+	page = 1,
+	limit = MERGE_QUEUE_PAGE_SIZE,
+): Promise<Paginated<MergeCandidate>> {
 	if (!backend.mergeQueue) throw new Error('Dedup review is unavailable on this backend.');
-	return backend.mergeQueue();
+	return backend.mergeQueue(page, limit);
 }
 
 /**
@@ -133,11 +198,13 @@ export async function addSourceSeries(suwayomiMangaId: string): Promise<MatchRes
  * Recently-updated mirrored MangaDex works + their latest stored chapter, from the
  * canonical `chapter` mirror (CATALOGUE.md §6). A monitoring feed for the mirror —
  * these works are not reader-openable yet.
+ *
+ * Always NSFW-inclusive — see {@link ADMIN_INCLUDE_NSFW}.
  */
 export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
 	if (!backend.canonicalUpdates)
 		throw new Error('Catalogue updates are unavailable on this backend.');
-	return backend.canonicalUpdates(page);
+	return backend.canonicalUpdates(page, ADMIN_INCLUDE_NSFW);
 }
 
 // ---- Sources & Extensions console (EXT-2) -----------------------------------
@@ -295,7 +362,7 @@ export async function setExtensionSubscription(pkgName: Id, subscribed: boolean)
 export async function persistCatalogue(): Promise<number> {
 	if (!backend.persistCatalogue)
 		throw new Error('Catalogue persistence is unavailable on this backend.');
-	return backend.persistCatalogue();
+	return withTimeout(backend.persistCatalogue(), 10 * 60_000, 'Catalogue persistence');
 }
 
 /**
@@ -307,7 +374,7 @@ export async function persistCatalogue(): Promise<number> {
 export async function materializeCatalogueCovers(): Promise<number> {
 	if (!backend.materializeCatalogueCovers)
 		throw new Error('Cover materialization is unavailable on this backend.');
-	return backend.materializeCatalogueCovers();
+	return withTimeout(backend.materializeCatalogueCovers(), 5 * 60_000, 'Cover materialization');
 }
 
 // ---- Series-detail editor (metadata + chapters + rescan) --------------------
@@ -338,6 +405,39 @@ export async function saveSeriesMetadata(input: SeriesMetadataInput): Promise<Se
 	if (!backend.updateSeriesMetadata)
 		throw new Error('Series metadata editing is unavailable on this backend.');
 	return backend.updateSeriesMetadata(input);
+}
+
+/** Add an alternative title; auto-merges any other work sharing it. Returns the series. */
+export async function addSeriesAltTitle(id: string, title: string): Promise<Series> {
+	if (!backend.addSeriesAltTitle)
+		throw new Error('Alt-title editing is unavailable on this backend.');
+	return backend.addSeriesAltTitle(id, title);
+}
+
+/** Remove an alternative title. Returns the recomputed series. */
+export async function removeSeriesAltTitle(id: string, title: string): Promise<Series> {
+	if (!backend.removeSeriesAltTitle)
+		throw new Error('Alt-title editing is unavailable on this backend.');
+	return backend.removeSeriesAltTitle(id, title);
+}
+
+/**
+ * Merge one batch of the duplicate-work backlog — up to `limit` clusters per call.
+ * Returns how many works were merged away (0 when the backlog is clear).
+ *
+ * DESTRUCTIVE: each cluster folds via `merge_works`, which physically DELETEs the
+ * losing work. Clusters are grouped by NORMALIZED ALIAS (alternative titles included),
+ * so this is broader than "same exact title" — callers must confirm it and bound the
+ * number of batches rather than looping until the server returns zero.
+ */
+export async function consolidateDuplicates(limit?: number): Promise<number> {
+	if (!backend.consolidateExactDuplicates)
+		throw new Error('Duplicate consolidation is unavailable on this backend.');
+	return withTimeout(
+		backend.consolidateExactDuplicates(limit),
+		3 * 60_000,
+		'Duplicate consolidation',
+	);
 }
 
 /** The source mappings for one canonical work (per-source rescan + provenance). */

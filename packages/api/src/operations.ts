@@ -7,6 +7,46 @@
  * these operations expect is documented in `schema/komika.graphql`.
  */
 
+/**
+ * Fields the client selects OPPORTUNISTICALLY.
+ *
+ * They are newer than some deployed servers, and GraphQL rejects the whole
+ * document on an unknown field — so a reader shipped ahead of the API would fail
+ * every query, not just degrade one label. {@link GraphQLBackend} watches for
+ * `Unknown field "…"`, strips the offender from the document and retries once,
+ * then omits it for the rest of the session. Every field listed here MUST
+ * therefore be optional in `@komika/types` and have a caller-side fallback.
+ *
+ * The stripper is LINE-BASED, so each name here must additionally be selected:
+ *   - on its OWN LINE (`id detectedAt` on one line is not removed), and
+ *   - with NO alias, arguments or sub-selection (`when: detectedAt`,
+ *     `detectedAt(tz:…)`, `detectedAt { … }` are not removed), and
+ *   - never as the ONLY selection in its set — removing it would leave `{ }`.
+ * Violating any of these is not corrupting (`stripUnsupported` returns the document
+ * unchanged rather than emit invalid GraphQL) but it silently disables the fallback,
+ * so the query just fails against an older server.
+ */
+export const OPTIONAL_SERIES_FIELDS = ['detectedAt'] as const;
+
+/**
+ * Query ARGUMENTS the client passes OPPORTUNISTICALLY — same deploy-ordering hazard
+ * as {@link OPTIONAL_SERIES_FIELDS}, different error: an argument the server doesn't
+ * know fails validation with `Unknown argument "…"`, which likewise rejects the whole
+ * document. The reader never sets `includeNsfw`, but it ships the same documents, so
+ * a reader deployed ahead of the API would break every browse/search screen on an
+ * argument it doesn't even use. {@link GraphQLBackend} strips it and retries once.
+ *
+ * Unlike the field stripper this one is TOKEN-based, not line-based: it removes the
+ * `$name: Type` declaration and every `name: $name` use wherever they sit, so
+ * `canonicalUpdates(page: $page, includeNsfw: $includeNsfw)` on one line is fine (the
+ * leftover comma is an ignored token in GraphQL, and an argument list left completely
+ * empty is collapsed). The constraints that DO apply: each name here must be passed
+ * as a variable of the SAME name (a literal `includeNsfw: true`, or a renamed
+ * `includeNsfw: $wantNsfw`, is not removed), and must be safe to omit — omitting it
+ * just falls back to the server's default behaviour.
+ */
+export const OPTIONAL_ARGUMENTS = ['includeNsfw'] as const;
+
 const SERIES_FIELDS = /* GraphQL */ `
 	fragment SeriesFields on Series {
 		id
@@ -41,6 +81,12 @@ const SERIES_FIELDS = /* GraphQL */ `
 		}
 		createdAt
 		updatedAt
+		# Chapter recency. \`updatedAt\` is a metadata touch that moves on every poll,
+		# so it can never be the "· 4h" label; \`latestChapterAt\` is the real publish
+		# time and \`detectedAt\` is when we found it. Keep \`detectedAt\` on its own
+		# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
+		latestChapterAt
+		detectedAt
 	}
 `;
 
@@ -106,6 +152,7 @@ export const SEARCH = /* GraphQL */ `
 		$genres: [String!]
 		$minRating: Float
 		$maxRating: Float
+		$includeNsfw: Boolean
 	) {
 		search(
 			query: $query
@@ -113,6 +160,7 @@ export const SEARCH = /* GraphQL */ `
 			genres: $genres
 			minRating: $minRating
 			maxRating: $maxRating
+			includeNsfw: $includeNsfw
 		) {
 			items {
 				...SeriesFields
@@ -589,17 +637,22 @@ export const SET_USER_ADMIN = /* GraphQL */ `
 `;
 
 export const MERGE_QUEUE = /* GraphQL */ `
-	query MergeQueue {
-		mergeQueue {
-			id
-			sourceSeriesId
-			candidateWorkId
-			candidateTitle
-			sourceTitle
-			score
-			method
-			status
-			createdAt
+	query MergeQueue($page: Int, $limit: Int) {
+		mergeQueue(page: $page, limit: $limit) {
+			items {
+				id
+				sourceSeriesId
+				candidateWorkId
+				candidateTitle
+				sourceTitle
+				score
+				method
+				status
+				createdAt
+			}
+			page
+			hasNextPage
+			total
 		}
 	}
 `;
@@ -820,8 +873,8 @@ export const MY_ACTIVITY = /* GraphQL */ `
 `;
 
 export const CANONICAL_UPDATES = /* GraphQL */ `
-	query CanonicalUpdates($page: Int) {
-		canonicalUpdates(page: $page) {
+	query CanonicalUpdates($page: Int, $includeNsfw: Boolean) {
+		canonicalUpdates(page: $page, includeNsfw: $includeNsfw) {
 			workId
 			mangadexId
 			title
@@ -830,6 +883,36 @@ export const CANONICAL_UPDATES = /* GraphQL */ `
 			latestChapter
 			latestChapterTitle
 			latestAt
+		}
+	}
+`;
+
+// The reader's merged Updates feed, paginated server-side. `page` and `type` are CORE
+// arguments, not opportunistic ones, so neither belongs in OPTIONAL_ARGUMENTS — and note
+// that `stripUnsupported` cannot rescue this document at all: it strips unknown
+// ARGUMENTS, and an unknown FIELD (`updatesFeed` on a server that predates it) fails
+// validation outright. Deploy the server before the reader; the reader guards with
+// `backend.updatesFeed?.()` and falls back to the two-feed merge when it is absent.
+export const UPDATES_FEED = /* GraphQL */ `
+	query UpdatesFeed($page: Int, $type: ComicType) {
+		updatesFeed(page: $page, type: $type) {
+			items {
+				id
+				workId
+				title
+				coverUrl
+				type
+				latestChapter
+				latestChapterTitle
+				chapterCount
+				releasedAt
+				detectedAt
+				rating
+				isNsfw
+			}
+			page
+			hasNextPage
+			total
 		}
 	}
 `;
@@ -1050,6 +1133,30 @@ export const UPDATE_SERIES_METADATA = /* GraphQL */ `
 		updateSeriesMetadata(input: $input) {
 			...SeriesFields
 		}
+	}
+`;
+
+export const ADD_SERIES_ALT_TITLE = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation AddSeriesAltTitle($id: ID!, $title: String!) {
+		addSeriesAltTitle(id: $id, title: $title) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const REMOVE_SERIES_ALT_TITLE = /* GraphQL */ `
+	${SERIES_FIELDS}
+	mutation RemoveSeriesAltTitle($id: ID!, $title: String!) {
+		removeSeriesAltTitle(id: $id, title: $title) {
+			...SeriesFields
+		}
+	}
+`;
+
+export const CONSOLIDATE_EXACT_DUPLICATES = /* GraphQL */ `
+	mutation ConsolidateExactDuplicates($limit: Int) {
+		consolidateExactDuplicates(limit: $limit)
 	}
 `;
 

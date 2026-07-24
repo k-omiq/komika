@@ -155,6 +155,40 @@ export interface CanonicalUpdate {
 }
 
 /**
+ * One row of the reader's merged Updates feed (`updatesFeed`).
+ *
+ * The feed is the union of the MangaDex mirror updates and our scanner's Suwayomi
+ * detections, taken server-side and keyed by canonical work, so it can be paginated
+ * with an honest `total`. The reader used to fetch page 1 of each feed, merge, dedupe
+ * by lowercased title and cap the result at 60 cards; that is what this replaces.
+ */
+export interface UpdateFeedRow {
+	/** The id to OPEN: a `w_`-prefixed canonical work id when the work is
+	 *  MangaDex-anchored, else the numeric Suwayomi series id. Not always `workId` —
+	 *  `canonicalSeries` rejects a work with no MangaDex anchor. */
+	id: Id;
+	/** The canonical work this row is one-per-of; the feed's dedupe key. */
+	workId: Id;
+	title: string;
+	coverUrl: string | null;
+	/** Effective format, filtered server-side via the `type` argument. */
+	type: ComicType | null;
+	/** Chapter NUMBER of the newest mirrored chapter ("10.5"); null on scanner-only rows. */
+	latestChapter: string | null;
+	latestChapterTitle: string | null;
+	/** Total chapters known for the series; null on mirror-only rows. */
+	chapterCount: number | null;
+	/** Real upstream release time of the newest chapter — the feed's sort key AND the
+	 *  instant the card labels with, so order and label can never disagree. */
+	releasedAt: string;
+	/** When OUR scanner noticed; null on mirror-only rows. Tooltip only, never a sort key. */
+	detectedAt: string | null;
+	/** Aggregate user rating 0-10, or null when unrated. */
+	rating: number | null;
+	isNsfw: boolean;
+}
+
+/**
  * One Keiyoushi/Mihon extension as known to the Suwayomi engine — the admin
  * management view (installed or not). CATALOGUE.md §2 Tier-2.
  */
@@ -405,6 +439,30 @@ export interface Series {
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;
+	/**
+	 * Real newest-chapter time (ISO) — the "recently updated" clock.
+	 *
+	 * `updatedAt` is a METADATA touch that moves on every poll, so labelling a card
+	 * with it renders "0h" for a series whose last chapter shipped a week ago (the
+	 * server documents this on `Series.updated_at`). `latestChapterAt` only advances
+	 * when a new chapter is actually published upstream, so it is what feeds, cards
+	 * and the series header label and sort by.
+	 *
+	 * Optional: adapters that don't track chapter recency (Suwayomi/mock) omit it,
+	 * and the server sends an empty string when no dated chapter is cached — callers
+	 * fall back to `updatedAt`.
+	 */
+	latestChapterAt?: string;
+	/**
+	 * When OUR catalogue first detected the series' newest chapter — discovery
+	 * time, as distinct from the upstream publish time in `latestChapterAt`.
+	 *
+	 * Optional AND nullable: not every deployed server exposes it (see
+	 * `OPTIONAL_SERIES_FIELDS` in `@komika/api`, which drops it from the query
+	 * document against an older API), so treat its absence as "unknown" — never as
+	 * "just now", and never as a substitute for `latestChapterAt`.
+	 */
+	detectedAt?: string | null;
 	/**
 	 * Per-series view (chapter-read) counts — the popularity signal. Resolved lazily
 	 * server-side and selected only by the series-detail queries, so it's `undefined`

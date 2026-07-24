@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
@@ -10,48 +11,69 @@
 	import { FLAG, type Shelf } from '$lib/data/types';
 	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
+	import { images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
 	import { socialLive, loadSeriesSocial, saveSeriesRating } from '$lib/data/social-repo';
 
-	import type { SeriesView } from '$lib/data/source';
+	import type { SeriesResult } from '$lib/data/source';
 
 	let { data } = $props();
-	// Stream the series detail; the page shows a hero/chapter skeleton until it
-	// resolves. `data.series` never rejects — it resolves to { view, error }: a null
-	// view with error=false is a genuine not-found; error=true is a backend failure
-	// (outage) that gets an honest error state + retry instead of "not found".
-	let view = $state<SeriesView | null>(null);
-	let loading = $state(true);
-	let loadError = $state(false);
+
+	// `data.series` is a RESOLVED result on the server and on hydration, and a
+	// pending Promise on client-side navigations — see +page.ts. It never rejects:
+	// it resolves to { view, error }, where a null view with error=false is a genuine
+	// not-found and error=true is a backend outage (honest error state + retry).
+	//
+	// The resolved case MUST be a $derived, not an $effect: effects don't run during
+	// SSR, so filling `view` from one is exactly what made the edge serve — and cache
+	// — an empty hero/chapter skeleton for every shareable series link.
+	const settled = $derived(
+		data.series instanceof Promise ? undefined : (data.series as SeriesResult),
+	);
+	// Filled by the effect on client-side navigations only.
+	let streamed = $state<SeriesResult | undefined>(undefined);
 	$effect(() => {
-		loading = true;
-		view = null;
-		loadError = false;
+		const s = data.series;
+		streamed = undefined;
+		if (!(s instanceof Promise)) return;
 		// Guard against a slow A→B navigation letting A's response overwrite B
 		// (mirrors the social-load effect below).
 		let cancelled = false;
-		data.series.then((r) => {
-			if (cancelled) return;
-			view = r.view;
-			loadError = r.error;
-			loading = false;
+		s.then((r) => {
+			if (!cancelled) streamed = r;
 		});
 		return () => {
 			cancelled = true;
 		};
 	});
 
+	// A locally-refetched result (retry, or a translator switch) that supersedes
+	// `load`'s payload until the next navigation replaces it.
+	let override = $state<SeriesResult | undefined>(undefined);
+	$effect(() => {
+		data.series; // a new payload (navigation) discards any local override
+		untrack(() => (override = undefined));
+	});
+
+	let retrying = $state(false);
+	const result = $derived(override ?? settled ?? streamed);
+	const view = $derived(result?.view ?? null);
+	const loading = $derived(retrying || !result);
+	const loadError = $derived(result?.error ?? false);
+
 	async function retrySeries(): Promise<void> {
-		loading = true;
-		view = null;
-		loadError = false;
+		if (retrying) return;
+		retrying = true;
+		override = undefined;
 		// Pin the slug we're retrying so a mid-flight navigation can't be clobbered.
 		const slug = data.slug;
-		const r = await getSeries(slug);
-		if (data.slug !== slug) return;
-		view = r.view;
-		loadError = r.error;
-		loading = false;
+		try {
+			const r = await getSeries(slug);
+			if (data.slug !== slug) return;
+			override = r;
+		} finally {
+			retrying = false;
+		}
 	}
 
 	const detail = $derived(view?.detail);
@@ -96,9 +118,58 @@
 	let myBody = $state('');
 	let sort = $state<'newest' | 'oldest'>('newest');
 
+	// EVERY id-keyed action on this page (library mark, favourite, shelf, ratings,
+	// reviews, chapter links) goes through `detail.id` — which is the id the BACKEND
+	// resolved, not the one in the URL. Those differ for a work that has been merged
+	// away: the server follows `work_redirect` and answers with the survivor, so
+	// writes land on the live work instead of a retired row nothing will ever read.
 	const seriesId = $derived(detail?.id ?? '');
+	// Offline/mock storage key only — the live social path keys off `seriesId`
+	// above. Left on the URL slug so a locally-stored rating doesn't move out from
+	// under an offline reader; there is no server to merge works in that mode.
 	const socialKey = $derived(data.slug ?? page.params.slug ?? '');
 	const needsAuth = $derived(socialLive() && !auth.user);
+
+	// Heal the address bar when the id we asked for is not the id we got back.
+	//
+	// A shallow `replaceState`, deliberately:
+	//  • REPLACE, not push — Back must still return to wherever the reader came
+	//    from, not step through the retired URL they never chose to visit.
+	//  • SHALLOW (no `goto`) — `load` must NOT re-run. The rendered page is already
+	//    the right one; re-running it would repeat the whole multi-round-trip
+	//    resolution and, on a client-side navigation, flash the streaming skeleton
+	//    for what is a purely cosmetic URL correction.
+	// Nothing on the page depends on this landing — it only decides what the reader
+	// bookmarks or copies next. `healedId` (deliberately not `$state`) makes the
+	// effect idempotent: `replaceState` publishes a new `page` object, so a version
+	// that re-read `page.url` reactively would loop.
+	let healedId = '';
+	$effect(() => {
+		const id = detail?.id ?? '';
+		if (!id.startsWith('w_') || id === healedId) return;
+		healedId = id;
+		let cancelled = false;
+		// Deferred by one microtask: on a first (hydrating) load this effect flushes
+		// while SvelteKit is still finishing `_hydrate`, and shallow routing refuses
+		// to run before the router reports itself started — which it does one awaited
+		// microtask after mounting the root. Reading `location` rather than
+		// `page.url` also keeps the callback out of the effect's dependency graph, so
+		// the new `page` object `replaceState` publishes can't re-trigger it.
+		queueMicrotask(() => {
+			if (cancelled) return;
+			const want = `/series/${id}`;
+			if (location.pathname === want) return;
+			try {
+				replaceState(want + location.search + location.hash, page.state);
+			} catch (err) {
+				// Purely cosmetic — never break the page over it.
+				console.warn('[komiq] could not rewrite the URL to the resolved work id:', err);
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	// Reflect the backend's library state on load (resets when navigating series).
 	$effect(() => {
@@ -121,13 +192,27 @@
 			(totalCh > 0 && readCount >= totalCh ? 'completed' : readCount === 0 ? 'plan' : 'reading'),
 	);
 
+	// Library writes are optimistic, but a FAILED write now rolls back and says so.
+	// Previously the data layer returned the optimistic argument on error, so an
+	// expired token left the button reading "In Library" forever and the reader only
+	// discovered nothing had saved by reloading. `WriteResult.ok` makes the two
+	// distinguishable and `.value` is always the state to display.
+	let writeError = $state('');
+
 	async function toggleLibrary(): Promise<void> {
 		if (marking) return;
-		const next = !inLibrary;
+		const prev = inLibrary;
+		const next = !prev;
 		inLibrary = next; // optimistic
 		marking = true;
+		writeError = '';
 		try {
-			inLibrary = await setLibraryMark(seriesId, next);
+			const r = await setLibraryMark(seriesId, next, prev);
+			inLibrary = r.value;
+			if (!r.ok) {
+				writeError = r.error ?? '';
+				return;
+			}
 			// Removing from the library also drops its shelf/favourite server-side (the
 			// row is deleted) — reflect that so the controls don't show stale state.
 			if (!inLibrary) {
@@ -141,23 +226,46 @@
 
 	async function toggleFavorite(): Promise<void> {
 		if (favBusy) return;
-		const next = !isFavorite;
+		const prevFav = isFavorite;
+		const prevInLibrary = inLibrary;
+		const next = !prevFav;
 		isFavorite = next; // optimistic
 		if (next) inLibrary = true; // favouriting implies membership
 		favBusy = true;
+		writeError = '';
 		try {
-			isFavorite = await setFavorite(seriesId, next);
+			const r = await setFavorite(seriesId, next, prevFav);
+			isFavorite = r.value;
+			if (!r.ok) {
+				inLibrary = prevInLibrary; // the implied membership didn't happen either
+				writeError = r.error ?? '';
+			}
 		} finally {
 			favBusy = false;
 		}
 	}
 
+	// Guarded like the two above: without a busy flag a double-click fired two
+	// mutations whose completion order decided the stored shelf.
+	let statusBusy = $state(false);
 	async function chooseStatus(s: Shelf): Promise<void> {
+		if (statusBusy) return;
 		const prev = libStatus;
+		const prevInLibrary = inLibrary;
 		libStatus = s; // optimistic
 		inLibrary = true; // filing a shelf implies membership
-		const result = await setLibraryStatus(seriesId, s);
-		libStatus = result ?? prev;
+		statusBusy = true;
+		writeError = '';
+		try {
+			const r = await setLibraryStatus(seriesId, s, prev);
+			libStatus = r.value;
+			if (!r.ok) {
+				inLibrary = prevInLibrary;
+				writeError = r.error ?? '';
+			}
+		} finally {
+			statusBusy = false;
+		}
 	}
 
 	// Load ratings + reviews for this series (re-runs on navigation and sign-in).
@@ -235,8 +343,12 @@
 		setPreferredTranslator(workId, key);
 		switching = true;
 		try {
-			const r = await getSeries(data.slug);
-			if (r.view) view = r.view;
+			// Refetch by `workId`, NOT `data.slug`: after a `work_redirect` the two are
+			// different ids, and getSeries() re-reads the preference we just stored
+			// under `workId` — asking with the retired id would look up a preference
+			// that isn't there and silently ignore the reader's choice.
+			const r = await getSeries(workId);
+			if (r.view) override = r;
 		} finally {
 			switching = false;
 		}
@@ -332,7 +444,71 @@
 				? `You rated ${userRating} / 10 · tap a star to update`
 				: 'Tap a star to rate — out of 10',
 	);
+
+	// ---- link previews / SEO --------------------------------------------------
+	// The root layout emits site-wide defaults ("komiq" / "Read manga, together")
+	// and steps aside when a route declares `ownsMeta` in its `load` — otherwise
+	// both sets would end up in <head> and a crawler would read whichever came
+	// first. These are $derived (not effects) so they render during SSR, which is
+	// the only run a crawler or a chat link-unfurler ever sees.
+	const metaTitle = $derived(title ? `${title} · komiq` : 'komiq');
+	const metaDescription = $derived.by(() => {
+		const raw = (detail?.synopsis ?? '').replace(/\s+/g, ' ').trim();
+		if (!raw) {
+			return title
+				? `Read ${title} on komiq — chapters, ratings and discussion.`
+				: 'Read manga, together. Track your library, follow updates, and discuss chapters.';
+		}
+		return raw.length > 200 ? `${raw.slice(0, 197).trimEnd()}…` : raw;
+	});
+	// The cover goes through the SAME resolver the <img> uses, so the preview image
+	// is the proxied/cached absolute URL rather than an upstream host that blocks
+	// hotlinking. Falls back to the site card (what the layout would have emitted)
+	// when there's no cover to show — native has no sync resolver, and a not-found
+	// slug has no detail at all.
+	const metaCover = $derived(
+		detail?.cover && images.resolveCoverSync ? images.resolveCoverSync(detail.cover) : '',
+	);
+	const ogImage = $derived(metaCover || '/og-image.png');
+	// The page's canonical location: the id the BACKEND resolved (after any
+	// `work_redirect`), not necessarily the one in the URL. A crawler landing on a
+	// merged-away id never runs the client-side heal above, so without this the
+	// retired URL advertises ITSELF and two URLs compete as duplicates of one work.
+	const canonicalHref = $derived.by(() => {
+		const id = detail?.id;
+		if (!id || !id.startsWith('w_') || page.url.pathname === `/series/${id}`) return page.url.href;
+		const u = new URL(page.url);
+		u.pathname = `/series/${id}`;
+		return u.href;
+	});
 </script>
+
+<!--
+	`load` sets `ownsMeta: true` for this route, which makes the root layout stand
+	down from ALL its overridable head tags. So this block must emit a COMPLETE set
+	on every state, not just when `detail` is present: gating og:*/twitter:* on
+	`detail` left a not-found slug (a merged/renamed/deleted work — routine here,
+	the dedup queue folds works continuously) with og:site_name and nothing else,
+	because the layout had already stood down. Verified before the fix: GET
+	/series/<bad-slug> returned 0 og:title and 0 twitter:card tags, where the same
+	URL previously carried the full generic komiq card.
+
+	`metaTitle`/`metaDescription` already fall back to the site defaults, so the
+	no-detail case now reproduces exactly what the layout used to emit.
+-->
+<svelte:head>
+	<title>{metaTitle}</title>
+	<meta name="description" content={metaDescription} />
+	<meta property="og:type" content={detail ? 'book' : 'website'} />
+	<meta property="og:title" content={metaTitle} />
+	<meta property="og:description" content={metaDescription} />
+	<meta property="og:url" content={canonicalHref} />
+	<meta property="og:image" content={ogImage} />
+	<meta name="twitter:card" content="summary_large_image" />
+	<meta name="twitter:title" content={metaTitle} />
+	<meta name="twitter:description" content={metaDescription} />
+	<meta name="twitter:image" content={ogImage} />
+</svelte:head>
 
 {#if loading}
 	<!-- LOADING -->
@@ -382,7 +558,15 @@
 						<span class="fact"><Icon name="eye" size={15} />{viewsLabel} views</span>
 					{/if}
 					<span class="sep"></span>
-					<span class="fact">Updated {seriesDetail.updated}</span>
+					<!-- Chapter RELEASE time (the same clock the feed cards use), with our
+					     detection time on hover when the backend reports it. -->
+					<span
+						class="fact"
+						title={seriesDetail.detected
+							? `Newest chapter released ${seriesDetail.updated} · we detected it ${seriesDetail.detected}`
+							: `Newest chapter released ${seriesDetail.updated}`}
+						>Updated {seriesDetail.updated}</span
+					>
 				</div>
 				<div class="cta">
 					<a class="read" href={readHref}
@@ -399,7 +583,7 @@
 						<StatusMenu
 							status={effectiveShelf}
 							onchange={chooseStatus}
-							disabled={marking}
+							disabled={marking || statusBusy}
 							variant="button"
 						/>
 					{/if}
@@ -422,6 +606,12 @@
 						onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={18} /></button
 					>
 				</div>
+				{#if writeError}
+					<div class="write-error" role="alert">
+						<Icon name="alert" size={15} />
+						<span>{writeError}</span>
+					</div>
+				{/if}
 			</div>
 		</div>
 	</div>
@@ -433,6 +623,16 @@
 				<span class="gchip">{g}</span>
 			{/each}
 		</div>
+		{#if seriesDetail.altTitles.length}
+			<div class="alt-titles">
+				<span class="alt-label">Also known as</span>
+				<div class="alt-chips">
+					{#each seriesDetail.altTitles as t (t)}
+						<span class="alt-chip">{t}</span>
+					{/each}
+				</div>
+			</div>
+		{/if}
 		{#if descriptions.length > 1}
 			<div class="desc-lang">
 				<span class="desc-lang-label">Description language</span>
@@ -570,7 +770,10 @@
 							<span class="ch-name">{c.title}</span>
 							{#if c.isNew}<span class="new">NEW</span>{/if}
 						</div>
-						<div class="ch-date">{c.date}</div>
+						<!-- Multi-source works can carry a chapter no source we can date
+						     provides (S2 aggregation) — render nothing rather than an empty
+						     line among dated rows. -->
+						{#if c.date}<div class="ch-date">{c.date}</div>{/if}
 					</div>
 					{#if c.read}<span class="ch-read"
 							><Icon name="check" size={13} strokeWidth={2.4} />Read</span
@@ -941,6 +1144,20 @@
 		gap: 12px;
 		flex-wrap: wrap;
 	}
+	.write-error {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		margin-top: 12px;
+		padding: 9px 14px;
+		border-radius: 8px;
+		background: rgba(246, 183, 60, 0.1);
+		border: 1px solid rgba(246, 183, 60, 0.34);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 600;
+	}
 	.read {
 		height: 50px;
 		padding: 0 30px;
@@ -1048,6 +1265,31 @@
 		padding: 7px 15px;
 		border-radius: var(--k-radius-pill);
 		border: 1px solid var(--k-border-3);
+	}
+	.alt-titles {
+		display: flex;
+		flex-direction: column;
+		gap: 7px;
+	}
+	.alt-label {
+		font-size: 11.5px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+	}
+	.alt-chips {
+		display: flex;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+	.alt-chip {
+		font-size: 12.5px;
+		color: var(--k-text-muted);
+		padding: 5px 12px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-1);
 	}
 	.synopsis {
 		max-width: 820px;

@@ -1,32 +1,171 @@
 <script lang="ts">
 	import type { MergeCandidate } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
-	import { loadMergeQueue, resolveMergeCandidate } from '$lib/data';
+	import {
+		consolidateDuplicates,
+		loadMergeQueue,
+		MERGE_QUEUE_PAGE_SIZE,
+		resolveMergeCandidate,
+	} from '$lib/data';
 
+	// ---- server-side paging ----------------------------------------------------
+	// `mergeQueue` is paginated on the server (page/limit, `total` = the pending
+	// count). The backlog is ~10k rows, so only the current page is ever held here.
 	let queue = $state<MergeCandidate[]>([]);
+	let page = $state(1);
+	let hasNext = $state(false);
+	let total = $state<number | null>(null);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
 	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // candidate id currently being resolved
+	/**
+	 * Rows resolved since this page was fetched — the OFFSET DRIFT.
+	 *
+	 * `mergeQueue` is offset-paged (`OFFSET (page-1)*limit`, `ORDER BY score DESC`) over
+	 * a list that resolving a row REMOVES from. Resolve k rows on page p and every row
+	 * after them shifts k slots earlier, so k rows that were the head of page p+1 fall
+	 * back into page p's slot — and asking the server for p+1 steps straight over them.
+	 * With a ~10k backlog those candidates are then never seen again.
+	 *
+	 * The page/limit API can't express "offset 50p − k", so Next re-reads the CURRENT
+	 * page while this is non-zero: same 50-slot window, now holding the rows that
+	 * shifted in. It converges (the rows we resolved are gone from it) and it never
+	 * skips. A full drain is the special case where the shift is exactly one page, and
+	 * {@link settleAfterResolve} already re-reads the same page number for it.
+	 */
+	let resolvedOnPage = $state(0);
+
+	// ---- bulk consolidation (destructive: merge_works DELETEs the folded work) ----
+	// One batch of clusters per server call. The run is BOUNDED (never "loop until the
+	// server says zero"): an explicit confirm gates the first batch, MAX_BATCHES caps a
+	// single run, and Stop halts it between batches. Matching is by normalized alias —
+	// which includes alternative titles, not just the primary one — so a run can fold
+	// genuinely distinct entries; it stays attended by design.
+	const BATCH_SIZE = 200;
+	const MAX_BATCHES = 5;
+
+	let consolidating = $state(false);
+	let stopRequested = $state(false);
+	let consolidateMsg = $state<string | null>(null);
+	let batchesDone = $state(0);
+	let mergedTotal = $state(0);
+
+	function consolidateConfirmText(): string {
+		return (
+			`Consolidate duplicate works?\n\n` +
+			`This merges works whose NORMALIZED TITLE OR ALTERNATIVE TITLE collides — not ` +
+			`only exact primary-title matches. Each merge PERMANENTLY DELETES the folded ` +
+			`work; there is no undo.\n\n` +
+			`This run processes at most ${MAX_BATCHES} batches of ${BATCH_SIZE} clusters ` +
+			`(stop it any time). Review the result before running it again.`
+		);
+	}
+
+	async function consolidate(): Promise<void> {
+		if (consolidating) return;
+		if (!confirm(consolidateConfirmText())) return;
+		consolidating = true;
+		stopRequested = false;
+		batchesDone = 0;
+		mergedTotal = 0;
+		consolidateMsg = 'Starting…';
+		let stopped = false;
+		let exhausted = false;
+		try {
+			for (let i = 0; i < MAX_BATCHES; i++) {
+				if (stopRequested) {
+					stopped = true;
+					break;
+				}
+				const n = await consolidateDuplicates(BATCH_SIZE);
+				batchesDone += 1;
+				mergedTotal += n;
+				consolidateMsg = `Batch ${batchesDone}/${MAX_BATCHES} · merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'}…`;
+				if (n === 0) {
+					exhausted = true;
+					break;
+				}
+			}
+			const merged = `merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} in ${batchesDone} batch${batchesDone === 1 ? '' : 'es'}`;
+			consolidateMsg = stopped
+				? `Stopped — ${merged}.`
+				: exhausted
+					? mergedTotal === 0
+						? 'No duplicate clusters left to merge.'
+						: `Done — ${merged}; nothing left to merge.`
+					: `Batch limit reached — ${merged}. Run again to continue.`;
+		} catch (err) {
+			const why = err instanceof Error ? err.message : 'Consolidation failed.';
+			consolidateMsg = `${why} (merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} before failing.)`;
+		} finally {
+			consolidating = false;
+			stopRequested = false;
+		}
+		// Consolidation may have folded works referenced by pending review rows —
+		// pull the authoritative queue so stale/merged candidates drop out. Back to
+		// page 1: rows leaving anywhere in the backlog shift every page after them.
+		if (batchesDone > 0) await refresh(1);
+	}
 
 	// Auth redirect is centralized in +layout.svelte.
 
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh();
+		void refresh(1);
 	});
 
-	async function refresh(): Promise<void> {
+	async function refresh(p = page): Promise<void> {
 		loading = true;
 		loadError = null;
 		try {
-			queue = await loadMergeQueue();
+			let res = await loadMergeQueue(p);
+			// Landed past the end of a backlog that shrank under us (another admin, or a
+			// consolidation run). The server echoes the requested page rather than
+			// clamping, and the pager isn't rendered for an empty table — so without this
+			// the admin is stranded on "the queue is clear" beside a non-zero count, and
+			// Refresh just re-reads the same empty page. Jump to the real last page; one
+			// extra round-trip, bounded (the second read is not re-clamped).
+			if (res.items.length === 0 && res.page > 1 && (res.total ?? 0) > 0) {
+				const last = Math.max(1, Math.ceil((res.total ?? 1) / MERGE_QUEUE_PAGE_SIZE));
+				if (last < res.page) res = await loadMergeQueue(last);
+			}
+			queue = res.items;
+			page = res.page;
+			hasNext = res.hasNextPage;
+			total = res.total ?? null;
+			resolvedOnPage = 0;
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load the review queue.';
 			queue = [];
+			hasNext = false;
 		} finally {
 			loading = false;
 		}
+	}
+
+	/**
+	 * Step forward without stepping OVER anything — see {@link resolvedOnPage}. Once
+	 * this page has drifted, `page + 1` is the wrong window and `page` is the right one.
+	 */
+	function nextPage(): void {
+		void refresh(resolvedOnPage > 0 ? page : page + 1);
+	}
+
+	/** 1-based index of the first row on this page, within the whole backlog. */
+	const rangeStart = $derived(queue.length === 0 ? 0 : (page - 1) * MERGE_QUEUE_PAGE_SIZE + 1);
+	const rangeEnd = $derived((page - 1) * MERGE_QUEUE_PAGE_SIZE + queue.length);
+
+	/**
+	 * Rows are removed optimistically as they resolve, so a page can drain while the
+	 * backlog is still large. Re-pull rather than leave an empty table that reads as
+	 * "queue clear": the SAME page number is the right window, because a full drain
+	 * shifts the backlog by exactly one page and the server backfills this slot from
+	 * what used to be the next one. Resolving the last row on the LAST page reads as
+	 * empty, and `refresh()`'s past-the-end clamp walks it back.
+	 */
+	async function settleAfterResolve(): Promise<void> {
+		if (queue.length === 0 && total != null && total > 0) await refresh(page);
 	}
 
 	function fmtDate(iso: string): string {
@@ -51,17 +190,25 @@
 		busy = c.id;
 		actionError = null;
 		try {
-			const closed = await resolveMergeCandidate(c.id, accept);
-			if (closed) {
-				queue = queue.filter((x) => x.id !== c.id);
-			} else {
-				// Another admin already resolved this candidate — don't fake a local
-				// removal; surface it and pull the authoritative queue.
-				actionError = 'Already resolved by another admin — refreshing…';
-				await refresh();
-			}
+			// The resolver has no "already resolved" SUCCESS value — every exit path is
+			// either an error or a true. So a concurrent resolve arrives as a throw, and
+			// the stale-row cleanup has to live in the catch below.
+			await resolveMergeCandidate(c.id, accept);
+			queue = queue.filter((x) => x.id !== c.id);
+			resolvedOnPage += 1;
+			if (total != null && total > 0) total -= 1;
+			await settleAfterResolve();
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Action failed.';
+			const why = err instanceof Error ? err.message : 'Action failed.';
+			// "already resolved" / "no such candidate" => the row is a phantom another
+			// admin (or a consolidation run) already closed. Drop it and re-pull the
+			// authoritative queue instead of leaving it there to be clicked again.
+			const stale = /already resolved|no such merge candidate|not found/i.test(why);
+			actionError = stale ? `${why} Refreshing the queue…` : why;
+			if (stale) {
+				await refresh();
+				await settleAfterResolve();
+			}
 		} finally {
 			busy = null;
 		}
@@ -73,11 +220,33 @@
 		<div>
 			<h1>Dedup review</h1>
 			<p class="lede">
-				{queue.length} pending match{queue.length === 1 ? '' : 'es'} · confirm a merge into the canonical
-				work, or keep the series as a distinct entry
+				{total ?? queue.length}{total == null && hasNext ? '+' : ''} pending match{(total ??
+					queue.length) === 1
+					? ''
+					: 'es'} · confirm a merge into the canonical work, or keep the series as a distinct entry
 			</p>
 		</div>
-		<button class="pg" disabled={loading} onclick={() => refresh()}>Refresh</button>
+		<div class="head-actions">
+			{#if consolidateMsg}<span class="cmsg">{consolidateMsg}</span>{/if}
+			{#if consolidating}
+				<button class="pg stop" disabled={stopRequested} onclick={() => (stopRequested = true)}>
+					{stopRequested ? 'Stopping after this batch…' : 'Stop'}
+				</button>
+			{/if}
+			<button
+				class="pg"
+				disabled={consolidating}
+				onclick={() => consolidate()}
+				title="Merge works whose normalized title OR alternative title collides — destructive, deletes the folded work. Runs at most {MAX_BATCHES} batches of {BATCH_SIZE} clusters."
+			>
+				{consolidating
+					? `Consolidating… (batch ${batchesDone + 1}/${MAX_BATCHES})`
+					: 'Consolidate duplicates…'}
+			</button>
+			<button class="pg" disabled={loading || consolidating} onclick={() => refresh()}
+				>Refresh</button
+			>
+		</div>
 	</div>
 
 	{#if loadError}
@@ -123,6 +292,24 @@
 				</div>
 			{/each}
 		</div>
+		{#if page > 1 || hasNext}
+			<div class="pager">
+				<button class="pg" disabled={page <= 1 || loading} onclick={() => refresh(page - 1)}>
+					Prev
+				</button>
+				<span class="page-num">
+					Page {page} · showing {rangeStart}–{rangeEnd}{total != null ? ` of ${total}` : ''}
+					{#if resolvedOnPage > 0}
+						· <span
+							class="drift"
+							title="Resolving a row removes it from the server's ordered backlog, so the rows behind it shift into this page's slot. Next re-reads this page instead of advancing, otherwise those candidates would be skipped."
+							>{resolvedOnPage} resolved here — Next re-reads this page</span
+						>
+					{/if}
+				</span>
+				<button class="pg" disabled={!hasNext || loading} onclick={nextPage}> Next </button>
+			</div>
+		{/if}
 	{/if}
 </div>
 
@@ -258,6 +445,15 @@
 		opacity: 0.5;
 		cursor: default;
 	}
+	.head-actions {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.cmsg {
+		font-size: 12.5px;
+		color: var(--k-text-dim);
+	}
 	.pg {
 		height: 36px;
 		padding: 0 16px;
@@ -273,5 +469,24 @@
 	.pg:disabled {
 		opacity: 0.4;
 		cursor: default;
+	}
+	.pg.stop {
+		border-color: rgba(224, 131, 105, 0.5);
+		color: var(--k-accent);
+	}
+	.pager {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 16px;
+	}
+	.page-num {
+		font-size: 13px;
+		color: var(--k-text-dim);
+	}
+	.drift {
+		color: var(--k-hiatus);
+		border-bottom: 1px dotted var(--k-border-4);
+		cursor: help;
 	}
 </style>

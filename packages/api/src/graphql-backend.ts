@@ -5,6 +5,7 @@ import type {
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
+	ComicType,
 	Comment,
 	CommentVote,
 	Notification,
@@ -29,6 +30,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -71,7 +73,80 @@ export class GraphQLBackend implements Backend {
 		this.config = { ...this.config, token };
 	}
 
-	private async gql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
+	/**
+	 * Optional fields (see {@link ops.OPTIONAL_SERIES_FIELDS}) this API has told us
+	 * it doesn't know. Process-wide: the reader and the API deploy separately, so a
+	 * client shipped first must not break — and once one document is rejected every
+	 * document that shares the fragment would be too.
+	 */
+	private static readonly unsupportedFields = new Set<string>();
+
+	/**
+	 * Optional ARGUMENTS (see {@link ops.OPTIONAL_ARGUMENTS}) this API has told us it
+	 * doesn't know. Same lifetime and rationale as {@link unsupportedFields}.
+	 */
+	private static readonly unsupportedArgs = new Set<string>();
+
+	/**
+	 * Drop already-known-unsupported field selections (one per line by construction)
+	 * and optional arguments (both the `$name: Type` declaration and the `name: $name`
+	 * use, wherever they sit — the leftover whitespace/comma is an ignored token in
+	 * GraphQL, so the document stays valid).
+	 *
+	 * This rewrites a GraphQL document with regexes, so it is deliberately CONSERVATIVE:
+	 * it can only ever produce a document that still parses, or the ORIGINAL document.
+	 * Two shapes would otherwise be left syntactically invalid, and both are guarded:
+	 *
+	 *  - removing the last argument leaves an empty `()`, which is a syntax error
+	 *    (`ArgumentsDefinition`/`VariableDefinitions` must be non-empty). Collapsed
+	 *    below. Trailing/duplicated commas need no handling — commas are ignored
+	 *    tokens in GraphQL, so `foo(page: $page, )` is valid as-is. A variable's
+	 *    DEFAULT VALUE does have to go with it: commas being ignored, an orphaned
+	 *    `= false` silently re-binds to the PRECEDING variable definition
+	 *    (`$page: Int, $x: Boolean = false` -> `$page: Int = false`, which parses).
+	 *    Only scalar/enum defaults are matched; a list/object default is left alone
+	 *    and caught by the bail-out below only if it also empties a selection set, so
+	 *    keep optional arguments default-less (none in `operations.ts` use one).
+	 *  - removing the last selection in a set leaves `{ }`, which is a syntax error and
+	 *    CANNOT be repaired locally (the parent field would have to go too). If the
+	 *    strip introduces one, we bail and return the original: the request then fails
+	 *    with the server's real `Unknown field` error instead of a baffling syntax
+	 *    error, which is the honest outcome.
+	 */
+	private stripUnsupported(query: string): string {
+		if (GraphQLBackend.unsupportedFields.size === 0 && GraphQLBackend.unsupportedArgs.size === 0)
+			return query;
+		let out = query;
+		for (const field of GraphQLBackend.unsupportedFields) {
+			out = out.replace(new RegExp(`^[\\t ]*${field}[\\t ]*\\r?\\n`, 'gm'), '');
+		}
+		for (const arg of GraphQLBackend.unsupportedArgs) {
+			out = out
+				.replace(new RegExp(`\\b${arg}\\s*:\\s*\\$${arg}\\b`, 'g'), '')
+				.replace(
+					new RegExp(
+						`\\$${arg}\\s*:\\s*\\[?[A-Za-z_][A-Za-z0-9_]*!?\\]?!?` +
+							`(?:\\s*=\\s*(?:-?\\d+(?:\\.\\d+)?|"(?:[^"\\\\]|\\\\.)*"|[A-Za-z_][A-Za-z0-9_]*))?`,
+						'g',
+					),
+					'',
+				);
+		}
+		// `(` + nothing but ignored tokens + `)` — never valid, so dropping it is always
+		// an improvement (`query Q()` -> `query Q`, `field()` -> `field`).
+		if (GraphQLBackend.unsupportedArgs.size > 0) out = out.replace(/\(\s*(?:,\s*)*\)/g, '');
+		// Emptied a selection set? Only count sets the strip CREATED, so a legitimately
+		// empty object value in the source document (`input: {}`) can't disable this.
+		const emptySets = (s: string) => (s.match(/\{\s*\}/g) ?? []).length;
+		if (emptySets(out) > emptySets(query)) return query;
+		return out;
+	}
+
+	private async gql<T>(
+		query: string,
+		variables?: Record<string, unknown>,
+		retried = false,
+	): Promise<T> {
 		const doFetch = this.config.fetch ?? fetch;
 		const res = await doFetch(this.config.endpoint, {
 			method: 'POST',
@@ -79,11 +154,38 @@ export class GraphQLBackend implements Backend {
 				'content-type': 'application/json',
 				...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
 			},
-			body: JSON.stringify({ query, variables }),
+			body: JSON.stringify({ query: this.stripUnsupported(query), variables }),
 		});
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
-		if (json.errors?.length) throw new Error(json.errors.map((e) => e.message).join('; '));
+		if (json.errors?.length) {
+			const messages = json.errors.map((e) => e.message);
+			// An unknown field fails the WHOLE document, so a server that predates an
+			// opportunistic field would otherwise take down every screen. Remember it,
+			// strip it, retry once — the mapped type declares those fields optional and
+			// callers already fall back.
+			// An unknown ARGUMENT (`includeNsfw`) is a different validation error but the
+			// same failure mode, so it gets the same treatment. Both are collected in one
+			// pass: validation reports every error at once, and there is only one retry.
+			if (!retried) {
+				const dropped = ops.OPTIONAL_SERIES_FIELDS.filter(
+					(f) =>
+						!GraphQLBackend.unsupportedFields.has(f) &&
+						messages.some((m) => m.includes(`Unknown field "${f}"`)),
+				);
+				const droppedArgs = ops.OPTIONAL_ARGUMENTS.filter(
+					(a) =>
+						!GraphQLBackend.unsupportedArgs.has(a) &&
+						messages.some((m) => m.includes(`Unknown argument "${a}"`)),
+				);
+				if (dropped.length || droppedArgs.length) {
+					for (const f of dropped) GraphQLBackend.unsupportedFields.add(f);
+					for (const a of droppedArgs) GraphQLBackend.unsupportedArgs.add(a);
+					return this.gql<T>(query, variables, true);
+				}
+			}
+			throw new Error(messages.join('; '));
+		}
 		if (json.data == null) throw new Error('Backend returned no data');
 		return json.data;
 	}
@@ -114,13 +216,19 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page });
 		return d.updates;
 	}
-	async search(query: string, page = 1, filters?: SearchFilters): Promise<Paginated<Series>> {
+	async search(
+		query: string,
+		page = 1,
+		filters?: SearchFilters,
+		includeNsfw?: boolean,
+	): Promise<Paginated<Series>> {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, {
 			query,
 			page,
 			genres: filters?.genres && filters.genres.length ? filters.genres : undefined,
 			minRating: filters?.minRating,
 			maxRating: filters?.maxRating,
+			includeNsfw,
 		});
 		return d.search;
 	}
@@ -293,6 +401,30 @@ export class GraphQLBackend implements Backend {
 		return d.updateSeriesMetadata;
 	}
 
+	async addSeriesAltTitle(id: Id, title: string): Promise<Series> {
+		const d = await this.gql<{ addSeriesAltTitle: Series }>(ops.ADD_SERIES_ALT_TITLE, {
+			id,
+			title,
+		});
+		return d.addSeriesAltTitle;
+	}
+
+	async removeSeriesAltTitle(id: Id, title: string): Promise<Series> {
+		const d = await this.gql<{ removeSeriesAltTitle: Series }>(ops.REMOVE_SERIES_ALT_TITLE, {
+			id,
+			title,
+		});
+		return d.removeSeriesAltTitle;
+	}
+
+	async consolidateExactDuplicates(limit?: number): Promise<number> {
+		const d = await this.gql<{ consolidateExactDuplicates: number }>(
+			ops.CONSOLIDATE_EXACT_DUPLICATES,
+			{ limit },
+		);
+		return d.consolidateExactDuplicates;
+	}
+
 	async workChaptersAdmin(workId: Id): Promise<AdminChapter[]> {
 		const d = await this.gql<{ workChaptersAdmin: AdminChapter[] }>(ops.WORK_CHAPTERS_ADMIN, {
 			workId,
@@ -333,8 +465,11 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- admin dedup review ---
-	async mergeQueue(): Promise<MergeCandidate[]> {
-		const d = await this.gql<{ mergeQueue: MergeCandidate[] }>(ops.MERGE_QUEUE);
+	async mergeQueue(page = 1, limit?: number): Promise<Paginated<MergeCandidate>> {
+		const d = await this.gql<{ mergeQueue: Paginated<MergeCandidate> }>(ops.MERGE_QUEUE, {
+			page,
+			limit,
+		});
 		return d.mergeQueue;
 	}
 
@@ -566,11 +701,20 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- canonical catalogue ---
-	async canonicalUpdates(page = 1): Promise<CanonicalUpdate[]> {
+	async canonicalUpdates(page = 1, includeNsfw?: boolean): Promise<CanonicalUpdate[]> {
 		const d = await this.gql<{ canonicalUpdates: CanonicalUpdate[] }>(ops.CANONICAL_UPDATES, {
 			page,
+			includeNsfw,
 		});
 		return d.canonicalUpdates;
+	}
+
+	async updatesFeed(page = 1, type?: ComicType): Promise<Paginated<UpdateFeedRow>> {
+		const d = await this.gql<{ updatesFeed: Paginated<UpdateFeedRow> }>(ops.UPDATES_FEED, {
+			page,
+			type,
+		});
+		return d.updatesFeed;
 	}
 
 	// --- canonical reader path ---

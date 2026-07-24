@@ -2,7 +2,7 @@
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
-	import { slug } from '$lib/data/types';
+	import { slug, cardSub, cardTimeTooltip as timeTooltip } from '$lib/data/types';
 	import type { FeaturedView } from '$lib/data/source';
 
 	let { data } = $props();
@@ -15,9 +15,6 @@
 	let heroIndex = $state(0);
 	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
 	let heroPicked = $state(false);
-	// Featured slides, populated once the home feeds resolve. Kept as its own
-	// state so the auto-rotate effect can depend on its length.
-	let featured = $state<FeaturedView[]>([]);
 
 	function pickHero(i: number): void {
 		heroIndex = i;
@@ -28,16 +25,32 @@
 		return `/series/${f.id ?? slug(f.title)}`;
 	}
 
-	// Mirror the resolved featured list into local state (drives the hero +
-	// auto-rotate). `data.home` never rejects (empty results on error); an empty
-	// featured list keeps the placeholder hero (same look as the loading hero).
+	// The hero slides. This is a $derived, NOT an $effect: effects don't run during
+	// SSR, so populating `featured` from one left the edge-rendered HTML with no
+	// cover, no title and no CTA — the single most prominent thing on the page was
+	// blank in the server response (and in the s-maxage cache behind it), even
+	// though the data was right there in `data.home`.
+	//
+	// `data.home` is a resolved object on the server and on hydration, and a pending
+	// Promise on client-side navigations (see +page.ts); the promise arm still needs
+	// an effect, but only that arm.
+	const settled = $derived(data.home instanceof Promise ? undefined : (data.home as HomeData));
+	let streamed = $state<HomeData | undefined>(undefined);
 	$effect(() => {
-		// `data.home` is a Promise on the client and a resolved object on the server;
-		// `Promise.resolve` normalises both so the hero fills in either case.
-		Promise.resolve(data.home).then((h) => {
-			featured = h.featured;
+		const h = data.home;
+		streamed = undefined;
+		if (!(h instanceof Promise)) return;
+		let cancelled = false;
+		h.then((r) => {
+			if (!cancelled) streamed = r;
 		});
+		return () => {
+			cancelled = true;
+		};
 	});
+	// `data.home` never rejects (empty feeds on error); an empty featured list keeps
+	// the placeholder hero (same look as the loading hero).
+	const featured = $derived<FeaturedView[]>((settled ?? streamed)?.featured ?? []);
 
 	// Auto-rotate the hero, unless the user prefers reduced motion.
 	$effect(() => {
@@ -145,7 +158,8 @@
 					{#each home.latestUpdates as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
-							sub={item.ch ? `${item.ch} · ${item.time}` : item.time}
+							sub={cardSub(item)}
+							subTitle={timeTooltip(item)}
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
@@ -164,7 +178,8 @@
 					{#each home.trending as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
-							sub={item.ch ? `${item.ch} · ${item.time}` : item.time}
+							sub={cardSub(item)}
+							subTitle={timeTooltip(item)}
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
@@ -183,7 +198,7 @@
 					{#each home.latestAdded as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
-							sub={`${item.ch} · Added ${item.time}`}
+							sub={cardSub(item, 'Added ')}
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}

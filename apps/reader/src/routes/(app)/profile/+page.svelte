@@ -1,13 +1,12 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
+	import Cover from '$lib/components/Cover.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import { slug } from '$lib/data/types';
 	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
 	import { auth, revalidateSession } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
-
-	let { data } = $props();
 
 	// NSFW visibility preference (CATALOGUE.md §2). Reflects the signed-in user's
 	// server-side setting; the toggle persists via `setShowNsfw` and updates auth.
@@ -27,18 +26,21 @@
 			savingNsfw = false;
 		}
 	}
-	// Re-fetch once auth has restored the session token onto the backend — the
-	// initial `load` can race ahead of `initAuth`, so without this the signed-in
-	// user's real profile wouldn't resolve on first paint. Falls back to the load
-	// result (null when signed out / backend off) until then.
+	// The profile is fetched HERE, once, and only once auth is ready.
+	//
+	// There used to be a `+page.ts` that awaited `getProfile()` as well, so every
+	// visit pulled the entire payload (session + library + progress + activity)
+	// twice: the `load` copy raced ahead of `initAuth`, went out with no token and
+	// resolved to null for a signed-in user, and the effect below immediately
+	// refetched the real one. Deleting that load removes a full duplicate round trip
+	// per visit and costs nothing — its result was always discarded.
 	let liveProfile = $state<ProfileView | null>(null);
-	const profile = $derived(liveProfile ?? data.profile);
+	const profile = $derived(liveProfile);
 	// Signed-out is decided by AUTH — the source of truth — not by `profile` being
-	// null. The `load` runs before `initAuth` restores the token, so `getProfile()`
-	// there returns null for a signed-in user until the effect re-fetches; keying
-	// the CTA off `profile` would flash (or, on a hiccup, stick on) "Sign in" for
-	// someone who is actually signed in. A signed-in user only ever sees the profile
-	// or the loading skeleton.
+	// null: a signed-in viewer has no profile yet while the fetch is in flight, and
+	// keying the CTA off `profile` would flash (or, on a hiccup, stick on) "Sign in"
+	// for someone who is actually signed in. A signed-in user only ever sees the
+	// profile or the loading skeleton.
 	const signedOut = $derived(auth.ready && !auth.user);
 	// `profileLoaded` distinguishes "fetch still in flight" from "fetch settled on
 	// null" — without it, a signed-in user whose `getProfile()` resolves null (an
@@ -291,7 +293,9 @@
 					{#each profile.reading as r (r.id ?? r.title)}
 						{@const pct = Math.round((r.ch / r.total) * 100)}
 						<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
-							<div class="mini-cover k-cover"></div>
+							<div class="mini-cover k-cover">
+								<Cover src={r.cover} alt={r.title} loading="lazy" />
+							</div>
 							<div class="reading-info">
 								<div class="reading-top">
 									<span class="reading-title">{r.title}</span>
@@ -317,6 +321,7 @@
 					{#each shelfItems as item (item.id ?? item.title + item.shelf)}
 						<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
 							<div class="cover k-cover">
+								<Cover src={item.cover} alt={item.title} loading="lazy" />
 								<span class="rating"
 									><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
 								>
@@ -379,7 +384,10 @@
 							<div class="act-icon" style="background:{a.iconBg}">{a.icon}</div>
 							<div class="act-body">
 								<div class="act-text">{a.text}</div>
-								<div class="act-time">{a.time}</div>
+								<!-- Omitted when the event carries no usable timestamp: relTimeAgo()
+								     returns '' there rather than claiming "just now", and an empty
+								     line would leave a stray 3px gap under the text. -->
+								{#if a.time}<div class="act-time">{a.time}</div>{/if}
 							</div>
 						</div>
 					{/each}
@@ -771,6 +779,7 @@
 		background: rgba(255, 255, 255, 0.035);
 	}
 	.mini-cover {
+		position: relative;
 		flex: 0 0 auto;
 		width: 48px;
 		height: 68px;

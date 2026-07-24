@@ -60,6 +60,13 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
             MAX_SOURCE_BYTES / (1024 * 1024)
         );
     }
+    // Truncation gate, BEFORE the decode. `zune-jpeg` returns `Ok` for a JPEG that was
+    // cut off mid-scan and fills the missing rows with a flat decoder value, so a
+    // partial download would otherwise be re-encoded and frozen into the cache behind a
+    // one-year immutable TTL. `decode_limited` calls this too; the explicit call here
+    // keeps the failure attributable to the cover pipeline (and to
+    // `classify_cover_error`'s `truncated` reason) for every `process_cover` caller.
+    crate::avatar::ensure_complete(bytes)?;
     let img = decode_limited(bytes)?;
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -230,9 +237,17 @@ struct PendingCover {
 pub async fn pending_cover_count(pool: &SqlitePool) -> Result<i64> {
     // Uncached works we can materialize a cover for: a MangaDex-anchored work with a
     // cover file name, OR a Suwayomi-anchored work (cover comes from its thumbnail).
+    //
+    // The `work_cover_issue` exclusion mirrors BOTH crawl SELECTs (see
+    // `crawl_uncached_covers`' `BASE` and `SUW_BASE`). Without it this counted works the
+    // crawl will never select: measured live, 27 "pending" against 1 actually selectable,
+    // because 26 works carry a recorded issue. That made the drainer's `Ok(0) => nothing
+    // to do` short-circuit unreachable — it launched a full crawl pass every 300 s to
+    // process a single row — and overstated the operator-facing backlog by 27x.
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work w \
-         WHERE w.cover_cached_version IS NULL AND ( \
+         WHERE w.cover_cached_version IS NULL \
+           AND w.id NOT IN (SELECT work_id FROM work_cover_issue) AND ( \
              (w.cover_file_name IS NOT NULL \
               AND EXISTS (SELECT 1 FROM source_series ss \
                           WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')) \
@@ -250,6 +265,9 @@ pub fn classify_cover_error(err: &anyhow::Error) -> &'static str {
     let s = err.to_string().to_ascii_lowercase();
     if s.contains("source too large") {
         "too_large"
+    } else if s.contains("truncated") {
+        // A partial download, not a property of the source — see `is_transient`.
+        "truncated"
     } else if s.contains("unsupported") || s.contains("corrupt") || s.contains("zero dimension") {
         "unsupported"
     } else if s.contains("empty") {
@@ -257,6 +275,17 @@ pub fn classify_cover_error(err: &anyhow::Error) -> &'static str {
     } else {
         "encode"
     }
+}
+
+/// Whether a `process_cover` failure is TRANSIENT — i.e. re-fetching the same work later
+/// could plausibly succeed, so it must NOT be written to `work_cover_issue` (which
+/// permanently excludes the work from every crawl SELECT).
+///
+/// `truncated` is the case that matters: the source image is fine, the *download* was
+/// cut short. Recording it would turn one flaky CDN response into a permanently
+/// coverless work — exactly the failure mode this whole change set exists to remove.
+pub fn is_transient_cover_error(err: &anyhow::Error) -> bool {
+    classify_cover_error(err) == "truncated"
 }
 
 /// Record (or refresh) a cover-processing failure so the crawl stops re-attempting
@@ -330,9 +359,16 @@ pub async fn retry_one_cover(
     }
     if source_bytes.is_none() {
         // Fall back to the Suwayomi thumbnail anchor.
+        // The cast is on `ss.source_key` (TEXT, no usable index for this join), NOT on
+        // `s.id`. Casting the INDEXED side — `CAST(s.id AS TEXT)` — hides
+        // `suwayomi_series`' INTEGER PRIMARY KEY from the planner, which then has no
+        // choice but `SCAN s` across all 13,802 rows for every call. Same fix and same
+        // reasoning as `catalog::work_effective_genres`. Measured on a copy of
+        // production: 2.00 ms -> 0.01 ms, and 5.99 ms -> 0.01 ms once 0058 drops
+        // `idx_suwayomi_series_library` and the fallback scan target widens.
         let thumb = sqlx::query_scalar::<_, Option<String>>(
             "SELECT s.thumbnail_url FROM source_series ss \
-             JOIN suwayomi_series s ON CAST(s.id AS TEXT) = ss.source_key \
+             JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
              WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' \
              ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
         )
@@ -359,7 +395,10 @@ pub async fn retry_one_cover(
             Ok(true)
         }
         Ok(Err(e)) => {
-            record_cover_issue(main, work_id, classify_cover_error(&e), &e.to_string()).await;
+            // A truncated download is transient — don't freeze it into work_cover_issue.
+            if !is_transient_cover_error(&e) {
+                record_cover_issue(main, work_id, classify_cover_error(&e), &e.to_string()).await;
+            }
             Err(anyhow!("cover processing failed: {e}"))
         }
         // A spawn_blocking JoinError (panic) is not necessarily deterministic — surface
@@ -454,13 +493,16 @@ pub async fn crawl_uncached_covers(
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
-                    record_cover_issue(
-                        main,
-                        &job.work_id,
-                        classify_cover_error(&e),
-                        &e.to_string(),
-                    )
-                    .await;
+                    // …unless it's a truncated download, which a later tick may fetch whole.
+                    if !is_transient_cover_error(&e) {
+                        record_cover_issue(
+                            main,
+                            &job.work_id,
+                            classify_cover_error(&e),
+                            &e.to_string(),
+                        )
+                        .await;
+                    }
                 }
             },
             // Upstream fetch failure is TRANSIENT (rate limit / network) — do NOT
@@ -479,9 +521,19 @@ pub async fn crawl_uncached_covers(
     // serve from our own `/covers/{work_id}.webp` (immutable, CDN-cacheable) instead
     // of a live proxy to the Suwayomi engine on every request. Deterministic anchor:
     // the oldest suwayomi source_series (matches the reader's source pick).
+    //
+    // The thumbnail lookup is a CORRELATED scalar subquery — it runs once per candidate
+    // work — so the join direction matters far more here than in `retry_one_cover`. The
+    // cast goes on `ss.source_key` (TEXT, unindexed for this join), never on `s.id`:
+    // `CAST(s.id AS TEXT)` hides the INTEGER PRIMARY KEY and forces `SCAN s` over all
+    // 13,802 `suwayomi_series` rows PER WORK. Harmless today (the crawl is drained to a
+    // single pending work) but quadratic on a fresh seed or after a
+    // `cover_cached_version` bump invalidates the ~13.8k Suwayomi-anchored works: ~6 ms
+    // x 13.8k = ~80 s of pure scan before a single byte is fetched. Post-fix the plan is
+    // `SEARCH s USING INTEGER PRIMARY KEY (rowid=?)`.
     const SUW_BASE: &str = "SELECT w.id, \
                 (SELECT s.thumbnail_url FROM source_series ss \
-                 JOIN suwayomi_series s ON CAST(s.id AS TEXT) = ss.source_key \
+                 JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
                  WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
          FROM work w \
@@ -520,7 +572,13 @@ pub async fn crawl_uncached_covers(
     // Suwayomi engine or contending hard with the DB writer during a seed. Each item
     // yields (saved, failed) which we sum after the stream drains.
     use futures::StreamExt as _;
-    const SUW_CRAWL_CONCURRENCY: usize = 5;
+    // Bounded to the background share of the shared cover-fetch pool
+    // (`suwayomi::COVER_FETCH_CONCURRENCY`), so this crawl can never occupy enough
+    // permits to make an on-demand `<img>` request fail fast. Was a private 5, which is
+    // what the headroom arithmetic is computed against — the semaphore alone does not
+    // give on-demand requests headroom, only a cap on the background holders' share does
+    // (they wait patiently, on-demand does not queue at all).
+    const SUW_CRAWL_CONCURRENCY: usize = crate::suwayomi::WARM_COVER_CONCURRENCY;
     let (suw_saved, suw_failed) = futures::stream::iter(suw_jobs)
         .map(|(work_id, thumb)| async move {
             let bytes = match suwayomi.cover_bytes(Some(&thumb)).await {
@@ -545,7 +603,9 @@ pub async fn crawl_uncached_covers(
                 // Deterministic — record so we stop re-attempting an unprocessable source.
                 Ok(Err(e)) => {
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
-                    record_cover_issue(main, &work_id, classify_cover_error(&e), &e.to_string()).await;
+                    if !is_transient_cover_error(&e) {
+                        record_cover_issue(main, &work_id, classify_cover_error(&e), &e.to_string()).await;
+                    }
                     (0, 1)
                 }
                 Err(e) => {
@@ -567,6 +627,216 @@ pub async fn crawl_uncached_covers(
     );
 }
 
+/// Cursor value meaning "start from the newest id". See [`warm_suwayomi_covers`].
+pub const WARM_CURSOR_START: i64 = i64::MAX;
+
+/// The manga-id set that already has a `suwayomi_cover_blob` row.
+///
+/// NOTE this is NOT the same as "rows in the table": `serve_suwayomi_cover` caches a
+/// blob for ANY manga id the browser asks for, including Browse results that were never
+/// enrolled into `suwayomi_series`. So the table is a superset of the candidate set and
+/// `COUNT(*)` on it is not a coverage figure — see [`pending_suwayomi_cover_count`].
+async fn cached_suwayomi_cover_ids(covers: &SqlitePool) -> Result<std::collections::HashSet<i64>> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT manga_id FROM suwayomi_cover_blob")
+            .fetch_all(covers)
+            .await?
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// Cached series that have a usable thumbnail, newest id first, restricted to
+/// `id < before_id` (the warmer's rotating window; [`WARM_CURSOR_START`] = no restriction).
+async fn thumbnailed_series_ids(main: &SqlitePool, before_id: i64) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM suwayomi_series \
+         WHERE thumbnail_url IS NOT NULL AND thumbnail_url <> '' AND id < ? \
+         ORDER BY id DESC",
+    )
+    .bind(before_id)
+    .fetch_all(main)
+    .await?)
+}
+
+/// Suwayomi manga ids below `before_id` that still have NO row in `suwayomi_cover_blob`,
+/// newest-first, capped at `limit`.
+///
+/// `suwayomi_series` lives in the main (replicated) DB and `suwayomi_cover_blob` in the
+/// separate covers DB, so SQLite cannot join them — the "LEFT JOIN" is done in memory:
+/// pull the cached id set (a few i64 per row, ~110 KB at full coverage) and difference
+/// it against the candidate list. Both queries are index-only-ish scans of small tables.
+///
+/// Ordering is by id DESC so a fresh deploy warms the most recently added series first
+/// (those are what the "Latest updates" / discovery feeds surface). `before_id` is what
+/// makes successive ticks make progress even when the newest batch *fails* — see
+/// [`warm_suwayomi_covers`].
+async fn uncached_suwayomi_cover_ids(
+    main: &SqlitePool,
+    covers: &SqlitePool,
+    limit: i64,
+    before_id: i64,
+) -> Result<Vec<i64>> {
+    let cached = cached_suwayomi_cover_ids(covers).await?;
+    Ok(thumbnailed_series_ids(main, before_id)
+        .await?
+        .into_iter()
+        .filter(|id| !cached.contains(id))
+        .take(limit.max(0) as usize)
+        .collect())
+}
+
+/// How many Suwayomi source covers are still un-warmed. Coverage gauge for the drainer's
+/// "nothing to do" short-circuit and for logging.
+///
+/// This is the SET DIFFERENCE, not `series - COUNT(*)`. The subtraction is wrong because
+/// `suwayomi_cover_blob` also holds blobs for manga that are not in `suwayomi_series` at
+/// all (every Browse cover the request path materializes, see
+/// [`cached_suwayomi_cover_ids`] — a live audit found 78 such rows). Those inflate the
+/// cached count, understate the gap, and once they outnumber the real gap this reports 0
+/// and the drainer concludes "fully warm" while genuine candidates remain — the warmer
+/// would then never run again.
+pub async fn pending_suwayomi_cover_count(main: &SqlitePool, covers: &SqlitePool) -> Result<i64> {
+    let cached = cached_suwayomi_cover_ids(covers).await?;
+    Ok(thumbnailed_series_ids(main, WARM_CURSOR_START)
+        .await?
+        .into_iter()
+        .filter(|id| !cached.contains(id))
+        .count() as i64)
+}
+
+/// Warm `suwayomi_cover_blob` — the cache the reader's home/discovery feeds ACTUALLY
+/// read from.
+///
+/// Discovery hands the browser `/api/v1/manga/{manga_id}/thumbnail`, which
+/// `main::serve_suwayomi_cover` serves out of `suwayomi_cover_blob` keyed by the
+/// **Suwayomi manga id**. Nothing populated that table: `crawl_uncached_covers`' second
+/// pass filters on `work.cover_cached_version IS NULL` and writes `work_cover_blob` keyed
+/// by **work id** — a different table, a different key, a different consumer. The two
+/// never met, so coverage sat at ~9% and every cold cover was a synchronous fetch through
+/// Suwayomi to the source CDN (measured p50 5.6 s / p90 22.0 s / max 29.0 s at grid
+/// concurrency, 502 past the timeout).
+///
+/// This pass closes exactly that gap: same batching/budget/shutdown shape as the crawl
+/// above, fetching through [`crate::suwayomi::SuwayomiClient::fetch_cover_background`] so
+/// it shares — and is capped inside — the bounded cover-fetch pool that on-demand
+/// requests pre-empt.
+///
+/// # Progress guarantee
+///
+/// `cursor` is what makes the scan finish. Taking the newest `limit` uncached ids every
+/// tick only progresses while those ids SUCCEED — a warmed id drops out of the candidate
+/// set, an unwarmed one does not. A batch that persistently fails (a dead source
+/// extension, and ids are assigned sequentially so one bulk enrolment IS a contiguous
+/// newest block) would therefore be retried forever and the remaining ~12k candidates
+/// below it would never be reached. So the window slides: each tick starts strictly below
+/// the previous tick's lowest id and resets to [`WARM_CURSOR_START`] on reaching the
+/// bottom. Failures now cost one tick each instead of every tick, and a full rotation
+/// still retries them.
+///
+/// ARCHITECTURAL FOLLOW-UP (not done here — needs files this change set doesn't own):
+/// collapse the two cover caches into one by having `series_cache.rs` / `graphql/mod.rs`
+/// emit `/covers/{work_id}.webp` for Suwayomi-anchored works too. Then
+/// `work_cover_blob` is the single cache, this warmer disappears, and the
+/// `cover_cached_version` pointer covers every surface.
+pub async fn warm_suwayomi_covers(
+    covers: &SqlitePool,
+    main: &SqlitePool,
+    suwayomi: &crate::suwayomi::SuwayomiClient,
+    limit: i64,
+    cursor: &std::sync::atomic::AtomicI64,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> (usize, usize) {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let start = cursor.load(AtomicOrdering::Relaxed);
+    let load = |before| uncached_suwayomi_cover_ids(main, covers, limit, before);
+    let ids = match load(start).await {
+        // Bottom of the scan: wrap and take the newest window again, so a tick that
+        // lands on the tail is not wasted.
+        Ok(ids) if ids.is_empty() && start != WARM_CURSOR_START => {
+            match load(WARM_CURSOR_START).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %e, "suwayomi cover warmer: failed to load candidates");
+                    return (0, 0);
+                }
+            }
+        }
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "suwayomi cover warmer: failed to load candidates");
+            return (0, 0);
+        }
+    };
+    // Advance BEFORE doing the work: the point is that this tick's ids are not re-taken
+    // next tick whatever happens to them (including a shutdown mid-batch). A short batch
+    // means we reached the bottom, so restart from the newest.
+    let next = match ids.last() {
+        Some(&lowest) if (ids.len() as i64) >= limit => lowest,
+        _ => WARM_CURSOR_START,
+    };
+    cursor.store(next, AtomicOrdering::Relaxed);
+    if ids.is_empty() {
+        return (0, 0);
+    }
+    let total = ids.len();
+    tracing::info!(
+        total,
+        from_id = start,
+        next_from_id = next,
+        "suwayomi cover warmer: starting"
+    );
+
+    use futures::StreamExt as _;
+    let (saved, failed) = futures::stream::iter(ids)
+        .map(|manga_id| async move {
+            // Cooperative shutdown: stop taking new work the moment the signal flips,
+            // rather than draining a 500-item batch through a shutting-down process.
+            if *shutdown.borrow() {
+                return (0usize, 0usize);
+            }
+            let path = format!("/api/v1/manga/{manga_id}/thumbnail");
+            let bytes = match suwayomi.fetch_cover_background(&path).await {
+                Ok((b, _ct)) => b,
+                Err(e) => {
+                    tracing::debug!(manga_id, error = %e, "suwayomi cover warmer: fetch failed");
+                    return (0, 1);
+                }
+            };
+            match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
+                Ok(Ok(webp)) => match put_suwayomi_cover(covers, manga_id, &webp).await {
+                    Ok(()) => (1, 0),
+                    Err(e) => {
+                        tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: store failed");
+                        (0, 1)
+                    }
+                },
+                Ok(Err(e)) => {
+                    // No per-id issue table exists for Suwayomi covers, so an
+                    // unprocessable source is simply retried on a later tick. That is
+                    // acceptable: the candidate list is small and bounded, and the
+                    // alternative (a second issue table) buys little.
+                    tracing::debug!(manga_id, error = %e, "suwayomi cover warmer: encode failed");
+                    (0, 1)
+                }
+                Err(e) => {
+                    tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: encode task panicked");
+                    (0, 1)
+                }
+            }
+        })
+        // Never more than the background share of the shared cover-fetch pool, so an
+        // on-demand `<img>` request always finds free permits and never fails fast
+        // because of the warmer.
+        .buffer_unordered(crate::suwayomi::WARM_COVER_CONCURRENCY)
+        .fold((0usize, 0usize), |(s, f), (ds, df)| async move {
+            (s + ds, f + df)
+        })
+        .await;
+    tracing::info!(saved, failed, total, "suwayomi cover warmer: complete");
+    (saved, failed)
+}
+
 /// Recurring background drainer that keeps the cover cache full with NO manual
 /// trigger: every `interval_secs` it fetches + stores up to `batch` still-uncached
 /// covers, so works added by catalogue sync / ingest get their cover cached
@@ -577,7 +847,42 @@ pub async fn crawl_uncached_covers(
 ///
 /// FLEET CONSTRAINT: like the catalogue sync / metadata backfill, this hits
 /// MangaDex under the in-process rate limiter, so run it on exactly ONE replica.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
+    main: SqlitePool,
+    covers: SqlitePool,
+    mangadex: Arc<MangaDexClient>,
+    suwayomi: crate::suwayomi::SuwayomiClient,
+    inflight: Arc<AtomicBool>,
+    interval_secs: u64,
+    batch: i64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    // Panic-supervised (crate::task::supervise): an unhandled panic in a crawl used to
+    // end cover caching silently for the process lifetime. The factory re-clones the
+    // loop's state on each restart. All captured handles are cheap to clone (pools are
+    // Arc-backed, the client is Arc, inflight is Arc).
+    tokio::spawn(crate::task::supervise(
+        "cover-drainer",
+        Duration::from_secs(30),
+        shutdown.clone(),
+        move || {
+            run_loop(
+                main.clone(),
+                covers.clone(),
+                mangadex.clone(),
+                suwayomi.clone(),
+                inflight.clone(),
+                interval_secs,
+                batch,
+                shutdown.clone(),
+            )
+        },
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
     main: SqlitePool,
     covers: SqlitePool,
     mangadex: Arc<MangaDexClient>,
@@ -587,43 +892,83 @@ pub fn spawn(
     batch: i64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(interval_secs, batch, "cover cache drainer started");
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    // Yield to a manual full crawl if one is in flight (don't stack
-                    // two MangaDex crawls); we'll pick up the remainder next tick.
-                    if inflight
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    match pending_cover_count(&main).await {
-                        Ok(0) => { /* nothing to do this tick */ }
-                        Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch)).await,
-                        Err(e) => tracing::warn!(error = %e, "cover drainer: count failed"),
-                    }
-                    inflight.store(false, Ordering::SeqCst);
+    // Start 90s behind the scanner. This loop and the scan scheduler BOTH default
+    // to a 300s period, so with both starting at t=0 they collided on every single
+    // tick, forever — two of the six writers contending for SQLite's single writer
+    // in lockstep. A phase offset that is not a divisor of the shared period keeps
+    // them permanently out of step.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(90),
+        Duration::from_secs(interval_secs),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A second handle on the same channel: `shutdown` itself is mutably borrowed by the
+    // `select!` below for the whole expression, so the tick body can't also read it.
+    let warm_shutdown = shutdown.clone();
+    // Rotating window for the Suwayomi warmer, so a persistently-failing newest batch
+    // can't monopolise every tick — see `warm_suwayomi_covers`. Loop-local: a supervised
+    // restart simply begins the rotation again from the newest id.
+    let warm_cursor = std::sync::atomic::AtomicI64::new(WARM_CURSOR_START);
+    tracing::info!(interval_secs, batch, "cover cache drainer started");
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Yield to a manual full crawl if one is in flight (don't stack
+                // two MangaDex crawls); we'll pick up the remainder next tick.
+                if inflight
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    continue;
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        tracing::info!("cover cache drainer stopping");
-                        break;
+                match pending_cover_count(&main).await {
+                    Ok(0) => { /* nothing to do this tick */ }
+                    Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch)).await,
+                    Err(e) => tracing::warn!(error = %e, "cover drainer: count failed"),
+                }
+                // Second cache, second pass. `work_cover_blob` (above) is what
+                // `/covers/{work_id}.webp` serves; `suwayomi_cover_blob` (here) is what
+                // the reader's home/discovery feeds actually request via
+                // `/api/v1/manga/{id}/thumbnail`. Nothing warmed the latter, so 91% of
+                // home covers were a live source-CDN fetch on the request path. Reuses
+                // this loop's existing interval/batch budget rather than adding a knob;
+                // its fan-out is capped at the background share of the shared cover
+                // semaphore so it cannot saturate the pool it exists to relieve.
+                if !*warm_shutdown.borrow() {
+                    match pending_suwayomi_cover_count(&main, &covers).await {
+                        Ok(0) => { /* fully warm */ }
+                        Ok(pending) => {
+                            tracing::debug!(pending, "suwayomi cover warmer: pending");
+                            warm_suwayomi_covers(
+                                &covers,
+                                &main,
+                                &suwayomi,
+                                batch,
+                                &warm_cursor,
+                                &warm_shutdown,
+                            )
+                            .await;
+                        }
+                        Err(e) => tracing::warn!(error = %e, "suwayomi cover warmer: count failed"),
                     }
+                }
+                inflight.store(false, Ordering::SeqCst);
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("cover cache drainer stopping");
+                    break;
                 }
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{DynamicImage, RgbImage};
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
     fn noisy_png(w: u32, h: u32) -> Vec<u8> {
         let mut img = RgbImage::new(w, h);
@@ -911,6 +1256,50 @@ mod tests {
         assert_eq!(pending_cover_count(&main).await.unwrap(), 0);
     }
 
+    /// The drainer's "nothing to do" short-circuit is only meaningful if the count agrees
+    /// with what the crawl SELECTs can actually pick up. A work with a recorded
+    /// `work_cover_issue` is excluded by BOTH crawl passes, so counting it made the
+    /// short-circuit unreachable — measured live as 27 "pending" against 1 selectable,
+    /// i.e. a full crawl pass every 300 s to process a single row.
+    #[tokio::test]
+    async fn pending_cover_count_excludes_works_with_a_recorded_issue() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        for id in ["w_ok", "w_broken"] {
+            sqlx::query(
+                "INSERT INTO work (id, cover_file_name, created_at, updated_at) \
+                 VALUES (?, 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .execute(&main)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+                 VALUES (?, ?, 'mangadex', ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("ss_{id}"))
+            .bind(id)
+            .bind(format!("md-{id}"))
+            .execute(&main)
+            .await
+            .unwrap();
+        }
+        assert_eq!(pending_cover_count(&main).await.unwrap(), 2);
+
+        record_cover_issue(&main, "w_broken", "unsupported", "nope").await;
+        assert_eq!(
+            pending_cover_count(&main).await.unwrap(),
+            1,
+            "a work the crawl will never select must not be counted as pending"
+        );
+    }
+
     #[test]
     fn work_cover_url_prefers_cached_then_own_lazy_route() {
         // Cached → versioned VPS blob path.
@@ -927,5 +1316,372 @@ mod tests {
         // No anchor → empty.
         assert_eq!(work_cover_url("w_1", None, None, None), "");
         assert_eq!(work_cover_url("w_1", None, Some("md-uuid"), None), "");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Truncation gate (P3)
+    // ---------------------------------------------------------------------------
+
+    fn real_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut img = RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([
+                ((x * 73 + y * 151) % 256) as u8,
+                ((x * 199 + y * 37) % 256) as u8,
+                ((x ^ (y.wrapping_mul(101))) % 256) as u8,
+            ]);
+        }
+        let mut out = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        out
+    }
+
+    /// The corruption regression: a truncated JPEG must be REJECTED by `process_cover`,
+    /// not silently re-encoded into a cover with a flat decoder-fill tail and frozen
+    /// behind `cover_cached_version` + a one-year immutable edge TTL.
+    #[test]
+    fn process_cover_rejects_truncated_jpeg() {
+        let whole = real_jpeg(400, 600);
+        process_cover(&whole).expect("whole JPEG still processes");
+
+        let mut decoder_would_have_accepted = 0;
+        for pct in [25, 40, 55, 70, 85, 95] {
+            let part = &whole[..whole.len() * pct / 100];
+            if image::load_from_memory(part).is_ok() {
+                decoder_would_have_accepted += 1;
+            }
+            let e = process_cover(part).expect_err("truncated source must not be stored");
+            assert_eq!(
+                classify_cover_error(&e),
+                "truncated",
+                "reason must be attributable in the admin Bugs panel: {e}"
+            );
+            assert!(
+                is_transient_cover_error(&e),
+                "a truncated DOWNLOAD is transient — recording it in work_cover_issue \
+                 would permanently strand a work that has a perfectly good source"
+            );
+        }
+        assert!(
+            decoder_would_have_accepted > 0,
+            "precondition: `image`/zune-jpeg must accept at least one of these \
+             truncations, otherwise the gate is redundant"
+        );
+    }
+
+    #[test]
+    fn deterministic_cover_errors_stay_non_transient() {
+        // Everything except `truncated` must still be recorded, or the crawl will
+        // re-attempt an unprocessable source on every single tick forever.
+        for msg in [
+            "cover source too large (max 24 MB)",
+            "image too large or unsupported",
+            "empty cover source",
+            "libwebp exploded",
+        ] {
+            assert!(
+                !is_transient_cover_error(&anyhow!("{msg}")),
+                "{msg} must remain recordable"
+            );
+        }
+        assert!(is_transient_cover_error(&anyhow!(
+            "truncated JPEG (no EOI marker)"
+        )));
+    }
+
+    // ---------------------------------------------------------------------------
+    // suwayomi_cover_blob warmer (P1)
+    // ---------------------------------------------------------------------------
+
+    /// Build the two-DB pair the warmer works across: main (migrated, holds
+    /// `suwayomi_series`) and covers (holds `suwayomi_cover_blob`), exactly as
+    /// `db::init_covers` shapes it.
+    async fn warm_test_pools() -> (SqlitePool, SqlitePool) {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        let covers = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        (main, covers)
+    }
+
+    async fn insert_series(main: &SqlitePool, id: i64, thumb: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, in_library, \
+             thumbnail_url, updated_at) VALUES (?, ?, 'ONGOING', '1', 1, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(format!("s{id}"))
+        .bind(thumb)
+        .execute(main)
+        .await
+        .unwrap();
+    }
+
+    /// The candidate query is the "LEFT JOIN across two SQLite files" that the missing
+    /// warmer never had: only series with a usable thumbnail and NO blob yet, newest
+    /// first, capped.
+    #[tokio::test]
+    async fn uncached_ids_excludes_cached_and_thumbless_series() {
+        let (main, covers) = warm_test_pools().await;
+        insert_series(&main, 10, Some("/api/v1/manga/10/thumbnail")).await;
+        insert_series(&main, 11, Some("/api/v1/manga/11/thumbnail")).await;
+        insert_series(&main, 12, None).await; // no thumbnail → not a candidate
+        insert_series(&main, 13, Some("")).await; // empty thumbnail → not a candidate
+        insert_series(&main, 14, Some("/api/v1/manga/14/thumbnail")).await;
+        put_suwayomi_cover(&covers, 11, b"already-warm")
+            .await
+            .unwrap();
+
+        let ids = uncached_suwayomi_cover_ids(&main, &covers, 100, WARM_CURSOR_START)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![14, 10],
+            "newest-first, cached + thumbless excluded"
+        );
+        assert_eq!(
+            pending_suwayomi_cover_count(&main, &covers).await.unwrap(),
+            2
+        );
+
+        // The limit bounds a single tick.
+        let one = uncached_suwayomi_cover_ids(&main, &covers, 1, WARM_CURSOR_START)
+            .await
+            .unwrap();
+        assert_eq!(one, vec![14]);
+    }
+
+    /// THE regression test for the outage: the warmer must populate
+    /// `suwayomi_cover_blob` — the table the reader's home/discovery feeds actually read
+    /// — for an uncached in-library series. Before this pass nothing wrote that table at
+    /// all (the drainer's Suwayomi pass writes `work_cover_blob` keyed by work id), so
+    /// coverage sat at 1,253/13,847 and every cold home cover was a live source-CDN
+    /// fetch on the request path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warmer_populates_the_cache_the_reader_reads() {
+        let (main, covers) = warm_test_pools().await;
+        for id in [21, 22, 23] {
+            insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
+        }
+        // 22 is already warm; the warmer must not refetch it.
+        put_suwayomi_cover(&covers, 22, b"already-warm")
+            .await
+            .unwrap();
+
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+        let (saved, failed) =
+            warm_suwayomi_covers(&covers, &main, &client, 500, &cursor, &rx).await;
+        assert_eq!((saved, failed), (2, 0), "both uncached series warmed");
+
+        // Exactly what `serve_suwayomi_cover` reads on the request path.
+        for id in [21, 23] {
+            let blob = get_suwayomi_cover(&covers, id)
+                .await
+                .unwrap_or_else(|| panic!("manga {id} must now be cached"));
+            assert!(
+                blob.len() <= MAX_COVER_BYTES,
+                "warmed cover {id} is {} bytes, over the {MAX_COVER_BYTES} budget",
+                blob.len()
+            );
+            image::load_from_memory(&blob).expect("warmed blob is a decodable image");
+        }
+        // The already-warm row is untouched (no wasted upstream fetch, no re-encode).
+        assert_eq!(
+            get_suwayomi_cover(&covers, 22).await.as_deref(),
+            Some(&b"already-warm"[..])
+        );
+        assert_eq!(
+            origin.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one fetch per uncached series, none for the cached one"
+        );
+        // Coverage is now complete, so a second tick is a no-op.
+        assert_eq!(
+            pending_suwayomi_cover_count(&main, &covers).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 500, &cursor, &rx).await,
+            (0, 0),
+            "a fully warm cache does no work"
+        );
+    }
+
+    /// The warmer must never occupy enough of the shared cover-fetch pool to make an
+    /// on-demand request fail fast — that would trade the outage for a different one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warmer_leaves_headroom_for_on_demand_requests() {
+        let (main, covers) = warm_test_pools().await;
+        for id in 1..=40 {
+            insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
+        }
+        // Slow origin so the warmer is provably mid-flight while we probe the pool.
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(64, 96),
+            std::time::Duration::from_millis(120),
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let warm = {
+            let (covers, main, client, rx) =
+                (covers.clone(), main.clone(), client.clone(), rx.clone());
+            tokio::spawn(async move {
+                let cursor = AtomicI64::new(WARM_CURSOR_START);
+                warm_suwayomi_covers(&covers, &main, &client, 40, &cursor, &rx).await
+            })
+        };
+
+        // Sample the pool while the warmer runs: it must never hold more than its share.
+        let mut min_free = usize::MAX;
+        for _ in 0..40 {
+            min_free = min_free.min(client.cover_permits_available());
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            if warm.is_finished() {
+                break;
+            }
+        }
+        let (saved, _) = warm.await.unwrap();
+        assert_eq!(saved, 40, "warmer completed its batch");
+        assert!(
+            min_free
+                >= crate::suwayomi::COVER_FETCH_CONCURRENCY
+                    - crate::suwayomi::WARM_COVER_CONCURRENCY,
+            "warmer left only {min_free} permits free; on-demand needs at least {}",
+            crate::suwayomi::COVER_FETCH_CONCURRENCY - crate::suwayomi::WARM_COVER_CONCURRENCY
+        );
+        assert!(
+            origin
+                .peak_concurrent
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= crate::suwayomi::WARM_COVER_CONCURRENCY,
+            "warmer exceeded its fan-out bound at the origin"
+        );
+    }
+
+    /// Shutdown must stop the warmer taking new work rather than draining a full batch
+    /// through a shutting-down process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warmer_honours_shutdown() {
+        let (main, covers) = warm_test_pools().await;
+        for id in 1..=30 {
+            insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
+        }
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(64, 96),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (tx, rx) = tokio::sync::watch::channel(true); // already shutting down
+        let _ = tx;
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 30, &cursor, &rx).await;
+        assert_eq!((saved, failed), (0, 0), "no work started after shutdown");
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// LIVELOCK regression. Taking the newest `limit` uncached ids every tick only makes
+    /// progress while they SUCCEED — a failing id stays in the candidate set and is
+    /// re-selected forever, so a dead source occupying the newest ids (they are assigned
+    /// sequentially, so one bulk enrolment is a contiguous block) would starve every
+    /// other candidate indefinitely. The rotating cursor must slide the window down
+    /// regardless of outcome, and wrap at the bottom.
+    #[tokio::test]
+    async fn warmer_rotates_past_a_persistently_failing_batch() {
+        let (main, covers) = warm_test_pools().await;
+        for id in 1..=6 {
+            insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
+        }
+        // Nothing listening: every fetch fails immediately (connection refused), so no id
+        // ever leaves the candidate set.
+        let client = crate::suwayomi::SuwayomiClient::new(
+            "http://127.0.0.1:1".into(),
+            None,
+            Some("1".into()),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+
+        // Three ticks of two must cover all six ids, not retry {6,5} three times.
+        for expect_cursor in [5, 3, 1] {
+            let (saved, failed) =
+                warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+            assert_eq!(
+                (saved, failed),
+                (0, 2),
+                "every fetch fails against a dead origin"
+            );
+            assert_eq!(
+                cursor.load(AtomicOrdering::Relaxed),
+                expect_cursor,
+                "the window must slide down even though nothing succeeded"
+            );
+        }
+        // Bottom reached: the next tick wraps to the newest window instead of idling.
+        let (_, failed) = warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+        assert_eq!(failed, 2, "wrapped and retried the newest ids");
+        assert_eq!(cursor.load(AtomicOrdering::Relaxed), 5);
+    }
+
+    /// The coverage gauge must be a SET DIFFERENCE, not `series - COUNT(*)`.
+    /// `suwayomi_cover_blob` also holds blobs the request path materialized for Browse
+    /// manga that were never enrolled in `suwayomi_series`; counting those as coverage
+    /// drives `pending` to 0 while real candidates remain, and the drainer then skips the
+    /// warmer forever.
+    #[tokio::test]
+    async fn pending_count_ignores_blobs_for_unenrolled_manga() {
+        let (main, covers) = warm_test_pools().await;
+        for id in [31, 32] {
+            insert_series(&main, id, Some(&format!("/api/v1/manga/{id}/thumbnail"))).await;
+        }
+        // Three Browse covers cached on the request path; none is an enrolled series.
+        for id in [900, 901, 902] {
+            put_suwayomi_cover(&covers, id, b"browse").await.unwrap();
+        }
+        assert_eq!(
+            pending_suwayomi_cover_count(&main, &covers).await.unwrap(),
+            2,
+            "both enrolled series are still un-warmed"
+        );
+        assert_eq!(
+            uncached_suwayomi_cover_ids(&main, &covers, 10, WARM_CURSOR_START)
+                .await
+                .unwrap(),
+            vec![32, 31]
+        );
     }
 }

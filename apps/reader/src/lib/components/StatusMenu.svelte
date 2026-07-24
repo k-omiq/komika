@@ -63,7 +63,7 @@
 	});
 </script>
 
-<div class="sm" class:open bind:this={root}>
+<div class="sm" class:open class:chip={variant === 'chip'} bind:this={root}>
 	<button
 		type="button"
 		class="trigger {variant}"
@@ -152,6 +152,15 @@
 		top: calc(100% + 6px);
 		left: 0;
 		min-width: 176px;
+	}
+	/* The chip variant sits at the cover's bottom-right corner — open the menu
+	   upward and right-aligned so it stays over the cover and doesn't spill past
+	   the card edge or cover the title below. */
+	.sm.chip .menu {
+		top: auto;
+		bottom: calc(100% + 6px);
+		left: auto;
+		right: 0;
 		display: flex;
 		flex-direction: column;
 		padding: 6px;

@@ -1,9 +1,12 @@
 <script lang="ts">
 	import type { MatchResult, Series, SeriesSourceGroup, SeriesStatus, WorkSource } from '@komika/types';
+	import { untrack } from 'svelte';
 	import { auth } from '$lib/auth.svelte';
+	import { assetSrc } from '$lib/config';
 	import {
 		loadCatalog,
 		loadSeriesSources,
+		loadWorkSources,
 		mergeWorks,
 		saveSeriesAdmin,
 		setSeriesPaused,
@@ -11,6 +14,17 @@
 		addSourceSeries,
 		STATUS_OPTIONS,
 	} from '$lib/data';
+
+	/**
+	 * The two id spaces this table can hold. An EMPTY query lists Suwayomi mangas
+	 * (numeric ids); a TEXT query hits the canonical FTS index and returns canonical
+	 * works (`w_`-prefixed). They take different actions — provenance is keyed by
+	 * Suwayomi id, `Add` only accepts a Suwayomi id — so every row action branches on
+	 * this, the same way `loadSeriesDetail()` routes in lib/data.ts.
+	 */
+	function isCanonical(s: Series): boolean {
+		return s.id.startsWith('w_');
+	}
 
 	let query = $state('');
 	// `series` holds ONLY the current SERVER page (≤ the server's page size, itself far
@@ -42,17 +56,41 @@
 	let provenance = $state<Record<string, SeriesSourceGroup>>({});
 	let provenanceError = $state<string | null>(null);
 
-	/** Fetch provenance for just the current server page (its size ≤ the 200-id cap). */
+	/** Monotonic token: a slow provenance fetch must not overwrite a newer page's. */
+	let provSeq = 0;
+
+	/**
+	 * Fetch provenance for just the current server page (its size ≤ the 200-id cap).
+	 * Only Suwayomi-id rows are sent: `seriesSourcesBatch` looks up `source_type =
+	 * 'suwayomi'` mappings, so a `w_` work id would match nothing and come back as a
+	 * null workId — which the table used to render as "not catalogued".
+	 *
+	 * The map is REPLACED in one assignment once the response lands (never cleared
+	 * up-front), so a single-row mutation that re-runs this can't flicker every row's
+	 * Source column to "—" and yank the Merge button mid-selection.
+	 */
 	async function loadProvenance(list: Series[]): Promise<void> {
+		const seq = ++provSeq;
 		provenanceError = null;
-		provenance = {};
-		if (list.length === 0) return;
+		const ids = list.filter((s) => !isCanonical(s)).map((s) => s.id);
+		if (ids.length === 0) {
+			provenance = {};
+			return;
+		}
 		try {
-			const groups = await loadSeriesSources(list.map((s) => s.id));
+			const groups = await loadSeriesSources(ids);
+			if (seq !== provSeq) return; // a newer page superseded this fetch
+			// Carry over what we already knew for the rows still on screen, then
+			// overlay the fresh groups — bounded to the current page either way.
 			const map: Record<string, SeriesSourceGroup> = {};
+			for (const id of ids) {
+				const prev = provenance[id];
+				if (prev) map[id] = prev;
+			}
 			for (const g of groups) map[String(g.seriesId)] = g;
 			provenance = map;
 		} catch (err) {
+			if (seq !== provSeq) return;
 			provenanceError =
 				err instanceof Error ? err.message : 'Failed to load source provenance.';
 		}
@@ -94,8 +132,10 @@
 	let mergeError = $state<string | null>(null);
 	let mergeResult = $state<{ targetTitle: string; movedSourceSeries: number } | null>(null);
 
-	/** The canonical work id for a catalogue row, or null when not catalogued. */
+	/** The canonical work id for a row, or null when not catalogued. A text-search row
+	 * IS a canonical work, so its own id is the work id — no provenance lookup needed. */
 	function workIdOf(s: Series): string | null {
+		if (isCanonical(s)) return s.id;
 		const g = provenance[s.id];
 		return g?.workId ?? null;
 	}
@@ -107,14 +147,29 @@
 		return !!wid && wid !== mergeSource.workId;
 	}
 
-	function sideFor(s: Series): MergeSide | null {
-		const g = provenance[s.id];
-		if (!g?.workId) return null;
-		return { seriesId: s.id, workId: g.workId, title: s.title, group: g };
+	/**
+	 * Build a merge side for a row. Suwayomi rows reuse the batch provenance already on
+	 * screen; canonical (`w_`) rows aren't in that batch at all, so their source
+	 * mappings are pulled from the work itself — the confirm dialog must show real
+	 * provenance for a destructive, irreversible merge, not an empty list.
+	 */
+	async function sideFor(s: Series): Promise<MergeSide | null> {
+		const workId = workIdOf(s);
+		if (!workId) return null;
+		const cached = provenance[s.id];
+		if (cached?.workId === workId)
+			return { seriesId: s.id, workId, title: s.title, group: cached };
+		let sources: WorkSource[] = [];
+		try {
+			sources = await loadWorkSources(workId);
+		} catch {
+			// Provenance chips are informational; the merge itself doesn't need them.
+		}
+		return { seriesId: s.id, workId, title: s.title, group: { seriesId: s.id, workId, sources } };
 	}
 
-	function startMerge(s: Series): void {
-		const side = sideFor(s);
+	async function startMerge(s: Series): Promise<void> {
+		const side = await sideFor(s);
 		if (!side) return;
 		mergeSource = side;
 		mergeTarget = null;
@@ -122,9 +177,11 @@
 		mergeResult = null;
 	}
 
-	function pickTarget(s: Series): void {
+	async function pickTarget(s: Series): Promise<void> {
 		if (!mergeSource || !canBeTarget(s)) return;
-		mergeTarget = sideFor(s);
+		const side = await sideFor(s);
+		if (!mergeSource) return; // the merge was cancelled while we fetched
+		mergeTarget = side;
 		mergeError = null;
 	}
 
@@ -143,10 +200,13 @@
 			mergeResult = { targetTitle: mergeTarget.title, movedSourceSeries: res.movedSourceSeries };
 			mergeSource = null;
 			mergeTarget = null;
-			// Re-fetch the current server page so the deleted work's phantom row is gone
-			// and provenance is re-fetched (the series effect handles provenance once the
-			// series array is replaced).
+			// Re-fetch the current server page so the deleted work's phantom row is gone.
 			await refresh(query, page);
+			// Provenance too, explicitly: the page's id list usually survives a merge
+			// unchanged (source-series rows don't disappear when their work is folded),
+			// and the provenance effect is keyed on that id list — so it wouldn't re-fire
+			// and the Source column would keep showing the deleted work's mappings.
+			await loadProvenance(series);
 		} catch (err) {
 			mergeError = err instanceof Error ? err.message : 'Merge failed.';
 		} finally {
@@ -164,17 +224,28 @@
 
 	// Fetch provenance for only the rows on the current server page (≤ the 200-id batch
 	// cap), so no rendered row ever silently shows "—" from a batch-size truncation.
-	// Re-fires whenever the page's series array is replaced (fresh result / page change).
+	// Keyed on the ID LIST, not the array reference: unpause/save/scan replace `series`
+	// with a new array holding the same ids, and re-running the whole page's provenance
+	// query for a one-row edit blanked every Source cell (and every Merge button) while
+	// it was in flight.
+	const seriesIdKey = $derived(series.map((s) => s.id).join(','));
 	$effect(() => {
-		void loadProvenance(series);
+		void seriesIdKey; // the effect's only dependency
+		void loadProvenance(untrack(() => series));
 	});
+
+	/** Monotonic token so a slow page load can't land after a newer one (rapid Next /
+	 * search-then-page would otherwise leave the table on a stale page). */
+	let loadSeq = 0;
 
 	/** Fetch ONE server page of the catalog (default page 1 on a fresh query). */
 	async function refresh(q: string, toPage = 1): Promise<void> {
+		const seq = ++loadSeq;
 		loading = true;
 		loadError = null;
 		try {
 			const res = await loadCatalog(q, toPage);
+			if (seq !== loadSeq) return; // a newer request superseded this one
 			series = res.items;
 			page = res.page;
 			total = res.total;
@@ -185,13 +256,14 @@
 			else if (pageSize === 0) pageSize = res.items.length;
 			// Provenance for the new page is fetched by the series effect.
 		} catch (err) {
+			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load catalog.';
 			series = [];
 			provenance = {};
 			total = null;
 			hasNextPage = false;
 		} finally {
-			loading = false;
+			if (seq === loadSeq) loading = false;
 		}
 	}
 
@@ -231,6 +303,9 @@
 
 	async function onAdd(s: Series): Promise<void> {
 		if (addingId) return;
+		// `addSourceSeries` takes a Suwayomi manga id; a canonical work is already in the
+		// catalogue, so the button isn't rendered for one. Guarded here too.
+		if (isCanonical(s)) return;
 		addingId = s.id;
 		try {
 			const r = await addSourceSeries(s.id);
@@ -254,7 +329,16 @@
 	let scanning = $state(false);
 	let scanMsg = $state<string | null>(null);
 
+	/**
+	 * The row editor writes SCAN/STATUS overrides, which are keyed by Suwayomi series
+	 * id: `updateSeriesAdmin` and `triggerScan` both `parse::<i64>()` the id and reject
+	 * a `w_` one ("seriesId must be a numeric Suwayomi series id"). A text query now
+	 * returns canonical works, so opening this on one would guarantee an error on Save
+	 * and on Scan now — those rows link to /series/{id} (the metadata editor, which
+	 * does operate on works) instead.
+	 */
 	function openEditor(s: Series): void {
+		if (isCanonical(s)) return;
 		editing = s;
 		saveError = null;
 		scanMsg = null;
@@ -337,7 +421,14 @@
 			<p class="lede">
 				{query.trim() ? 'Search results' : 'Library'} · {total != null
 					? `${total} series`
-					: `${series.length}${hasNextPage ? '+' : ''} series`} · manage scan cadence and status
+					: `${series.length}${hasNextPage ? '+' : ''} series`} · {query.trim()
+					? 'canonical works from the catalogue index'
+					: 'source series'} · manage scan cadence and status ·
+				<span
+					class="nsfw-note"
+					title="This console always requests NSFW-inclusive results (an admin-only per-request override), independent of the NSFW on/off preference in the header. The reader still honours each viewer's own preference — so the console deliberately lists more than the reader does, including the mis-flagged mainstream titles it exists to correct."
+					>incl. NSFW-flagged</span
+				>
 			</p>
 		</div>
 		<form class="search" onsubmit={onSearch}>
@@ -404,7 +495,7 @@
 						{#if s.coverUrl}
 							<img
 								class="cover"
-								src={s.coverUrl}
+								src={assetSrc(s.coverUrl)}
 								alt=""
 								loading="lazy"
 								referrerpolicy="no-referrer"
@@ -423,7 +514,12 @@
 					</span>
 					<span class="col-ch">{s.chapterCount}</span>
 					<span class="col-src">
-						{#if provenance[s.id]}
+						{#if isCanonical(s)}
+							<span class="src-entry" title="Canonical work — text search returns works, not source series">
+								<span class="src-name">canonical work</span>
+								<span class="src-id">{s.id}</span>
+							</span>
+						{:else if provenance[s.id]}
 							{#if provenance[s.id].workId && provenance[s.id].sources.length > 0}
 								{#each provenance[s.id].sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
 									<span
@@ -463,10 +559,21 @@
 								<span class="add-msg">same work</span>
 							{/if}
 						{:else}
-							<button class="edit" onclick={() => openEditor(s)}>Edit</button>
-							<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
-								{addingId === s.id ? 'Adding…' : 'Add'}
-							</button>
+							{#if !isCanonical(s)}
+								<button class="edit" onclick={() => openEditor(s)}>Edit</button>
+							{:else}
+								<a
+									class="edit"
+									href="/series/{s.id}"
+									title="Scan cadence and status are Suwayomi-source settings — a canonical work has none. Edit its metadata on the series page."
+									>Edit metadata</a
+								>
+							{/if}
+							{#if !isCanonical(s)}
+								<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
+									{addingId === s.id ? 'Adding…' : 'Add'}
+								</button>
+							{/if}
 							{#if workIdOf(s)}
 								<button class="merge-btn" onclick={() => startMerge(s)} title="Merge this work into another (delete this duplicate)">Merge…</button>
 							{/if}
@@ -646,6 +753,17 @@
 		margin-top: 6px;
 		font-size: 13.5px;
 		color: var(--k-text-dim);
+	}
+	/* The console reads the catalogue NSFW-inclusive regardless of the header's NSFW
+	   preference pill; say so, so the console/reader difference isn't a mystery. */
+	.nsfw-note {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+		border-bottom: 1px dotted var(--k-border-4);
+		cursor: help;
 	}
 	.search {
 		display: flex;
@@ -917,6 +1035,13 @@
 	.edit:hover,
 	.add:hover {
 		border-color: var(--k-border-strong);
+	}
+	/* The canonical-work variant is a link, not a button: an inline <a> ignores the
+	   shared `height`, so give it the same box explicitly. */
+	a.edit {
+		display: inline-flex;
+		align-items: center;
+		text-decoration: none;
 	}
 	.add:disabled {
 		opacity: 0.6;

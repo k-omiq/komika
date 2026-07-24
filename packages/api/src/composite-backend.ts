@@ -4,6 +4,7 @@ import type {
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
+	ComicType,
 	Comment,
 	CommentVote,
 	Notification,
@@ -28,6 +29,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -210,8 +212,13 @@ export class CompositeBackend implements Backend {
 	updates(page?: number): Promise<Paginated<Series>> {
 		return this.opts.hosted.updates(page);
 	}
-	search(query: string, page?: number, filters?: SearchFilters): Promise<Paginated<Series>> {
-		return this.opts.hosted.search(query, page, filters);
+	search(
+		query: string,
+		page?: number,
+		filters?: SearchFilters,
+		includeNsfw?: boolean,
+	): Promise<Paginated<Series>> {
+		return this.opts.hosted.search(query, page, filters, includeNsfw);
 	}
 	searchAllSources(query: string, page?: number): Promise<FederatedSearchPage> {
 		return this.opts.hosted.searchAllSources!(query, page);
@@ -313,8 +320,11 @@ export class CompositeBackend implements Backend {
 	}
 
 	// --- canonical catalogue (MangaDex mirror) ---
-	canonicalUpdates(page?: number): Promise<CanonicalUpdate[]> {
-		return this.opts.hosted.canonicalUpdates!(page);
+	canonicalUpdates(page?: number, includeNsfw?: boolean): Promise<CanonicalUpdate[]> {
+		return this.opts.hosted.canonicalUpdates!(page, includeNsfw);
+	}
+	updatesFeed(page?: number, type?: ComicType): Promise<Paginated<UpdateFeedRow>> {
+		return this.opts.hosted.updatesFeed!(page, type);
 	}
 	canonicalSeries(workId: Id): Promise<Series> {
 		return this.opts.hosted.canonicalSeries!(workId);
@@ -509,8 +519,8 @@ export class CompositeBackend implements Backend {
 	}
 
 	// --- admin dedup review ---
-	mergeQueue(): Promise<MergeCandidate[]> {
-		return this.opts.hosted.mergeQueue!();
+	mergeQueue(page?: number, limit?: number): Promise<Paginated<MergeCandidate>> {
+		return this.opts.hosted.mergeQueue!(page, limit);
 	}
 	resolveMergeCandidate(id: Id, accept: boolean): Promise<boolean> {
 		return this.opts.hosted.resolveMergeCandidate!(id, accept);

@@ -54,12 +54,73 @@ export interface CatalogEntry {
 export interface Card {
 	title: string;
 	ch: string;
+	/**
+	 * The card's headline recency label. On update/trending rows this is the real
+	 * upstream CHAPTER RELEASE time (`Series.latestChapterAt`), never our polling
+	 * clock; on the "Latest Added" row it's the catalogue-add time. See
+	 * `source.ts` → `chapterRecency`.
+	 */
 	time: string;
+	/**
+	 * The numeric companion to {@link time} — the SAME instant, as epoch
+	 * milliseconds, so card lists can be sorted by recency without re-parsing a
+	 * formatted string like "4h" or "March 2023" (which is lossy and unorderable).
+	 *
+	 * `0` when the row carries no usable timestamp, which sorts it LAST under a
+	 * descending sort. That mirrors the server's `NULLS LAST` on the Updates feed,
+	 * for the same reason: a row whose recency we don't know cannot be honestly
+	 * placed among rows whose recency we do.
+	 *
+	 * Always on the same clock as `time`, per card constructor — the "Latest Added"
+	 * row labels with the catalogue-add time, so its `timeAt` is that too, not the
+	 * chapter-release time.
+	 */
+	timeAt?: number;
+	/**
+	 * When WE detected the release, when the backend reports it. Formatted the same
+	 * way as `time` and empty when unknown — surfaced only as a hover title, so the
+	 * two clocks stay distinguishable without changing the card design.
+	 */
+	detected?: string;
 	rating: string;
 	cover?: string;
 	id?: string;
 	/** Format of the series, when the source feed knows it. */
 	type?: ComicType;
+}
+
+/**
+ * Hover text spelling out a card's terse recency label.
+ *
+ * The visible "· 4h" is the CHAPTER RELEASE time; when the backend also reports
+ * when we detected it, the two are named apart here. Three different clocks used
+ * to render under one identical-looking label (our poll time on cards, the real
+ * publish time on the MangaDex rows, another on the series header), which is how
+ * the feed could say "1h" and the series page "1d" for the same chapter.
+ */
+export function cardTimeTooltip(card: Card): string {
+	if (!card.time) return '';
+	const released = `Chapter released ${card.time}`;
+	return card.detected ? `${released} · we detected it ${card.detected}` : released;
+}
+
+/**
+ * A card's terse sub-line — "Ch. 12 · 4h" — with the separator dropped whenever a
+ * half is missing.
+ *
+ * BOTH halves are genuinely optional and were being interpolated unguarded:
+ *  • `ch` is '' for a canonical update row with no chapter number, which rendered
+ *    a leading "· 4h".
+ *  • `time` is '' whenever no timestamp survives `chapterRecency` (an unscanned
+ *    series whose `latestChapterAt` is null and whose `updatedAt` the backend
+ *    didn't supply), which rendered a trailing "Ch. 12 · ".
+ * Neither is a state to paper over with a fake value — the honest render is the
+ * half we actually know. `prefix` labels the time where the card is on a different
+ * clock ("Added 2d").
+ */
+export function cardSub(card: Card, prefix = ''): string {
+	const time = card.time ? `${prefix}${card.time}` : '';
+	return [card.ch, time].filter(Boolean).join(' · ');
 }
 
 /** URL-safe slug for title-based series links (fallback when no id is known). */

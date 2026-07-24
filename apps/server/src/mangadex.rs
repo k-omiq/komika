@@ -8,7 +8,7 @@
 //! by default (`CATALOGUE_SYNC`); nothing here runs unless explicitly enabled.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,12 +36,15 @@ const EMPTY_PAGE_RETRIES: u32 = 3;
 /// also write the main DB, and even with `busy_timeout` a burst can return BUSY; a
 /// dropped work stays missing until the next full seed, so it's worth a few retries.
 const UPSERT_LOCK_RETRIES: u32 = 4;
+/// Cap on a cover-thumbnail body read. The 512px thumbnails are tens of KB, so this is
+/// purely a safety bound against an unbounded/hostile body (`Response::bytes` is
+/// otherwise limited only by the 30s client timeout). Matches the 8 MB pre-decode cap
+/// the upload paths use (`media::MAX_UPLOAD_BYTES`, `avatar::MAX_UPLOAD_BYTES`).
+const MAX_COVER_FETCH_BYTES: usize = 8 * 1024 * 1024;
 
-/// True if `e` is a transient SQLite lock/BUSY error worth retrying (vs a real failure).
-fn is_locked_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("database is locked") || s.contains("database table is locked")
-}
+/// Transient SQLite lock/BUSY predicate. Single definition in `db` so the scanner's
+/// retry loop and this one agree on what "transient" means.
+use crate::db::is_locked_error;
 
 /// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
 /// `createdAt`; recurring incremental refreshes walk only recently-changed records by
@@ -135,6 +138,40 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// Exponential backoff for retry attempt `n` (0-based): 0.5s, 1s, 2s, 4s, …
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(500u64 << attempt.min(6))
+}
+
+/// Read a response body into memory, streamed, refusing anything past `cap` bytes.
+/// `Response::bytes()` is unbounded (a 30s timeout is the only ceiling), so a huge or
+/// hostile body could otherwise balloon the process; chunked reading lets us bail on
+/// the first chunk that crosses the cap. `None` on transport failure or overflow.
+async fn read_capped(mut res: reqwest::Response, cap: usize, label: &str) -> Option<Vec<u8>> {
+    // Cheap pre-check when the server declares a length; the streaming guard below
+    // still applies for chunked responses that declare nothing.
+    if res.content_length().is_some_and(|len| len > cap as u64) {
+        tracing::warn!(
+            label,
+            cap,
+            "mangadex: response body exceeds cap (declared length)"
+        );
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match res.chunk().await {
+            Ok(Some(chunk)) => {
+                if out.len() + chunk.len() > cap {
+                    tracing::warn!(label, cap, "mangadex: response body exceeds cap");
+                    return None;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Some(out),
+            Err(e) => {
+                tracing::debug!(label, error = %e, "mangadex: response body read failed");
+                return None;
+            }
+        }
+    }
 }
 
 /// The direct MangaDex API client. Cheap to clone-share via `Arc`.
@@ -241,18 +278,15 @@ impl MangaDexClient {
         }
     }
 
-    /// One page of `/manga`, ordered by `createdAt` asc, cover expanded. Returns the
-    /// parsed mangas (bad individual records are skipped, not fatal), the total for the
-    /// query, and the RAW page length (records the API returned, before parse-skips).
-    /// The raw length — not `mangas.len()` — is what the sweep uses to detect the last
-    /// page and advance its offset, so a page shortened only by unparseable records is
-    /// never mistaken for the end of the window.
+    /// One page of `/manga`, ordered by `createdAt` asc, cover expanded. Bad individual
+    /// records are skipped rather than failing the page, but they are COUNTED and
+    /// returned (`MangaPage::dropped`) — see `MangaPage`.
     pub async fn list_manga(
         &self,
         window: SyncWindow,
         since: Option<&str>,
         offset: i64,
-    ) -> Result<(Vec<MdManga>, i64, usize)> {
+    ) -> Result<MangaPage> {
         let mut params: Vec<(String, String)> = vec![
             ("limit".into(), PAGE_LIMIT.to_string()),
             ("offset".into(), offset.to_string()),
@@ -274,18 +308,14 @@ impl MangaDexClient {
             .await?;
         let body: RawList = res.json().await?;
         let raw_len = body.data.len();
-        let mut mangas = Vec::with_capacity(raw_len);
-        let mut skipped = 0usize;
-        for raw in body.data {
-            match serde_json::from_value::<MdManga>(raw) {
-                Ok(m) => mangas.push(m),
-                Err(_) => skipped += 1,
-            }
-        }
-        if skipped > 0 {
-            tracing::warn!(skipped, "mangadex: skipped unparseable manga records");
-        }
-        Ok((mangas, body.total, raw_len))
+        let (mangas, drops) = parse_manga_page(body.data);
+        log_record_drops(&drops, "manga", "/manga");
+        Ok(MangaPage {
+            mangas,
+            total: body.total,
+            raw_len,
+            dropped: drops.len() as u64,
+        })
     }
 
     /// Fetch specific manga by MangaDex ids (max 100 per call — the API's ids[]
@@ -316,11 +346,25 @@ impl MangaDexClient {
                 .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga?ids")
                 .await?;
             let body: RawList = res.json().await?;
-            for raw in body.data {
-                if let Ok(m) = serde_json::from_value::<MdManga>(raw) {
-                    mangas.push(m);
-                }
-            }
+            // Same parse path (and the same loud, attributable drop log) as the sweep:
+            // this enrichment path silently swallowed the null-`links` cohort too, so an
+            // enrich of one of those 4,493 ids returned "nothing" with no explanation.
+            //
+            // The signature stays `Vec<MdManga>` rather than gaining a drop count: the
+            // only caller lives in `graphql/mod.rs` (`enrich_works`), which this change
+            // is not allowed to touch.
+            //
+            // WHAT A DROP HERE ACTUALLY COSTS (checked, not assumed): `enrich_works`
+            // calls `mark_metadata_synced` / `mark_covers_synced` over EVERY id in the
+            // chunk — deliberately, "including ones MangaDex didn't return", so the drain
+            // terminates. So a dropped record is NOT re-offered by the enrichment drain;
+            // it keeps the catalogue row the sweep already wrote and simply never gets its
+            // S2 metadata / F2 cover set until something re-marks it. That is a much
+            // smaller loss than the seed's (the work itself is present either way), but it
+            // is not self-healing, which is why these drops are logged at ERROR too.
+            let (parsed, drops) = parse_manga_page(body.data);
+            log_record_drops(&drops, "manga", "/manga?ids");
+            mangas.extend(parsed);
         }
         Ok(mangas)
     }
@@ -345,24 +389,43 @@ impl MangaDexClient {
         let body: RawList = res.json().await?;
         let mut out = Vec::with_capacity(body.data.len());
         for raw in body.data {
-            if let Ok(c) = serde_json::from_value::<MdCover>(raw) {
-                if let Some(fname) = c.attributes.file_name {
-                    if !fname.is_empty() {
-                        out.push((fname, c.attributes.locale, c.attributes.volume));
+            let cover_id = raw
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no-id>")
+                .to_string();
+            match serde_json::from_value::<MdCover>(raw) {
+                Ok(c) => {
+                    if let Some(fname) = c.attributes.file_name {
+                        if !fname.is_empty() {
+                            out.push((fname, c.attributes.locale, c.attributes.volume));
+                        }
                     }
                 }
+                // Never `Err(_) => ()`: that exact shape is what hid the 4,493-record
+                // parse failure for months. WARN rather than ERROR because the blast
+                // radius really is one gallery entry — the work and its primary cover
+                // come from the sweep, not from here — but it is no longer silent.
+                Err(e) => tracing::warn!(
+                    manga = %manga_id,
+                    cover = %cover_id,
+                    error = %e,
+                    "mangadex: DROPPED an unparseable cover record"
+                ),
             }
         }
         Ok(out)
     }
 
-    /// One page of the global `/chapter` firehose, ordered by `createdAt` asc.
+    /// One page of the global `/chapter` firehose, ordered by `createdAt` asc. Like
+    /// `list_manga`, bad individual records are skipped but COUNTED and returned
+    /// (`ChapterPage::raw_len` / `dropped`) — see `ChapterPage`.
     pub async fn list_chapters(
         &self,
         window: SyncWindow,
         since: Option<&str>,
         offset: i64,
-    ) -> Result<(Vec<MdChapter>, i64)> {
+    ) -> Result<ChapterPage> {
         let mut params: Vec<(String, String)> = vec![
             ("limit".into(), PAGE_LIMIT.to_string()),
             ("offset".into(), offset.to_string()),
@@ -379,13 +442,15 @@ impl MangaDexClient {
             .get_with_retry(&format!("{API_BASE}/chapter"), &params, false, "/chapter")
             .await?;
         let body: RawChapterList = res.json().await?;
-        let mut chapters = Vec::with_capacity(body.data.len());
-        for raw in body.data {
-            if let Ok(c) = serde_json::from_value::<MdChapter>(raw) {
-                chapters.push(c);
-            }
-        }
-        Ok((chapters, body.total))
+        let raw_len = body.data.len();
+        let (chapters, drops) = parse_chapter_page(body.data);
+        log_record_drops(&drops, "chapter", "/chapter");
+        Ok(ChapterPage {
+            chapters,
+            total: body.total,
+            raw_len,
+            dropped: drops.len() as u64,
+        })
     }
 
     /// Download a work's cover thumbnail and compute its perceptual hash. Uses the
@@ -393,14 +458,26 @@ impl MangaDexClient {
     /// on any network/decode failure — a missing hash just means one fewer dedup
     /// signal, never a failed sync. Rate-limited like the API calls.
     pub async fn cover_phash(&self, manga_id: &str, file_name: &str) -> Option<String> {
-        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
-        self.limiter.acquire().await;
-        let res = self.http.get(url).send().await.ok()?;
-        if !res.status().is_success() {
-            return None;
-        }
-        let bytes = res.bytes().await.ok()?;
+        let bytes = self.fetch_cover_thumb(manga_id, file_name).await?;
         crate::phash::dhash(&bytes)
+    }
+
+    /// Shared 512px cover-thumbnail fetch behind `cover_phash` / `cover_thumb_bytes`.
+    /// Goes through `get_with_retry` like the API calls, so a 429 from the cover CDN
+    /// backs off (honoring `Retry-After`) instead of being silently read as "this work
+    /// has no cover" — the old direct `http.get(...).send()` turned every rate-limit
+    /// into a permanent miss. The body is read with a hard length cap. `None` on any
+    /// failure: a missing cover is one fewer dedup signal, never a failed sync.
+    async fn fetch_cover_thumb(&self, manga_id: &str, file_name: &str) -> Option<Vec<u8>> {
+        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
+        let res = match self.get_with_retry(&url, &[], false, "cover").await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::debug!(manga = %manga_id, error = %e, "mangadex: cover fetch failed");
+                return None;
+            }
+        };
+        read_capped(res, MAX_COVER_FETCH_BYTES, manga_id).await
     }
 
     /// Download a work's 512px cover thumbnail as raw bytes, for the DB-backed
@@ -409,13 +486,7 @@ impl MangaDexClient {
     /// Best-effort: `None` on any network / non-success failure so a single bad
     /// cover never aborts the crawl.
     pub async fn cover_thumb_bytes(&self, manga_id: &str, file_name: &str) -> Option<Vec<u8>> {
-        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
-        self.limiter.acquire().await;
-        let res = self.http.get(url).send().await.ok()?;
-        if !res.status().is_success() {
-            return None;
-        }
-        Some(res.bytes().await.ok()?.to_vec())
+        self.fetch_cover_thumb(manga_id, file_name).await
     }
 
     /// Resolve a chapter's ordered page image URLs via MangaDex@Home
@@ -457,7 +528,13 @@ struct AtHome {
 #[derive(Deserialize)]
 struct AtHomeChapter {
     hash: String,
-    #[serde(default)]
+    /// Strict in both directions (like `RawList::total`, and unlike every `data` on a
+    /// COLLECTION envelope). This one is the page list of a single chapter: decoding a
+    /// missing/null `data` as `[]` would hand the reader a chapter with zero pages —
+    /// indistinguishable from a successful fetch, and a blank screen with nothing in
+    /// the logs. Failing the decode surfaces a retryable error to the resolver instead.
+    /// `data` is always present live (verified 2026-07-26), so this only ever fires on
+    /// a genuinely broken response.
     data: Vec<String>,
 }
 
@@ -476,45 +553,107 @@ pub fn cover_thumb_url(manga_id: &str, file_name: &str) -> String {
 
 // ---- Response shapes -------------------------------------------------------
 
+/// Deserialize a field that may be an explicit JSON `null` as `T::default()`.
+///
+/// THE 4,493-RECORD BUG (2026-07-26). `#[serde(default)]` covers only an ABSENT
+/// field: when the key is present with value `null`, serde still invokes `T`'s
+/// `Deserialize`, and `HashMap`/`Vec` reject a `Null` token with
+/// `invalid type: null, expected a map`. Because the fields below live inside
+/// `MdManga`, ONE null container failed the WHOLE record — and `list_manga` used to
+/// throw the error away (`Err(_) => skipped += 1`).
+///
+/// MangaDex emits `"links": null` on a closed legacy cohort (2018-02 → 2021, zero
+/// records from 2022 on); exemplar `c6a8967b-2b61-4e14-8aca-1525a37b63f7` ("Yururira",
+/// createdAt 2018-02-12). That cohort is exactly 4,493 records, 100% of the catalogue
+/// gap (109,266 stored = 113,759 upstream − 4,493), and every one of them was fetched,
+/// parsed-failed, and dropped on every sweep since the seed — while the sweep reported
+/// a clean completion, because a dropped record shrinks neither `raw_len` nor `total`.
+///
+/// Applied to every non-`Option` container in the response shapes whose absence is
+/// SURVIVABLE, not just `links`, so a second cohort with a different null field can never
+/// reproduce this. The four that are deliberately strict instead — `RawList::total`,
+/// `RawChapterList::total`, `MdManga::attributes`, `MdCover::attributes` (plus
+/// `AtHomeChapter::data`, which is a single chapter's page list rather than a collection
+/// envelope) — each say so at their definition, and "strict" there means strict in BOTH
+/// directions: no `#[serde(default)]` either, because an ABSENT field decoding to
+/// `0`/empty is the same silent lie as a null one.
+///
+/// Measured against the live API on 2026-07-26 (3,000 records sampled over `/manga`
+/// windows from 2018-01 to 2026-07, plus `/chapter` and `/cover`): `attributes.links` is
+/// null on ~4.8% of records; `title`, `altTitles`, `description`, `attributes`,
+/// `relationships`, `id` and `type` were never null and never absent; every `altTitles`
+/// element and every `relationships` element was an object. The remaining theoretical
+/// hole is a null ELEMENT inside one of those arrays (`"altTitles": [null]`), which would
+/// still fail the whole record — unobserved, and not worth a custom seq visitor, but
+/// worth knowing about if a future cohort ever drops with a `expected a map` error
+/// pointing at an array index.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct RawList {
-    #[serde(default)]
+    /// Hardened: a null `data` would otherwise fail the whole BODY, costing 100
+    /// records instead of one. An empty page is handled safely downstream
+    /// (`classify_page` → `RetryEmpty`, then `truncated`, which blocks completion).
+    #[serde(default, deserialize_with = "null_as_default")]
     data: Vec<Value>,
-    #[serde(default)]
+    /// DELIBERATELY STRICT, IN BOTH DIRECTIONS — no `#[serde(default)]`, no
+    /// `null_as_default`. A `total` of `0` makes `classify_page` / `offset >= total`
+    /// read "window exhausted", which ends the window, reports a clean+complete sweep
+    /// and can latch a one-shot marker (or `seed_done`) over an unwalked catalogue.
+    ///
+    /// `#[serde(default)]` used to sit here, which left that guard HALF-APPLIED: it
+    /// covered a null `total` (which fails, correctly) but silently turned an ABSENT
+    /// `total` into exactly the `0` the comment was warning about. Every MangaDex
+    /// collection envelope carries `total` — verified live on 2026-07-26 across 30
+    /// `/manga` pages spanning 2018→2026 plus `/chapter` and `/cover`, all with the
+    /// identical key set `{result, response, data, limit, offset, total}` — so
+    /// requiring it costs nothing real, and a body without it fails the decode. That
+    /// is the safe direction: a decode failure leaves the cursor untouched and is not
+    /// a tolerable page error, so it aborts the sweep instead of faking its end.
     total: i64,
 }
 
 #[derive(Deserialize)]
 struct RawChapterList {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     data: Vec<Value>,
-    #[serde(default)]
+    /// Strict in both directions, for the same reason as `RawList::total`.
     total: i64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MdManga {
     pub id: String,
+    /// Left REQUIRED on purpose: a manga with no attributes has no title, and
+    /// upserting a titleless work into the canonical spine is worse than dropping it.
+    /// Such a record now fails loudly (counted in `dropped`, logged with its uuid).
     pub attributes: MdAttrs,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub relationships: Vec<MdRel>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MdAttrs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub alt_titles: Vec<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub description: HashMap<String, String>,
     pub original_language: Option<String>,
     pub status: Option<String>,
     pub year: Option<i64>,
     pub publication_demographic: Option<String>,
     pub content_rating: Option<String>,
-    #[serde(default)]
+    /// The field that dropped 4,493 works — see `null_as_default`.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub links: HashMap<String, String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -539,9 +678,115 @@ pub struct MdRelAttrs {
     pub volume: Option<String>,
 }
 
+/// One page of `/manga`, as the sweeps consume it.
+///
+/// A struct rather than a 4-tuple: `raw_len` and `dropped` are both "counts of records"
+/// with completely different meanings, and the pagination invariant below is far easier
+/// to state (and to not get wrong at a call site) against named fields.
+pub struct MangaPage {
+    /// Records that parsed. May be SHORTER than `raw_len` — see `dropped`.
+    pub mangas: Vec<MdManga>,
+    /// `total` for the whole query, as reported by the API.
+    pub total: i64,
+    /// Records the API returned, BEFORE parse-drops. This — never `mangas.len()` — is
+    /// what drives `classify_page` and `offset` advancement, so a page shortened only by
+    /// unparseable records is never mistaken for the end of the window and the cursor
+    /// stays aligned with the API's own pagination.
+    pub raw_len: usize,
+    /// Records that were fetched and then failed to parse: `raw_len - mangas.len()`.
+    /// Fetched-but-unpersisted is the same class of loss as a failed upsert, so callers
+    /// must treat a non-zero value as blocking completion — 4,493 works hid here for
+    /// months precisely because nobody returned this number.
+    pub dropped: u64,
+}
+
+/// The per-record parse step of `list_manga`, pure and HTTP-free so it is testable.
+/// Returns the parsed records plus `(uuid, serde error)` for every record dropped —
+/// the uuid is read straight off the raw `Value` before the parse attempt, so a drop is
+/// always attributable. The old code did `Err(_) => skipped += 1`, discarding the one
+/// string (`invalid type: null, expected a map`) that would have named `links` on day one.
+fn parse_manga_page(raw: Vec<Value>) -> (Vec<MdManga>, Vec<(String, String)>) {
+    let mut mangas = Vec::with_capacity(raw.len());
+    let mut drops = Vec::new();
+    for v in raw {
+        let id = v
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<no-id>")
+            .to_string();
+        match serde_json::from_value::<MdManga>(v) {
+            Ok(m) => mangas.push(m),
+            Err(e) => drops.push((id, e.to_string())),
+        }
+    }
+    (mangas, drops)
+}
+
+/// How many parse-drops this process logs INDIVIDUALLY (uuid + serde message) before
+/// falling back to one aggregate line per page.
+///
+/// Unbounded per-record logging was the other half of this fix's risk: a recurrence of
+/// the `links: null` shape drops ~4,493 records per full walk, and a dirty backfill pass
+/// re-walks the catalogue up to `BACKFILL_MAX_PASSES` times — >100k ERROR lines per boot,
+/// which is how a log pipeline gets dropped on the floor exactly when it matters. 200
+/// individual lines is far more than a human needs to spot a cohort (they carry the uuid,
+/// so `/manga/{uuid}` reproduces it), and the aggregate line that follows still carries a
+/// per-page count plus one exemplar uuid, so nothing becomes invisible.
+const MAX_DETAILED_DROP_LOGS: u64 = 200;
+
+/// Individually-logged drops so far this process. Only ever feeds the log-verbosity
+/// decision — never a completion predicate (`dropped` counts are exact and unsampled).
+static DETAILED_DROP_LOGS: AtomicU64 = AtomicU64::new(0);
+
+/// How many of a page's `page_drops` still fit under the per-process detail budget,
+/// given `already_logged`. Pure so the sampling rule is testable.
+fn detailed_drop_count(already_logged: u64, page_drops: usize) -> usize {
+    // `budget <= MAX_DETAILED_DROP_LOGS`, so the cast can never truncate.
+    let budget = MAX_DETAILED_DROP_LOGS.saturating_sub(already_logged) as usize;
+    page_drops.min(budget)
+}
+
+/// Log parse-drops at ERROR with the offending uuid and the serde message. ERROR, not
+/// warn: a fetched record that never reaches the spine is data loss, and the previous
+/// aggregate `warn!(skipped)` (no id, no reason) is why this survived a full audit.
+/// Past `MAX_DETAILED_DROP_LOGS` the per-record detail is replaced by one aggregate
+/// ERROR per page — still loud, still attributable, but bounded. `kind` is `manga` or
+/// `chapter`; both share the one budget, since a systematic drop hits both endpoints.
+fn log_record_drops(drops: &[(String, String)], kind: &str, endpoint: &str) {
+    if drops.is_empty() {
+        return;
+    }
+    let already = DETAILED_DROP_LOGS.fetch_add(drops.len() as u64, Ordering::Relaxed);
+    let detailed = detailed_drop_count(already, drops.len());
+    for (id, err) in &drops[..detailed] {
+        tracing::error!(
+            id = %id,
+            kind,
+            error = %err,
+            endpoint,
+            "mangadex: DROPPED an unparseable record — it will not reach the catalogue"
+        );
+    }
+    if detailed < drops.len() {
+        let (id, err) = &drops[detailed];
+        tracing::error!(
+            kind,
+            endpoint,
+            suppressed = drops.len() - detailed,
+            example = %id,
+            error = %err,
+            detail_cap = MAX_DETAILED_DROP_LOGS,
+            "mangadex: DROPPED more unparseable records on this page — per-record logging \
+             is capped for this process; the counts in the sweep/backfill summary are exact"
+        );
+    }
+}
+
 /// A `/cover` record (F2). Only the fields F2 stores.
 #[derive(Debug, Deserialize)]
 struct MdCover {
+    /// Required, like `MdManga::attributes`: a cover record with no attributes has no
+    /// `fileName`, so there is nothing to store — dropping it is the right outcome.
     attributes: MdCoverAttrs,
 }
 
@@ -557,7 +802,10 @@ struct MdCoverAttrs {
 pub struct MdChapter {
     pub id: String,
     pub attributes: MdChapterAttrs,
-    #[serde(default)]
+    /// Hardened for symmetry with `MdManga::relationships`: the chapter firehose
+    /// resolves its work through this list, so a null here would silently drop the
+    /// chapter exactly the way a null `links` dropped a whole work.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub relationships: Vec<MdRel>,
 }
 
@@ -571,6 +819,46 @@ pub struct MdChapterAttrs {
     pub publish_at: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+}
+
+/// One page of `/chapter`, as `sync_chapters` consumes it. The mirror image of
+/// `MangaPage`, and for the same reason: the firehose loop used to page on
+/// `chapters.len()` — the PARSED count — so ONE unparseable chapter shortened the page
+/// to 99, tripped the `page_len < PAGE_LIMIT` end-of-window test, and ended the window
+/// early. The cursor then advanced to the cycle's start time anyway, so every chapter
+/// after the truncation point in that window was never mirrored and (the window being
+/// forward-only) never re-offered. Same bug class as the 4,493-record catalogue gap,
+/// same fix: raw counts drive pagination, parsed records drive nothing but the work.
+pub struct ChapterPage {
+    /// Records that parsed. May be SHORTER than `raw_len` — see `dropped`.
+    pub chapters: Vec<MdChapter>,
+    /// `total` for the whole query, as reported by the API.
+    pub total: i64,
+    /// Records the API returned, BEFORE parse-drops. Drives `classify_page`, the
+    /// end-of-window test and the `offset` advance — never `chapters.len()`.
+    pub raw_len: usize,
+    /// Records fetched and then failed to parse: `raw_len - chapters.len()`.
+    pub dropped: u64,
+}
+
+/// The per-record parse step of `list_chapters`, pure and HTTP-free so it is testable.
+/// Mirrors `parse_manga_page`, including reading the uuid off the raw `Value` first so
+/// every drop is attributable.
+fn parse_chapter_page(raw: Vec<Value>) -> (Vec<MdChapter>, Vec<(String, String)>) {
+    let mut chapters = Vec::with_capacity(raw.len());
+    let mut drops = Vec::new();
+    for v in raw {
+        let id = v
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<no-id>")
+            .to_string();
+        match serde_json::from_value::<MdChapter>(v) {
+            Ok(c) => chapters.push(c),
+            Err(e) => drops.push((id, e.to_string())),
+        }
+    }
+    (chapters, drops)
 }
 
 // ---- Mapping ---------------------------------------------------------------
@@ -840,6 +1128,59 @@ fn classify_page(raw_len: usize, offset: i64, total: i64) -> PageStep {
     }
 }
 
+/// The next page offset, advanced by the RAW page length.
+///
+/// A one-line function so the single most dangerous mistake in this file has one
+/// definition and one test: advancing by the PARSED count instead would step the cursor
+/// short of the API's own pagination on every page that dropped a record, silently
+/// re-fetching some records and — combined with a `< PAGE_LIMIT` end test — skipping
+/// others. `saturating_add` because `offset` is a plain `i64` fed by an upstream length.
+fn next_offset(offset: i64, raw_len: usize) -> i64 {
+    offset.saturating_add(raw_len as i64)
+}
+
+/// The HTTP status embedded in a `get_with_retry` error message
+/// (`"MangaDex /manga error 400 Bad Request"` → `400`), if any.
+fn page_error_status(msg: &str) -> Option<u16> {
+    msg.rsplit_once(" error ")?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether a page fetch that ALREADY exhausted `get_with_retry`'s own four attempts is
+/// one the caller should absorb (cut the window short, keep the cursor) rather than let
+/// abort the whole sweep. MangaDex emits sporadic 400s under fleet-shared-IP load — the
+/// 2026-07-24 backfill boot logged twenty of them, three of which outlasted every retry
+/// — and none of those means "this window is malformed"; the same is true of 429/5xx and
+/// of transport failures (timeout, connection reset). A real 401/403/404, or a JSON
+/// decode failure, still propagates.
+fn is_tolerable_page_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    if msg.contains("request failed") {
+        return true; // transport-level: timeout / connect reset, already retried twice
+    }
+    matches!(
+        page_error_status(&msg),
+        Some(400) | Some(408) | Some(429) | Some(500..=599)
+    )
+}
+
+/// The result of one `sync_catalogue` or `sync_chapters` sweep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// Records upserted: works for the catalogue sweep, chapters for the firehose.
+    pub upserted: u64,
+    /// Records fetched from `/manga` (or `/chapter`) that failed to parse and so never
+    /// reached the spine. NON-ZERO MUST NOT LATCH `seed_done`: the cursor is forward-only
+    /// (`updatedAtSince` never revisits an old `createdAt`), so a dropped record is lost
+    /// until a full re-seed — which is exactly how 4,493 works went missing while the
+    /// seed reported success.
+    pub dropped: u64,
+}
+
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
 /// the `createdAtSince` window past the 10k offset cap, upserting each work. A
 /// failed *record* upsert is logged and skipped, but a page that still errors
@@ -853,17 +1194,22 @@ pub async fn sync_catalogue(
     initial_since: Option<String>,
     cover_phash: bool,
     job: &str,
-) -> Result<u64> {
+) -> Result<SweepOutcome> {
     let mut since = initial_since;
-    let mut upserted: u64 = 0;
+    let mut out = SweepOutcome::default();
     loop {
         let mut offset = 0i64;
         let mut last_created: Option<String> = None;
         let mut done = false;
         let mut empty_retries = 0u32;
         loop {
-            let (mangas, total, raw_len) =
-                client.list_manga(window, since.as_deref(), offset).await?;
+            let MangaPage {
+                mangas,
+                total,
+                raw_len,
+                dropped,
+            } = client.list_manga(window, since.as_deref(), offset).await?;
+            out.dropped += dropped;
             // Completion is decided by the RAW page length + `total`, NEVER by the
             // parsed count: a page trimmed only by unparseable records (list_manga skips
             // them) must not be mistaken for the last page — that single misread at
@@ -919,7 +1265,7 @@ pub async fn sync_catalogue(
                     result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
                 }
                 match result {
-                    Ok(_) => upserted += 1,
+                    Ok(_) => out.upserted += 1,
                     Err(e) => tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed"),
                 }
                 if let Some(ts) = manga_window_ts(m, window) {
@@ -928,8 +1274,14 @@ pub async fn sync_catalogue(
             }
             // Advance by the RAW page size so `offset` stays aligned with the API's
             // pagination and `total`; parse-skips must not desync the cursor.
-            offset += raw_len as i64;
-            tracing::info!(offset, total, upserted, "mangadex: catalogue page");
+            offset = next_offset(offset, raw_len);
+            tracing::info!(
+                offset,
+                total,
+                upserted = out.upserted,
+                dropped = out.dropped,
+                "mangadex: catalogue page"
+            );
             // Checkpoint the seed cursor after EVERY page (not only on window-slide) so a
             // mid-window crash/restart resumes near here instead of re-walking the window
             // from its start. Only during the createdAt seed; incremental cursors are
@@ -994,36 +1346,732 @@ pub async fn sync_catalogue(
             }
         }
     }
-    tracing::info!(upserted, "mangadex: catalogue sweep complete");
-    Ok(upserted)
+    if out.dropped > 0 {
+        // Deliberately not "completion will be withheld": that is only true of a sweep
+        // that is still seeding. On an already-seeded (incremental) sweep the cursor
+        // advances regardless — see `run_one_cycle` — because refusing to advance it
+        // would freeze catalogue updates entirely on one permanently-malformed record.
+        tracing::error!(
+            upserted = out.upserted,
+            dropped = out.dropped,
+            "mangadex: catalogue sweep DROPPED records — they were fetched and never \
+             reached the spine; the gap backfill is what repairs them"
+        );
+    }
+    tracing::info!(
+        upserted = out.upserted,
+        dropped = out.dropped,
+        "mangadex: catalogue sweep complete"
+    );
+    Ok(out)
+}
+
+// ---- DEPLOY NOTE: the v2 catalogue backfill (2026-07-26) -------------------------
+//
+// `CATALOGUE_SYNC=on` and `COVER_PHASH=off` in production, so the corrected walk starts
+// itself ~45s after the next server restart. It is a one-shot; these are the numbers that
+// tell success apart from another silent no-op.
+//
+// EXPECT, on the pass that reports `complete=true`:
+//   backfill: complete  scanned≈113,760  ingested≈4,493  dropped=0  failed=0  truncated=0
+// and per-pass `dropped=0` throughout. `scanned` summed over the passes is the giveaway:
+// v1 summed to 109,261 (parsed records only) — v2 must sum to ≈113,760, the upstream
+// `total` measured live on 2026-07-26. The catalogue grows a few dozen records a day, so
+// treat ≥113,759 as the floor, not an exact equality.
+//
+// THE CRISP DB CHECK (exact, independent of dedup folding):
+//   SELECT COUNT(DISTINCT source_key) FROM source_series WHERE source_type='mangadex';
+//   109,266 (before)  ->  ~113,760 (after)
+// Net new `work` rows will be LOWER than +4,493, because `run_post_ingest_dedup_ex` folds
+// backfilled works into existing Suwayomi-anchored ones via shared aliases. A crude
+// normalized-title match puts the fold at somewhere between ~140 and ~557 of the 4,493
+// (the loose upper bound is mine, measured 2026-07-26; Tier-2 dedup rejects many of those
+// on other signals), so expect roughly +3,950…+4,350 `work` rows. Do NOT treat that as a
+// pass/fail number — use the `source_series` count above.
+//
+// TIMING: v1's enumeration took ~25 min of wall clock at 4 req/s (pass 1 spent its full
+// 20-min budget at scanned=83,805; pass 2 finished the tail in ~5 min). v2 adds ~4,493
+// presence-checks-plus-upserts to that, so expect completion on PASS 2 — boot +45s, 20 min
+// of pass 1, a 30 min gap, then a few minutes — i.e. ~55-60 min after restart, possibly
+// pass 3 if the DB is busy. Not a regression: only `is_clean_completion()` latches.
+//
+// ~2,032 of the 4,493 arrive `is_nsfw=1` (1,964 `pornographic` + 68 `erotica`, measured
+// over the cohort's own `/manga` bodies), so they are hidden from anonymous surfaces on
+// arrival. EXPECTED, not a regression — the catalogue stores the flag and gates at query
+// time. (Separately pre-existing: ~2,500 mainstream works are wrongly flagged NSFW.)
+//
+// THE SAME DEPLOY ALSO CHANGES THE CHAPTER FIREHOSE (2026-07-26 review). `sync_chapters`
+// paged on the PARSED count, so one unparseable chapter shortened a page to 99, tripped
+// the `< PAGE_LIMIT` end-of-window test and ended the window while the cursor still jumped
+// to the cycle's start — silently unmirrored chapters, forever. It now pages on the raw
+// length and retries a transient empty page. Watch for `chapter cycle done  dropped=N`:
+// N should be 0. The chapter mirror is at 805,307 rows and both seeds are already done, so
+// this only affects the incremental sweep.
+//
+// ANOTHER SILENT NO-OP LOOKS LIKE: `scanned≈109,2xx` with `ingested=0` and the marker
+// latched — i.e. the whole catalogue enumerated, nothing added. With this change that
+// cannot latch, because those same records now count into `dropped`, which blocks
+// `is_clean_completion()` and rewinds the cursor; and each one is logged at ERROR with its
+// uuid and the serde message. If it somehow recurs, `docker logs | grep DROPPED` names the
+// records and the reason directly.
+//
+// -----------------------------------------------------------------------------------
+
+/// The maintenance key for the one-time gap backfill (migration 0055).
+///
+/// VERSIONED TO `_v2` ON 2026-07-26. `_v1` ran to a "clean completion" on 2026-07-26
+/// 08:44 and latched its marker having ingested nothing, because every one of the 4,493
+/// records it was meant to repair failed to parse (`links: null`) and the drop was
+/// discarded — see `null_as_default`. Nothing ever clears `maintenance_flag`, so the only
+/// way to re-arm the corrected walk is a new key.
+///
+/// WHY A CONSTANT BUMP AND NOT A MIGRATION OR AN ADMIN MUTATION: the code deploy is
+/// mandatory regardless (the parse fix lives in the same file), so the bump costs nothing
+/// extra; a migration whose semantics are "un-do a done-marker" is not repeatable and
+/// reads oddly in the migration history forever; and versioning KEEPS v1's rows as audit
+/// history of the no-op instead of rewriting them.
+const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v2";
+
+/// The `catalogue_sync_state` job key holding the backfill's window cursor. A key of its
+/// own so it never disturbs the `catalogue`/`chapters` rows the recurring sweep reads;
+/// only `last_synced_at` is used (`seed_done` stays 0 — completion is the
+/// `maintenance_flag` marker, which is the one-shot the boot task keys on).
+///
+/// VERSIONED TO `_v2` ALONGSIDE `BACKFILL_FLAG`, AND BOTH BUMPS ARE MANDATORY. `_v1`
+/// finished its walk, so `catalogue_sync_state('catalogue_backfill').last_synced_at` sits
+/// at 2026-07-25T22:16:20 — the newest end of the catalogue. `backfill_missing_catalogue`
+/// RESUMES from that cursor, so renaming only the flag would restart the walk in mid-2026
+/// and skip the entire 2018–2021 window where 100% of the 4,493-record cohort lives,
+/// ingesting zero again. A fresh job key has no row, so `get_sync_state` returns `None`,
+/// `since` stays `None`, and the walk starts from the beginning of the catalogue (2018-01).
+const BACKFILL_JOB: &str = "catalogue_backfill_v2";
+
+/// How many extra times a backfill page fetch that already survived `get_with_retry`'s
+/// own four attempts is re-tried, after a much longer cool-down, before the window is
+/// cut short. `get_with_retry`'s ladder tops out at 4s, which the 2026-07-24 400 burst
+/// outlasted; a 30s pause clears bursts of that shape.
+const PAGE_ERROR_RETRIES: u32 = 2;
+const PAGE_ERROR_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How long the spawned backfill waits before touching the DB or MangaDex at all. The
+/// boot write burst — the scanner's first tick, `refresh_feed_updates` / `refresh_work_fts`
+/// (themselves staggered ~20s in `main.rs`) and Litestream's checkpoint — ran from
+/// t+0 to roughly t+30s on the 2026-07-24 boot and cost four works to SQLITE_BUSY.
+/// 45s clears that window with margin. `main.rs` isn't ours to stagger, so the delay
+/// lives here, inside the spawned task, and needs no call-site change.
+const BACKFILL_BOOT_DELAY: Duration = Duration::from_secs(45);
+
+/// Wall-clock budget for ONE backfill pass. A pass holds the catalogue single-flight
+/// lock, and a full `/manga` enumeration is ~1,140 pages at 4 req/s; without a budget
+/// the backfill would own the lock (and so suppress the recurring sweep's tick) for the
+/// whole run. Each pass stops on the budget with its cursor persisted and the next pass
+/// resumes exactly there.
+const BACKFILL_PASS_BUDGET: Duration = Duration::from_secs(20 * 60);
+
+/// Idle gap between passes, so the recurring sweep gets the lock in between.
+const BACKFILL_PASS_GAP: Duration = Duration::from_secs(30 * 60);
+
+/// Consecutive zero-progress passes (lock permanently busy, or a pass that scans
+/// nothing) after which this process gives up and leaves the rest to a later boot.
+const BACKFILL_IDLE_PASSES: u32 = 3;
+
+/// Hard ceiling on passes per process, so a pathological "sweeps fine but always loses a
+/// record to BUSY" state re-walks the catalogue a bounded number of times rather than
+/// forever. 24 passes × 30min ≈ half a day of attempts.
+///
+/// THE FAILURE MODE THIS BOUNDS, stated plainly, because `dropped` now feeds `is_dirty()`
+/// and so widens it: if ONE upstream record is permanently unparseable, every pass is
+/// dirty, every dirty pass rewinds the cursor, and the process re-walks from 2018 until
+/// this ceiling — ~20 hours of passes, repeated on every boot. That is deliberate (a
+/// record we fetch and cannot store is a real gap, and the alternative is latching a
+/// marker over it that nothing can ever clear) but it is NOT free: it burns the shared
+/// 4 req/s MangaDex budget. The ceiling is the bound, and hitting it logs at ERROR with
+/// the last pass's loss counters so the operator can fix the record (or widen the parse)
+/// rather than watch it spin. A rewind costs nothing on the DB side — present ids are
+/// skipped — so the cost is purely upstream requests.
+const BACKFILL_MAX_PASSES: u32 = 24;
+
+/// The result of one bounded backfill pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackfillOutcome {
+    /// Records enumerated from `/manga` this pass AND successfully parsed. Records that
+    /// were fetched and failed to parse land in `dropped`, not here — so `scanned +
+    /// dropped` is what compares against the upstream `total`, and a `scanned` short of
+    /// it with `dropped == 0` means the walk did not cover the catalogue.
+    pub scanned: u64,
+    /// Records absent from `source_series` that were upserted.
+    pub ingested: u64,
+    /// Records this pass could not persist (SQLITE_BUSY outlasting `UPSERT_LOCK_RETRIES`,
+    /// or a failed presence check). NON-ZERO BLOCKS THE ONE-SHOT COMPLETION MARKER — a
+    /// partially-complete backfill must never mark itself done, or those ids are lost
+    /// for good (four were, on 2026-07-24).
+    pub failed: u64,
+    /// Whether this pass reached the end of the catalogue. False when the pass stopped
+    /// on its wall-clock budget or on a window that could not advance.
+    pub complete: bool,
+    /// Windows cut short by a page that stayed empty past `EMPTY_PAGE_RETRIES` while
+    /// `offset < total`, i.e. records the API said existed but never handed over.
+    ///
+    /// Tracked SEPARATELY from `complete` because a truncated window still lets the
+    /// loop reach the end of the catalogue, and an exhausted-empty page is EXACTLY the
+    /// blip that truncated the original seed and latched `seed_done` — the gap this
+    /// backfill exists to repair. Latching the one-shot marker after one would make the
+    /// gap permanent and unrepairable, since nothing ever clears `maintenance_flag`.
+    pub truncated: u64,
+    /// Records this pass FETCHED from `/manga` and then failed to parse, so they never
+    /// reached the presence check, let alone the spine (`MangaPage::dropped`).
+    ///
+    /// This field exists because of 2026-07-26: the v1 backfill enumerated the whole
+    /// catalogue, dropped all 4,493 records it existed to repair on the `links: null`
+    /// parse, reported `scanned = 109,266 / ingested = 0 / failed = 0 / truncated = 0`,
+    /// passed `is_clean_completion()`, and latched a permanent marker over a total no-op.
+    /// A fetched-but-unpersisted record is the same class of loss as `failed`/`truncated`,
+    /// so it blocks the marker AND forces the cursor rewind.
+    pub dropped: u64,
+}
+
+impl BackfillOutcome {
+    /// The ONLY condition under which the one-shot completion marker may be latched:
+    /// the sweep reached the end of the catalogue having lost nothing and skipped
+    /// nothing. Anything less resumes on a later pass or a later boot.
+    pub fn is_clean_completion(&self) -> bool {
+        self.complete && self.failed == 0 && self.truncated == 0 && self.dropped == 0
+    }
+
+    /// Whether this pass left the catalogue in a state that must not be resumed from —
+    /// the cursor has advanced past records that were never persisted, so completing
+    /// from here would skip them for good.
+    pub fn is_dirty(&self) -> bool {
+        self.failed > 0 || self.truncated > 0 || self.dropped > 0
+    }
+}
+
+/// Fill catalogue gaps the original `createdAt` seed missed (transient empty-page /
+/// parse blips truncated specific windows; the forward-only `updatedAtSince`
+/// incremental never revisits them). Enumerates the WHOLE `/manga` catalogue by
+/// `createdAt` asc (all content ratings) exactly like `sync_catalogue`, but upserts
+/// ONLY ids absent from `source_series` — so it's a lightweight top-up, not a full
+/// re-seed, and it does not touch the chapter firehose. Returns `(scanned, ingested)`.
+///
+/// The window-sliding is the seed's: slide `since` to the last record's `createdAt`
+/// (overlap is harmless — present ids are skipped), and step +1s only on the
+/// pathological >9,900-in-one-second boundary.
+///
+/// RESUMABILITY: the window cursor is checkpointed to `catalogue_sync_state` under
+/// `BACKFILL_JOB` after every completed window, and the pass RESUMES from it. Previously
+/// the cursor lived in a local and every pass restarted at `since = NULL`, so a failure
+/// threw away all progress and re-burned ~3 minutes of the shared MangaDex budget
+/// re-enumerating the same first window on every boot.
+///
+/// `budget`, when set, stops the pass (cleanly, cursor persisted, `complete = false`)
+/// once that much wall-clock has elapsed, so the pass can release the catalogue
+/// single-flight lock and resume later.
+pub async fn backfill_missing_catalogue(
+    pool: &sqlx::SqlitePool,
+    client: &MangaDexClient,
+    cover_phash: bool,
+    budget: Option<Duration>,
+) -> Result<BackfillOutcome> {
+    let started = Instant::now();
+    let mut since: Option<String> = catalog::get_sync_state(pool, BACKFILL_JOB)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.cursor);
+    if let Some(ref s) = since {
+        tracing::info!(resume = %s, "backfill: resuming from the stored window cursor");
+    }
+    let mut out = BackfillOutcome::default();
+    loop {
+        let mut offset = 0i64;
+        let mut last_created: Option<String> = None;
+        let mut done = false;
+        let mut empty_retries = 0u32;
+        let mut page_errors = 0u32;
+        loop {
+            let page = client
+                .list_manga(SyncWindow::Created, since.as_deref(), offset)
+                .await;
+            let MangaPage {
+                mangas,
+                total,
+                raw_len,
+                dropped,
+            } = match page {
+                Ok(p) => p,
+                // A page error that outlived `get_with_retry` must NOT kill the pass:
+                // MangaDex's sporadic 400s are transient, and the `?` that used to be
+                // here is exactly what ended the 2026-07-24 run with 3 of ~4,500 series
+                // ingested. Cool off and re-fetch; if it persists, end the window here
+                // (the cursor slides on, so the pass advances instead of dying).
+                Err(e) if is_tolerable_page_error(&e) => {
+                    if page_errors < PAGE_ERROR_RETRIES {
+                        page_errors += 1;
+                        tracing::warn!(
+                            error = %e, offset, page_errors,
+                            "backfill: page fetch failed after retries — cooling down"
+                        );
+                        tokio::time::sleep(PAGE_ERROR_COOLDOWN).await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        error = %e, offset,
+                        "backfill: page still failing — ending this window and sliding on"
+                    );
+                    break; // done stays false → slide the window below
+                }
+                Err(e) => return Err(e),
+            };
+            page_errors = 0;
+            // Fetched-but-unparseable records: counted BEFORE `classify_page`, because a
+            // page that is 100% drops still has to advance `offset` by `raw_len` and must
+            // still block completion. This is the counter that was missing on 2026-07-26,
+            // when a whole 4,493-record cohort came back and went nowhere in silence.
+            out.dropped += dropped;
+            match classify_page(raw_len, offset, total) {
+                PageStep::EndWindow => {
+                    done = true;
+                    break;
+                }
+                PageStep::RetryEmpty => {
+                    if empty_retries < EMPTY_PAGE_RETRIES {
+                        empty_retries += 1;
+                        continue;
+                    }
+                    // `offset < total`: MangaDex told us more records exist in this
+                    // window and then kept handing back an empty page. This is the
+                    // ORIGINAL truncation blip — the one that ended the seed early and
+                    // latched `seed_done`. Do NOT set `done`: that would mark the pass
+                    // `complete`, and a complete+clean pass latches a one-shot
+                    // `maintenance_flag` that nothing ever clears, freezing the very gap
+                    // this backfill exists to close. Record it and slide the window so
+                    // the pass still makes progress, but keep completion blocked.
+                    out.truncated += 1;
+                    tracing::error!(
+                        offset,
+                        total,
+                        "backfill: repeated empty page before total — window truncated; \
+                         completion withheld"
+                    );
+                    break;
+                }
+                PageStep::Process => {}
+            }
+            empty_retries = 0;
+            for m in &mangas {
+                out.scanned += 1;
+                if let Some(ts) = manga_window_ts(m, SyncWindow::Created) {
+                    last_created = Some(ts);
+                }
+                let (id, mut input) = to_work_input(m);
+                // Skip ids we already carry — this is a top-up, not a re-seed. A failed
+                // presence check (BUSY on the read side) counts as a lost record rather
+                // than aborting the pass: we can't tell whether it needs ingesting.
+                let present: Option<i64> = match sqlx::query_scalar(
+                    "SELECT 1 FROM source_series \
+                     WHERE source_type = 'mangadex' AND source_key = ? LIMIT 1",
+                )
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        out.failed += 1;
+                        tracing::warn!(manga = %id, error = %e, "backfill: presence check failed");
+                        continue;
+                    }
+                };
+                if present.is_some() {
+                    continue;
+                }
+                if cover_phash {
+                    if let Some(fname) = cover_file_name(m) {
+                        input.cover_phash = client.cover_phash(&id, &fname).await;
+                    }
+                }
+                let mut result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
+                let mut lock_retry = 0u32;
+                while let Err(e) = &result {
+                    if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
+                        break;
+                    }
+                    lock_retry += 1;
+                    tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64)).await;
+                    result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
+                }
+                match result {
+                    Ok(_) => out.ingested += 1,
+                    Err(e) => {
+                        // Counted, not just logged: the caller refuses to latch the
+                        // one-shot completion marker while `failed > 0`, so these ids
+                        // get another pass instead of being silently abandoned.
+                        out.failed += 1;
+                        tracing::warn!(manga = %id, error = %e, "backfill: upsert failed");
+                    }
+                }
+            }
+            // Checkpoint after EVERY page, exactly as the seed does, so a crash or a
+            // budget stop mid-window resumes near here instead of at the window's start.
+            // Resuming from an already-processed record's `createdAt` only re-enumerates
+            // a little, and present ids are skipped, so the overlap costs nothing.
+            if let Some(s) = last_created.as_deref().and_then(to_since) {
+                if let Err(e) = catalog::set_seed_progress(pool, BACKFILL_JOB, &s).await {
+                    tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+                }
+            }
+            // RAW length, never `mangas.len()` — see `next_offset`.
+            offset = next_offset(offset, raw_len);
+            if offset >= total {
+                done = true;
+                break;
+            }
+            if offset >= WINDOW_OFFSET_CAP {
+                break;
+            }
+            // Budget is checked here too, not just at window boundaries: a window is up
+            // to 9,900 records, so a boundary-only check could overrun it many-fold.
+            // Breaking with `done = false` falls through to the slide + outer check.
+            if budget.is_some_and(|b| started.elapsed() >= b) {
+                break;
+            }
+        }
+        if done {
+            out.complete = true;
+            break;
+        }
+        // Slide the window. `slid == false` means the cursor cannot advance at all (no
+        // record seen this window — e.g. the very first page kept failing); stop rather
+        // than spin, leaving the stored cursor for the next pass.
+        let next_since = last_created.as_deref().and_then(to_since);
+        let slid = if next_since.is_none() || next_since == since {
+            match last_created.as_deref().and_then(to_since_next_second) {
+                Some(stepped) if Some(&stepped) != since.as_ref() => {
+                    since = Some(stepped);
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            since = next_since;
+            true
+        };
+        if !slid {
+            tracing::warn!(
+                since = since.as_deref().unwrap_or("<none>"),
+                "backfill: window could not advance — keeping the cursor for the next pass"
+            );
+            break;
+        }
+        // Checkpoint after every completed window so a crash/failure resumes here.
+        if let Some(ref s) = since {
+            if let Err(e) = catalog::set_seed_progress(pool, BACKFILL_JOB, s).await {
+                tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+            }
+        }
+        tracing::info!(
+            scanned = out.scanned,
+            ingested = out.ingested,
+            failed = out.failed,
+            dropped = out.dropped,
+            since = %since.as_deref().unwrap_or("<none>"),
+            "backfill: catalogue window done"
+        );
+        if budget.is_some_and(|b| started.elapsed() >= b) {
+            tracing::info!(
+                elapsed_secs = started.elapsed().as_secs(),
+                "backfill: pass budget spent — pausing here (cursor persisted)"
+            );
+            break;
+        }
+    }
+    tracing::info!(
+        scanned = out.scanned,
+        ingested = out.ingested,
+        failed = out.failed,
+        dropped = out.dropped,
+        truncated = out.truncated,
+        complete = out.complete,
+        "backfill: catalogue gap backfill pass finished"
+    );
+    Ok(out)
+}
+
+/// What the pass scheduler should do next.
+enum PassResult {
+    /// Finished, or must not run at all — stop scheduling passes in this process.
+    Stop,
+    /// Run another pass after `BACKFILL_PASS_GAP`. `scanned` drives the idle guard;
+    /// `last` is the pass's outcome when it actually ran (absent when the pass never
+    /// started — flag read failed, lock busy), so the scheduler can say WHY it gave up.
+    Retry {
+        scanned: u64,
+        last: Option<BackfillOutcome>,
+    },
+}
+
+/// One bounded backfill pass, under the catalogue single-flight lock.
+async fn run_backfill_pass(
+    pool: &sqlx::SqlitePool,
+    covers: &sqlx::SqlitePool,
+    client: &MangaDexClient,
+    cover_phash: bool,
+) -> PassResult {
+    // Already done, or the catalogue seed hasn't finished yet → nothing to do now.
+    match catalog::maintenance_flag_present(pool, BACKFILL_FLAG).await {
+        Ok(true) => return PassResult::Stop,
+        // A read failure here is almost always transient SQLITE_BUSY against the boot
+        // write burst. `Stop` would abandon the backfill for the whole process lifetime
+        // on a 15s lock timeout, so retry after the gap instead — the flag re-read is
+        // free and the pass is a no-op once it really is set.
+        Err(e) => {
+            tracing::warn!(error = %e, "backfill: flag read failed; retrying after the pass gap");
+            return PassResult::Retry {
+                scanned: 0,
+                last: None,
+            };
+        }
+        Ok(false) => {}
+    }
+    let seeded = catalog::get_sync_state(pool, "catalogue")
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.seed_done)
+        .unwrap_or(false);
+    if !seeded {
+        tracing::info!("backfill: catalogue seed not complete yet; deferring to a later boot");
+        return PassResult::Stop;
+    }
+    // Don't race the seed / recurring sync / resync for the single writer + rate limit.
+    if CATALOGUE_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::info!("backfill: a catalogue sync is running; retrying after the pass gap");
+        return PassResult::Retry {
+            scanned: 0,
+            last: None,
+        };
+    }
+    let _guard = SyncGuard; // releases the lock on completion or panic
+    tracing::info!("backfill: starting a catalogue gap backfill pass");
+    match backfill_missing_catalogue(pool, client, cover_phash, Some(BACKFILL_PASS_BUDGET)).await {
+        Ok(o) if o.is_clean_completion() => {
+            tracing::info!(
+                scanned = o.scanned,
+                ingested = o.ingested,
+                "backfill: complete"
+            );
+            if let Err(e) = catalog::set_maintenance_flag(pool, BACKFILL_FLAG).await {
+                tracing::warn!(error = %e, "backfill: failed to persist completion marker");
+            }
+            // The backfill keys on the MangaDex UUID only, so a backfilled series that
+            // the catalogue already had as a Suwayomi-only work becomes a second
+            // canonical work. Fold those together now (aliases include the MangaDex
+            // altTitles, so older entries under a different name match). Still inside
+            // the SyncGuard — nothing else is writing the catalogue.
+            //
+            // `_ex` with the covers pool: every fold here retires a work whose cached
+            // cover blob lives in the separate (un-cascaded) covers DB, so without the
+            // pool this one-time backfill leaked one orphan per merge.
+            crate::graphql::run_post_ingest_dedup_ex(pool, Some(covers)).await;
+            PassResult::Stop
+        }
+        Ok(o) => {
+            // Rewind on ANY dirty pass, not just one that also reached the end.
+            //
+            // `failed`/`truncated` are PER-PASS, but the completion marker is process-
+            // wide and permanent. A budget-truncated pass that lost records used to keep
+            // its cursor, so the NEXT pass resumed past those records, could reach the
+            // end reporting `failed == 0`, and latched the marker — silently abandoning
+            // them. Worse, the cursor survives a restart, so a fresh process would do the
+            // same with no memory of the loss at all. Rewinding here makes "reached the
+            // end cleanly" mean "re-walked the whole catalogue cleanly", independent of
+            // pass and process boundaries. The re-walk is cheap on the DB side (present
+            // ids are skipped) and bounded by `BACKFILL_MAX_PASSES`.
+            if o.is_dirty() {
+                tracing::warn!(
+                    failed = o.failed,
+                    truncated = o.truncated,
+                    dropped = o.dropped,
+                    complete = o.complete,
+                    "backfill: pass lost or skipped records — NOT marking done; rewinding \
+                     the cursor so the next pass re-walks from the start"
+                );
+                if let Err(e) = catalog::reset_sync_state(pool, BACKFILL_JOB).await {
+                    tracing::warn!(error = %e, "backfill: failed to rewind the window cursor");
+                }
+            }
+            PassResult::Retry {
+                scanned: o.scanned,
+                last: Some(o),
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "backfill: pass failed; cursor kept for the next pass");
+            PassResult::Retry {
+                scanned: 0,
+                last: None,
+            }
+        }
+    }
+}
+
+/// Spawn the one-time catalogue gap backfill in the background if it hasn't run yet
+/// (marker in `maintenance_flag`, migration 0055). Gated on the catalogue seed being
+/// complete (a top-up only makes sense against a finished spine) and on the shared
+/// catalogue single-flight lock (so it never races the seed/resync). Non-blocking.
+///
+/// Runs as a series of budgeted passes rather than one long sweep: each pass checkpoints
+/// its window cursor, then releases the single-flight lock for `BACKFILL_PASS_GAP` so the
+/// recurring sweep can run. The completion marker is set only when a pass reaches the end
+/// of the catalogue with ZERO lost records; anything else simply resumes next pass/boot.
+///
+/// Takes the shutdown watch so the schedule is INTERRUPTIBLE. The pass ceiling spans up
+/// to 24 × (20 min work + 30 min gap) ≈ 20 hours, so without this a redeploy would leave
+/// the task sleeping through the drain and still hitting MangaDex — and, because the
+/// single-flight lock is taken per pass, still able to start a fresh 20-minute pass while
+/// the server is shutting down. Every await point that can block for minutes selects on
+/// the signal; the in-flight pass itself is not cancelled mid-record (its cursor is
+/// checkpointed per page, so the next boot resumes within one page).
+pub fn spawn_backfill_if_needed(
+    pool: sqlx::SqlitePool,
+    covers: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    cover_phash: bool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        /// Sleep, unless shutdown fires first. `true` => shut down, stop scheduling.
+        async fn nap(d: Duration, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+            tokio::select! {
+                _ = tokio::time::sleep(d) => false,
+                // A dropped sender means the process is going away and `changed()` will
+                // return `Err` INSTANTLY, forever. Reading `*borrow()` there (still
+                // `false`) collapsed every nap in this task to a no-op: the 45s boot
+                // stagger and all 24 pass gaps would vanish and the passes would run
+                // back to back. Treat it as shutdown.
+                r = shutdown.changed() => r.is_err() || *shutdown.borrow(),
+            }
+        }
+        // Stagger behind the boot write burst (scanner tick + feed/FTS rebuilds +
+        // Litestream checkpoint) — starting at t+0 is what cost four works to
+        // SQLITE_BUSY. `main.rs` isn't ours to stagger, so the delay lives here.
+        if nap(BACKFILL_BOOT_DELAY, &mut shutdown).await {
+            return;
+        }
+        let mut idle_passes = 0u32;
+        let mut last_outcome: Option<BackfillOutcome> = None;
+        for pass in 1..=BACKFILL_MAX_PASSES {
+            if *shutdown.borrow() {
+                tracing::info!(pass, "backfill: shutting down before the next pass");
+                return;
+            }
+            match run_backfill_pass(&pool, &covers, &client, cover_phash).await {
+                PassResult::Stop => return,
+                PassResult::Retry { scanned, last } => {
+                    if last.is_some() {
+                        last_outcome = last;
+                    }
+                    if scanned == 0 {
+                        idle_passes += 1;
+                        if idle_passes >= BACKFILL_IDLE_PASSES {
+                            tracing::warn!(
+                                pass,
+                                "backfill: no progress in {BACKFILL_IDLE_PASSES} passes; \
+                                 leaving the rest to a later boot"
+                            );
+                            return;
+                        }
+                    } else {
+                        idle_passes = 0;
+                    }
+                }
+            }
+            if nap(BACKFILL_PASS_GAP, &mut shutdown).await {
+                tracing::info!(pass, "backfill: shutting down during the pass gap");
+                return;
+            }
+        }
+        // ERROR, not warn, and with the last pass's counters. Reaching this means ~20
+        // hours of passes each re-walked the whole catalogue and none came back clean —
+        // i.e. something upstream is permanently unparseable/unwritable and the walk will
+        // burn the same budget again on every boot until a human looks. The counters say
+        // which of the three loss classes it is; the matching `DROPPED` lines name the
+        // records.
+        tracing::error!(
+            passes = BACKFILL_MAX_PASSES,
+            dropped = last_outcome.map(|o| o.dropped).unwrap_or(0),
+            failed = last_outcome.map(|o| o.failed).unwrap_or(0),
+            truncated = last_outcome.map(|o| o.truncated).unwrap_or(0),
+            complete = last_outcome.map(|o| o.complete).unwrap_or(false),
+            "backfill: pass ceiling reached without a clean completion — the same walk \
+             will be retried on the next boot; check the DROPPED/failed lines above"
+        );
+    });
 }
 
 /// Global `/chapter` firehose → mirrored `chapter` rows. Each chapter is attached to
 /// the `mangadex` source_series of its `manga` relationship; chapters whose work
 /// hasn't been catalogued yet are skipped (a later catalogue sweep + re-run picks
 /// them up). Same `createdAt` windowing as the catalogue sweep.
+///
+/// Pagination is driven by the RAW page length exactly as the catalogue sweep's is —
+/// see `ChapterPage` for the truncation bug that cost.
 pub async fn sync_chapters(
     pool: &sqlx::SqlitePool,
     client: &MangaDexClient,
     window: SyncWindow,
     initial_since: Option<String>,
     job: &str,
-) -> Result<u64> {
+) -> Result<SweepOutcome> {
     let mut since = initial_since;
-    let mut stored: u64 = 0;
+    let mut out = SweepOutcome::default();
     loop {
         let mut offset = 0i64;
         let mut last_created: Option<String> = None;
         let mut done = false;
+        let mut empty_retries = 0u32;
         loop {
-            let (chapters, total) = client
+            let ChapterPage {
+                chapters,
+                total,
+                raw_len,
+                dropped,
+            } = client
                 .list_chapters(window, since.as_deref(), offset)
                 .await?;
-            if chapters.is_empty() {
-                done = true;
-                break;
+            out.dropped += dropped;
+            // RAW length + `total`, never `chapters.len()`: a page trimmed only by
+            // unparseable chapters must not read as the end of the window.
+            match classify_page(raw_len, offset, total) {
+                PageStep::EndWindow => {
+                    done = true;
+                    break;
+                }
+                PageStep::RetryEmpty => {
+                    if empty_retries < EMPTY_PAGE_RETRIES {
+                        empty_retries += 1;
+                        tracing::warn!(
+                            offset,
+                            total,
+                            empty_retries,
+                            "mangadex: empty chapter page before reaching total — retrying"
+                        );
+                        continue;
+                    }
+                    tracing::error!(
+                        offset,
+                        total,
+                        "mangadex: repeated empty chapter page before total — ending window"
+                    );
+                    done = true;
+                    break;
+                }
+                PageStep::Process => {}
             }
-            let page_len = chapters.len() as i64;
+            empty_retries = 0;
             for c in &chapters {
                 if let Some(ts) = chapter_window_ts(c, window) {
                     last_created = Some(ts);
@@ -1057,19 +2105,26 @@ pub async fn sync_chapters(
                     published_at: c.attributes.publish_at.clone(),
                 };
                 match catalog::upsert_chapter(pool, &ssid, &ch).await {
-                    Ok(_) => stored += 1,
+                    Ok(_) => out.upserted += 1,
                     Err(e) => tracing::warn!(error = %e, "mangadex: chapter upsert failed"),
                 }
             }
-            offset += page_len;
-            if page_len < PAGE_LIMIT {
+            // RAW length, never the parsed count — see `next_offset` / `ChapterPage`.
+            offset = next_offset(offset, raw_len);
+            // A short page means the API ran out of records for this window. Short of
+            // the RAW limit, not of the parsed count: that distinction is the whole bug.
+            // Deliberately NOT also `offset >= total` (which is how `sync_catalogue`
+            // terminates): adding it here would end the window earlier than the old code
+            // ever did if `total` under-reported, and this change is meant to remove a
+            // truncation, not trade it for a new one. An exhausted window still ends
+            // promptly — the next fetch is empty, which `classify_page` calls `EndWindow`.
+            if (raw_len as i64) < PAGE_LIMIT {
                 done = true;
                 break;
             }
             if offset >= WINDOW_OFFSET_CAP {
                 break;
             }
-            let _ = total;
         }
         if done {
             break;
@@ -1111,8 +2166,19 @@ pub async fn sync_chapters(
             }
         }
     }
-    tracing::info!(stored, "mangadex: chapter sweep complete");
-    Ok(stored)
+    if out.dropped > 0 {
+        tracing::error!(
+            stored = out.upserted,
+            dropped = out.dropped,
+            "mangadex: chapter sweep DROPPED records — they were fetched and never mirrored"
+        );
+    }
+    tracing::info!(
+        stored = out.upserted,
+        dropped = out.dropped,
+        "mangadex: chapter sweep complete"
+    );
+    Ok(out)
 }
 
 /// Single-flight lock over `run_one_cycle`: only one catalogue sync cycle runs at a
@@ -1210,9 +2276,10 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
         None => (SyncWindow::Created, None),                      // fresh seed
     };
     match sync_catalogue(pool, client, window, since, cover_phash, "catalogue").await {
-        Ok(n) => {
+        Ok(o) => {
             tracing::info!(
-                upserted = n,
+                upserted = o.upserted,
+                dropped = o.dropped,
                 incremental = catalogue_seeded,
                 "mangadex: catalogue cycle done"
             );
@@ -1220,6 +2287,30 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
             // incremental cursor; an already-seeded run just advances the cursor.
             let res = if catalogue_seeded {
                 catalog::set_sync_cursor(pool, "catalogue", &run_start).await
+            } else if o.dropped > 0 {
+                // A seed that FETCHED records and failed to parse them must not latch
+                // `seed_done`: doing so switches the sweep to the forward-only
+                // `updatedAtSince` window, which never revisits an old `createdAt`, so
+                // those records become unreachable without a full manual re-seed. That is
+                // precisely how the 4,493-record gap became permanent.
+                //
+                // BE CLEAR ABOUT WHAT THIS DOES AND DOESN'T BUY. The per-page cursor is
+                // kept (`set_seed_progress` already wrote it, advanced to the last PARSED
+                // record — which is normally past the dropped ones), so the next cycle
+                // resumes AHEAD of the drops and, finding none of its own, marks the seed
+                // done. This is therefore a one-cycle delay plus a loud, attributable
+                // ERROR — not a recovery mechanism. Recovering the dropped records is the
+                // gap backfill's job (`backfill_missing_catalogue`), which rewinds its
+                // cursor and re-walks from 2018 on any dirty pass. The alternative here —
+                // rewinding the seed cursor — would re-walk 113k records every cycle
+                // forever on a single permanently-malformed upstream record.
+                tracing::error!(
+                    dropped = o.dropped,
+                    "mangadex: catalogue seed dropped records — withholding seed_done so \
+                     the seed keeps resuming instead of switching to the forward-only \
+                     incremental window"
+                );
+                Ok(())
             } else {
                 catalog::mark_seed_done(pool, "catalogue", &run_start).await
             };
@@ -1232,7 +2323,18 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
         }
     }
 
-    // --- Chapters ------------------------------------------------------------
+    run_chapter_cycle(pool, client, &run_start).await;
+}
+
+/// The chapter half of a sync cycle: seed or incrementally refresh the `/chapter`
+/// firehose mirror. Split out of `run_one_cycle` because the two halves have very
+/// different costs — the incremental chapter sweep is ~75 chapters a cycle while a
+/// catalogue sweep is thousands of records — so this half can be driven on a much
+/// tighter schedule than `CATALOGUE_SYNC_INTERVAL_SECS` (6h, which is why a brand-new
+/// chapter can surface already labelled "5h ago"). `run_start` is the wall-clock at the
+/// caller's cycle start in MangaDex `since` form: anything updated during the cycle is
+/// >= it, so it's caught next cycle rather than missed.
+async fn run_chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, run_start: &str) {
     // Gate the chapter seed on the catalogue seed having completed (M3): until
     // every work is catalogued, a chapter whose work is missing is skipped, and
     // the chapters cursor would advance past it (updatedAtSince never revisits an
@@ -1263,16 +2365,29 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
         None => (SyncWindow::Created, None),
     };
     match sync_chapters(pool, client, window, since, "chapters").await {
-        Ok(n) => {
+        Ok(o) => {
             tracing::info!(
-                stored = n,
+                stored = o.upserted,
+                dropped = o.dropped,
                 incremental = chapters_seeded,
                 "mangadex: chapter cycle done"
             );
             let res = if chapters_seeded {
-                catalog::set_sync_cursor(pool, "chapters", &run_start).await
+                catalog::set_sync_cursor(pool, "chapters", run_start).await
+            } else if o.dropped > 0 {
+                // Same rule as the catalogue seed: a seed that fetched records and could
+                // not parse them must not flip `seed_done`, because that switches the
+                // sweep to the forward-only `updatedAtSince` window which never revisits
+                // an old `createdAt`. The per-window `set_seed_progress` checkpoint is
+                // kept, so the next cycle resumes rather than restarting.
+                tracing::error!(
+                    dropped = o.dropped,
+                    "mangadex: chapter seed dropped records — withholding seed_done so the \
+                     seed keeps resuming instead of switching to the incremental window"
+                );
+                Ok(())
             } else {
-                catalog::mark_seed_done(pool, "chapters", &run_start).await
+                catalog::mark_seed_done(pool, "chapters", run_start).await
             };
             if let Err(e) = res {
                 tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
@@ -1331,7 +2446,12 @@ async fn run_recurring(
     interval_secs: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    // Start 60s behind the scanner so the boot burst is spread across the five
+    // background loops rather than landing in one instant — see scanner::run_loop.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(interval_secs),
+    );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(
         interval_secs,
@@ -1342,6 +2462,19 @@ async fn run_recurring(
         tokio::select! {
             _ = ticker.tick() => {
                 sync_cycle(&pool, &client, cover_phash).await;
+                // New canonical chapters just landed — rebuild the materialized updates
+                // feed so `canonicalUpdates` reflects them (migration 0051). Non-fatal:
+                // a stale feed is better than a crashed sync loop.
+                match crate::catalog::refresh_feed_updates(&pool).await {
+                    Ok(n) => tracing::info!(works = n, "mangadex: feed_updates refreshed"),
+                    Err(e) => tracing::warn!(error = %e, "mangadex: feed_updates refresh failed"),
+                }
+                // AD-5: new/renamed works just landed — rebuild the search index too so
+                // text search reflects them (migration 0052). Non-fatal like above.
+                match crate::catalog::refresh_work_fts(&pool).await {
+                    Ok(n) => tracing::info!(works = n, "mangadex: work_fts refreshed"),
+                    Err(e) => tracing::warn!(error = %e, "mangadex: work_fts refresh failed"),
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -1380,6 +2513,174 @@ mod tests {
         // A transient empty page short of the total is NOT the end — retry it.
         assert_eq!(classify_page(0, 1_100, 113_610), PageStep::RetryEmpty);
         assert_eq!(classify_page(0, 0, 113_610), PageStep::RetryEmpty);
+    }
+
+    #[test]
+    fn page_error_status_extracts_the_http_code() {
+        assert_eq!(
+            page_error_status("MangaDex /manga error 400 Bad Request"),
+            Some(400)
+        );
+        assert_eq!(
+            page_error_status("MangaDex /manga?ids error 404 Not Found"),
+            Some(404)
+        );
+        assert_eq!(
+            page_error_status("MangaDex /manga request failed: connection reset"),
+            None
+        );
+    }
+
+    #[test]
+    fn tolerable_page_errors_are_the_transient_ones() {
+        // The exact error that killed the 2026-07-24 backfill after 3 of ~4,500 works.
+        assert!(is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga error 400 Bad Request"
+        )));
+        assert!(is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga error 429 Too Many Requests"
+        )));
+        assert!(is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga error 503 Service Unavailable"
+        )));
+        // Transport failures (already retried twice inside get_with_retry) too.
+        assert!(is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga request failed: operation timed out"
+        )));
+        // Real client errors and decode failures still abort the pass.
+        assert!(!is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga error 404 Not Found"
+        )));
+        assert!(!is_tolerable_page_error(&anyhow!(
+            "MangaDex /manga error 403 Forbidden"
+        )));
+        assert!(!is_tolerable_page_error(&anyhow!(
+            "error decoding response body"
+        )));
+    }
+
+    #[test]
+    fn backfill_completion_requires_a_clean_sweep() {
+        // The gate `run_backfill_pass` applies before latching the one-shot marker:
+        // reaching the end of the catalogue is NOT enough if records were lost.
+        let clean = BackfillOutcome {
+            scanned: 113_610,
+            ingested: 4_500,
+            failed: 0,
+            complete: true,
+            truncated: 0,
+            dropped: 0,
+        };
+        assert!(clean.is_clean_completion());
+        assert!(!clean.is_dirty());
+        let lossy = BackfillOutcome { failed: 4, ..clean };
+        assert!(!lossy.is_clean_completion());
+        // A budget-truncated pass never completes either.
+        let partial = BackfillOutcome {
+            complete: false,
+            ..clean
+        };
+        assert!(!partial.is_clean_completion());
+        // A fresh pass starts clean and incomplete.
+        assert!(!BackfillOutcome::default().complete);
+        assert!(!BackfillOutcome::default().is_clean_completion());
+    }
+
+    #[test]
+    fn a_truncated_window_never_latches_completion() {
+        // REGRESSION: an empty page that outlives EMPTY_PAGE_RETRIES while
+        // `offset < total` used to set `done = true`, which made the pass report
+        // `complete` with `failed == 0` — latching a one-shot `maintenance_flag` that
+        // nothing ever clears. That is the exact blip that truncated the original seed,
+        // so it would have frozen the very gap this backfill exists to repair.
+        let truncated = BackfillOutcome {
+            scanned: 40_000,
+            ingested: 900,
+            failed: 0,
+            complete: true,
+            truncated: 1,
+            dropped: 0,
+        };
+        assert!(
+            !truncated.is_clean_completion(),
+            "a truncated window must never latch the one-shot completion marker"
+        );
+        assert!(
+            truncated.is_dirty(),
+            "a truncated window must force a cursor rewind"
+        );
+    }
+
+    #[test]
+    fn a_dirty_pass_rewinds_even_when_incomplete() {
+        // REGRESSION (cross-pass amnesia): `failed`/`truncated` are per-pass but the
+        // completion marker is permanent and survives restarts. A budget-stopped pass
+        // that lost records used to keep its cursor, so a LATER pass resumed past them,
+        // reported `failed == 0`, and latched the marker — abandoning them for good.
+        // `is_dirty()` is checked regardless of `complete`, so the cursor is rewound and
+        // any future completion is preceded by a full clean re-walk.
+        let dirty_partial = BackfillOutcome {
+            scanned: 20_000,
+            ingested: 300,
+            failed: 2,
+            complete: false, // stopped on the wall-clock budget
+            truncated: 0,
+            dropped: 0,
+        };
+        assert!(
+            dirty_partial.is_dirty(),
+            "a budget-stopped pass that lost records must still rewind the cursor"
+        );
+        assert!(!dirty_partial.is_clean_completion());
+        // The clean budget-stop is the case that must NOT rewind — it keeps its
+        // hard-won cursor so the next pass resumes instead of re-walking.
+        let clean_partial = BackfillOutcome {
+            scanned: 20_000,
+            ingested: 300,
+            failed: 0,
+            complete: false,
+            truncated: 0,
+            dropped: 0,
+        };
+        assert!(
+            !clean_partial.is_dirty(),
+            "a clean budget-stop must keep its cursor"
+        );
+    }
+
+    #[test]
+    fn dropped_records_never_latch_completion() {
+        // REGRESSION (2026-07-26, the 4,493-record no-op). The v1 backfill walked the
+        // ENTIRE catalogue, fetched all 4,493 records it existed to repair, failed to
+        // parse every one of them on `"links": null`, threw the serde error away, and
+        // reported scanned≈109,266 / ingested=0 / failed=0 / truncated=0. That passed
+        // `is_clean_completion()` and latched a permanent `maintenance_flag` over a total
+        // no-op — the gap looked repaired and was not. A record that was FETCHED but never
+        // persisted is the same class of loss as `failed`/`truncated`, so `dropped` must
+        // both block the one-shot marker and force the cursor rewind.
+        let dropped = BackfillOutcome {
+            scanned: 109_266,
+            ingested: 0,
+            failed: 0,
+            complete: true,
+            truncated: 0,
+            dropped: 1,
+        };
+        assert!(
+            !dropped.is_clean_completion(),
+            "a pass that dropped a fetched record must never latch the one-shot marker"
+        );
+        assert!(
+            dropped.is_dirty(),
+            "a dropped record must force the cursor rewind, like failed/truncated"
+        );
+        // The shape of the actual 2026-07-26 no-op, for the record.
+        let the_no_op = BackfillOutcome {
+            dropped: 4_493,
+            ..dropped
+        };
+        assert!(!the_no_op.is_clean_completion());
+        assert!(the_no_op.is_dirty());
     }
 
     fn manga_json() -> Value {
@@ -1531,6 +2832,281 @@ mod tests {
     }
 
     #[test]
+    fn null_links_record_still_parses() {
+        // THE REGRESSION GUARD for the 4,493-record silent gap (2026-07-26).
+        //
+        // MangaDex emits an explicit `"links": null` — key PRESENT, value null — on a
+        // closed legacy cohort (2018: 636, 2019: 1,520, 2020: 2,054, 2021: 283, 2022+: 0).
+        // Live exemplar: c6a8967b-2b61-4e14-8aca-1525a37b63f7 ("Yururira", createdAt
+        // 2018-02-12), whose `links` and `year` are both null.
+        //
+        // `#[serde(default)]` covers only an ABSENT field: with the key present, serde
+        // still calls `HashMap`'s `Deserialize` on a `Null` token and fails with
+        // "invalid type: null, expected a map" — failing the WHOLE `MdManga`. 4,493 works
+        // were fetched and thrown away on every sweep because of it.
+        let mut v = manga_json();
+        v["attributes"]["links"] = Value::Null;
+        v["attributes"]["year"] = Value::Null; // null alongside it in the real cohort
+        let m: MdManga = serde_json::from_value(v)
+            .expect("a record with links: null must parse, not fail the whole work");
+        let (id, input) = to_work_input(&m);
+        assert_eq!(id, "md-uuid-1");
+        // The title survives — this is the whole point: the work reaches the spine.
+        assert_eq!(input.primary_lang.as_deref(), Some("ja-ro"));
+        assert!(input
+            .aliases
+            .iter()
+            .any(|a| a.raw.contains("Slime Datta Ken")));
+        // A null `links` yields no external ids, exactly like an absent one.
+        assert!(
+            input.external_ids.is_empty(),
+            "null links must behave like absent links"
+        );
+        assert_eq!(input.year, None);
+    }
+
+    #[test]
+    fn every_null_container_behaves_like_an_absent_one() {
+        // Same trap, every other non-`Option` container in the response shapes. `links`
+        // is the field that actually bit us; hardening only `links` would just wait for a
+        // second cohort with a different null field to reproduce the outage.
+        for field in ["title", "altTitles", "description", "links"] {
+            let mut v = manga_json();
+            v["attributes"][field] = Value::Null;
+            let m: MdManga = serde_json::from_value(v)
+                .unwrap_or_else(|e| panic!("attributes.{field} = null must parse, got: {e}"));
+            let (id, _) = to_work_input(&m);
+            assert_eq!(id, "md-uuid-1");
+        }
+        // Top-level `relationships: null` (drops author/artist/cover, keeps the work).
+        let mut v = manga_json();
+        v["relationships"] = Value::Null;
+        let m: MdManga =
+            serde_json::from_value(v).expect("relationships = null must parse, not fail the work");
+        let (_, input) = to_work_input(&m);
+        assert_eq!(input.primary_lang.as_deref(), Some("ja-ro"));
+        assert_eq!(input.author, None);
+        assert!(input.covers.is_empty());
+        assert_eq!(cover_file_name(&m), None);
+        // A record with EVERY container null still yields a usable (if bare) work.
+        let mut v = manga_json();
+        v["attributes"]["altTitles"] = Value::Null;
+        v["attributes"]["description"] = Value::Null;
+        v["attributes"]["links"] = Value::Null;
+        v["relationships"] = Value::Null;
+        let m: MdManga = serde_json::from_value(v).expect("all-null containers must parse");
+        let (_, input) = to_work_input(&m);
+        assert!(input.external_ids.is_empty());
+        assert!(input.descriptions.is_empty());
+
+        // Chapter records get the same hardening, for symmetry.
+        let c: MdChapter = serde_json::from_value(serde_json::json!({
+            "id": "ch-1",
+            "attributes": { "chapter": "1", "translatedLanguage": "en" },
+            "relationships": Value::Null,
+        }))
+        .expect("chapter relationships = null must parse");
+        assert_eq!(c.id, "ch-1");
+        assert!(c.relationships.is_empty());
+    }
+
+    #[test]
+    fn parse_manga_page_reports_drops() {
+        // The pure per-record parse step, split out of `list_manga` so the drop
+        // accounting is testable without HTTP.
+        let good = manga_json();
+        let mut null_links = manga_json();
+        null_links["id"] = serde_json::json!("c6a8967b-2b61-4e14-8aca-1525a37b63f7");
+        null_links["attributes"]["links"] = Value::Null;
+        let mut third = manga_json();
+        third["id"] = serde_json::json!("md-uuid-3");
+
+        let raw = vec![good, null_links, third];
+        let raw_len = raw.len();
+        let (mangas, drops) = parse_manga_page(raw);
+        // AFTER THE FIX: all three parse. Before it, the middle record vanished.
+        assert_eq!(mangas.len(), 3, "the null-links record must parse now");
+        assert!(drops.is_empty(), "nothing should be dropped: {drops:?}");
+
+        // And when a record genuinely IS unparseable, the drop is ATTRIBUTABLE: the uuid
+        // is read off the raw Value before the parse attempt and the serde message is
+        // kept, instead of the old `Err(_) => skipped += 1` that hid this bug for months.
+        let mut broken = manga_json();
+        broken["id"] = serde_json::json!("md-uuid-broken");
+        broken["attributes"] = Value::Null; // no attributes => no title => rightly dropped
+        let raw = vec![manga_json(), broken];
+        let raw_len_with_drop = raw.len();
+        let (mangas, drops) = parse_manga_page(raw);
+        assert_eq!(mangas.len(), 1);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].0, "md-uuid-broken");
+        assert!(
+            !drops[0].1.is_empty(),
+            "the serde error must be kept, not discarded"
+        );
+
+        // PAGINATION INVARIANT: `raw_len` — never the parsed count — drives
+        // `classify_page` and the `offset` advance. A page trimmed only by drops must
+        // still be `Process`, or the sweep mistakes it for the end of the window (and,
+        // with a short offset advance, desyncs from the API's own pagination).
+        assert_eq!(
+            classify_page(raw_len, 0, 113_759),
+            PageStep::Process,
+            "raw_len must drive classify_page"
+        );
+        assert_eq!(
+            classify_page(raw_len_with_drop, 0, 113_759),
+            PageStep::Process
+        );
+        // The parsed count is what would have been WRONG: a 100-record page where every
+        // record dropped (the real 2026-07-26 shape at some offsets) reads as EndWindow.
+        assert_eq!(classify_page(0, 0, 113_759), PageStep::RetryEmpty);
+        assert_ne!(classify_page(0, 0, 0), PageStep::Process);
+    }
+
+    #[test]
+    fn offset_advances_by_the_raw_length_not_the_parsed_one() {
+        // THE HIGHEST-RISK REGRESSION in the drop-accounting change, pinned: `offset`
+        // must advance by the number of records the API RETURNED. A page of 100 that
+        // parsed 97 still advances 100 — advancing 97 would re-request three records
+        // every page and, with a `< PAGE_LIMIT` end test, walk off the API's own
+        // pagination. Silent record loss, worse than the bug being fixed.
+        let raw = vec![manga_json(), {
+            let mut broken = manga_json();
+            broken["attributes"] = Value::Null;
+            broken
+        }];
+        let raw_len = raw.len();
+        let (parsed, drops) = parse_manga_page(raw);
+        assert_eq!((parsed.len(), drops.len()), (1, 1));
+        assert_eq!(next_offset(0, raw_len), 2);
+        assert_ne!(
+            next_offset(0, raw_len),
+            next_offset(0, parsed.len()),
+            "the parsed count must not be what advances the cursor"
+        );
+        // Ordinary paging, and the >9,900 window cap arithmetic.
+        assert_eq!(next_offset(0, 100), 100);
+        assert_eq!(next_offset(9_800, 100), 9_900);
+        assert_eq!(next_offset(42, 0), 42);
+        // Saturating, so a hostile page length can never wrap the cursor negative.
+        assert_eq!(next_offset(i64::MAX, 100), i64::MAX);
+    }
+
+    #[test]
+    fn chapter_pagination_uses_the_raw_page_length() {
+        // REGRESSION: `sync_chapters` paged on `chapters.len()`, the PARSED count. One
+        // unparseable chapter in a 100-record page made `page_len` 99, which tripped the
+        // `page_len < PAGE_LIMIT` end-of-window test — ending the window early while the
+        // cursor still advanced to the cycle's start time, so every later chapter in that
+        // window was never mirrored and never re-offered.
+        let ok = serde_json::json!({
+            "id": "ch-ok",
+            "attributes": { "chapter": "1", "translatedLanguage": "en" },
+            "relationships": [ { "id": "m-1", "type": "manga" } ],
+        });
+        let broken = serde_json::json!({
+            "id": "ch-broken",
+            "attributes": Value::Null, // no attributes => nothing to mirror => dropped
+            "relationships": [],
+        });
+        let mut raw: Vec<Value> = (0..99).map(|_| ok.clone()).collect();
+        raw.push(broken);
+        let raw_len = raw.len();
+        let (chapters, drops) = parse_chapter_page(raw);
+        assert_eq!(chapters.len(), 99);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].0, "ch-broken", "drops stay attributable");
+
+        // The full raw page is a full page: keep going.
+        assert_eq!(raw_len as i64, PAGE_LIMIT);
+        assert_eq!(classify_page(raw_len, 0, 810_270), PageStep::Process);
+        assert_eq!(next_offset(0, raw_len), 100);
+        // What the old code did with the same page: 99 < PAGE_LIMIT => "window over".
+        assert!(
+            (chapters.len() as i64) < PAGE_LIMIT,
+            "the parsed count is exactly what used to truncate the window"
+        );
+        // And a chapter whose relationships are null still parses (null hardening).
+        let (chapters, drops) = parse_chapter_page(vec![serde_json::json!({
+            "id": "ch-null-rels",
+            "attributes": { "chapter": "1", "translatedLanguage": "en" },
+            "relationships": Value::Null,
+        })]);
+        assert!(drops.is_empty());
+        assert_eq!(chapter_manga_id(&chapters[0]), None);
+    }
+
+    #[test]
+    fn a_list_envelope_without_a_usable_total_fails_the_decode() {
+        // `total` gates every "is this window exhausted?" decision, so a 0 there ends a
+        // window, reports a clean+complete sweep and can latch a permanent marker over an
+        // unwalked catalogue. Both ways of arriving at 0 must therefore fail the body:
+        // an explicit null AND an absent key (which `#[serde(default)]` used to swallow).
+        let ok: RawList = serde_json::from_value(serde_json::json!({
+            "data": [], "limit": 100, "offset": 0, "total": 113_762
+        }))
+        .expect("a normal envelope decodes");
+        assert_eq!(ok.total, 113_762);
+        assert!(
+            serde_json::from_value::<RawList>(serde_json::json!({ "data": [] })).is_err(),
+            "an absent total must fail the body, not decode as 0"
+        );
+        assert!(
+            serde_json::from_value::<RawList>(
+                serde_json::json!({ "data": [], "total": Value::Null })
+            )
+            .is_err(),
+            "a null total must fail the body, not decode as 0"
+        );
+        assert!(
+            serde_json::from_value::<RawChapterList>(serde_json::json!({ "data": [] })).is_err(),
+            "same rule for the chapter envelope"
+        );
+        // `data`, by contrast, IS hardened both ways: absent or null decodes as empty,
+        // which is handled safely downstream (RetryEmpty → truncated → completion blocked).
+        let d: RawList =
+            serde_json::from_value(serde_json::json!({ "data": Value::Null, "total": 5 })).unwrap();
+        assert!(d.data.is_empty());
+        let d: RawList = serde_json::from_value(serde_json::json!({ "total": 5 })).unwrap();
+        assert!(d.data.is_empty());
+    }
+
+    #[test]
+    fn at_home_requires_its_page_list() {
+        // A chapter's page list is not a collection envelope: decoding a missing/null
+        // `data` as `[]` hands the reader a zero-page chapter that looks like a success.
+        let ok: AtHome = serde_json::from_value(serde_json::json!({
+            "baseUrl": "https://x.mangadex.network",
+            "chapter": { "hash": "h", "data": ["1.png", "2.png"] }
+        }))
+        .unwrap();
+        assert_eq!(ok.chapter.data.len(), 2);
+        assert!(serde_json::from_value::<AtHome>(serde_json::json!({
+            "baseUrl": "https://x.mangadex.network",
+            "chapter": { "hash": "h" }
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<AtHome>(serde_json::json!({
+            "baseUrl": "https://x.mangadex.network",
+            "chapter": { "hash": "h", "data": Value::Null }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn drop_logging_is_detailed_then_capped() {
+        // The counts that gate completion are exact; only the PER-RECORD log lines are
+        // capped, so a recurrence can't emit >100k ERROR lines per boot (24 dirty passes
+        // × 4,493 drops) and get the whole stream dropped by the log pipeline.
+        assert_eq!(detailed_drop_count(0, 100), 100);
+        assert_eq!(detailed_drop_count(150, 100), 50, "partial page budget");
+        assert_eq!(detailed_drop_count(MAX_DETAILED_DROP_LOGS, 100), 0);
+        assert_eq!(detailed_drop_count(u64::MAX, 100), 0, "no underflow");
+        assert_eq!(detailed_drop_count(0, 0), 0);
+    }
+
+    #[test]
     fn nsfw_flag_from_content_rating() {
         let mut v = manga_json();
         v["attributes"]["contentRating"] = serde_json::json!("pornographic");
@@ -1545,6 +3121,50 @@ mod tests {
             Some("2018-10-04T22:16:00")
         );
         assert_eq!(to_since("garbage"), None);
+    }
+
+    #[test]
+    fn to_since_is_inclusive_at_the_boundary_second() {
+        // Records the MEASURED semantics of `createdAtSince` (verified live 2026-07-26):
+        // it is INCLUSIVE (`>=`). Querying the earliest record's exact timestamp,
+        // `createdAtSince=2018-01-18T00:00:00`, returns that record
+        // (c0ee660b-f9f2-45c3-8068-5123ff53f84a, createdAt 2018-01-18T00:00:00+00:00) at
+        // offset 0, with the full total (113,760) unchanged.
+        //
+        // That is what makes the sweep's overlapping window slide LOSSLESS: `to_since`
+        // truncates to whole seconds and slides to the LAST record seen, so every record
+        // sharing that boundary second is re-offered in the next window (present ids are
+        // then skipped, so the overlap is free). `to_since_next_second` is therefore the
+        // ONLY lossy path in the slide — it deliberately skips the tail of a second that
+        // holds more than WINDOW_OFFSET_CAP records, and is reached only there.
+        let earliest = "2018-01-18T00:00:00+00:00";
+        assert_eq!(
+            to_since(earliest).as_deref(),
+            Some("2018-01-18T00:00:00"),
+            "the cursor keeps the boundary second, and the API re-includes it"
+        );
+        // Sub-second components are truncated, never rounded up, so the slide can only
+        // ever re-fetch — it can never step over an unseen record.
+        assert_eq!(
+            to_since("2018-01-18T00:00:00.999+00:00").as_deref(),
+            Some("2018-01-18T00:00:00")
+        );
+        // The lossy sibling, for contrast: +1s EXCLUDES everything in the tied second.
+        assert_eq!(
+            to_since_next_second(earliest).as_deref(),
+            Some("2018-01-18T00:00:01")
+        );
+        // Minute/hour/day carries are the calendar's, not string arithmetic.
+        assert_eq!(
+            to_since_next_second("2018-01-18T23:59:59+00:00").as_deref(),
+            Some("2018-01-19T00:00:00")
+        );
+        // A non-UTC offset is normalized through the same formatter as the sweep uses.
+        assert_eq!(
+            to_since("2018-01-18T09:00:00+09:00").as_deref(),
+            Some("2018-01-18T09:00:00")
+        );
+        assert_eq!(to_since_next_second("garbage"), None);
     }
 
     #[test]

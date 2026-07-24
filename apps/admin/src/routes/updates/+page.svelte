@@ -51,7 +51,12 @@
 			<h1>Catalogue updates</h1>
 			<p class="lede">
 				Recently-updated MangaDex works from the canonical mirror, newest chapter first. A
-				monitoring feed — these works are not reader-openable yet.
+				monitoring feed — these works are not reader-openable yet. ·
+				<span
+					class="nsfw-note"
+					title="This console always requests NSFW-inclusive results (an admin-only per-request override), independent of the NSFW on/off preference in the header. The reader still honours each viewer's own preference."
+					>incl. NSFW-flagged</span
+				>
 			</p>
 		</div>
 		<div class="pager">
@@ -123,6 +128,17 @@
 		max-width: 60ch;
 		font-size: 13.5px;
 		color: var(--k-text-dimmer);
+	}
+	/* The console reads this feed NSFW-inclusive regardless of the header's NSFW
+	   preference pill; say so, so the console/reader difference isn't a mystery. */
+	.nsfw-note {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+		border-bottom: 1px dotted var(--k-border-4);
+		cursor: help;
 	}
 	.pager {
 		display: flex;

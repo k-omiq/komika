@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { CoverIssue } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
-	import { config } from '$lib/config';
+	import { assetSrc } from '$lib/config';
 	import { loadCoverIssues, retryCover, uploadCover } from '$lib/data';
 
 	let issues = $state<CoverIssue[]>([]);
@@ -14,15 +14,6 @@
 	let busy = $state<string | null>(null); // workId currently acting
 	// Hidden file inputs keyed by workId, so each row's "Upload" button opens its own.
 	let fileInputs: Record<string, HTMLInputElement> = {};
-
-	// The API origin (covers are served from api.komiq.cc, not the admin origin), so a
-	// relative "/covers/…" URL from the server is resolved against it; an already
-	// absolute URL is left as-is.
-	const apiOrigin = config.apiEndpoint.replace(/\/graphql\/?$/, '');
-	function coverSrc(url: string): string {
-		if (!url) return '';
-		return /^https?:\/\//.test(url) ? url : `${apiOrigin}${url}`;
-	}
 
 	const REASON_LABEL: Record<string, string> = {
 		too_large: 'Source too large',
@@ -146,8 +137,8 @@
 			{#each issues as w (w.workId)}
 				<div class="row" role="row">
 					<span role="cell">
-						{#if coverSrc(w.coverUrl)}
-							<img class="cover" src={coverSrc(w.coverUrl)} alt="" loading="lazy" />
+						{#if assetSrc(w.coverUrl)}
+							<img class="cover" src={assetSrc(w.coverUrl)} alt="" loading="lazy" />
 						{:else}
 							<span class="cover placeholder" aria-hidden="true">?</span>
 						{/if}

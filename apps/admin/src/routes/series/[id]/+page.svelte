@@ -2,12 +2,15 @@
 	import type { Series, WorkSource } from '@komika/types';
 	import type { AdminChapter, SeriesAdminMeta, SeriesMetadataInput } from '@komika/api';
 	import { page } from '$app/state';
+	import { assetSrc } from '$lib/config';
 	import {
 		COMIC_TYPE_OPTIONS,
+		addSeriesAltTitle,
 		loadSeriesAdminMeta,
 		loadSeriesDetail,
 		loadWorkChaptersAdmin,
 		loadWorkSources,
+		removeSeriesAltTitle,
 		rescanWork,
 		saveSeriesMetadata,
 		setChapterOverride,
@@ -90,6 +93,42 @@
 	function removeTag(tag: string): void {
 		fTags = fTags.filter((t) => t !== tag);
 		tagsDirty = true;
+	}
+
+	// ---- alt-titles editor (persisted immediately; add can auto-merge duplicates) ----
+	let newAltTitle = $state('');
+	let altBusy = $state(false);
+	let altMsg = $state<string | null>(null);
+
+	async function addAlt(): Promise<void> {
+		const t = newAltTitle.trim();
+		if (!series || !t || altBusy) return;
+		altBusy = true;
+		altMsg = null;
+		try {
+			// Returns the recomputed series — reflects the new title AND any auto-merge of
+			// other works that shared it.
+			series = await addSeriesAltTitle(series.id, t);
+			newAltTitle = '';
+			altMsg = 'Added.';
+		} catch (err) {
+			altMsg = err instanceof Error ? err.message : 'Failed to add alt title.';
+		} finally {
+			altBusy = false;
+		}
+	}
+
+	async function removeAlt(title: string): Promise<void> {
+		if (!series || altBusy) return;
+		altBusy = true;
+		altMsg = null;
+		try {
+			series = await removeSeriesAltTitle(series.id, title);
+		} catch (err) {
+			altMsg = err instanceof Error ? err.message : 'Failed to remove alt title.';
+		} finally {
+			altBusy = false;
+		}
 	}
 
 	async function persistMeta(input: SeriesMetadataInput): Promise<void> {
@@ -214,7 +253,7 @@
 			{#if series.coverUrl}
 				<img
 					class="cover"
-					src={series.coverUrl}
+					src={assetSrc(series.coverUrl)}
 					alt=""
 					loading="lazy"
 					referrerpolicy="no-referrer"
@@ -307,6 +346,38 @@
 						>{meta.hasCuratedTags
 							? 'Curated set — “Reset to source” reverts to the source genres.'
 							: 'Derived from source — editing then saving pins it as a curated set.'}</small
+					>
+				</div>
+				<div class="field">
+					<span>Alternative titles</span>
+					<div class="tags">
+						{#each series.altTitles as t (t)}
+							<span class="tag"
+								>{t}<button
+									type="button"
+									class="tag-x"
+									aria-label={`Remove ${t}`}
+									disabled={altBusy}
+									onclick={() => removeAlt(t)}>×</button
+								></span
+							>
+						{/each}
+						{#if series.altTitles.length === 0}<span class="muted">No alternative titles</span
+							>{/if}
+					</div>
+					<div class="tag-add">
+						<input
+							type="text"
+							bind:value={newAltTitle}
+							placeholder="Add alt title…"
+							disabled={altBusy}
+							onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), addAlt())}
+						/>
+						<button type="button" onclick={addAlt} disabled={altBusy}>Add</button>
+						{#if altMsg}<span class="msg">{altMsg}</span>{/if}
+					</div>
+					<small
+						>Adding a title that exactly matches another entry auto-merges them into this one.</small
 					>
 				</div>
 				<div class="actions">

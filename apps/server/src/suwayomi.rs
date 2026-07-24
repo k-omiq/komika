@@ -3,15 +3,108 @@
 //! Mirrors the TS `SuwayomiBackend` adapter: it talks Suwayomi's real GraphQL and
 //! returns raw Suwayomi shapes, which `graphql` maps onto the Komika contract.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+/// Max simultaneous upstream COVER fetches (Suwayomi -> source CDN) across the whole
+/// process. Covers are the only Suwayomi call a browser `<img>` blocks on, and the
+/// engine proxies each one to a third-party CDN, so an unbounded fan-out (a 30-card
+/// grid on a cold cache) queues behind the engine's own connection pool and every
+/// request pays the full timeout. Bounding it makes the tail deterministic.
+///
+/// # On-demand headroom — the exact accounting
+///
+/// On-demand fetches use `try_acquire` and never queue; background ones wait. Tokio's
+/// semaphore hands a released permit to a queued waiter rather than back to the counter,
+/// so headroom cannot come from fairness — it comes from capping how many permits
+/// background work can ever hold at once:
+///
+/// | holder                                        | max concurrent |
+/// |-----------------------------------------------|----------------|
+/// | cover warmer / crawl (mutually exclusive, both under the drainer's `inflight` flag) | [`WARM_COVER_CONCURRENCY`] |
+/// | detached materializations                     | [`BG_MATERIALIZE_CONCURRENCY`] |
+///
+/// So the guaranteed floor is `COVER_FETCH_CONCURRENCY - (WARM + BG)` = 5 concurrent
+/// on-demand fetches, NOT `COVER_FETCH_CONCURRENCY - WARM`. One more consumer is
+/// unaccounted: `cover_bytes` on the enrol paths in `graphql` (dedup pHash) also waits
+/// patiently on this pool, one permit per in-flight admin/ingest request — sequential in
+/// practice, but nothing structurally bounds it. If that ever becomes concurrent, it must
+/// take the background pool instead.
+pub const COVER_FETCH_CONCURRENCY: usize = 12;
+
+/// Background cover-warmer share of [`COVER_FETCH_CONCURRENCY`]. Small on purpose.
+pub const WARM_COVER_CONCURRENCY: usize = 3;
+
+/// Max concurrent *background* materializations kicked off by a saturated on-demand
+/// request (`serve_suwayomi_cover`'s fast-path miss). Bounded so a burst of misses
+/// can't spawn thousands of detached fetch tasks.
+const BG_MATERIALIZE_CONCURRENCY: usize = 4;
+
+/// The headroom invariant above, enforced at compile time: background work must never be
+/// able to hold every permit, or an on-demand request could be refused indefinitely.
+const _: () =
+    assert!(WARM_COVER_CONCURRENCY + BG_MATERIALIZE_CONCURRENCY < COVER_FETCH_CONCURRENCY);
+
+/// Request timeout for a COVER fetch — deliberately far below the 30 s chapter-scan
+/// timeout on the shared client. A cover is on the critical path of a page render:
+/// failing fast (and retryably) beats a 29 s hang that the browser reports as a broken
+/// image anyway. The scanner keeps the long timeout: a chapter-list fetch is background
+/// work where patience is cheap and a retry is expensive.
+const COVER_TIMEOUT_SECS: u64 = 8;
+
+/// Hard cap on a single cover source body. Suwayomi thumbnails average ~0.8 MB; a few
+/// MB is legitimate, 24 MB is not. Streamed (see [`read_capped`]) so we bail on the
+/// first chunk that crosses the line instead of buffering a hostile body.
+pub const MAX_COVER_SOURCE_BYTES: usize = 24 * 1024 * 1024;
+
+/// Why an on-demand cover fetch didn't produce bytes.
+#[derive(Debug)]
+pub enum CoverFetchError {
+    /// The bounded cover-fetch pool is saturated. Callers should return immediately
+    /// (placeholder / retry-later) rather than queue — queueing is what produced the
+    /// 22 s p90.
+    Busy,
+    /// A real upstream failure (network, non-2xx, over-cap or truncated body).
+    Upstream(anyhow::Error),
+}
+
+impl std::fmt::Display for CoverFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "cover fetch pool saturated"),
+            Self::Upstream(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Read a response body into memory, streamed, refusing anything past `cap` bytes.
+/// `Response::bytes()` is unbounded (only the request timeout bounds it), so a huge or
+/// hostile body could otherwise balloon the process. Mirrors `mangadex::read_capped`.
+async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    if let Some(len) = res.content_length() {
+        if len > cap as u64 {
+            return Err(anyhow!("cover body exceeds cap ({len} > {cap})"));
+        }
+    }
+    let mut out: Vec<u8> =
+        Vec::with_capacity(res.content_length().unwrap_or(0).min(1 << 20) as usize);
+    while let Some(chunk) = res.chunk().await? {
+        if out.len() + chunk.len() > cap {
+            return Err(anyhow!("cover body exceeds cap ({cap})"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
 
 const MANGA_FIELDS: &str = r#"
 fragment MangaFields on MangaType {
-    id title thumbnailUrl author artist description genre status
+    id title url thumbnailUrl author artist description genre status
     inLibrary inLibraryAt lastFetchedAt sourceId
     source { lang }
     chapters { totalCount }
@@ -40,6 +133,14 @@ pub struct ChapterCount {
 pub struct SuwayomiManga {
     pub id: i64,
     pub title: String,
+    /// Source-relative manga URL (`MangaType.url`, e.g. `/manga/<uuid>` for the
+    /// MangaDex extension). Carries the source's own manga identity — for MangaDex
+    /// that's the canonical UUID, which lets ingest link a Suwayomi-mirrored
+    /// MangaDex series straight to its catalogue `work` by exact id instead of
+    /// fuzzy title/cover dedup. Not persisted in `suwayomi_series`, so it defaults
+    /// to None on any DB-derived manga; only a live fetch (`MANGA_FIELDS`) fills it.
+    #[serde(default)]
+    pub url: Option<String>,
     pub thumbnail_url: Option<String>,
     pub author: Option<String>,
     pub artist: Option<String>,
@@ -50,6 +151,11 @@ pub struct SuwayomiManga {
     pub in_library: bool,
     pub in_library_at: Option<String>,
     pub last_fetched_at: Option<String>,
+    /// Real newest-chapter time (millis-epoch string), from our cache — NOT part of the
+    /// Suwayomi wire shape, so it defaults to None on a live fetch and is only populated
+    /// when the value comes from `suwayomi_series` (see series_cache, migration 0050).
+    #[serde(default)]
+    pub latest_chapter_at: Option<String>,
     pub source_id: String,
     pub source: Option<SuwayomiSourceLang>,
     pub chapters: Option<ChapterCount>,
@@ -178,6 +284,15 @@ pub struct SuwayomiClient {
     /// re-resolving it against the engine.
     source_id: std::sync::Arc<Mutex<Option<String>>>,
     configured_source: Option<String>,
+    /// Separate HTTP client for COVER fetches only, with a much shorter timeout than
+    /// `http` (which the scanner shares). Same connection pool semantics, different
+    /// patience — see [`COVER_TIMEOUT_SECS`].
+    cover_http: reqwest::Client,
+    /// Global bound on in-flight upstream cover fetches. Shared by every clone of the
+    /// client (drainer, warmer, request handlers) — that is the whole point.
+    cover_sem: Arc<Semaphore>,
+    /// Bound on detached background materializations (see [`BG_MATERIALIZE_CONCURRENCY`]).
+    bg_sem: Arc<Semaphore>,
 }
 
 impl SuwayomiClient {
@@ -200,12 +315,23 @@ impl SuwayomiClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // Cover client: same host, much less patience. A cover is on the critical path
+        // of a page render, so a fast failure that the drainer/warmer can retry beats a
+        // 29 s hang the browser renders as a broken image regardless.
+        let cover_http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(COVER_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| http.clone());
         Self {
             base_url,
             image_base_url,
             http,
             source_id: std::sync::Arc::new(Mutex::new(configured_source.clone())),
             configured_source,
+            cover_http,
+            cover_sem: Arc::new(Semaphore::new(COVER_FETCH_CONCURRENCY)),
+            bg_sem: Arc::new(Semaphore::new(BG_MATERIALIZE_CONCURRENCY)),
         }
     }
 
@@ -238,11 +364,96 @@ impl SuwayomiClient {
         } else {
             format!("{}{}", self.base_url, raw)
         };
-        let res = self.http.get(url).send().await.ok()?;
+        // Patient acquire. Two classes of caller, and only one is fan-out bounded:
+        // the background crawl/warmer holds at most `WARM_COVER_CONCURRENCY` (enforced
+        // by its `buffer_unordered`), but the pHash enrol paths in `graphql/mod.rs`
+        // (`add_source_series`, `ingest_source_series`, `federated_ingest`) call this
+        // directly and are bounded only by being strictly sequential — one permit per
+        // in-flight request. They are NOT counted in the headroom arithmetic documented
+        // at the top of this module; see it for the real on-demand floor. If enrolment
+        // is ever parallelised it must take a background slot instead of competing here.
+        let _permit = self.cover_sem.clone().acquire_owned().await.ok()?;
+        let res = self.cover_http.get(url).send().await.ok()?;
         if !res.status().is_success() {
             return None;
         }
-        Some(res.bytes().await.ok()?.to_vec())
+        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES).await.ok()?;
+        // A well-formed HTTP response can still carry an INCOMPLETE image: the source
+        // CDN (or Suwayomi's proxy of it) closes the body early and `zune-jpeg` decodes
+        // the partial data to `Ok` with a flat decoder-fill tail. Reject it here so the
+        // truncated bytes never reach `process_cover` and get frozen into the cache.
+        if let Err(e) = crate::avatar::ensure_complete(&bytes) {
+            tracing::warn!(error = %e, "suwayomi cover: rejected truncated source");
+            return None;
+        }
+        Some(bytes)
+    }
+
+    /// Number of free permits in the bounded cover-fetch pool. Exposed for tests and
+    /// for the warmer's "is the on-demand path under pressure?" check.
+    pub fn cover_permits_available(&self) -> usize {
+        self.cover_sem.available_permits()
+    }
+
+    /// Take a slot for a DETACHED background cover materialization, or `None` if the
+    /// bounded background pool is full. Holding the returned permit for the lifetime of
+    /// the spawned task is what bounds the fan-out.
+    pub fn try_background_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.bg_sem.clone().try_acquire_owned().ok()
+    }
+
+    /// Fetch a cover image from the internal Suwayomi REST path for an ON-DEMAND
+    /// request. Unlike [`Self::fetch_image`] this:
+    ///
+    /// * takes a permit from the bounded cover pool with `try_acquire` and returns
+    ///   [`CoverFetchError::Busy`] immediately when saturated — no queueing, which is
+    ///   what turned a 5.6 s p50 into a 22 s p90;
+    /// * uses the short cover timeout, not the 30 s scan timeout;
+    /// * streams the body under [`MAX_COVER_SOURCE_BYTES`] and rejects a truncated
+    ///   image instead of handing partial bytes to the decoder.
+    pub async fn fetch_cover_now(
+        &self,
+        path: &str,
+    ) -> std::result::Result<(Vec<u8>, String), CoverFetchError> {
+        let Ok(_permit) = self.cover_sem.clone().try_acquire_owned() else {
+            return Err(CoverFetchError::Busy);
+        };
+        self.fetch_cover_inner(path)
+            .await
+            .map_err(CoverFetchError::Upstream)
+    }
+
+    /// Fetch a cover image from the internal Suwayomi REST path for BACKGROUND work
+    /// (warmer / detached materialization). Waits for a permit rather than failing —
+    /// background work is patient — but the caller must bound its own fan-out to
+    /// [`WARM_COVER_CONCURRENCY`] so on-demand requests keep their headroom.
+    pub async fn fetch_cover_background(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        let _permit = self
+            .cover_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("cover fetch semaphore closed"))?;
+        self.fetch_cover_inner(path).await
+    }
+
+    /// Shared body of the two cover fetchers. Assumes the caller holds a permit.
+    async fn fetch_cover_inner(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        let url = format!("{}{}", self.base_url, path);
+        let res = self.cover_http.get(url).send().await?;
+        if !res.status().is_success() {
+            return Err(anyhow!("Suwayomi cover error {}", res.status()));
+        }
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|ct| ct.starts_with("image/"))
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES).await?;
+        crate::avatar::ensure_complete(&bytes)?;
+        Ok((bytes, content_type))
     }
 
     /// Fetch a Suwayomi image (a cover thumbnail or a chapter page) by its internal
@@ -953,6 +1164,11 @@ impl SuwayomiClient {
             name: String,
             #[serde(default)]
             display_name: Option<String>,
+            // `#[serde(default)]` (→ "") so a single source node with a null/absent
+            // `lang` can't fail the whole `list_sources` deserialization — which, now
+            // that `lang` gates enrolment, would otherwise abort the entire sync pass
+            // and accrue a subscription failure. An empty lang simply isn't "en".
+            #[serde(default)]
             lang: String,
             is_nsfw: bool,
             #[serde(default)]
@@ -988,22 +1204,25 @@ impl SuwayomiClient {
             .collect())
     }
 
-    /// A source's display name + NSFW flag, for gating the admin browse surface
-    /// on the show_nsfw posture (a source id is user input there).
-    pub async fn source_meta(&self, source_id: &str) -> Result<(String, bool)> {
-        let doc = "query S($id: LongString!) { source(id: $id) { displayName isNsfw } }";
+    /// A source's display name + NSFW flag + language, for gating the admin browse /
+    /// ingest surfaces (a source id is user input there): NSFW on the show_nsfw
+    /// posture, and language on the English-only ingest policy.
+    pub async fn source_meta(&self, source_id: &str) -> Result<(String, bool, String)> {
+        let doc = "query S($id: LongString!) { source(id: $id) { displayName isNsfw lang } }";
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Src {
             display_name: String,
             is_nsfw: bool,
+            #[serde(default)]
+            lang: String,
         }
         #[derive(Deserialize)]
         struct Data {
             source: Src,
         }
         let d: Data = self.gql(doc, json!({ "id": source_id })).await?;
-        Ok((d.source.display_name, d.source.is_nsfw))
+        Ok((d.source.display_name, d.source.is_nsfw, d.source.lang))
     }
 
     pub async fn set_in_library(&self, id: i64, in_library: bool) -> Result<()> {
@@ -1017,4 +1236,224 @@ impl SuwayomiClient {
     // NOTE: reading progress is no longer pushed back to Suwayomi — it is per-user and
     // lives in `suwayomi_progress` (see the `set_progress` GraphQL mutation). Suwayomi
     // is a content source only, so the old `updateChapter` progress mutation was removed.
+}
+
+/// A minimal in-process HTTP/1.1 origin, for exercising the cover-fetch path (bounded
+/// pool, short timeout, truncation gate) end-to-end without a real Suwayomi engine.
+/// Raw TCP rather than a mock-server crate so the test suite gains no dependency.
+#[cfg(test)]
+pub(crate) mod testsrv {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A running test origin: `base_url` to point a `SuwayomiClient` at, plus a live
+    /// count of requests it has served.
+    pub struct TestOrigin {
+        pub base_url: String,
+        pub hits: Arc<AtomicUsize>,
+        /// Highest number of requests that were in flight at the same instant — the
+        /// observable that proves the client-side semaphore bounds concurrency.
+        pub peak_concurrent: Arc<AtomicUsize>,
+    }
+
+    /// Serve `body` as `image/jpeg` to every request, after `delay`.
+    pub async fn spawn(body: Vec<u8>, delay: Duration) -> TestOrigin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (h, i, p) = (hits.clone(), inflight.clone(), peak.clone());
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (h, i, p, body) = (h.clone(), i.clone(), p.clone(), body.clone());
+                tokio::spawn(async move {
+                    // Drain the request head; we don't care what it asks for.
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    h.fetch_add(1, Ordering::SeqCst);
+                    let now = i.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(now, Ordering::SeqCst);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                    i.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        TestOrigin {
+            base_url: format!("http://127.0.0.1:{port}"),
+            hits,
+            peak_concurrent: peak,
+        }
+    }
+
+    /// A real, complete JPEG of the given size (ends with the `FFD9` EOI marker).
+    pub fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([
+                ((x * 73 + y * 151) % 256) as u8,
+                ((x * 199 + y * 37) % 256) as u8,
+                ((x ^ (y.wrapping_mul(101))) % 256) as u8,
+            ]);
+        }
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        assert_eq!(
+            &out[out.len() - 2..],
+            &[0xFF, 0xD9],
+            "test JPEG must be whole"
+        );
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn client(base: &str) -> SuwayomiClient {
+        SuwayomiClient::new(base.to_string(), None, Some("1".into()))
+    }
+
+    /// The bounded pool is the fix for the 22 s p90: a burst larger than
+    /// `COVER_FETCH_CONCURRENCY` must be REFUSED at the (COVER_FETCH_CONCURRENCY+1)-th
+    /// request rather than queued behind the in-flight ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cover_fetch_semaphore_bounds_concurrency_and_fails_fast() {
+        let body = testsrv::jpeg(64, 96);
+        // Slow origin: every request is held long enough for the whole burst to overlap.
+        let origin = testsrv::spawn(body, Duration::from_millis(1500)).await;
+        let c = client(&origin.base_url);
+
+        // Saturate: exactly COVER_FETCH_CONCURRENCY in-flight fetches.
+        let mut handles = Vec::new();
+        for _ in 0..COVER_FETCH_CONCURRENCY {
+            let c = c.clone();
+            handles.push(tokio::spawn(async move {
+                c.fetch_cover_now("/api/v1/manga/1/thumbnail").await.is_ok()
+            }));
+        }
+        // Wait for every permit to be taken (not for the fetches to finish).
+        for _ in 0..200 {
+            if c.cover_permits_available() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            c.cover_permits_available(),
+            0,
+            "burst should have taken every cover permit"
+        );
+
+        // The next on-demand request must be refused IMMEDIATELY, not queued.
+        let t = std::time::Instant::now();
+        let over = c.fetch_cover_now("/api/v1/manga/2/thumbnail").await;
+        let waited = t.elapsed();
+        assert!(
+            matches!(over, Err(CoverFetchError::Busy)),
+            "over-limit on-demand fetch must report Busy, got {over:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(250),
+            "Busy must be returned without queueing, took {waited:?}"
+        );
+
+        for h in handles {
+            assert!(h.await.unwrap(), "saturating fetches should still succeed");
+        }
+        // Permits are released on drop, so the pool is reusable afterwards.
+        assert_eq!(c.cover_permits_available(), COVER_FETCH_CONCURRENCY);
+        assert!(
+            origin
+                .peak_concurrent
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= COVER_FETCH_CONCURRENCY,
+            "origin saw more concurrent requests than the pool allows"
+        );
+    }
+
+    /// A well-formed HTTP 200 carrying a TRUNCATED image must be rejected at the fetch,
+    /// so the partial bytes never reach `process_cover` and get frozen into the cache
+    /// behind a one-year immutable TTL. `zune-jpeg` would decode them to `Ok`.
+    #[tokio::test]
+    async fn cover_fetch_rejects_truncated_jpeg() {
+        let whole = testsrv::jpeg(200, 300);
+        let truncated = whole[..whole.len() * 6 / 10].to_vec();
+        assert!(
+            image::load_from_memory(&truncated).is_ok(),
+            "precondition: the decoder itself accepts this truncated JPEG"
+        );
+        let origin = testsrv::spawn(truncated, Duration::ZERO).await;
+        let c = client(&origin.base_url);
+
+        let res = c.fetch_cover_now("/api/v1/manga/1/thumbnail").await;
+        match res {
+            Err(CoverFetchError::Upstream(e)) => {
+                assert!(
+                    e.to_string().contains("truncated"),
+                    "expected a truncation error, got: {e}"
+                );
+            }
+            other => panic!("truncated source must be rejected, got {other:?}"),
+        }
+        // The `cover_bytes` (thumbnail-URL) entry point gates it too.
+        assert!(
+            c.cover_bytes(Some("/api/v1/manga/1/thumbnail"))
+                .await
+                .is_none(),
+            "cover_bytes must also reject a truncated source"
+        );
+    }
+
+    /// A whole image round-trips through the gated path unchanged.
+    #[tokio::test]
+    async fn cover_fetch_accepts_a_whole_jpeg() {
+        let whole = testsrv::jpeg(120, 160);
+        let origin = testsrv::spawn(whole.clone(), Duration::ZERO).await;
+        let c = client(&origin.base_url);
+        let (bytes, ct) = c
+            .fetch_cover_now("/api/v1/manga/1/thumbnail")
+            .await
+            .expect("whole jpeg accepted");
+        assert_eq!(bytes, whole, "bytes must be passed through exactly");
+        assert_eq!(ct, "image/jpeg");
+    }
+
+    /// The background pool is bounded independently, so a burst of on-demand misses
+    /// can't spawn unbounded detached materialization tasks.
+    #[tokio::test]
+    async fn background_slots_are_bounded() {
+        let c = client("http://127.0.0.1:1");
+        let slots: Vec<_> = (0..BG_MATERIALIZE_CONCURRENCY)
+            .map(|_| c.try_background_slot().expect("slot available"))
+            .collect();
+        assert!(
+            c.try_background_slot().is_none(),
+            "background pool must refuse past its bound"
+        );
+        drop(slots);
+        assert!(c.try_background_slot().is_some(), "slots free on drop");
+    }
 }

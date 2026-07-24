@@ -4,8 +4,37 @@
 	import mark from '$lib/assets/mark.png';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { auth, initAuth, logout } from '$lib/auth.svelte';
+	import { auth, initAuth, logout, toggleNsfwVisibility } from '$lib/auth.svelte';
 	import { theme, cycleTheme, initTheme } from '$lib/theme.svelte';
+
+	// ---- NSFW visibility (the admin's own show_nsfw flag) ---------------------
+	// Not a viewing preference here: with it off the server refuses source browsing,
+	// extension install and source ingest. Surfaced in the header so the state is
+	// never invisible.
+	//
+	// It no longer decides what the console LISTS: catalogue search and canonical
+	// updates are read with a per-request `includeNsfw: true` override (see
+	// ADMIN_INCLUDE_NSFW in $lib/data), which the server honours for admins only. The
+	// two are deliberately distinct — this pill is the ACCOUNT PREFERENCE (what the
+	// reader shows you, and what the write-side source APIs gate on), whereas the
+	// override is scoped to this console's read paths so the ~2.5k mis-flagged
+	// mainstream works stay reachable for correction either way. Folding the override
+	// into the pill would have made "NSFW off" silently mean two different things.
+	let nsfwBusy = $state(false);
+	let nsfwError = $state<string | null>(null);
+
+	async function onToggleNsfw(): Promise<void> {
+		if (!auth.user || nsfwBusy) return;
+		nsfwBusy = true;
+		nsfwError = null;
+		try {
+			await toggleNsfwVisibility(!auth.user.showNsfw);
+		} catch (err) {
+			nsfwError = err instanceof Error ? err.message : 'Failed to change NSFW visibility.';
+		} finally {
+			nsfwBusy = false;
+		}
+	}
 
 	let { children } = $props();
 
@@ -68,6 +97,16 @@
 			</div>
 			<div class="who">
 				<button
+					class="nsfw-toggle"
+					class:off={!auth.user.showNsfw}
+					disabled={nsfwBusy}
+					onclick={onToggleNsfw}
+					title={auth.user.showNsfw
+						? 'Your ACCOUNT preference — NSFW visible: source browsing, extension install and source ingest are unblocked. Click to opt out. (Catalog and Updates list NSFW-flagged works in this console either way.)'
+						: 'Your ACCOUNT preference — NSFW hidden: the server refuses source browsing, extension install and source ingest. Click to opt in. (Catalog and Updates still list NSFW-flagged works in this console, so mis-flagged titles stay fixable.)'}
+					>NSFW {nsfwBusy ? '…' : auth.user.showNsfw ? 'on' : 'off'}</button
+				>
+				<button
 					class="theme-toggle"
 					onclick={cycleTheme}
 					title="Theme: {themeLabel} (click to change)"
@@ -78,6 +117,9 @@
 				<button class="signout" onclick={logout}>Sign out</button>
 			</div>
 		</header>
+		{#if nsfwError}
+			<p class="nsfw-error">{nsfwError}</p>
+		{/if}
 	{/if}
 	<main class:full={!auth.user || onLogin}>
 		{@render children()}
@@ -153,6 +195,38 @@
 	.theme-toggle:hover {
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
+	}
+	.nsfw-toggle {
+		height: 32px;
+		padding: 0 14px;
+		border-radius: var(--k-radius-pill);
+		background: transparent;
+		border: 1px solid rgba(95, 200, 207, 0.4);
+		color: var(--k-accent-teal);
+		font-family: var(--k-font-sans);
+		font-size: 12.5px;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.nsfw-toggle.off {
+		border-color: rgba(224, 179, 84, 0.45);
+		color: var(--k-hiatus);
+	}
+	.nsfw-toggle:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+	}
+	.nsfw-toggle:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.nsfw-error {
+		margin: 0 auto;
+		padding: 10px var(--k-space-6) 0;
+		max-width: var(--k-max-content);
+		font-family: var(--k-font-sans);
+		font-size: 13px;
+		color: #f0808a;
 	}
 	.mark {
 		font-family: var(--k-font-display);

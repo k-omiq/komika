@@ -55,12 +55,98 @@ pub fn process_avatar(bytes: &[u8]) -> Result<Vec<u8>> {
     smallest.ok_or_else(|| anyhow!("no candidate size produced"))
 }
 
+/// How far back from the end of the file [`ensure_complete`] looks for the container's
+/// terminator.
+///
+/// MEASURED, not guessed. Against the 4,562 real source covers the Suwayomi engine has
+/// on disk (`downloads/thumbnails`, 4.1 GB — the exact bytes this pipeline ingests):
+///
+/// * 3,730 JPEG. 3,689 end exactly on `FFD9`; 41 carry trailing bytes after the EOI,
+///   up to **1,373** of them. A 64-byte window therefore FALSE-REJECTS 6 of 3,729
+///   perfectly good covers (0.16%) — and a `truncated` verdict is transient, so those
+///   covers are re-fetched, re-rejected and never cached on every crawl tick forever.
+/// * Dropping the window entirely (reverse-search the whole buffer) is much worse in the
+///   other direction: 12.4% of these JPEGs contain an `FFD9` before their real EOI (an
+///   EXIF thumbnail's own terminator), so a whole-buffer search accepts **12.3%** of
+///   simulated truncations — the exact corruption this gate exists to stop.
+/// * 4 KiB is the knee: 0 false rejects on the corpus (3x headroom over the observed
+///   1,373-byte maximum) and 0.013% false accepts (3 of 22,374 simulated truncations).
+///
+/// 465 PNG and 364 WebP in the same corpus terminate cleanly under both the old and the
+/// new window, so this only moves the JPEG number.
+const TAIL_WINDOW: usize = 4096;
+
+/// Reject an image whose container is *incomplete* (truncated download) BEFORE decoding.
+///
+/// This exists because `image` 0.25 / `zune-jpeg` returns `Ok` for truncated JPEG data:
+/// a body that was cut off mid-scan decodes "successfully" into a correct-size image
+/// whose missing rows are filled with the decoder's zero/neutral value — `(0,135,0)`
+/// (YCbCr zero-fill) or `(128,128,128)` (neutral DC). Nothing downstream can tell that
+/// from real art, so a partial fetch gets re-encoded and frozen into the cover cache
+/// with `cover_cached_version` set and a one-year immutable edge TTL. Checking the
+/// container's end-of-stream marker catches the truncation directly, at the only point
+/// where the information still exists.
+///
+/// Only formats with an UNAMBIGUOUS terminator are checked, and each check is
+/// deliberately permissive about trailing padding — a false reject costs a real cover
+/// (`truncated` is transient, so it is never recorded in `work_cover_issue`; instead the
+/// work is re-fetched and re-rejected on EVERY crawl tick, forever, and never gets a
+/// cover). Unknown/unchecked formats (GIF, AVIF, BMP, …) pass through.
+pub(crate) fn ensure_complete(bytes: &[u8]) -> Result<()> {
+    // JPEG: SOI `FFD8FF` … EOI `FFD9`. `FF` inside entropy-coded scan data is byte-
+    // stuffed as `FF00`, so the literal pair `FFD9` cannot occur inside valid *scan*
+    // data. It CAN occur earlier in the file (the EOI of an EXIF thumbnail, or ICC /
+    // comment payload bytes), which is why this searches a bounded tail rather than the
+    // whole buffer — see `TAIL_WINDOW`.
+    if bytes.len() >= 4 && bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let tail = &bytes[bytes.len().saturating_sub(TAIL_WINDOW)..];
+        let has_eoi = tail.windows(2).any(|w| w == [0xFF, 0xD9]);
+        if !has_eoi {
+            bail!("truncated JPEG (no EOI marker)");
+        }
+        return Ok(());
+    }
+    // WebP: RIFF container declares its own length — `RIFF` + u32 LE size + `WEBP`,
+    // where the file is exactly `size + 8` bytes. Exact, so no tolerance needed;
+    // trailing bytes past the declared length are fine, missing bytes are not.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        let declared = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        if bytes.len() < declared.saturating_add(8) {
+            bail!(
+                "truncated WebP (RIFF declares {} bytes, got {})",
+                declared + 8,
+                bytes.len()
+            );
+        }
+        return Ok(());
+    }
+    // PNG: must end with the zero-length IEND chunk (len 0, "IEND", CRC AE426082).
+    // Same tail window as JPEG, for the same reason (trailing bytes after the terminator
+    // are legal and do occur); the 8-byte name+CRC signature makes a false accept far
+    // less likely here than for JPEG's 2-byte marker.
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    const IEND: [u8; 8] = [b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+    if bytes.len() >= 16 && bytes.starts_with(&PNG_SIG) {
+        let tail = &bytes[bytes.len().saturating_sub(TAIL_WINDOW)..];
+        if !tail.windows(8).any(|w| w == IEND) {
+            bail!("truncated PNG (no IEND chunk)");
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
 /// Decode uploaded image bytes with hard decoder limits so a decompression bomb
 /// (a tiny, highly-compressible file that expands to gigabytes of RGBA — the
 /// `MAX_UPLOAD_BYTES` cap only bounds the *compressed* input) can't OOM the
 /// process before we ever downscale. Caps pixel dimensions and the decode
 /// allocation; an over-limit image is rejected as a client error, not decoded.
 pub(crate) fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
+    // Truncation gate first: a partial JPEG decodes to `Ok` with a flat filler tail, so
+    // the decoder cannot be trusted to report this. Applies to every caller of
+    // `decode_limited` — avatar upload, `process_cover`, both crawl passes, the lazy
+    // `serve_cover` path and the admin cover upload.
+    ensure_complete(bytes)?;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .context("unsupported or corrupt image")?;
@@ -204,5 +290,123 @@ mod tests {
     #[test]
     fn avatar_url_is_versioned_path() {
         assert_eq!(avatar_url("user-123", 42), "/avatars/user-123.webp?v=42");
+    }
+
+    fn encode(w: u32, h: u32, fmt: image::ImageFormat) -> Vec<u8> {
+        let mut img = RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([
+                ((x * 73 + y * 151) % 256) as u8,
+                ((x * 199 + y * 37) % 256) as u8,
+                ((x ^ (y.wrapping_mul(101))) % 256) as u8,
+            ]);
+        }
+        let mut out = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), fmt)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn ensure_complete_accepts_whole_images() {
+        for fmt in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Png,
+            image::ImageFormat::WebP,
+        ] {
+            let bytes = encode(64, 96, fmt);
+            ensure_complete(&bytes).unwrap_or_else(|e| panic!("{fmt:?} rejected: {e}"));
+        }
+    }
+
+    /// The bug this gate exists for: `zune-jpeg` returns `Ok` for a JPEG cut off
+    /// mid-scan, filling the missing rows with a flat decoder value. The terminator
+    /// check is the only place the truncation is still detectable.
+    #[test]
+    fn ensure_complete_rejects_truncated_jpeg_the_decoder_accepts() {
+        let whole = encode(200, 300, image::ImageFormat::Jpeg);
+        let mut caught = 0;
+        let mut decoder_fooled = 0;
+        for pct in [30, 40, 50, 60, 70, 80, 90] {
+            let part = &whole[..whole.len() * pct / 100];
+            if image::load_from_memory(part).is_ok() {
+                decoder_fooled += 1;
+            }
+            let err = ensure_complete(part).expect_err("truncated JPEG must be rejected");
+            assert!(err.to_string().contains("truncated"), "got: {err}");
+            caught += 1;
+        }
+        assert_eq!(caught, 7, "every truncation point must be caught");
+        assert!(
+            decoder_fooled > 0,
+            "precondition: the decoder must accept at least one truncation \
+             (otherwise this gate isn't testing anything)"
+        );
+    }
+
+    #[test]
+    fn ensure_complete_rejects_truncated_webp_and_png() {
+        for fmt in [image::ImageFormat::WebP, image::ImageFormat::Png] {
+            let whole = encode(200, 300, fmt);
+            ensure_complete(&whole).unwrap_or_else(|e| panic!("whole {fmt:?} rejected: {e}"));
+            let part = &whole[..whole.len() * 7 / 10];
+            let e = ensure_complete(part)
+                .unwrap_err_or_panic(&format!("{fmt:?} truncation must be rejected"));
+            assert!(e.to_string().contains("truncated"), "{fmt:?}: {e}");
+        }
+    }
+
+    /// Tiny local helper so the loop above reads as an assertion rather than a
+    /// double-negative `unwrap_or_else(|_| panic!(...))`.
+    trait UnwrapErrOrPanic<E> {
+        fn unwrap_err_or_panic(self, msg: &str) -> E;
+    }
+    impl<T, E> UnwrapErrOrPanic<E> for std::result::Result<T, E> {
+        fn unwrap_err_or_panic(self, msg: &str) -> E {
+            match self {
+                Ok(_) => panic!("{msg}"),
+                Err(e) => e,
+            }
+        }
+    }
+
+    /// A JPEG with trailing padding after the EOI still passes — the check searches a
+    /// tail window rather than demanding EOI be the very last byte, because a false
+    /// reject costs a real cover permanently.
+    ///
+    /// The 1,400-byte case is the regression guard for [`TAIL_WINDOW`]: six real covers
+    /// in the production corpus carry 376–1,373 bytes after their EOI and were rejected
+    /// outright by the original 64-byte window.
+    #[test]
+    fn ensure_complete_tolerates_trailing_padding() {
+        for pad in [16usize, 1400, TAIL_WINDOW - 8] {
+            let mut bytes = encode(64, 96, image::ImageFormat::Jpeg);
+            bytes.extend_from_slice(&vec![0u8; pad]);
+            ensure_complete(&bytes)
+                .unwrap_or_else(|e| panic!("{pad} bytes of trailing padding rejected: {e}"));
+        }
+        // Same for PNG: trailing bytes after IEND are not a truncation.
+        let mut png = encode(64, 96, image::ImageFormat::Png);
+        png.extend_from_slice(&[0u8; 1400]);
+        ensure_complete(&png).expect("PNG trailing padding must not be a rejection");
+    }
+
+    /// Formats with no unambiguous terminator (and non-images) are passed through to the
+    /// decoder, which reports them properly.
+    #[test]
+    fn ensure_complete_passes_unknown_formats_through() {
+        ensure_complete(b"not an image at all").expect("unknown bytes are the decoder's problem");
+        ensure_complete(&[]).expect("empty is caught by the emptiness check, not here");
+    }
+
+    #[test]
+    fn decode_limited_rejects_truncated_jpeg() {
+        let whole = encode(200, 300, image::ImageFormat::Jpeg);
+        let part = &whole[..whole.len() * 6 / 10];
+        assert!(
+            decode_limited(part).is_err(),
+            "decode_limited must inherit the truncation gate"
+        );
     }
 }

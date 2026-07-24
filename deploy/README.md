@@ -19,14 +19,44 @@ turns on the **FlareSolverr Cloudflare bypass**, creates the admin account, and 
 the library. When it finishes it prints the URLs.
 
 ```
-Reader      http://<PUBLIC_HOST>:8081
-API         http://<PUBLIC_HOST>:8080/graphql   (GraphiQL on GET)
-Suwayomi    http://<PUBLIC_HOST>:4567            (source management / image serving)
+Reader      not started (compose profile 'selfhost' — see below)
+API         http://127.0.0.1:8080/graphql   (loopback-only; POST only unless GRAPHIQL_ENABLED=on)
+Suwayomi    http://127.0.0.1:4567           (loopback-only; source management / images)
 admin login: <KOMIKA_ADMIN_USERS> / KOMIKA_ADMIN_PASSWORD
+```
+
+**Both published ports bind to `127.0.0.1` only.** Docker's DNAT bypasses the host
+firewall's `filter/INPUT` chain entirely, so a `0.0.0.0` publish here is *not* covered
+by your host firewall rules — and it is reachable from containers in unrelated
+compose stacks on the same machine, via any bridge. Put a reverse proxy or a
+Cloudflare Tunnel in front (see `CLOUDFLARE-RUNBOOK.md`) rather than widening these.
+
+**The `reader` container is opt-in.** It sits behind the compose profile `selfhost`,
+because in production the reader is a Cloudflare Worker and starting the nginx SPA
+would publish an unused world-bound port. To run it:
+
+```sh
+./deploy.sh up --with-reader     # or: export COMPOSE_PROFILES=selfhost
 ```
 
 Other commands: `./deploy.sh logs`, `./deploy.sh bootstrap` (re-run bootstrap only),
 `./deploy.sh down` (stop, keep data), `./deploy.sh destroy` (stop + delete volumes).
+
+**`up` runs a preflight** before it starts anything: `TRUSTED_PROXY_CIDRS` must cover
+the live `komika_komika` bridge gateway, and may only be set while the API port is
+loopback-bound. Both failures are otherwise silent — a stale gateway collapses every
+user into one auth rate-limit bucket, and a world-bound port lets clients forge
+`X-Forwarded-For` past the limiter. It prints the correct value when it aborts;
+`SKIP_PROXY_CIDR_CHECK=1` bypasses it. A bare `docker compose up -d` skips the check,
+which is why `./deploy.sh` is the documented path.
+
+**Resource + log limits** are set per-service in `docker-compose.yml`: `mem_limit`
+(suwayomi 8g / server 6g / flaresolverr 2g, of a 23.4 GiB host) so a runaway can't
+make the kernel pick an OOM victim from an unrelated stack, and `json-file` logging
+capped at `20m × 5` so container logs can't fill the disk. `/etc/docker/daemon.json`
+carries the same log cap as a **daemon-wide default** for containers started by other
+stacks — but daemon.json is only read at Docker-daemon start, so it takes effect at
+the next daemon restart, not at the next `docker compose up`.
 
 ## The four services
 
@@ -35,7 +65,7 @@ Other commands: `./deploy.sh logs`, `./deploy.sh bootstrap` (re-run bootstrap on
 | **suwayomi**     | Runs the source extensions (MangaDex, …): catalog, chapters, **and page/cover images**.                                                                                                          |
 | **flaresolverr** | Headless-browser sidecar that solves Cloudflare "checking your browser" challenges. Internal-only; Suwayomi calls it at `http://flaresolverr:8191`.                                              |
 | **server**       | `komika-server` — federates Suwayomi + adds accounts/social/admin, and runs the **adaptive scan scheduler** (auto-updates the library on a cadence derived from each series' chapter frequency). |
-| **reader**       | Static SvelteKit SPA (nginx), pointed at the server.                                                                                                                                             |
+| **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                            |
 
 ## How it's wired (important gotcha)
 
@@ -43,8 +73,10 @@ Other commands: `./deploy.sh logs`, `./deploy.sh bootstrap` (re-run bootstrap on
   `SUWAYOMI_URL=http://suwayomi:4567` over the private compose network.
 - **Image URLs are public:** page/cover images are `<img src>`s the _browser_ loads, so
   they can't use the internal `suwayomi:4567` hostname. The server rewrites them to
-  **`SUWAYOMI_PUBLIC_URL`** (`http://<PUBLIC_HOST>:4567` by default). That's why Suwayomi's
-  port is published — browsers fetch images straight from it (direct mode). Set
+  **`SUWAYOMI_PUBLIC_URL`**. Point this at the **komika server**, not at Suwayomi:
+  Suwayomi's `:4567` is loopback-bound (its admin API is unauthenticated, so it must
+  never be internet-reachable), and the server proxies the image bytes at
+  `/api/v1/manga/…`. In prod that is `SUWAYOMI_PUBLIC_URL=https://api.komiq.cc`. Set
   `PUBLIC_HOST` to your domain/IP in `.env` for a real deploy.
 - The reader's backend config is baked in **at build time** (Vite inlines `PUBLIC_*`), so
   the compose `reader` build args carry `PUBLIC_KOMIKA_API` / `PUBLIC_KOMIKA_IMG_MODE`.
