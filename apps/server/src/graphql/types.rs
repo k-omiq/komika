@@ -22,6 +22,102 @@ pub enum SeriesStatus {
     Unknown,
 }
 
+/// How Browse orders the catalogue. `TRENDING` is the default because it is the only
+/// ordering that reflects what people are actually reading; the other three are the
+/// deterministic ones a user reaches for when they want a specific slice.
+///
+/// `RATING` and `TRENDING` are implemented as two-phase queries (see
+/// `browse::browse_catalogue`) because their ranking key exists for a tiny minority of
+/// works, which makes the ranked set a strict PREFIX of the page order.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum BrowseSort {
+    /// Most-viewed over the last 24 hours first, then newest release.
+    Trending,
+    /// Newest upstream chapter release first.
+    Newest,
+    /// Highest user-review average first, then newest release for the unrated.
+    Rating,
+    /// Most English chapters first.
+    Chapters,
+}
+
+/// The content-rating floor Browse filters by. CUMULATIVE: each value admits everything
+/// the milder ones do.
+///
+/// This NARROWS within the viewer's NSFW gate and can never widen it — for an opted-out
+/// viewer `EROTICA` and `PORNOGRAPHIC` return exactly the `SUGGESTIVE` set, because no
+/// `is_nsfw = 0` work carries either rating. See `browse::build_where`.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ContentRatingFilter {
+    /// No rating clause at all.
+    All,
+    Safe,
+    Suggestive,
+    Erotica,
+    /// Admits every stored rating, so it is equivalent to `ALL` — kept as a member so a
+    /// client can name the top tier explicitly rather than inferring it.
+    Pornographic,
+    /// The ONE non-cumulative member: adult-rated works *only*, i.e. the complement of
+    /// `SAFE` rather than a ceiling above it.
+    ///
+    /// It exists because "show me only the adult titles" is not expressible as a tier —
+    /// every tier admits `safe` — and it is the other half of the control that replaced
+    /// Browse's NSFW toggle. It filters on the materialized `is_nsfw` flag, NOT on
+    /// `content_rating`, so it tracks admin `is_nsfw_override` decisions rather than
+    /// disagreeing with them.
+    ///
+    /// Still cannot widen the viewer's gate: for an opted-out viewer this yields an EMPTY
+    /// page, which is the honest answer (they may not see those works) rather than
+    /// silently degrading to "everything".
+    NsfwOnly,
+}
+
+/// The `content_rating` values one cumulative tier admits, or `None` for "no clause".
+///
+/// `ALL` and `PORNOGRAPHIC` both return `None` rather than the full four-value list: they
+/// are the same set, and omitting the predicate entirely is both cheaper (no index payload
+/// check per row) and immune to a fifth rating appearing upstream — a hard-coded list would
+/// silently start EXCLUDING it.
+pub fn content_rating_tier(f: ContentRatingFilter) -> Option<&'static [&'static str]> {
+    match f {
+        // `NSFW_ONLY` is not a rating tier at all — it constrains `is_nsfw` instead, via
+        // `content_rating_nsfw_only`. Emitting no rating clause here is what lets the two
+        // live side by side without either having to know about the other.
+        ContentRatingFilter::All
+        | ContentRatingFilter::Pornographic
+        | ContentRatingFilter::NsfwOnly => None,
+        ContentRatingFilter::Safe => Some(&["safe"]),
+        ContentRatingFilter::Suggestive => Some(&["safe", "suggestive"]),
+        ContentRatingFilter::Erotica => Some(&["safe", "suggestive", "erotica"]),
+    }
+}
+
+/// Whether this filter restricts to adult-rated works only (`is_nsfw = 1`).
+///
+/// Separate from [`content_rating_tier`] because the two constrain DIFFERENT columns:
+/// tiers narrow `content_rating`, this narrows the materialized `is_nsfw` flag. Folding
+/// them into one return type would force every caller to match on a shape that is
+/// `None`-or-list for four members and a boolean for the fifth.
+pub fn content_rating_nsfw_only(f: ContentRatingFilter) -> bool {
+    matches!(f, ContentRatingFilter::NsfwOnly)
+}
+
+/// The COLLAPSED format word `feed_series_updates.comic_type` stores, per the reader's
+/// `toViewType`: `WEBTOON` folds into `MANHWA` and `COMIC` into `MANGA`.
+///
+/// One function rather than a `match` copied into each of the three places that needs it
+/// (the feed refresh that WRITES the column, and the `updatesFeed` + Browse filters that
+/// READ it) — if the three ever disagreed, a format tab would return an empty page for a
+/// format the refresh had stored under a different word. Collapsing at write time is what
+/// keeps the filter a single indexed equality; see migration 0064.
+pub fn collapsed_comic_type_word(t: ComicType) -> &'static str {
+    match t {
+        ComicType::Manhwa | ComicType::Webtoon => "MANHWA",
+        ComicType::Manhua => "MANHUA",
+        ComicType::Manga | ComicType::Comic => "MANGA",
+    }
+}
+
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum DiscoveryFeedKind {
     Popular,

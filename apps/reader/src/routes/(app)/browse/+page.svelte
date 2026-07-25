@@ -20,7 +20,7 @@
 	const browseCache = new Map<string, BrowseCacheEntry>();
 	// Raised from 8 when the page number joined the key: at 8, paging one query eight
 	// deep evicted every other query's entry, so "page a bit, open a series, go back,
-	// page again" always missed. 12 × ≤20 view objects is trivial memory.
+	// page again" always missed. 12 × ≤30 view objects is trivial memory.
 	const BROWSE_CACHE_MAX = 12;
 	function putBrowseCache(sig: string, entry: BrowseCacheEntry) {
 		browseCache.delete(sig); // re-insert so it becomes most-recent
@@ -41,10 +41,10 @@
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
 	import Pager from '$lib/components/Pager.svelte';
 	import { FLAG, STATUS_META, type ComicType, type Status } from '$lib/data/types';
-	import { FEED_PAGE_SIZE, lastPage, pageParam, withPage } from '$lib/data/paging';
-	import { getFederatedSearch, getNativeSearch } from '$lib/data/source';
+	import { BROWSE_PAGE_SIZE, lastPage, pageParam, withPage } from '$lib/data/paging';
+	import { getFederatedSearch, getNativeSearch, type CatalogFilters } from '$lib/data/source';
+	import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 	import { auth } from '$lib/auth.svelte';
-	import { backend } from '$lib/context';
 
 	let { data } = $props();
 
@@ -55,10 +55,32 @@
 		data.facets.then((f) => (facets = f));
 	});
 
+	// The rail's vocabulary, and the whitelist every URL param is validated against —
+	// declared BEFORE the state it initialises, because that initialisation runs at
+	// component-setup time and a `const` referenced above its declaration is a TDZ throw,
+	// not a hoist.
+	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
+	const VALID_STATUS = ['ongoing', 'completed', 'hiatus', 'cancelled'];
+	const VALID_SORT = ['trending', 'rating', 'newest', 'chapters'];
+	/**
+	 * The content-rating tiers this rail offers, a deliberate SUBSET of the server's
+	 * `ContentRatingFilter`. The intermediate cumulative tiers (SUGGESTIVE, EROTICA,
+	 * PORNOGRAPHIC) are omitted: they are ceilings, not categories, so "Erotica" would
+	 * read as "erotica only" while actually returning everything up to and including it.
+	 * The three below are the ones whose plain-English label matches what comes back.
+	 */
+	const CONTENT_RATINGS = ['ALL', 'SAFE', 'NSFW_ONLY'] as const;
+	// `Extract`, not a bare `(typeof CONTENT_RATINGS)[number]`: it asserts the subset
+	// relationship against the wire enum, so a typo'd tier above collapses this to `never`
+	// and fails the build here instead of shipping a value the server rejects at runtime.
+	type RailContentRating = Extract<ContentRatingFilter, (typeof CONTENT_RATINGS)[number]>;
+
 	const params = page.url.searchParams;
 	let query = $state(params.get('q') ?? '');
-	let types = $state<ComicType[]>(params.get('type') ? [params.get('type') as ComicType] : []);
-	let selectedGenres = $state<string[]>(params.get('genre') ? [params.get('genre')!] : []);
+	// `type` and `genre` are REPEATABLE params — the rail multi-selects both, so a single
+	// `get()` would silently drop every choice after the first on reload/share.
+	let types = $state<ComicType[]>(params.getAll('type').filter(isViewType));
+	let selectedGenres = $state<string[]>(params.getAll('genre'));
 	let status = $state<Status | 'any'>('any');
 	// Rating is a dual-handle range on the 0–10 scale (10 = no upper bound).
 	let minRating = $state(0);
@@ -76,34 +98,69 @@
 	// on real data (rating_bayesian), it is not being dropped.
 	const RATING_FILTER_ENABLED = false;
 	let sort = $state<'trending' | 'rating' | 'newest' | 'chapters'>('trending');
+	// The wire enum is what the SERVER orders by; the lowercase word is what the URL has
+	// always carried and what the chips key off, so shared `?sort=` links keep working.
+	// One map, one direction — the reverse never needs to exist.
+	const SORT_TO_WIRE: Record<typeof sort, BrowseSort> = {
+		trending: 'TRENDING',
+		rating: 'RATING',
+		newest: 'NEWEST',
+		chapters: 'CHAPTERS',
+	};
+	let contentRating = $state<RailContentRating>('ALL');
+	/**
+	 * "Has chapters" — the one filter that is OFF by default and still worth having.
+	 *
+	 * Browse pages the whole catalogue, which includes ~67k works with no chapter yet.
+	 * They are not the obscure tail: MangaDex removes chapters when a series is licensed or
+	 * claimed, so the set is full of things people search for (Boku no Hero Academia,
+	 * Nausicaä, Ghost in the Shell), and many already have another source lined up. Showing
+	 * them is the default; this chip is for the reader who only wants what they can open
+	 * right now. Sent as `undefined` when off — `false` is a real wire value meaning "only
+	 * series with NO chapters", which no control here offers.
+	 */
+	let hasChapters = $state(false);
 	let genreQuery = $state(''); // filters the (long) facet list
 
-	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
-	const VALID_STATUS = ['ongoing', 'completed', 'hiatus', 'cancelled'];
-	const VALID_SORT = ['trending', 'rating', 'newest', 'chapters'];
+	function isViewType(t: string): t is ComicType {
+		return TYPES.includes(t as ComicType);
+	}
 
-	// Re-sync inputs/filters from the URL on same-route client navigation (home
-	// genre links, the search overlay's advanced filters). Only reads page.url, so
-	// writing this state can't feed back into the effect — user edits made via the
-	// rail (which don't touch the URL) are preserved until the next navigation.
-	//
-	// GATED on a signature of the FILTER params only, `page` deliberately excluded.
-	// The pager writes `?page=` and nothing else, and rail edits are component state
-	// that is never written to the URL — so without this guard every page step
-	// re-hydrated the filter block and WIPED the user's genre/status/format/sort
-	// selections (and reset `federatedFor`) back to whatever the URL happened to say.
-	// `page` is read separately, by `pageNum`.
-	let lastUrlSig: string | null = null;
-	$effect(() => {
-		const sp = page.url.searchParams;
-		const urlSig = JSON.stringify([
+	/**
+	 * The signature of the FILTER params in a URL — the gate on the URL→state sync below,
+	 * and what {@link syncFilterUrl} pre-arms so a write of our own doesn't read back.
+	 *
+	 * `page` is deliberately excluded: the pager writes `?page=` and nothing else, and
+	 * without that exclusion every page step re-hydrated the whole filter block from the
+	 * URL (and reset `federatedFor`). `q` IS included even though the search box never
+	 * writes it, because the search overlay and home links do.
+	 */
+	function filterUrlSig(sp: URLSearchParams): string {
+		return JSON.stringify([
 			sp.get('q') ?? '',
-			sp.get('type') ?? '',
+			sp.getAll('type'),
 			sp.getAll('genre'),
 			sp.get('status') ?? '',
 			sp.get('sort') ?? '',
+			sp.get('content') ?? '',
+			sp.get('chapters') ?? '',
 			sp.get('minRating') ?? '',
 		]);
+	}
+
+	// Re-sync inputs/filters from the URL on same-route client navigation (home genre
+	// links, the search overlay's advanced filters, Back/Forward) — and NOT on our own
+	// writes: the rail now publishes itself to the URL (see `syncFilterUrl`), so this
+	// effect would otherwise re-hydrate every field on every chip click. That is not
+	// merely wasteful, it is lossy: `query` and `genreQuery` live only in component state
+	// while a filter write is in flight, so a round-trip through here would wipe a typed
+	// search term and clear the federated opt-in on a mere sort change. `syncFilterUrl`
+	// pre-arms `lastUrlSig` with the signature it is about to produce, which turns this
+	// effect into a no-op for self-writes while leaving genuine navigations untouched.
+	let lastUrlSig: string | null = null;
+	$effect(() => {
+		const sp = page.url.searchParams;
+		const urlSig = filterUrlSig(sp);
 		// Starts null, so the first run still hydrates — mount behaviour is unchanged.
 		if (urlSig === lastUrlSig) return;
 		lastUrlSig = urlSig;
@@ -111,13 +168,23 @@
 		// A navigation (new search term, home genre link) always restarts on the fast
 		// local path; the viewer re-opts into the federated fan-out per query.
 		federatedFor = null;
-		const tp = sp.get('type');
-		types = tp && TYPES.includes(tp as ComicType) ? [tp as ComicType] : [];
+		types = sp.getAll('type').filter(isViewType);
 		selectedGenres = sp.getAll('genre');
 		const st = sp.get('status');
 		status = st && VALID_STATUS.includes(st) ? (st as Status) : 'any';
 		const so = sp.get('sort');
 		sort = so && VALID_SORT.includes(so) ? (so as typeof sort) : 'trending';
+		// Written lowercase for a readable URL, matched case-insensitively so a
+		// hand-typed `?content=SAFE` still lands. Anything else — including a tier this
+		// rail deliberately doesn't offer — falls back to ALL rather than applying a
+		// filter with no control to clear it from.
+		const cr = (sp.get('content') ?? '').toUpperCase();
+		contentRating = (CONTENT_RATINGS as readonly string[]).includes(cr)
+			? (cr as RailContentRating)
+			: 'ALL';
+		// Written as the bare presence `?chapters=1`, so anything else (including a
+		// hand-typed `?chapters=0`) reads as OFF — the default, and the wider result set.
+		hasChapters = sp.get('chapters') === '1';
 		// Only hydrate the rating from the URL while the facet is enabled. With it
 		// disabled the control is hidden, so a stale/shared `?minRating=` link must not
 		// still narrow the (signed-in) federated results or render a phantom "N.N
@@ -129,6 +196,50 @@
 			minRating = Number.isNaN(mrn) ? 0 : Math.min(10, Math.max(0, mrn));
 		}
 	});
+
+	/**
+	 * Publish the rail's server-side filters into the URL, and drop `?page=`.
+	 *
+	 * Every one of these is now a SERVER argument, so a filter change is a different
+	 * result set of a different length — page 7 of the old one is meaningless. The reset
+	 * happens HERE, in the same navigation that writes the filters, rather than in a
+	 * second `replacePage(1)`: two `goto`s racing off one state change both compute their
+	 * href from the pre-navigation `page.url`, so whichever landed second would erase the
+	 * other's params and the URL→state sync would then hydrate the loser back out of the
+	 * rail.
+	 *
+	 * Unknown params are carried through untouched (notably `q` and `minRating`) — this
+	 * owns the filter params, not the query string.
+	 */
+	function syncFilterUrl() {
+		const sp = new URLSearchParams(page.url.searchParams);
+		setAll(sp, 'type', types);
+		setAll(sp, 'genre', selectedGenres);
+		// Defaults are written as ABSENCE, not as `?status=any&sort=trending`: `/browse`
+		// is edge-SSR'd and shareable, so the unfiltered grid must have exactly one URL
+		// or it gets two cache keys and two crawlable addresses for identical content.
+		setOne(sp, 'status', status === 'any' ? null : status);
+		setOne(sp, 'sort', sort === 'trending' ? null : sort);
+		setOne(sp, 'content', contentRating === 'ALL' ? null : contentRating.toLowerCase());
+		setOne(sp, 'chapters', hasChapters ? '1' : null);
+		sp.delete('page');
+		const qs = sp.toString();
+		const href = qs ? `${page.url.pathname}?${qs}` : page.url.pathname;
+		if (href === `${page.url.pathname}${page.url.search}`) return;
+		lastUrlSig = filterUrlSig(sp); // this write is ours; don't read it back
+		void goto(href, { replaceState: true, noScroll: true, keepFocus: true });
+	}
+
+	/** Replace a repeatable param with `values` (empty → remove it entirely). */
+	function setAll(sp: URLSearchParams, key: string, values: string[]) {
+		sp.delete(key);
+		for (const v of values) sp.append(key, v);
+	}
+	/** Set a single-valued param, or remove it when `value` is null. */
+	function setOne(sp: URLSearchParams, key: string, value: string | null) {
+		if (value == null) sp.delete(key);
+		else sp.set(key, value);
+	}
 
 	function toggle<T>(arr: T[], v: T): T[] {
 		return arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v];
@@ -185,28 +296,44 @@
 	// Whole-catalogue pagination (native path only): the server pages the ENTIRE
 	// filtered catalogue and each page REPLACES the grid. THE page number is the URL's
 	// — not component state — so a reload, a shared link and the browser's Back button
-	// all agree, and the rows effect re-runs simply by reading it. Genre/rating filters
-	// are applied server-side across the whole catalogue; type/status/sort are refined
-	// client-side over the current page only (see `pageScopedNotice`).
+	// all agree, and the rows effect re-runs simply by reading it. EVERY facet in the
+	// rail is now applied server-side across the whole catalogue, so `totalCount` counts
+	// the filtered set and the pager walks it.
 	const pageNum = $derived(pageParam(page.url.searchParams));
 	let hasNext = $state(false);
 	let totalCount = $state<number | null>(null);
 
-	function serverFilters() {
+	// The content-rating control exists only for a viewer who has opted into NSFW: the
+	// server clamps the filter to the viewer's own posture, so for everyone else "Safe
+	// only" is what they already have and "NSFW only" returns a guaranteed-empty page —
+	// a control whose two interesting settings are a no-op and a dead end.
+	const nsfwOptedIn = $derived(auth.user?.showNsfw ?? false);
+
+	function serverFilters(): CatalogFilters {
 		return {
 			genres: [...selectedGenres],
 			// Gated on RATING_FILTER_ENABLED so a stale/shared ?minRating= URL can't
 			// still collapse the catalogue to 3 rows while the control is hidden.
 			minRating: RATING_FILTER_ENABLED && minRating > 0 ? minRating : undefined,
 			maxRating: RATING_FILTER_ENABLED && maxRating < 10 ? maxRating : undefined,
+			types: [...types],
+			status: status === 'any' ? undefined : status,
+			sort: SORT_TO_WIRE[sort],
+			// Same reasoning as the rating gate: the chip is hidden for an opted-out
+			// viewer, so a stale/shared `?content=nsfw_only` link must not silently pin
+			// them to an empty grid they have no control to clear.
+			contentRating: nsfwOptedIn ? contentRating : undefined,
+			// `undefined` when off, NEVER `false`: `false` asks the server for only the works
+			// with no chapters, which would invert the filter instead of clearing it.
+			hasChapters: hasChapters ? true : undefined,
 		};
 	}
 
 	// Signature of the currently-displayed result set, for the back-nav cache. Native
-	// results depend on query + server filters (genres/rating); federated results
-	// depend only on the query (filters are applied client-side), so its signature
-	// deliberately omits the filters — mirroring the effect's reactive-dependency
-	// split so a federated filter change neither re-fetches nor invalidates the cache.
+	// results depend on query + EVERY server filter; federated results depend only on the
+	// query (filters are applied client-side), so its signature deliberately omits the
+	// filters — mirroring the effect's reactive-dependency split so a federated filter
+	// change neither re-fetches nor invalidates the cache.
 	let lastSig: string | null = null;
 	// `reloadKey` at the time `lastSig` was set, so an explicit retry still refetches
 	// even though its signature is unchanged.
@@ -254,17 +381,32 @@
 		// — so a federated filter change neither re-fetches nor invalidates the cache.)
 		// The native sig also carries the PAGE (`p`): each page REPLACES the grid, so two
 		// pages of one query are two different result sets. Without it, back-nav from a
-		// series opened on page 3 would restore page 1's 20 rows under a URL still
+		// series opened on page 3 would restore page 1's 30 rows under a URL still
 		// reading `?page=3`. The federated key stays page-free — federated search
 		// returns a single deduped page (`hasNext = false`).
+		//
+		// Format/status/sort/content-rating are IN the native key. They used to be absent
+		// because they were applied client-side over whatever page was loaded; now the
+		// server resolves them, so two sorts of one query are two different result sets.
+		// Without them here the module cache would happily serve "Trending page 1" as
+		// "Top rated page 1" on any back-nav.
 		const idTag = `${auth.user?.id ?? 'anon'}:${auth.user?.showNsfw ? 1 : 0}`;
 		const sig = isFederated
 			? `fed:${idTag}:${q}`
 			: `nat:${idTag}:${JSON.stringify({
 					q,
-					g: [...nativeFilters!.genres].sort(),
+					g: [...nativeFilters!.genres!].sort(),
 					mn: nativeFilters!.minRating ?? 0,
 					mx: nativeFilters!.maxRating ?? 10,
+					t: [...nativeFilters!.types!].sort(),
+					st: nativeFilters!.status ?? '',
+					so: nativeFilters!.sort ?? '',
+					cr: nativeFilters!.contentRating ?? '',
+					// In the key because it is a SERVER argument: "has chapters, page 1" and
+					// "everything, page 1" are two different 30-row result sets of two
+					// different lengths, and the module cache would otherwise serve one as
+					// the other on any back-nav.
+					hc: nativeFilters!.hasChapters ?? '',
 					p: nativePage,
 				})}`;
 
@@ -426,25 +568,38 @@
 	// on), which would render an empty grid reading "No matches found" over a catalogue
 	// of 10,000+. Land on the last real page instead. replaceState, so Back doesn't
 	// bounce the viewer straight onto the bad page again.
+	//
+	// BROWSE_PAGE_SIZE, not FEED_PAGE_SIZE: browse pages at 30 while the rest of the API
+	// pages at 20, and this is the one place the constant is load-bearing rather than
+	// cosmetic — computing `lastPage` at 20 over-reports the page count by half and
+	// "repairs" the viewer onto a page that is itself past the end.
 	$effect(() => {
 		if (rowsLoading || rowsError || rowsAreFederated) return;
 		if (rows.length > 0 || pageNum === 1) return;
 		if (totalCount == null || totalCount === 0) return;
-		const last = lastPage(totalCount, FEED_PAGE_SIZE);
+		const last = lastPage(totalCount, BROWSE_PAGE_SIZE);
 		if (pageNum > last) replacePage(last);
 	});
 
-	// A new query or a new SERVER-side filter is a new result set — page 7 of the old
-	// one is meaningless, so drop back to page 1. replaceState so filter fiddling
-	// doesn't fill the history stack.
+	// A new query or a new filter is a new result set — page 7 of the old one is
+	// meaningless — so publish the rail to the URL and drop back to page 1, in ONE
+	// replaceState navigation (see `syncFilterUrl` for why it cannot be two, and why
+	// replaceState: filter fiddling must not fill the history stack).
 	//
-	// `types`/`status`/`sort` are deliberately ABSENT: they are applied client-side over
-	// the current page, so changing them must not throw away the page the viewer is on.
-	// (If they ever become server arguments they move in here.) `reloadKey` is absent
-	// too — an explicit Retry must re-fetch the page the viewer is ON, not page 1.
+	// `types`/`status`/`sort`/`contentRating` are IN here now. They used to be excluded
+	// on the grounds that they were applied client-side over the loaded page, so changing
+	// them shouldn't discard the viewer's page. They are server arguments as of the
+	// browse API, and the old comment said this is where they'd move. Leaving them out
+	// now would be actively broken twice over: the page wouldn't reset (page 7 of
+	// "Trending" is not page 7 of "Top rated") and, worse, the rows effect's
+	// unchanged-signature short-circuit would swallow the change entirely — the chip
+	// would light up and nothing would refetch.
+	//
+	// `reloadKey` is still absent — an explicit Retry must re-fetch the page the viewer
+	// is ON, not page 1.
 	//
 	// The viewer identity + NSFW posture ARE included: the server filters by the
-	// persisted `show_nsfw` preference, so flipping the rail's toggle (or logging in)
+	// persisted `show_nsfw` preference, so logging in (or flipping the profile setting)
 	// yields a different result set of a different length. Gated on `auth.ready`
 	// because `initAuth()` resolves the user asynchronously — recording the baseline
 	// before then would see anon→user as a filter change and blow away the page number
@@ -454,7 +609,12 @@
 		if (!auth.ready) return;
 		const fsig = JSON.stringify([
 			query.trim(),
+			[...types].sort(),
 			[...selectedGenres].sort(),
+			status,
+			sort,
+			contentRating,
+			hasChapters,
 			minRating,
 			maxRating,
 			auth.user?.id ?? 'anon',
@@ -467,7 +627,7 @@
 		}
 		if (fsig === lastFilterSig) return;
 		lastFilterSig = fsig;
-		replacePage(1);
+		syncFilterUrl();
 	});
 
 	function retryRows() {
@@ -486,79 +646,44 @@
 		replacePage(1);
 	}
 
-	// NSFW visibility: the SERVER filters browse/search results by the viewer's
-	// persisted `show_nsfw` preference, so the toggle flips that preference (via
-	// `setShowNsfw`, shared with the profile setting) and re-fetches. Only meaningful
-	// for signed-in viewers — anonymous browsing is always safe-filtered.
-	const showNsfw = $derived(auth.user?.showNsfw ?? false);
-	let savingNsfw = $state(false);
-	async function toggleNsfw() {
-		if (!auth.user || savingNsfw || !backend.setShowNsfw) return;
-		savingNsfw = true;
-		try {
-			const next = await backend.setShowNsfw(!auth.user.showNsfw);
-			if (auth.user) auth.user.showNsfw = next;
-			reloadKey++; // re-fetch results under the new NSFW posture
-		} catch {
-			// best-effort — leave the toggle as it was
-		} finally {
-			savingNsfw = false;
-		}
-	}
-
-	// Client-side facets the server search doesn't cover (type, status), plus
-	// genre/rating for FEDERATED rows (native rows are already server-filtered).
+	// The displayed rows.
+	//
+	// NATIVE rows are returned exactly as the server ordered and filtered them — every
+	// facet in the rail (genre, format, status, sort, content rating, rating range) is a
+	// server argument now, so there is nothing left to narrow here. Re-filtering or
+	// re-sorting them locally is precisely the bug this replaced: it operated on the one
+	// page that happened to be loaded while presenting itself as catalogue-wide, so
+	// "Top rated" ranked 30 arbitrary rows and a Format chip could empty a grid sitting
+	// on 48,000 matches.
+	//
+	// FEDERATED rows stay client-filtered BY DESIGN: `searchAllSources` takes no filter
+	// arguments (it fans out to live extensions), so genre/rating are the only facets it
+	// can honour and they are honoured here. Format/status/sort are simply not available
+	// on that path — see `facetsIgnored`, which says so rather than pretending.
 	const results = $derived.by(() => {
+		if (!rowsAreFederated) return rows;
 		const gsel = selectedGenres.map((g) => g.toLowerCase());
-		const list = rows.filter((m) => {
-			if (types.length && !types.includes(m.type)) return false;
-			if (status !== 'any' && m.status !== status) return false;
-			if (rowsAreFederated) {
-				if (gsel.length && !m.genres.some((mg) => gsel.includes(mg.toLowerCase()))) return false;
-				if (minRating > 0 && m.rating < minRating) return false;
-				if (maxRating < 10 && m.rating > maxRating) return false;
-			}
+		return rows.filter((m) => {
+			if (gsel.length && !m.genres.some((mg) => gsel.includes(mg.toLowerCase()))) return false;
+			if (minRating > 0 && m.rating < minRating) return false;
+			if (maxRating < 10 && m.rating > maxRating) return false;
 			return true;
 		});
-		const sorters = {
-			trending: (a: FederatedResultView, b: FederatedResultView) =>
-				b.rating - a.rating || b.ch - a.ch,
-			rating: (a: FederatedResultView, b: FederatedResultView) => b.rating - a.rating,
-			newest: (a: FederatedResultView, b: FederatedResultView) => b.addedAt - a.addedAt,
-			chapters: (a: FederatedResultView, b: FederatedResultView) => b.ch - a.ch,
-		};
-		return [...list].sort(sorters[sort]);
 	});
 
-	// True when a facet the SERVER doesn't apply has narrowed the view. `totalCount`
-	// is a catalogue-wide, pre-pagination count, so it is only an honest headline
-	// while type/status aren't filtering the loaded page down further.
-	const clientNarrowed = $derived(types.length > 0 || status !== 'any');
-
-	// HONESTY: the sort chips and the Format/Status chips are applied CLIENT-SIDE, over
-	// `rows` — and `rows` is now exactly the 20 series of the current page, because the
-	// server pages the catalogue and there is no server argument for either facet
-	// (browse order is fixed `latest_chapter_at DESC, s.id DESC`, and comic type is
-	// derived at read time with no column to filter on). Under "Load more" that was
-	// merely coarse and converged as the viewer loaded more rows. Under pagination it
-	// would LOOK like sorting/filtering the whole catalogue while touching 20 of 10,000+
-	// rows, so the scope is stated in the UI wherever a pager is on screen. Fixing it
-	// properly needs server-side `sort`/`status` args (and a materialized comic type) —
-	// see the follow-up note in the PR. `pageScoped` is defined below, next to
-	// `resultsLoading`, which it depends on.
-
-	// The header used to read `${results.length}${hasNext ? '+' : ''}` — i.e. the
-	// size of the current 20-row page — which is where the reported "20+ series"
-	// came from. The real catalogue total was already fetched and plumbed into
-	// `totalCount`; it was just never rendered here. This is the CATALOGUE-WIDE match
-	// count, deliberately not the page's — the per-page range lives in the Pager.
-	// Falls back to the old approximate form when the total is genuinely unknown. That is
-	// NOT the text-search path — both branches of the server's `search` resolver return
-	// `total: Some(..)` (the FTS branch counts in SQL, same as the browse branch), so a
-	// null total means the backend is off, the request failed, or an adapter that doesn't
-	// report one is in use. The federated fan-out has no pager at all and never gets here.
+	// The CATALOGUE-WIDE match count, deliberately not the page's — the per-page range
+	// lives in the Pager. It is honest unconditionally now that the server applies every
+	// facet: `totalCount` describes the same filtered set the grid is a window onto.
+	// (It previously had to be suppressed whenever a client-side chip narrowed the page,
+	// because the two numbers then described different sets.)
+	//
+	// Falls back to the approximate form only when the total is genuinely unknown. That
+	// is NOT the text-search path — both branches of the server's `search` resolver
+	// return `total: Some(..)` (the FTS branch counts in SQL, same as the browse branch)
+	// — so a null total means the backend is off, the request failed, an adapter that
+	// doesn't report one is in use, or these are federated rows.
 	const countLabel = $derived(
-		totalCount != null && !clientNarrowed
+		totalCount != null
 			? `${totalCount.toLocaleString()} series`
 			: `${results.length}${hasNext ? '+' : ''} series`,
 	);
@@ -566,20 +691,30 @@
 	const resultsLoading = $derived(rowsLoading);
 	const catalogError = $derived(rowsError);
 
-	// True exactly when a pager is on screen, i.e. when the client-side Sort and
-	// Format/Status facets are operating on one page of a larger set. See the honesty
-	// note above `clientNarrowed`.
-	const pageScoped = $derived(!rowsAreFederated && !resultsLoading && (pageNum > 1 || hasNext));
-	const pageScopeNote = $derived(
-		`Sort and Format/Status apply to the ${rows.length} series on this page, not to all ${
-			totalCount != null ? totalCount.toLocaleString() : 'matching'
-		} series.`,
+	// Format / Status / Sort / Content are BROWSE arguments: the server applies them to
+	// an empty query and ignores them for a text query, which is ordered by full-text
+	// relevance instead (and the federated fan-out can't take them at all). Rather than
+	// leave chips that look active and do nothing, say so — the same disclosure the old
+	// page-scope note existed for, reduced to the case that is still true.
+	const facetsIgnored = $derived(
+		queryActive &&
+			!resultsLoading &&
+			(types.length > 0 ||
+				status !== 'any' ||
+				sort !== 'trending' ||
+				hasChapters ||
+				// Gated: for an opted-out viewer the Content group isn't rendered and the
+				// filter isn't sent, so naming it here would point at a control that
+				// doesn't exist on their screen.
+				(nsfwOptedIn && contentRating !== 'ALL')),
 	);
 
 	const anyFilter = $derived(
 		types.length > 0 ||
 			selectedGenres.length > 0 ||
 			status !== 'any' ||
+			(nsfwOptedIn && contentRating !== 'ALL') ||
+			hasChapters ||
 			minRating > 0 ||
 			maxRating < 10,
 	);
@@ -615,6 +750,21 @@
 				label: STATUS_META[status].label,
 				remove: () => (status = 'any'),
 			});
+		// Gated on `nsfwOptedIn` for the same reason `serverFilters` gates it: with the
+		// chip group hidden, a pill from a shared `?content=` link would be the only
+		// evidence of a filter that isn't even being sent.
+		if (nsfwOptedIn && contentRating !== 'ALL')
+			pills.push({
+				kind: 'content',
+				label: CONTENT_LABEL[contentRating],
+				remove: () => (contentRating = 'ALL'),
+			});
+		if (hasChapters)
+			pills.push({
+				kind: 'chapters',
+				label: 'Has chapters',
+				remove: () => (hasChapters = false),
+			});
 		if (minRating > 0 || maxRating < 10)
 			pills.push({
 				kind: 'rating',
@@ -638,9 +788,37 @@
 	const sortChips = [
 		{ key: 'trending', label: 'Trending' },
 		{ key: 'rating', label: 'Top rated' },
-		{ key: 'newest', label: 'Newest' },
-		{ key: 'chapters', label: 'Most ch.' },
+		// NOT "Newest". The server's NEWEST orders by newest upstream CHAPTER release,
+		// not by when a work entered the catalogue, so a decade-old series that shipped a
+		// chapter this morning sits at the top. Labelled "Newest" the chip and its own
+		// ordering disagreed on screen, which reads as a bug in the sort.
+		{ key: 'newest', label: 'Recently updated' },
+		{ key: 'chapters', label: 'Most chapters' },
 	] as const;
+
+	/** Chip labels for the content-rating tiers this rail offers (see CONTENT_RATINGS).
+	 *  "only" is load-bearing on both: SAFE is a cumulative ceiling that happens to admit
+	 *  just `safe`, and NSFW_ONLY is an exclusion — neither is "include these too". */
+	const CONTENT_LABEL: Record<RailContentRating, string> = {
+		ALL: 'All',
+		SAFE: 'Safe only',
+		NSFW_ONLY: 'NSFW only',
+	};
+
+	/**
+	 * The card's second line.
+	 *
+	 * `m.ch` is legitimately 0 now that Browse pages the whole catalogue — ~67k works have no
+	 * chapter yet — and the old `` `${m.genre} · ${m.ch} ch` `` rendered that as "Action · 0
+	 * ch", or as a bare "· 0 ch" for a work with no genre. Both read as a broken card rather
+	 * than as the true statement "we have no chapters for this yet, try another source".
+	 * Neither half is guaranteed present, so the separator is only emitted between two real
+	 * parts.
+	 */
+	function cardSub(m: FederatedResultView): string {
+		const chapters = m.ch > 0 ? `${m.ch} ch` : 'No chapters yet';
+		return m.genre ? `${m.genre} · ${chapters}` : chapters;
+	}
 
 	// Mobile: the filter rail collapses into a bottom sheet toggled by this flag.
 	let filtersOpen = $state(false);
@@ -649,6 +827,8 @@
 		types = [];
 		selectedGenres = [];
 		status = 'any';
+		contentRating = 'ALL';
+		hasChapters = false;
 		minRating = 0;
 		maxRating = 10;
 	}
@@ -702,47 +882,57 @@
 			</div>
 		</div>
 
-		<div class="group">
-			<div class="glabel-row">
-				<span class="glabel">Genre</span>
-				{#if selectedGenres.length}<span class="glabel-count">{selectedGenres.length} selected</span
-					>{/if}
-			</div>
-			<div class="genre-search">
-				<Icon name="search" size={15} stroke="#87857f" />
-				<input bind:value={genreQuery} placeholder="Filter genres…" aria-label="Filter genres" />
-				{#if genreQuery}
-					<button class="gs-clear" aria-label="Clear" onclick={() => (genreQuery = '')}
-						><Icon name="x" size={14} /></button
-					>
-				{/if}
-			</div>
-			<div class="genre-list">
-				{#if facets.length === 0}
-					<span class="genre-empty">Genres load with the catalogue…</span>
-				{:else}
-					{#each shownFacets as f (f.genre)}
-						<button
-							class="genre-opt"
-							class:on={selectedGenres.includes(f.genre)}
-							onclick={() => (selectedGenres = toggle(selectedGenres, f.genre))}
+		<!-- Hidden entirely while there are no facets. `genreFacets` is empty until the
+		     MangaDex tags are backfilled into `work_tag`, and that backfill has not run:
+		     rendering the group would put a labelled, permanently-empty box in the rail
+		     that reads as a broken control rather than an absent one. It reappears on its
+		     own the moment the backfill lands — nothing here needs changing. Selected
+		     genres keep the group open even if the facet list is momentarily empty, so a
+		     shared `?genre=` link never strands a filter with no way to clear it. -->
+		{#if facets.length > 0 || selectedGenres.length > 0}
+			<div class="group">
+				<div class="glabel-row">
+					<span class="glabel">Genre</span>
+					{#if selectedGenres.length}<span class="glabel-count"
+							>{selectedGenres.length} selected</span
+						>{/if}
+				</div>
+				<div class="genre-search">
+					<Icon name="search" size={15} stroke="#87857f" />
+					<input bind:value={genreQuery} placeholder="Filter genres…" aria-label="Filter genres" />
+					{#if genreQuery}
+						<button class="gs-clear" aria-label="Clear" onclick={() => (genreQuery = '')}
+							><Icon name="x" size={14} /></button
 						>
-							<span class="go-check" aria-hidden="true">
-								{#if selectedGenres.includes(f.genre)}<Icon
-										name="check"
-										size={12}
-										strokeWidth={2.6}
-									/>{/if}
-							</span>
-							<span class="go-name">{f.genre}</span>
-							<span class="go-count">{f.count}</span>
-						</button>
+					{/if}
+				</div>
+				<div class="genre-list">
+					{#if facets.length === 0}
+						<span class="genre-empty">Genres load with the catalogue…</span>
 					{:else}
-						<span class="genre-empty">No genres match “{genreQuery}”.</span>
-					{/each}
-				{/if}
+						{#each shownFacets as f (f.genre)}
+							<button
+								class="genre-opt"
+								class:on={selectedGenres.includes(f.genre)}
+								onclick={() => (selectedGenres = toggle(selectedGenres, f.genre))}
+							>
+								<span class="go-check" aria-hidden="true">
+									{#if selectedGenres.includes(f.genre)}<Icon
+											name="check"
+											size={12}
+											strokeWidth={2.6}
+										/>{/if}
+								</span>
+								<span class="go-name">{f.genre}</span>
+								<span class="go-count">{f.count}</span>
+							</button>
+						{:else}
+							<span class="genre-empty">No genres match “{genreQuery}”.</span>
+						{/each}
+					{/if}
+				</div>
 			</div>
-		</div>
+		{/if}
 
 		<div class="group">
 			<span class="glabel">Status</span>
@@ -759,29 +949,48 @@
 			</div>
 		</div>
 
+		<!-- "Has chapters": a single toggle, not a two-chip Any/Yes pair, because the wire
+		     argument has three states and only two of them are worth offering. Absent (off) is
+		     the whole catalogue and `true` is the readable subset; `false` — "only series with
+		     NO chapters" — is a debugging view, not a reader's request. A checkbox-shaped chip
+		     therefore maps 1:1 onto what the server can usefully do. -->
 		<div class="group">
-			<span class="glabel">Content</span>
-			<div class="nsfw-row">
-				<div class="nsfw-text">
-					<span class="nsfw-label">Show NSFW</span>
-					<span class="nsfw-desc">
-						{auth.user ? 'Include adult-rated series' : 'Sign in to include adult-rated series'}
-					</span>
-				</div>
-				<button
-					type="button"
-					class="switch"
-					class:on={showNsfw}
-					role="switch"
-					aria-checked={showNsfw}
-					aria-label="Show NSFW content"
-					disabled={savingNsfw || !auth.user}
-					onclick={toggleNsfw}
-				>
-					<span class="knob"></span>
+			<span class="glabel">Availability</span>
+			<div class="chips">
+				<button class="chip" class:on={hasChapters} onclick={() => (hasChapters = !hasChapters)}>
+					Has chapters
 				</button>
 			</div>
+			<span class="ghint">
+				Off shows everything, including series whose chapters were pulled upstream after a licensing
+				deal.
+			</span>
 		</div>
+
+		<!-- Content rating, and ONLY for a viewer who has already opted into NSFW. This
+		     replaced a "Show NSFW" switch that lived here and wrote the account-wide
+		     `show_nsfw` preference — a permanent profile setting disguised as a browse
+		     filter, one click away from every anonymous-adjacent viewer. Opting in now
+		     happens in one place, on the profile screen; this narrows WITHIN that posture
+		     and can never widen past it (the server clamps it), so showing it to an
+		     opted-out viewer would offer three chips of which two are a no-op and a
+		     guaranteed-empty grid. See `nsfwOptedIn`. -->
+		{#if nsfwOptedIn}
+			<div class="group">
+				<span class="glabel">Content</span>
+				<div class="chips">
+					{#each CONTENT_RATINGS as cr (cr)}
+						<button
+							class="chip"
+							class:on={contentRating === cr}
+							onclick={() => (contentRating = cr)}
+						>
+							{CONTENT_LABEL[cr]}
+						</button>
+					{/each}
+				</div>
+			</div>
+		{/if}
 
 		<!-- Hidden until ratings come from MangaDex statistics rather than the 3-row
 		     local `reviews` table — see RATING_FILTER_ENABLED above. -->
@@ -845,8 +1054,11 @@
 						: countLabel}</span
 				>
 			</div>
+			<!-- Plain "Sort" again: it is the server's ORDER BY over the whole filtered
+			     catalogue now, not a re-sort of the loaded page, so it no longer needs the
+			     "Sort this page" qualifier that used to sit here. -->
 			<div class="sort">
-				<span class="sort-label">{pageScoped ? 'Sort this page' : 'Sort'}</span>
+				<span class="sort-label">Sort</span>
 				<div class="chips">
 					{#each sortChips as so (so.key)}
 						<button class="sortchip" class:on={sort === so.key} onclick={() => (sort = so.key)}
@@ -857,11 +1069,13 @@
 			</div>
 		</div>
 
-		<!-- The client-side scope of Sort / Format / Status, stated plainly whenever a
-		     pager is on screen. Without this the controls read as catalogue-wide while
-		     they only touch the 20 rows of the current page. -->
-		{#if pageScoped}
-			<p class="scope-note">{pageScopeNote}</p>
+		<!-- The one scope disclosure that survives: Format/Status/Sort/Content are browse
+		     arguments and a text query ignores them server-side. See `facetsIgnored`. -->
+		{#if facetsIgnored}
+			<p class="scope-note">
+				Format, Status, Sort, Content and Has chapters apply to browsing — a text search is ranked
+				by relevance and ignores them. Clear the search to use them.
+			</p>
 		{/if}
 
 		{#if activePills.length}
@@ -888,7 +1102,7 @@
 				{#each results as m (m.id ?? m.title)}
 					<MangaCard
 						title={m.title}
-						sub={`${m.genre} · ${m.ch} ch`}
+						sub={cardSub(m)}
 						rating={m.rating.toFixed(1)}
 						cover={m.cover}
 						id={m.id}
@@ -915,21 +1129,12 @@
 				</div>
 				<button class="empty-btn" onclick={retryRows}>Retry</button>
 			</div>
-		{:else if clientNarrowed && rows.length > 0}
-			<!-- The page HAS results; the client-side Format/Status chips just matched none
-			     of them. The generic "No matches found" below would claim the catalogue is
-			     empty, which is a lie — and this branch keeps the pager rendered so the
-			     viewer can page onward to where the matches actually are. -->
-			<div class="empty">
-				<div class="empty-icon"><Icon name="search" size={24} /></div>
-				<div class="empty-title">Nothing on this page matches</div>
-				<div class="empty-desc">
-					The Format and Status filters apply to the {rows.length} series on this page. Try another page,
-					or clear them to see the whole page.
-				</div>
-				<button class="empty-btn" onclick={resetFilters}>Clear filters</button>
-			</div>
 		{:else if !searchNotice}
+			<!-- Generic and now CORRECT: with every facet resolved server-side, an empty
+			     result set means the filtered catalogue is genuinely empty. There used to
+			     be a "Nothing on this page matches" branch above this one, because the
+			     client-side Format/Status chips could empty a page of a catalogue that had
+			     thousands of matches; that can no longer happen. -->
 			<div class="empty">
 				<div class="empty-icon"><Icon name="search" size={24} /></div>
 				<div class="empty-title">No matches found</div>
@@ -958,8 +1163,8 @@
 				page={pageNum}
 				{hasNext}
 				total={totalCount}
-				pageSize={FEED_PAGE_SIZE}
-				count={rows.length}
+				pageSize={BROWSE_PAGE_SIZE}
+				count={results.length}
 				loading={resultsLoading}
 				href={(p) => withPage(page.url, p)}
 				label="Browse results pages"
@@ -1075,63 +1280,6 @@
 		flex-wrap: wrap;
 		gap: 8px;
 	}
-	.nsfw-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 14px;
-	}
-	.nsfw-text {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-		min-width: 0;
-	}
-	.nsfw-label {
-		font-size: 13.5px;
-		font-weight: 600;
-		color: var(--k-text-1);
-	}
-	.nsfw-desc {
-		font-size: 12px;
-		color: var(--k-text-faint);
-		line-height: 1.35;
-	}
-	.switch {
-		flex: 0 0 auto;
-		width: 44px;
-		height: 26px;
-		border-radius: 999px;
-		border: 1px solid var(--k-border-4);
-		background: var(--k-border-1);
-		padding: 0;
-		cursor: pointer;
-		position: relative;
-		transition:
-			background 0.15s,
-			border-color 0.15s;
-	}
-	.switch:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.switch.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-	}
-	.switch .knob {
-		position: absolute;
-		top: 2px;
-		left: 2px;
-		width: 20px;
-		height: 20px;
-		border-radius: 50%;
-		background: var(--k-on-primary, #fff);
-		transition: transform 0.15s;
-	}
-	.switch.on .knob {
-		transform: translateX(18px);
-	}
 	.chip {
 		display: inline-flex;
 		align-items: center;
@@ -1165,6 +1313,13 @@
 		color: var(--k-text);
 	}
 	/* genre multi-select (S4) */
+	/* One-line explanation under a control whose OFF state is the surprising one. Matches
+	   `.genre-empty`'s size and colour, so the rail keeps one voice for secondary text. */
+	.ghint {
+		font-size: 12.5px;
+		line-height: 1.4;
+		color: var(--k-text-faint);
+	}
 	.glabel-row {
 		display: flex;
 		align-items: baseline;
@@ -1425,9 +1580,9 @@
 		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
 		gap: 30px 22px;
 	}
-	/* Scope disclosure for the client-side Sort / Format / Status facets. Sits
-	   directly under the results head, above the grid, so it is read before the
-	   cards rather than discovered after them. */
+	/* Scope disclosure for the browse-only facets under a text query. Sits directly
+	   under the results head, above the grid, so it is read before the cards rather
+	   than discovered after them. */
 	.scope-note {
 		margin: -10px 0 0;
 		font-size: 12.5px;

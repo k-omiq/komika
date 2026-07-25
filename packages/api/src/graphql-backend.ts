@@ -225,10 +225,22 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, {
 			query,
 			page,
+			// An EMPTY list is not "match nothing" here, it is "no filter" — send
+			// `undefined` so the server omits the clause entirely. `[]` would reach the
+			// resolver as an empty IN (…) and return zero rows, i.e. selecting no genre
+			// chips would empty the grid.
 			genres: filters?.genres && filters.genres.length ? filters.genres : undefined,
 			minRating: filters?.minRating,
 			maxRating: filters?.maxRating,
+			types: filters?.types && filters.types.length ? filters.types : undefined,
+			status: filters?.status,
+			sort: filters?.sort,
+			contentRating: filters?.contentRating,
 			includeNsfw,
+			// `undefined`, never `false`, when unset: `false` is a MEANINGFUL value here
+			// (only works with no chapters), so coercing an absent filter to it would
+			// hide the entire readable catalogue.
+			hasChapters: filters?.hasChapters,
 		});
 		return d.search;
 	}

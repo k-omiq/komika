@@ -9,7 +9,10 @@
 //! the engine binds **127.0.0.1 only**, and JS never fetches the loopback port
 //! directly — it calls `suwayomi_gql`, which proxies over IPC. Loopback is therefore
 //! *allowed* here (the opposite of the image path), so this module uses its own plain
-//! `reqwest::Client`, NOT `image_client()`.
+//! `reqwest::Client`, NOT `image_client()`. Loopback is not an authorization boundary
+//! on a shared desktop, so the engine additionally runs behind HTTP Basic auth with a
+//! per-run credential (see [`engine_password`]); every request this module makes
+//! carries it as a client default header.
 //!
 //! Nothing here runs unless the app spawns it; it does not touch `fetch_image` or any
 //! existing behavior. The boot recipe follows `suwayomi/SPIKE-FINDINGS.md` exactly
@@ -19,7 +22,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -40,8 +43,17 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Restart-storm cap: more than this many restarts inside 60 s trips a long backoff.
 const MAX_RESTARTS_PER_MIN: usize = 5;
-/// Grace period to let a killed JVM reap before we force it again.
+/// Grace period to let a signalled JVM reap before we force it again.
 const GRACE: Duration = Duration::from_secs(3);
+/// How often the lock holder rewrites its lockfile (the heartbeat that proves liveness).
+const LOCK_HEARTBEAT: Duration = Duration::from_secs(15);
+/// A lockfile whose heartbeat has been silent this long is treated as abandoned. Kept
+/// several beats wide so a suspended/resumed machine cannot look dead to a racing launch.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
+/// How often a refused engine lock is retried before the engine can start.
+const LOCK_RETRY: Duration = Duration::from_secs(5);
+/// Basic-auth username for the embedded engine; the password is the per-run secret.
+const ENGINE_AUTH_USER: &str = "komika";
 
 /// Lifecycle state, surfaced to JS as a lowercase string via `suwayomi_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,15 +102,104 @@ struct Inner {
   last_error: Option<String>,
 }
 
-/// Best-effort single-instance lockfile guard; removes the file on drop.
+/// Best-effort single-instance lockfile guard; removes the file on drop. The handle is
+/// kept open so [`LockGuard::refresh`] can beat the heartbeat without reopening the path.
 struct LockGuard {
   path: PathBuf,
+  file: std::fs::File,
+}
+
+impl LockGuard {
+  /// Rewrite the holder PID to push the lockfile's mtime forward. Drop only runs on a
+  /// clean exit, so this advancing mtime is the *only* signal a later launch has that the
+  /// holder is still alive — see `lock_is_abandoned`.
+  fn refresh(&mut self) {
+    use std::io::{Seek, SeekFrom, Write};
+    let _ = self.file.seek(SeekFrom::Start(0));
+    let _ = write!(self.file, "{}", std::process::id());
+    let _ = self.file.flush();
+  }
 }
 
 impl Drop for LockGuard {
   fn drop(&mut self) {
     let _ = std::fs::remove_file(&self.path);
   }
+}
+
+/// The engine's Basic-auth password, generated once per app run. The conf is rewritten
+/// with it before every (re)launch and the supervisor's client sends it on every request,
+/// so an in-run engine restart keeps working while a credential never outlives the process.
+fn engine_password() -> &'static str {
+  static PASSWORD: OnceLock<String> = OnceLock::new();
+  PASSWORD.get_or_init(random_token)
+}
+
+/// 128 bits of process-local entropy as hex, without adding an RNG dependency for one
+/// loopback credential: `RandomState`'s SipHash keys are seeded from the OS the first
+/// time the process uses them and are not observable from another process.
+fn random_token() -> String {
+  use std::collections::hash_map::RandomState;
+  use std::hash::{BuildHasher, Hasher};
+  let nonce = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_nanos() as u64)
+    .unwrap_or_default()
+    ^ u64::from(std::process::id());
+  let mut token = String::with_capacity(32);
+  for round in 0..2u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(nonce ^ round);
+    token.push_str(&format!("{:016x}", hasher.finish()));
+  }
+  token
+}
+
+/// Render an `Authorization: Basic …` value. Base64 is inlined rather than pulled in as a
+/// dependency: this is the only encoder the crate needs and the input shape is fixed.
+fn basic_auth_value(user: &str, password: &str) -> String {
+  const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let raw = format!("{user}:{password}");
+  let bytes = raw.as_bytes();
+  let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+  for chunk in bytes.chunks(3) {
+    let triple = ((chunk[0] as u32) << 16)
+      | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+      | (*chunk.get(2).unwrap_or(&0) as u32);
+    encoded.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+    encoded.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+    // The trailing group is padded, not truncated: 1 byte → "xx==", 2 bytes → "xxx=".
+    encoded.push(if chunk.len() > 1 {
+      ALPHABET[((triple >> 6) & 0x3f) as usize] as char
+    } else {
+      '='
+    });
+    encoded.push(if chunk.len() > 2 {
+      ALPHABET[(triple & 0x3f) as usize] as char
+    } else {
+      '='
+    });
+  }
+  format!("Basic {encoded}")
+}
+
+/// Build the supervisor's HTTP client. The engine credential rides as a default header so
+/// every caller of this client — the readiness poll, the `suwayomi_gql`/`suwayomi_image`
+/// proxies, and `cloudflare::apply_settings` (handed a clone) — is authenticated without
+/// the secret being threaded through each call site.
+fn build_client() -> reqwest::Client {
+  let mut auth =
+    reqwest::header::HeaderValue::from_str(&basic_auth_value(ENGINE_AUTH_USER, engine_password()))
+      .expect("basic auth header is ascii");
+  auth.set_sensitive(true);
+  let mut headers = reqwest::header::HeaderMap::new();
+  headers.insert(reqwest::header::AUTHORIZATION, auth);
+  reqwest::Client::builder()
+    .timeout(HTTP_TIMEOUT)
+    .default_headers(headers)
+    // No redirect policy / SSRF host guard here on purpose: loopback is allowed.
+    .build()
+    .expect("build suwayomi http client")
 }
 
 /// Owns the embedded engine's shared state, HTTP client, and shutdown signal.
@@ -119,11 +220,7 @@ pub struct SuwayomiSupervisor {
 
 impl SuwayomiSupervisor {
   pub fn new() -> Self {
-    let client = reqwest::Client::builder()
-      .timeout(HTTP_TIMEOUT)
-      // No redirect policy / SSRF host guard here on purpose: loopback is allowed.
-      .build()
-      .expect("build suwayomi http client");
+    let client = build_client();
     SuwayomiSupervisor {
       inner: Mutex::new(Inner {
         port: None,
@@ -183,6 +280,13 @@ impl SuwayomiSupervisor {
     }
   }
 
+  /// Beat the single-instance lockfile's heartbeat, if we currently hold it.
+  fn refresh_lock(&self) {
+    if let Some(guard) = self.lock.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+      guard.refresh();
+    }
+  }
+
   /// The `(port, client)` needed to proxy a GraphQL call, or `None` if not ready.
   fn ready_endpoint(&self) -> Option<(u16, reqwest::Client)> {
     let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,6 +332,13 @@ fn broker_port() -> std::io::Result<u16> {
 /// (JVM `-Dserver.*` sysprops do NOT reliably override Suwayomi's reactive config), so
 /// this is rewritten before every launch. `kcefEnabled = false` is CRITICAL (else the
 /// server downloads 226 MB of Chromium and SIGTRAPs headless).
+///
+/// The `authMode`/`authUsername`/`authPassword` trio is v2.3.2243's authentication
+/// surface (the older `basicAuth*` keys are deprecated and migrate onto these), and
+/// `BASIC_AUTH` is the enum constant name the config parser expects. It is not optional
+/// hardening: the engine's GraphQL API can add extension repos and install extensions,
+/// i.e. run arbitrary JVM code in-process, and a loopback bind keeps out *remote* callers
+/// only — every other process on the machine can reach 127.0.0.1 just as easily as we can.
 fn render_server_conf(port: u16) -> String {
   format!(
     "server.ip = \"127.0.0.1\"\n\
@@ -236,7 +347,12 @@ fn render_server_conf(port: u16) -> String {
      server.initialOpenInBrowserEnabled = false\n\
      server.systemTrayEnabled = false\n\
      server.kcefEnabled = false\n\
-     server.flareSolverrEnabled = false\n"
+     server.flareSolverrEnabled = false\n\
+     server.authMode = \"BASIC_AUTH\"\n\
+     server.authUsername = \"{user}\"\n\
+     server.authPassword = \"{password}\"\n",
+    user = ENGINE_AUTH_USER,
+    password = engine_password()
   )
 }
 
@@ -304,6 +420,10 @@ async fn poll_ready(
   let url = format!("http://127.0.0.1:{port}/api/graphql");
   let body = json!({ "query": "{ aboutServer { version } }" }).to_string();
   let deadline = Instant::now() + timeout;
+  // Set once something answers 2xx on our port without being Suwayomi. The port broker is
+  // inherently TOCTOU (we release the port before the JVM binds it), so this turns the
+  // "a stranger owns the port" case from an opaque timeout into a named cause.
+  let mut foreign_service = false;
   loop {
     if let Ok(resp) = client
       .post(&url)
@@ -312,29 +432,48 @@ async fn poll_ready(
       .send()
       .await
     {
-      if let Ok(bytes) = resp.bytes().await {
-        if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
-          if let Some(ver) = val
-            .pointer("/data/aboutServer/version")
-            .and_then(|v| v.as_str())
-          {
-            return Ok(ver.to_string());
-          }
-        }
+      let ok = resp.status().is_success();
+      let parsed = resp
+        .bytes()
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+      if let Some(ver) = parsed
+        .as_ref()
+        .and_then(|val| val.pointer("/data/aboutServer/version"))
+        .and_then(|v| v.as_str())
+      {
+        return Ok(ver.to_string());
       }
+      // A 2xx whose body isn't even GraphQL-shaped is not a half-booted engine (which
+      // would answer `{"data":…}`/`{"errors":…}` or refuse the connection outright).
+      let graphql_shaped = parsed
+        .as_ref()
+        .is_some_and(|val| val.get("data").is_some() || val.get("errors").is_some());
+      foreign_service |= ok && !graphql_shaped;
     }
     if Instant::now() >= deadline {
-      return Err(format!(
-        "engine did not become ready within {}s",
-        timeout.as_secs()
-      ));
+      return Err(if foreign_service {
+        format!(
+          "port {port} answered but is not the engine; another process took the brokered port"
+        )
+      } else {
+        format!(
+          "engine did not become ready within {}s (port {port})",
+          timeout.as_secs()
+        )
+      });
     }
     tokio::time::sleep(POLL_INTERVAL).await;
   }
 }
 
-/// Full core boot path: broker port, write conf, spawn, poll readiness. On readiness
-/// failure the just-spawned child is killed before returning the error (no orphan).
+/// Full core boot path: broker port, write conf, spawn, poll readiness. Readiness races
+/// the child's own exit, so a JVM that dies immediately (bad jar, missing JRE module,
+/// stolen port, OOM) is reported as an exit status in about a second instead of burning
+/// the whole `ready_timeout` on a process that is already gone — which also lets the
+/// caller's restart-storm accounting actually engage. Either failure kills the child
+/// before returning (no orphan); the next attempt re-brokers a fresh port.
 /// Returns the live child, the port, and the reported version.
 async fn boot_engine(
   cfg: &EngineConfig,
@@ -345,19 +484,61 @@ async fn boot_engine(
   prepare_data_dir(&cfg.data_dir, port)?;
   log::info!(target: "suwayomi", "launching engine on 127.0.0.1:{port}");
   let mut child = spawn_engine(cfg)?;
-  match poll_ready(client, port, ready_timeout).await {
+  // `biased` so a dead child is reported as such even if a readiness poll happens to be
+  // resolvable in the same wake — the exit status is always the more useful diagnostic.
+  let outcome = tokio::select! {
+    biased;
+    status = child.wait() => Err(match status {
+      Ok(st) => format!("engine exited during startup ({st}); see the suwayomi log for the JVM's own output"),
+      Err(e) => format!("waiting on the engine process failed during startup: {e}"),
+    }),
+    ready = poll_ready(client, port, ready_timeout) => ready,
+  };
+  match outcome {
     Ok(version) => Ok((child, port, version)),
     Err(e) => {
-      let _ = child.start_kill();
-      let _ = child.wait().await;
+      stop_child(&mut child).await;
       Err(e)
     }
   }
 }
 
-/// Terminate a live child: SIGKILL (spike-proven to leave no orphan), confirm within a
-/// grace window, and force again if it somehow lingers.
+/// Ask the JVM to exit on its own terms. `Child::start_kill` is SIGKILL on unix, which
+/// skips every shutdown hook; the engine registers hooks that stop Javalin and close the
+/// embedded H2 store, so killing outright is what leaves the DB to recover (or refuse to
+/// open) on the next launch. std exposes no signal API and the crate has no libc
+/// dependency, hence `kill(1)`. Returns whether the signal was delivered.
+#[cfg(unix)]
+async fn request_graceful_exit(child: &tokio::process::Child) -> bool {
+  let Some(pid) = child.id() else {
+    return false; // already reaped
+  };
+  let mut cmd = tokio::process::Command::new("kill");
+  cmd
+    .arg("-TERM")
+    .arg(pid.to_string())
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+  matches!(cmd.status().await, Ok(st) if st.success())
+}
+
+/// Windows has no console-less equivalent of SIGTERM for a child we did not create a job
+/// object for, so the caller's `TerminateProcess` path stands unchanged.
+#[cfg(not(unix))]
+async fn request_graceful_exit(_child: &tokio::process::Child) -> bool {
+  false
+}
+
+/// Terminate a live child: request a graceful exit first so the JVM's shutdown hooks run,
+/// then fall back to a kill (spike-proven to leave no orphan), confirming within a grace
+/// window and forcing again if it somehow lingers.
 async fn stop_child(child: &mut tokio::process::Child) {
+  if request_graceful_exit(child).await
+    && tokio::time::timeout(GRACE, child.wait()).await.is_ok()
+  {
+    return;
+  }
   let _ = child.start_kill();
   if tokio::time::timeout(GRACE, child.wait()).await.is_err() {
     let _ = child.start_kill();
@@ -533,33 +714,82 @@ fn resolve_config(app: &AppHandle) -> Result<EngineConfig, String> {
 }
 
 /// Best-effort single-instance lock: a lockfile in the data dir keeps a second app
-/// instance from double-spawning the engine. PARTIAL: a hard crash leaves a stale
-/// lockfile that must be cleared manually (we cannot verify the holder's liveness
-/// without a platform syscall / extra crate). Cleared on clean shutdown via Drop.
+/// instance from double-spawning the engine against one data dir (two engines on one H2
+/// store corrupt it). `LockGuard::drop` only runs on a clean exit, so liveness is proved
+/// by the holder's heartbeat (`run_lock_heartbeat` refreshes the file every
+/// `LOCK_HEARTBEAT`): a file whose mtime has stood still for `LOCK_STALE_AFTER` belongs
+/// to a process that was killed or lost power, and we take it over. Callers retry rather
+/// than treat a refusal as fatal, so neither a crash nor a live second instance can leave
+/// the engine permanently disabled.
 fn acquire_lock(data_dir: &Path) -> Result<LockGuard, String> {
   std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
   let path = data_dir.join("komika-suwayomi.lock");
-  match std::fs::OpenOptions::new()
-    .write(true)
-    .create_new(true)
-    .open(&path)
-  {
-    Ok(mut f) => {
-      use std::io::Write;
-      let _ = write!(f, "{}", std::process::id());
-      Ok(LockGuard { path })
-    }
+  match create_lock_file(&path) {
+    Ok(guard) => Ok(guard),
     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-      Err("another Komika instance holds the engine lock".into())
+      if !lock_is_abandoned(&path) {
+        return Err("another Komika instance holds the engine lock".into());
+      }
+      log::warn!(target: "suwayomi", "taking over stale engine lock ({})", path.display());
+      let _ = std::fs::remove_file(&path);
+      // If a second launch is racing us for the same corpse, exactly one `create_new`
+      // wins; the loser reports the lock as held and retries on its own timer.
+      create_lock_file(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => {
+          "another Komika instance holds the engine lock".to_string()
+        }
+        _ => format!("acquire engine lock: {e}"),
+      })
     }
     Err(e) => Err(format!("acquire engine lock: {e}")),
   }
 }
 
-/// Initialize and launch the supervisor. Non-fatal by design: a resolution or lock
-/// failure logs, sets `Degraded`, and returns — it never aborts app startup. The
-/// supervisor is always started; the JS-side flag gates *use*, and an unused engine is
-/// harmless (nothing calls it).
+/// Create the lockfile exclusively and stamp it with our PID (diagnostics, plus the write
+/// that seeds the heartbeat mtime). The handle stays open inside the returned guard.
+fn create_lock_file(path: &Path) -> std::io::Result<LockGuard> {
+  let file = std::fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(path)?;
+  let mut guard = LockGuard {
+    path: path.to_path_buf(),
+    file,
+  };
+  guard.refresh();
+  Ok(guard)
+}
+
+/// Whether the lockfile's heartbeat has been silent longer than `LOCK_STALE_AFTER`.
+/// Unreadable or future-dated metadata answers `false`: never steal a lock we cannot
+/// reason about — the cost of waiting is a retry, the cost of a wrong takeover is two
+/// engines on one database.
+fn lock_is_abandoned(path: &Path) -> bool {
+  match std::fs::metadata(path).and_then(|m| m.modified()) {
+    Ok(modified) => modified
+      .elapsed()
+      .map(|age| age > LOCK_STALE_AFTER)
+      .unwrap_or(false),
+    Err(_) => false,
+  }
+}
+
+/// Keep our lockfile's heartbeat advancing for as long as we hold it. Without this a
+/// long-lived, perfectly healthy instance would look abandoned to the next launch.
+async fn run_lock_heartbeat(sup: Arc<SuwayomiSupervisor>) {
+  loop {
+    tokio::select! {
+      biased;
+      _ = wait_for_stop(&sup) => return,
+      _ = tokio::time::sleep(LOCK_HEARTBEAT) => sup.refresh_lock(),
+    }
+  }
+}
+
+/// Initialize and launch the supervisor. Non-fatal by design: a resolution failure logs,
+/// sets `Degraded`, and returns — it never aborts app startup, and a held lock only defers
+/// the launch (see `run_engine`). The supervisor is always started; the JS-side flag gates
+/// *use*, and an unused engine is harmless (nothing calls it).
 pub fn start(app: AppHandle) {
   let sup = match app.try_state::<Arc<SuwayomiSupervisor>>() {
     Some(s) => s.inner().clone(),
@@ -578,14 +808,46 @@ pub fn start(app: AppHandle) {
     }
   };
 
-  match acquire_lock(&cfg.data_dir) {
-    Ok(guard) => *sup.lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard),
-    Err(e) => {
-      log::warn!(target: "suwayomi", "not starting engine: {e}");
-      sup.transition(EngineState::Degraded, Some(e));
+  tauri::async_runtime::spawn(run_engine(app, sup, cfg));
+}
+
+/// Take the single-instance lock, wire the Cloudflare shim, then run the supervision
+/// loop. The lock is *waited for*, not demanded once: a stale lock from a killed
+/// predecessor becomes takeable one `LOCK_STALE_AFTER` after its heartbeat stops, and a
+/// genuine second instance may quit at any time — either way the engine heals itself
+/// instead of staying Degraded for the rest of the session.
+async fn run_engine(app: AppHandle, sup: Arc<SuwayomiSupervisor>, cfg: EngineConfig) {
+  let mut announced = false;
+  loop {
+    if sup.stopping.load(Ordering::SeqCst) {
+      sup.transition(EngineState::Stopped, None);
       return;
     }
+    match acquire_lock(&cfg.data_dir) {
+      Ok(guard) => {
+        *sup.lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+        break;
+      }
+      Err(e) => {
+        // Log/report once, then keep quiet: this can poll for the whole session.
+        if !announced {
+          log::warn!(target: "suwayomi", "engine start deferred: {e}");
+          sup.transition(EngineState::Degraded, Some(e));
+          announced = true;
+        }
+        tokio::select! {
+          biased;
+          _ = wait_for_stop(&sup) => {
+            sup.transition(EngineState::Stopped, None);
+            return;
+          }
+          _ = tokio::time::sleep(LOCK_RETRY) => {}
+        }
+      }
+    }
   }
+
+  tauri::async_runtime::spawn(run_lock_heartbeat(sup.clone()));
 
   // On-device Cloudflare shim (N-CF): start the loopback FlareSolverr-v1 listener and
   // record its URL so the supervisor wires it into the engine once ready. Best effort;
@@ -596,7 +858,7 @@ pub fn start(app: AppHandle) {
     app.manage(shim);
   }
 
-  tauri::async_runtime::spawn(run_supervisor(sup, cfg));
+  run_supervisor(sup, cfg).await;
 }
 
 // ---- JS-facing commands ----------------------------------------------------
@@ -762,6 +1024,31 @@ mod tests {
     // The two lines that keep the JVM from crashing / phoning out.
     assert!(conf.contains("server.kcefEnabled = false"));
     assert!(conf.contains("server.flareSolverrEnabled = false"));
+    // Auth is mandatory: loopback keeps remote callers out, not local ones.
+    assert!(conf.contains("server.authMode = \"BASIC_AUTH\""));
+    assert!(conf.contains(&format!("server.authUsername = \"{ENGINE_AUTH_USER}\"")));
+    assert!(conf.contains(&format!("server.authPassword = \"{}\"", engine_password())));
+  }
+
+  #[test]
+  fn engine_password_is_stable_and_unguessable() {
+    let password = engine_password();
+    assert_eq!(password, engine_password(), "one credential per process");
+    assert_eq!(password.len(), 32, "128 bits of hex");
+    assert!(password.chars().all(|c| c.is_ascii_hexdigit()));
+    // Two fresh draws must not collide (a constant token would defeat the whole point).
+    assert_ne!(random_token(), random_token());
+  }
+
+  #[test]
+  fn basic_auth_value_matches_rfc_vector() {
+    // RFC 7617's own example, which also exercises both padding lengths.
+    assert_eq!(
+      basic_auth_value("Aladdin", "open sesame"),
+      "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+    );
+    assert_eq!(basic_auth_value("a", "b"), "Basic YTpi");
+    assert_eq!(basic_auth_value("ab", "c"), "Basic YWI6Yw==");
   }
 
   #[test]
@@ -836,6 +1123,42 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// The crash case: a lockfile left behind by a process that never ran `Drop` must not
+  /// disable the engine forever.
+  #[test]
+  fn stale_lockfile_is_taken_over() {
+    let dir = std::env::temp_dir().join(format!("komika-stale-lock-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let guard = acquire_lock(&dir).expect("first lock acquires");
+    assert!(acquire_lock(&dir).is_err(), "a beating lock is respected");
+    // Age the heartbeat past the abandonment window — what a SIGKILLed holder looks like.
+    guard
+      .file
+      .set_modified(std::time::SystemTime::now() - LOCK_STALE_AFTER * 2)
+      .expect("age the lockfile");
+    let taken = acquire_lock(&dir).expect("an abandoned lock is taken over");
+    drop(taken);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn lock_heartbeat_clears_abandonment() {
+    let dir = std::env::temp_dir().join(format!("komika-beat-lock-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut guard = acquire_lock(&dir).expect("lock acquires");
+    let path = dir.join("komika-suwayomi.lock");
+    guard
+      .file
+      .set_modified(std::time::SystemTime::now() - LOCK_STALE_AFTER * 2)
+      .expect("age the lockfile");
+    assert!(lock_is_abandoned(&path), "a silent lock reads as abandoned");
+    guard.refresh();
+    assert!(!lock_is_abandoned(&path), "a beat lock reads as live");
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// Live boot against a REAL Suwayomi-Server jar. Skipped unless BOTH
   /// `KOMIKA_JAVA_BIN` and `KOMIKA_SUWAYOMI_JAR` are set; kept `#[ignore]` so the
   /// normal `cargo test` stays fast and offline. Run with:
@@ -860,10 +1183,9 @@ mod tests {
       jar: PathBuf::from(jar),
       data_dir: data_dir.clone(),
     };
-    let client = reqwest::Client::builder()
-      .timeout(HTTP_TIMEOUT)
-      .build()
-      .unwrap();
+    // Must be the supervisor's own client: the conf we write enables Basic auth, so a
+    // credential-less client would poll a 401 until the readiness gate gave up.
+    let client = build_client();
 
     // Boot: broker port, write conf, spawn, poll aboutServer.
     let (mut child, port, version) = boot_engine(&cfg, &client, Duration::from_secs(60))

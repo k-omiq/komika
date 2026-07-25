@@ -426,18 +426,7 @@ impl MangaDexClient {
         since: Option<&str>,
         offset: i64,
     ) -> Result<ChapterPage> {
-        let mut params: Vec<(String, String)> = vec![
-            ("limit".into(), PAGE_LIMIT.to_string()),
-            ("offset".into(), offset.to_string()),
-            (window.order_key().into(), "asc".into()),
-            ("includes[]".into(), "manga".into()),
-            // English-only: Komika serves only English chapters, so filter the firehose
-            // at the source (smaller pages, no non-English rows to mirror).
-            ("translatedLanguage[]".into(), "en".into()),
-        ];
-        if let Some(since) = since {
-            params.push((window.since_param().into(), since.to_string()));
-        }
+        let params = chapter_list_params(window, since, offset);
         let res = self
             .get_with_retry(&format!("{API_BASE}/chapter"), &params, false, "/chapter")
             .await?;
@@ -515,6 +504,51 @@ impl MangaDexClient {
             .map(|filename| format!("{base}/data/{hash}/{filename}"))
             .collect())
     }
+}
+
+/// The query params for one page of the `/chapter` firehose. Factored out of
+/// `list_chapters` so the content-rating set is unit-testable without a live request —
+/// the omission fixed below survived the mirror's entire life partly because nothing
+/// could assert on it.
+///
+/// ALL FOUR CONTENT RATINGS, mirroring `list_manga`. MangaDex defaults every list
+/// endpoint to `safe,suggestive,erotica`, so for as long as this call omitted
+/// `contentRating[]` the whole `pornographic` slice of the firehose was invisible to us.
+/// Measured upstream 2026-07-26: `/chapter?translatedLanguage[]=en` reports a `total` of
+/// 810,292 with the defaults against 876,433 with all four — a 66,141-chapter hole. The
+/// mirror shows the same shape from the inside: of the MangaDex works we carry, exactly
+/// **4** `pornographic` ones have any chapter at all versus 19,923 with none, while
+/// `erotica` (which the defaults DO include) sits at 4,742 with chapters vs 4,197
+/// without.
+///
+/// THIS FIXES THE FORWARD PATH ONLY AND RECOVERS NO BACKLOG BY ITSELF. Once
+/// `chapters.seed_done` is latched the sweep runs the `updatedAtSince` window, which
+/// never revisits an old `createdAt`, so the ~66k historical chapters stay unreachable
+/// until the seed is walked again — that is what migration 0067 forces, exactly once.
+fn chapter_list_params(
+    window: SyncWindow,
+    since: Option<&str>,
+    offset: i64,
+) -> Vec<(String, String)> {
+    let mut params: Vec<(String, String)> = vec![
+        ("limit".into(), PAGE_LIMIT.to_string()),
+        ("offset".into(), offset.to_string()),
+        (window.order_key().into(), "asc".into()),
+        ("includes[]".into(), "manga".into()),
+        // English-only: Komika serves only English chapters, so filter the firehose
+        // at the source (smaller pages, no non-English rows to mirror).
+        ("translatedLanguage[]".into(), "en".into()),
+        // Skip nothing on content rating — the work carries the flag and every surface
+        // gates at query time, same contract as the catalogue sweep.
+        ("contentRating[]".into(), "safe".into()),
+        ("contentRating[]".into(), "suggestive".into()),
+        ("contentRating[]".into(), "erotica".into()),
+        ("contentRating[]".into(), "pornographic".into()),
+    ];
+    if let Some(since) = since {
+        params.push((window.since_param().into(), since.to_string()));
+    }
+    params
 }
 
 /// MangaDex@Home server response for a chapter (the fields we build page URLs from).
@@ -655,8 +689,36 @@ pub struct MdAttrs {
     /// The field that dropped 4,493 works — see `null_as_default`.
     #[serde(default, deserialize_with = "null_as_default")]
     pub links: HashMap<String, String>,
+    /// Genre/theme/format/content tags. THE source of genres for canonical works: until
+    /// this field existed, `work_tag` was empty and the ~101k MangaDex-only works had no
+    /// genre at all (see migration 0066). Rides along in the `/manga` payload the sweep
+    /// already fetches, so reading it costs no extra request.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub tags: Vec<MdTag>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+}
+
+/// One entry of `attributes.tags[]`.
+///
+/// `attributes` is OPTIONAL on purpose. A tag object the API returns stripped down (or
+/// null) must contribute nothing rather than fail the whole manga record — the exact
+/// failure mode `null_as_default` exists to prevent, and a genre is far less valuable
+/// than the work it hangs off.
+#[derive(Debug, Deserialize)]
+pub struct MdTag {
+    #[serde(default)]
+    pub attributes: Option<MdTagAttrs>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MdTagAttrs {
+    /// Localized tag names, e.g. `{"en": "Isekai", "ja": "異世界"}`.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: HashMap<String, String>,
+    /// `genre` | `theme` | `format` | `content` — drives the stored ordering, see
+    /// `TAG_GROUP_ORDER`.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -865,6 +927,61 @@ fn parse_chapter_page(raw: Vec<Value>) -> (Vec<MdChapter>, Vec<(String, String)>
 
 const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap"];
 
+/// Tag groups in the order they are STORED, so `work_tag.ord` puts the tags a reader
+/// actually browses by first and the noisier axes last.
+///
+/// All four groups are kept, deliberately:
+///   * `genre`  — "Action", "Romance": the browsable axis the genre filter exists for.
+///   * `theme`  — "Isekai", "Martial Arts": likewise, and what MangaDex users search by.
+///   * `format` — "Long Strip", "Oneshot": kept because `resolve_comic_type` reads genre
+///                STRINGS to tell a manhwa from a manga, so dropping these would make
+///                canonical format detection worse than it already is.
+///   * `content`— "Gore", "Sexual Violence": kept because MangaDex exposes them as
+///                filterable tags and omitting them would silently narrow what the
+///                catalogue can express. They are rare, so they sink in a
+///                frequency-ordered facet list on their own.
+/// An unrecognised or missing group sorts last rather than being dropped.
+const TAG_GROUP_ORDER: &[&str] = &["genre", "theme", "format", "content"];
+
+/// English tag names for a manga, ordered by [`TAG_GROUP_ORDER`] and then by the order
+/// the API listed them within a group.
+///
+/// English only. A tag with no `en` name is unusable as a label on an English-language
+/// surface, and there is no sensible fallback: the other locales are localized values of
+/// the SAME tag, so taking one would drop a Japanese string into an English facet list.
+///
+/// Deduped by name, keeping the first (highest-precedence group) occurrence.
+/// `work_tag`'s primary key is (work_id, tag), so a duplicate would be silently dropped
+/// at insert anyway — doing it here keeps `ord` contiguous and the count honest.
+fn tag_names(m: &MdManga) -> Vec<String> {
+    let mut ranked: Vec<(usize, usize, String)> = Vec::new();
+    for (i, t) in m.attributes.tags.iter().enumerate() {
+        let Some(a) = t.attributes.as_ref() else {
+            continue;
+        };
+        let Some(name) = a.name.get("en") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let group = a.group.as_deref().unwrap_or("");
+        let rank = TAG_GROUP_ORDER
+            .iter()
+            .position(|g| *g == group)
+            .unwrap_or(TAG_GROUP_ORDER.len());
+        ranked.push((rank, i, name.to_string()));
+    }
+    ranked.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut seen = std::collections::HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|(_, _, n)| seen.insert(n.clone()))
+        .map(|(_, _, n)| n)
+        .collect()
+}
+
 /// Map a MangaDex manga to `(mangadex_id, WorkInput)` for the canonical spine.
 pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
     let a = &m.attributes;
@@ -942,6 +1059,9 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             external_ids,
             descriptions,
             credits,
+            // Upstream genres (migration 0066). Written as the `source = 'mangadex'`
+            // half of `work_tag`, so admin curation still wins outright.
+            tags: tag_names(m),
             // ALL cover_art relationships the manga response carries (F2). In
             // practice the manga endpoint expands only the primary (one entry) —
             // the full per-volume set is fetched separately via `/cover` in the
@@ -1179,6 +1299,22 @@ pub struct SweepOutcome {
     /// until a full re-seed — which is exactly how 4,493 works went missing while the
     /// seed reported success.
     pub dropped: u64,
+    /// Records that reached the write and whose upsert ERRORED (SQLITE_BUSY under the
+    /// scanner/cover/Litestream writers, a constraint violation, a closed pool). Same
+    /// class of loss as `dropped` — the record was fetched and is not in the mirror — and
+    /// gated the same way: NON-ZERO MUST NOT LATCH `seed_done`, or the forward-only
+    /// `updatedAtSince` window makes the miss permanent.
+    ///
+    /// Populated by `sync_chapters` only. The catalogue sweep's equivalent failure is
+    /// deliberately left as-is here (its recovery path is `backfill_missing_catalogue`,
+    /// which re-walks from 2018 on any dirty pass); nothing plays that role for chapters,
+    /// so the chapter seed has to hold its own line.
+    pub failed: u64,
+    /// Chapters already mirrored with every mutable column identical, so no write was
+    /// issued (`chapter_row_unchanged`). Counted so the seed's log line can say "876k
+    /// examined, 71k written, 805k already correct" instead of reporting a near-zero
+    /// `stored` that reads like a broken sweep.
+    pub unchanged: u64,
 }
 
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
@@ -1430,7 +1566,14 @@ pub async fn sync_catalogue(
 /// extra; a migration whose semantics are "un-do a done-marker" is not repeatable and
 /// reads oddly in the migration history forever; and versioning KEEPS v1's rows as audit
 /// history of the no-op instead of rewriting them.
-const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v2";
+/// VERSIONED TO `_v3` ON 2026-07-26, hours after `_v2` completed. `_v2` did its job (the
+/// 4,493-record cohort is in), so it latched its marker and will never run again — but the
+/// walk it performed predates migration 0066, so it wrote no `work_tag` rows. `work_tag`
+/// is filled only by ingest, and the recurring sweep only revisits works whose upstream
+/// record CHANGED, so without a new generation the ~113k works catalogued before 0066
+/// would wait years to acquire a genre. `_v3` re-walks the catalogue with the genre
+/// top-up branch active (see `refresh_source_tags` at the presence check).
+const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v3";
 
 /// The `catalogue_sync_state` job key holding the backfill's window cursor. A key of its
 /// own so it never disturbs the `catalogue`/`chapters` rows the recurring sweep reads;
@@ -1444,7 +1587,12 @@ const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v2";
 /// and skip the entire 2018–2021 window where 100% of the 4,493-record cohort lives,
 /// ingesting zero again. A fresh job key has no row, so `get_sync_state` returns `None`,
 /// `since` stays `None`, and the walk starts from the beginning of the catalogue (2018-01).
-const BACKFILL_JOB: &str = "catalogue_backfill_v2";
+/// VERSIONED TO `_v3` ALONGSIDE `BACKFILL_FLAG` — the same "BOTH BUMPS ARE MANDATORY"
+/// rule the `_v2` note above spells out, and for the identical reason: `_v2` ran to
+/// completion, so its cursor sits at the NEWEST end of the catalogue, and renaming only
+/// the flag would resume there and skip every work that needs genres. A fresh job key has
+/// no row, so `since` stays `None` and the walk restarts from 2018-01.
+const BACKFILL_JOB: &str = "catalogue_backfill_v3";
 
 /// How many extra times a backfill page fetch that already survived `get_with_retry`'s
 /// own four attempts is re-tried, after a much longer cool-down, before the window is
@@ -1501,6 +1649,14 @@ pub struct BackfillOutcome {
     pub scanned: u64,
     /// Records absent from `source_series` that were upserted.
     pub ingested: u64,
+    /// Records ALREADY in the spine whose `work_tag` upstream half was (re)written from
+    /// the same `/manga` page (migration 0066).
+    ///
+    /// Deliberately NOT counted in `ingested`: no work was added, and conflating the two
+    /// would make "did the gap close?" unanswerable from the log line. It is also not a
+    /// completion criterion — a tag write is a metadata top-up, whereas `ingested` is the
+    /// catalogue itself.
+    pub tagged: u64,
     /// Records this pass could not persist (SQLITE_BUSY outlasting `UPSERT_LOCK_RETRIES`,
     /// or a failed presence check). NON-ZERO BLOCKS THE ONE-SHOT COMPLETION MARKER — a
     /// partially-complete backfill must never mark itself done, or those ids are lost
@@ -1667,8 +1823,10 @@ pub async fn backfill_missing_catalogue(
                 // Skip ids we already carry — this is a top-up, not a re-seed. A failed
                 // presence check (BUSY on the read side) counts as a lost record rather
                 // than aborting the pass: we can't tell whether it needs ingesting.
-                let present: Option<i64> = match sqlx::query_scalar(
-                    "SELECT 1 FROM source_series \
+                // Selects `work_id`, not a `1` sentinel: a present work still needs its
+                // genres topped up below, and that write is keyed by work id.
+                let present: Option<String> = match sqlx::query_scalar(
+                    "SELECT work_id FROM source_series \
                      WHERE source_type = 'mangadex' AND source_key = ? LIMIT 1",
                 )
                 .bind(&id)
@@ -1682,7 +1840,46 @@ pub async fn backfill_missing_catalogue(
                         continue;
                     }
                 };
-                if present.is_some() {
+                if let Some(work_id) = present {
+                    // GENRE TOP-UP (migration 0066). The full upsert is still skipped —
+                    // this is a top-up, not a re-seed — but `work_tag` was introduced
+                    // EMPTY and is only written by ingest from this deploy onward, so the
+                    // ~113k works catalogued before it each need exactly one visit to
+                    // gain the tags this very `/manga` page is already carrying. Without
+                    // this branch a generation bump would walk the whole catalogue, skip
+                    // every record, and write zero genres.
+                    //
+                    // Costs no extra upstream request and one small transaction. Skipped
+                    // entirely when upstream sent no tags, so a work with no tags is not
+                    // rewritten on every generation for nothing.
+                    if !input.tags.is_empty() {
+                        let mut res =
+                            catalog::refresh_source_tags(pool, &work_id, &input.tags).await;
+                        let mut lock_retry = 0u32;
+                        while let Err(e) = &res {
+                            if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
+                                break;
+                            }
+                            lock_retry += 1;
+                            tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64))
+                                .await;
+                            res = catalog::refresh_source_tags(pool, &work_id, &input.tags).await;
+                        }
+                        match res {
+                            Ok(()) => out.tagged += 1,
+                            Err(e) => {
+                                // Counted into `failed` for the same reason an upsert
+                                // failure is: it withholds the one-shot completion
+                                // marker, so the record gets another pass rather than
+                                // being silently left genreless forever.
+                                out.failed += 1;
+                                tracing::warn!(
+                                    manga = %id, work = %work_id, error = %e,
+                                    "backfill: tag refresh failed"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
                 if cover_phash {
@@ -1772,6 +1969,7 @@ pub async fn backfill_missing_catalogue(
         tracing::info!(
             scanned = out.scanned,
             ingested = out.ingested,
+            tagged = out.tagged,
             failed = out.failed,
             dropped = out.dropped,
             since = %since.as_deref().unwrap_or("<none>"),
@@ -1788,6 +1986,7 @@ pub async fn backfill_missing_catalogue(
     tracing::info!(
         scanned = out.scanned,
         ingested = out.ingested,
+        tagged = out.tagged,
         failed = out.failed,
         dropped = out.dropped,
         truncated = out.truncated,
@@ -1861,6 +2060,7 @@ async fn run_backfill_pass(
             tracing::info!(
                 scanned = o.scanned,
                 ingested = o.ingested,
+                tagged = o.tagged,
                 "backfill: complete"
             );
             if let Err(e) = catalog::set_maintenance_flag(pool, BACKFILL_FLAG).await {
@@ -2012,6 +2212,65 @@ pub fn spawn_backfill_if_needed(
     });
 }
 
+/// Whether the `chapter` row for `(source_series_id, ch.external_id)` already exists AND
+/// carries every mutable column exactly as `ch` would set it — i.e. `upsert_chapter`
+/// would spend a write transaction to change nothing.
+///
+/// WHY THE FIREHOSE ASKS BEFORE WRITING (the same "skip ids we already carry" shape as
+/// `backfill_missing_catalogue`, for the same reason): the forced re-seed of migration
+/// 0067 re-walks all ~876k English chapters, of which the ~805,307 already in the mirror
+/// are byte-identical. Handing every one of them to `upsert_chapter` is ~876k autocommit
+/// transactions against SQLite's single writer, ~92% of them no-op UPDATEs, each one
+/// contending with the scanner, the cover crawler and Litestream's checkpointer — for
+/// hours. The read is nearly free by comparison: `UNIQUE (source_series_id, external_id)`
+/// backs the lookup with `sqlite_autoindex_chapter_2` (verified against the live schema),
+/// so this trades a write transaction for one index seek.
+///
+/// A FAILED READ RETURNS `false`, i.e. "go write it". This is an optimisation, never a
+/// filter: "I could not tell" must degrade to mirroring the chapter (where a real failure
+/// is then counted into `SweepOutcome::failed`), not to silently skipping it.
+async fn chapter_row_unchanged(
+    pool: &sqlx::SqlitePool,
+    source_series_id: &str,
+    ch: &catalog::ChapterInput,
+) -> bool {
+    type MutableCols = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<MutableCols> = match sqlx::query_as(
+        "SELECT number, volume, lang, title, published_at FROM chapter \
+         WHERE source_series_id = ? AND external_id = ?",
+    )
+    .bind(source_series_id)
+    .bind(&ch.external_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::debug!(error = %e, "mangadex: chapter presence check failed; writing anyway");
+            return false;
+        }
+    };
+    match row {
+        // Exactly the columns `upsert_chapter`'s DO UPDATE SET touches, compared as
+        // `Option<String>` so NULL == absent: if this list ever grows there, it must grow
+        // here too, or the re-seed will skip a genuine change.
+        Some((number, volume, lang, title, published_at)) => {
+            number == ch.number
+                && volume == ch.volume
+                && lang == ch.lang
+                && title == ch.title
+                && published_at == ch.published_at
+        }
+        None => false,
+    }
+}
+
 /// Global `/chapter` firehose → mirrored `chapter` rows. Each chapter is attached to
 /// the `mangadex` source_series of its `manga` relationship; chapters whose work
 /// hasn't been catalogued yet are skipped (a later catalogue sweep + re-run picks
@@ -2104,9 +2363,24 @@ pub async fn sync_chapters(
                     title: c.attributes.title.clone(),
                     published_at: c.attributes.publish_at.clone(),
                 };
+                // Already mirrored and identical → no write. See `chapter_row_unchanged`
+                // for the cost this avoids on the 0067 re-seed.
+                if chapter_row_unchanged(pool, &ssid, &ch).await {
+                    out.unchanged += 1;
+                    continue;
+                }
                 match catalog::upsert_chapter(pool, &ssid, &ch).await {
                     Ok(_) => out.upserted += 1,
-                    Err(e) => tracing::warn!(error = %e, "mangadex: chapter upsert failed"),
+                    // COUNTED, not just logged. A warn-and-forget here is how a seed could
+                    // lose chapters to SQLITE_BUSY and still flip `seed_done`, after which
+                    // the forward-only `updatedAtSince` window never re-offers them —
+                    // the same failure mode that made the catalogue's 4,493-record gap
+                    // permanent. `run_chapter_cycle` withholds `seed_done` while this is
+                    // non-zero, so the seed re-runs instead.
+                    Err(e) => {
+                        out.failed += 1;
+                        tracing::warn!(error = %e, "mangadex: chapter upsert failed");
+                    }
                 }
             }
             // RAW length, never the parsed count — see `next_offset` / `ChapterPage`.
@@ -2166,16 +2440,20 @@ pub async fn sync_chapters(
             }
         }
     }
-    if out.dropped > 0 {
+    if out.dropped > 0 || out.failed > 0 {
         tracing::error!(
             stored = out.upserted,
             dropped = out.dropped,
-            "mangadex: chapter sweep DROPPED records — they were fetched and never mirrored"
+            failed = out.failed,
+            "mangadex: chapter sweep LOST records — they were fetched and never mirrored \
+             (dropped = unparseable, failed = the write errored)"
         );
     }
     tracing::info!(
         stored = out.upserted,
+        unchanged = out.unchanged,
         dropped = out.dropped,
+        failed = out.failed,
         "mangadex: chapter sweep complete"
     );
     Ok(out)
@@ -2326,6 +2604,17 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
     run_chapter_cycle(pool, client, &run_start).await;
 }
 
+/// Whether a completed chapter SEED may latch `seed_done` — i.e. whether it landed
+/// everything it fetched. Both counters mean "fetched and not in the mirror", differing
+/// only in where the record died (`dropped` = it never parsed, `failed` = the write
+/// errored), and latching on either one switches the sweep to the forward-only
+/// `updatedAtSince` window, which never revisits an old `createdAt`: the loss becomes
+/// permanent until a human forces another re-seed. One predicate rather than two branches
+/// so a future third loss class can only be added in one place.
+fn chapter_seed_may_latch(o: &SweepOutcome) -> bool {
+    o.dropped == 0 && o.failed == 0
+}
+
 /// The chapter half of a sync cycle: seed or incrementally refresh the `/chapter`
 /// firehose mirror. Split out of `run_one_cycle` because the two halves have very
 /// different costs — the incremental chapter sweep is ~75 chapters a cycle while a
@@ -2368,22 +2657,26 @@ async fn run_chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, run
         Ok(o) => {
             tracing::info!(
                 stored = o.upserted,
+                unchanged = o.unchanged,
                 dropped = o.dropped,
+                failed = o.failed,
                 incremental = chapters_seeded,
                 "mangadex: chapter cycle done"
             );
             let res = if chapters_seeded {
                 catalog::set_sync_cursor(pool, "chapters", run_start).await
-            } else if o.dropped > 0 {
-                // Same rule as the catalogue seed: a seed that fetched records and could
-                // not parse them must not flip `seed_done`, because that switches the
-                // sweep to the forward-only `updatedAtSince` window which never revisits
-                // an old `createdAt`. The per-window `set_seed_progress` checkpoint is
-                // kept, so the next cycle resumes rather than restarting.
+            } else if !chapter_seed_may_latch(&o) {
+                // Same rule as the catalogue seed: a seed that fetched records and did not
+                // land them must not flip `seed_done`, because that switches the sweep to
+                // the forward-only `updatedAtSince` window which never revisits an old
+                // `createdAt`. The per-window `set_seed_progress` checkpoint is kept, so
+                // the next cycle resumes rather than restarting.
                 tracing::error!(
                     dropped = o.dropped,
-                    "mangadex: chapter seed dropped records — withholding seed_done so the \
-                     seed keeps resuming instead of switching to the incremental window"
+                    failed = o.failed,
+                    "mangadex: chapter seed lost records (dropped = unparseable, failed = \
+                     the write errored) — withholding seed_done so the seed keeps resuming \
+                     instead of switching to the incremental window"
                 );
                 Ok(())
             } else {
@@ -2490,6 +2783,161 @@ async fn run_recurring(
 mod tests {
     use super::*;
 
+    /// A migrated in-memory DB, as in the `catalog` tests.
+    async fn pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[test]
+    fn chapter_firehose_requests_every_content_rating() {
+        // REGRESSION (2026-07-26): `list_chapters` sent no `contentRating[]` at all, and
+        // MangaDex defaults list endpoints to safe,suggestive,erotica — so every
+        // `pornographic` English chapter was invisible to the firehose from day one.
+        // Upstream `total` for /chapter?translatedLanguage[]=en: 810,292 with the defaults
+        // vs 876,433 with all four. In the mirror: 4 pornographic works with chapters,
+        // 19,923 without.
+        let params = chapter_list_params(SyncWindow::Created, None, 0);
+        let ratings: Vec<&str> = params
+            .iter()
+            .filter(|(k, _)| k == "contentRating[]")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            ratings,
+            vec!["safe", "suggestive", "erotica", "pornographic"],
+            "the chapter firehose must not inherit MangaDex's default rating filter"
+        );
+        // Whatever else changes, these must not: English-only at the source, the manga
+        // relationship (the only thing that maps a chapter to a source_series), and the
+        // window's own order/since keys.
+        assert!(params.contains(&("translatedLanguage[]".into(), "en".into())));
+        assert!(params.contains(&("includes[]".into(), "manga".into())));
+        assert!(params.contains(&("order[createdAt]".into(), "asc".into())));
+        assert!(
+            !params.iter().any(|(k, _)| k.ends_with("Since")),
+            "a seed with no cursor must send no since param — that is what makes it \
+             start at the beginning of the firehose"
+        );
+        // The same params with a cursor carry exactly one since key, matching the window.
+        let incremental =
+            chapter_list_params(SyncWindow::Updated, Some("2026-07-26T00:00:00"), 100);
+        assert!(incremental.contains(&("updatedAtSince".into(), "2026-07-26T00:00:00".into())));
+        assert!(incremental.contains(&("offset".into(), "100".into())));
+        assert_eq!(
+            incremental
+                .iter()
+                .filter(|(k, _)| k == "contentRating[]")
+                .count(),
+            4,
+            "the incremental window needs the ratings too, or the forward path re-opens \
+             the same hole"
+        );
+    }
+
+    #[test]
+    fn a_lost_chapter_write_never_latches_the_seed() {
+        // REGRESSION: an `upsert_chapter` error was only `warn!`ed, so a seed that lost
+        // chapters to SQLITE_BUSY (the scanner, the cover crawler and Litestream all write
+        // this DB during a sweep) still reported dropped == 0 and latched `seed_done`.
+        // After that the sweep runs the forward-only `updatedAtSince` window, which never
+        // revisits an old `createdAt` — the loss is permanent, which is precisely how the
+        // catalogue's 4,493-record gap became permanent.
+        let clean = SweepOutcome {
+            upserted: 71_126,
+            dropped: 0,
+            failed: 0,
+            unchanged: 805_307,
+        };
+        assert!(chapter_seed_may_latch(&clean));
+        assert!(!chapter_seed_may_latch(&SweepOutcome {
+            failed: 1,
+            ..clean
+        }));
+        assert!(!chapter_seed_may_latch(&SweepOutcome {
+            dropped: 1,
+            ..clean
+        }));
+        assert!(!chapter_seed_may_latch(&SweepOutcome {
+            dropped: 3,
+            failed: 4,
+            ..clean
+        }));
+        // `unchanged` is bookkeeping, not loss: a re-seed over an already-complete mirror
+        // writes almost nothing and MUST still be allowed to latch, or the seed re-runs
+        // its 45-70 minute walk every cycle forever.
+        assert!(chapter_seed_may_latch(&SweepOutcome {
+            upserted: 0,
+            unchanged: 876_433,
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_chapter_row_is_not_rewritten() {
+        // The 0067 re-seed re-walks ~876k chapters of which ~805k are already mirrored
+        // byte-identical. Without this check that is ~805k no-op write transactions
+        // against SQLite's single writer; with it they are one index seek each.
+        let pool = pool().await;
+        let m: MdManga = serde_json::from_value(manga_json()).unwrap();
+        let (id, input) = to_work_input(&m);
+        catalog::upsert_work_from_mangadex(&pool, &id, &input)
+            .await
+            .unwrap();
+        let ssid = catalog::find_source_series_id(&pool, "mangadex", "mangadex", &id)
+            .await
+            .unwrap()
+            .expect("the mangadex source_series was ensured by the upsert");
+
+        let ch = catalog::ChapterInput {
+            external_id: "ch-uuid-1".into(),
+            number: Some("12".into()),
+            volume: Some("2".into()),
+            lang: Some("en".into()),
+            title: Some("The Storm".into()),
+            published_at: Some("2026-07-01T00:00:00+00:00".into()),
+        };
+        // Absent → must be written, never skipped.
+        assert!(!chapter_row_unchanged(&pool, &ssid, &ch).await);
+        catalog::upsert_chapter(&pool, &ssid, &ch).await.unwrap();
+        assert!(chapter_row_unchanged(&pool, &ssid, &ch).await);
+
+        // Every mutable column `upsert_chapter`'s DO UPDATE SET touches must defeat the
+        // skip — a re-seed that swallowed a retitled or renumbered chapter would be worse
+        // than the writes it saves.
+        for changed in [
+            catalog::ChapterInput {
+                number: Some("12.5".into()),
+                ..ch.clone()
+            },
+            catalog::ChapterInput {
+                volume: None,
+                ..ch.clone()
+            },
+            catalog::ChapterInput {
+                lang: Some("es".into()),
+                ..ch.clone()
+            },
+            catalog::ChapterInput {
+                title: Some("The Storm (revised)".into()),
+                ..ch.clone()
+            },
+            catalog::ChapterInput {
+                published_at: Some("2026-07-02T00:00:00+00:00".into()),
+                ..ch.clone()
+            },
+        ] {
+            assert!(
+                !chapter_row_unchanged(&pool, &ssid, &changed).await,
+                "a changed column must not be skipped: {changed:?}"
+            );
+        }
+        // Same external id under a DIFFERENT source_series is a different row: the
+        // presence check is keyed on the pair, exactly like the UNIQUE constraint.
+        assert!(!chapter_row_unchanged(&pool, "ss_does_not_exist", &ch).await);
+    }
+
     #[test]
     fn classify_page_non_empty_always_processes() {
         // The regression guard: a full RAW page whose PARSED count fell below
@@ -2566,6 +3014,7 @@ mod tests {
         let clean = BackfillOutcome {
             scanned: 113_610,
             ingested: 4_500,
+            tagged: 0,
             failed: 0,
             complete: true,
             truncated: 0,
@@ -2596,6 +3045,7 @@ mod tests {
         let truncated = BackfillOutcome {
             scanned: 40_000,
             ingested: 900,
+            tagged: 0,
             failed: 0,
             complete: true,
             truncated: 1,
@@ -2622,6 +3072,7 @@ mod tests {
         let dirty_partial = BackfillOutcome {
             scanned: 20_000,
             ingested: 300,
+            tagged: 0,
             failed: 2,
             complete: false, // stopped on the wall-clock budget
             truncated: 0,
@@ -2637,6 +3088,7 @@ mod tests {
         let clean_partial = BackfillOutcome {
             scanned: 20_000,
             ingested: 300,
+            tagged: 0,
             failed: 0,
             complete: false,
             truncated: 0,
@@ -2661,6 +3113,7 @@ mod tests {
         let dropped = BackfillOutcome {
             scanned: 109_266,
             ingested: 0,
+            tagged: 0,
             failed: 0,
             complete: true,
             truncated: 0,
@@ -2829,6 +3282,73 @@ mod tests {
         );
         assert!(covers[0].is_primary);
         assert_eq!(covers.iter().filter(|c| c.is_primary).count(), 1);
+    }
+
+    /// `manga_json()` plus a realistic `attributes.tags[]`, in deliberately SHUFFLED
+    /// group order so the ordering assertions below can't pass by accident.
+    fn manga_json_with_tags() -> Value {
+        let mut v = manga_json();
+        v["attributes"]["tags"] = serde_json::json!([
+            // `content` — must sort LAST despite appearing first.
+            { "id": "t-gore", "attributes": { "group": "content", "name": { "en": "Gore" } } },
+            // `theme`, listed before `genre` on purpose.
+            { "id": "t-isekai", "attributes": { "group": "theme", "name": { "en": "Isekai", "ja": "異世界" } } },
+            { "id": "t-monsters", "attributes": { "group": "theme", "name": { "en": "Monsters" } } },
+            // `genre` — must sort FIRST. Two of them, to prove within-group API order holds.
+            { "id": "t-action", "attributes": { "group": "genre", "name": { "en": "Action" } } },
+            { "id": "t-comedy", "attributes": { "group": "genre", "name": { "en": "Comedy" } } },
+            // `format`, between theme and content.
+            { "id": "t-strip", "attributes": { "group": "format", "name": { "en": "Long Strip" } } },
+            // Japanese-only: unusable as an English facet label, must be DROPPED rather
+            // than leaking a Japanese string into an English genre list.
+            { "id": "t-jp", "attributes": { "group": "genre", "name": { "ja": "日本語のみ" } } },
+            // A duplicate of an earlier tag — the (work_id, tag) primary key would drop
+            // it at insert anyway; dedupe here keeps `ord` contiguous.
+            { "id": "t-dup", "attributes": { "group": "content", "name": { "en": "Action" } } },
+            // Whitespace-only name: nothing to store.
+            { "id": "t-blank", "attributes": { "group": "genre", "name": { "en": "   " } } },
+            // Unknown group: kept, sorted after every known group.
+            { "id": "t-weird", "attributes": { "group": "newfangled", "name": { "en": "Experimental" } } },
+            // No attributes at all — must contribute nothing and, crucially, must not
+            // fail the whole record (the `links: null` lesson).
+            { "id": "t-bare" }
+        ]);
+        v
+    }
+
+    #[test]
+    fn tags_become_ordered_english_genres() {
+        let m: MdManga = serde_json::from_value(manga_json_with_tags())
+            .expect("a realistic tags[] array must parse");
+        let (_, input) = to_work_input(&m);
+        // Grouped genre -> theme -> format -> content -> unknown, API order within a
+        // group, English only, deduped, blanks dropped.
+        assert_eq!(
+            input.tags,
+            vec![
+                "Action",       // genre
+                "Comedy",       // genre
+                "Isekai",       // theme
+                "Monsters",     // theme
+                "Long Strip",   // format
+                "Gore",         // content
+                "Experimental", // unknown group sorts last
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_or_null_tags_yield_no_genres() {
+        // A work with no tags is a legitimate state, and `replace_source_tags` relies on
+        // an empty list meaning "this work genuinely has none" rather than "parse failed".
+        let m: MdManga = serde_json::from_value(manga_json()).unwrap();
+        assert!(to_work_input(&m).1.tags.is_empty(), "absent tags[]");
+
+        let mut v = manga_json();
+        v["attributes"]["tags"] = Value::Null;
+        let m: MdManga = serde_json::from_value(v)
+            .expect("tags: null must behave like absent tags, not fail the work");
+        assert!(to_work_input(&m).1.tags.is_empty(), "null tags[]");
     }
 
     #[test]

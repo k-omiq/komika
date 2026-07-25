@@ -20,8 +20,8 @@ type Query {
 	# catalog
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
 	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, ordered by latestChapterAt (real upstream release time) DESC — the clock the cards display. Membership is the scanner's detection; only the ORDER is upstream's. Undated rows sort last.
-	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, includeNsfw: Boolean): SeriesPage! # [komika] S4: catalogue search. Empty query browses the persisted catalogue from the DB (filterable); text query does a live source search. `genres` matches ANY (case-insensitive); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them
-	genreFacets: [GenreFacet!]! # [komika] S4: available genre/tag facets across the persisted catalogue (most common first) — drives the search UI's genre filter
+	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, types: [ComicType!], status: SeriesStatus, sort: BrowseSort, contentRating: ContentRatingFilter, includeNsfw: Boolean, hasChapters: Boolean): SeriesPage! # [komika] S4: catalogue search + BROWSE. An EMPTY query browses the whole BROWSABLE canonical catalogue (115.6k works, from the materialized `browse_catalogue`) with every filter and sort applied in SQL, so `total`/`hasNextPage` describe the filtered set — it used to browse only the 13.8k-work Suwayomi library subset with one fixed order, then the 48.5k works that have a DATED chapter. A TEXT query runs full-text search over the canonical works instead; `types`/`status`/`sort`/`contentRating` apply to the BROWSE path only. Page size is 30 on both. `genres` matches ANY (capped at 12); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `contentRating` can only NARROW within the viewer's NSFW posture, never widen past it (see ContentRatingFilter). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them. `hasChapters` (BROWSE only) narrows to works we know a chapter for (`true`) or know none for (`false`); ABSENT means no clause, i.e. the ~67k works whose chapters MangaDex removed on licensing (Boku no Hero Academia, Nausicaä) or that will get them from a Suwayomi source are INCLUDED and sorted last on the recency ordering — hiding them hid exactly what people search for
+	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId}) — one source's chapter list (served from the DB cache, S1)
@@ -131,6 +131,42 @@ enum SeriesStatus {
 	HIATUS
 	CANCELLED
 	UNKNOWN
+}
+
+# How Browse (`search` with an empty query) orders the catalogue. TRENDING is the
+# default — the only ordering that reflects what people are actually reading — and it
+# degrades to NEWEST for everything with no views in the last 24h, so a cold view
+# table cannot render Browse empty. RATING likewise puts rated works first and falls
+# through to NEWEST for the unrated.
+enum BrowseSort {
+	TRENDING # most-viewed over the last 24h first, then newest release
+	NEWEST # newest upstream chapter release first
+	RATING # highest user-review average first, then newest for the unrated
+	CHAPTERS # most English chapters first (the same number `chapterCount` reports)
+}
+
+# The content-rating ceiling Browse filters by. CUMULATIVE: each value admits
+# everything the milder ones do (SAFE ⊂ SUGGESTIVE ⊂ EROTICA ⊂ PORNOGRAPHIC), and ALL
+# applies no rating clause at all. NSFW_ONLY is the sole exception — see below.
+#
+# THE VIEWER'S NSFW GATE DOMINATES THIS. The filter can only narrow within what the
+# viewer's `show_nsfw` already allows — it never widens past it. Concretely: no
+# NSFW-cleared work carries `erotica` or `pornographic`, so for an opted-out viewer
+# EROTICA and PORNOGRAPHIC return exactly the SUGGESTIVE set rather than revealing
+# anything. Asking for a spicier tier is not a way to opt in.
+enum ContentRatingFilter {
+	ALL
+	SAFE
+	SUGGESTIVE
+	EROTICA
+	PORNOGRAPHIC # admits every stored rating, i.e. equivalent to ALL
+	# Adult-rated works ONLY — the complement of SAFE, not a ceiling above it, and the
+	# only non-cumulative member. Exists because "show me just the adult titles" cannot
+	# be said with a tier (every tier admits `safe`); it is the other half of the control
+	# that replaced Browse's NSFW toggle. Filters the materialized `is_nsfw` flag, so it
+	# follows admin overrides rather than contradicting them. For an opted-out viewer it
+	# returns an EMPTY page — the honest answer — rather than degrading to "everything".
+	NSFW_ONLY
 }
 
 type Series {

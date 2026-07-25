@@ -69,6 +69,25 @@ const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Native stack for the thread that owns the VM and runs Java `main` — the Zero
 /// interpreter burns C stack per Java frame, so give it far more than `-Xss`.
 const JVM_THREAD_STACK: usize = 16 * 1024 * 1024;
+/// `-Xss` for every thread the VM creates ITSELF (Javalin/OkHttp workers, the
+/// extension installer's class rewriting, the class loaders) — the threads that
+/// actually run deep recursive Java code. Same reasoning as `JVM_THREAD_STACK`:
+/// under Zero every Java frame costs a C frame of the bytecode interpreter, so the
+/// HotSpot default (~1 MiB) buys a fraction of the Java depth it buys on a JIT VM,
+/// and a StackOverflowError here shows up as an engine that is `ready` but never
+/// serves a chapter. Thread stacks are reserved address space committed page by
+/// page, so the RSS cost is the depth actually used; the peak thread count is an
+/// N4.3 measurement input. Desktop's JIT sidecar sets no `-Xss` at all.
+const JAVA_THREAD_STACK_OPT: &str = "-Xss4m";
+/// How often a Ready engine is re-checked for liveness (see `spawn_heartbeat`).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Per-heartbeat request timeout — deliberately shorter than the interval so a hung
+/// engine is observed rather than queued behind the client's 60 s default.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive heartbeat failures before the engine is declared dead. Three misses
+/// (≈90 s) rides out a long GC pause or an app suspend/resume without a false
+/// terminal degrade.
+const HEARTBEAT_FAILURES_TO_DEGRADE: u32 = 3;
 /// Bounded pre-VM boot attempts. iOS can create a JVM exactly once per process
 /// (`JNI_CreateJavaVM` is irreversible), so EVERYTHING that can fail before it —
 /// port broker, port re-verification, `server.conf` write — is wrapped in this
@@ -193,6 +212,11 @@ impl SuwayomiSupervisor {
     }
   }
 
+  fn is_ready(&self) -> bool {
+    let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    g.state == EngineState::Ready
+  }
+
   fn ready_endpoint(&self) -> Option<(u16, reqwest::Client)> {
     let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
     if g.state == EngineState::Ready {
@@ -294,9 +318,20 @@ fn render_server_conf(port: u16) -> String {
   )
 }
 
-/// Write `server.conf` into the data dir (creating it), mirroring desktop.
+/// The engine's temp dir, pinned as `java.io.tmpdir` (see `jvm_options`). Kept in
+/// one place so `prepare_data_dir` and `run_jvm` cannot disagree about it.
+fn engine_tmp_dir(data_dir: &Path) -> PathBuf {
+  data_dir.join("tmp")
+}
+
+/// Write `server.conf` into the data dir (creating it), mirroring desktop, and
+/// create the app-private temp dir the VM is pointed at.
 fn prepare_data_dir(data_dir: &Path, port: u16) -> Result<(), String> {
   std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
+  // Must exist BEFORE the VM starts: the JVM does not create `java.io.tmpdir`, it
+  // just fails every `File.createTempFile` if the directory is missing.
+  std::fs::create_dir_all(engine_tmp_dir(data_dir))
+    .map_err(|e| format!("create engine temp dir: {e}"))?;
   std::fs::write(data_dir.join("server.conf"), render_server_conf(port))
     .map_err(|e| format!("write server.conf: {e}"))?;
   let kcef = data_dir.join("bin").join("kcef");
@@ -359,28 +394,95 @@ unsafe fn describe_exception(env: *mut JNIEnv) {
   }
 }
 
-/// Create the in-process JVM and run the engine's `main` on THIS thread. Blocks
-/// for the lifetime of the engine (i.e. of the app) on success; returns `Err`
-/// only when the boot itself failed.
+/// Invoke `suwayomi.tachidesk.MainKt.main(String[])` on the CURRENT thread, which the
+/// caller has already attached to the VM. Returns when Java `main` returns (the
+/// engine's server threads keep running), or `Err` if the class/method/argv could not
+/// be resolved or `main` threw. Attach/detach pairing is the caller's job — see
+/// `run_jvm`'s epilogue.
 ///
-/// `-Xmx256m` is the jetsam-informed cap from the spike plan (§2 Q1); `-Xss1m`
-/// bounds per-Java-thread stacks. NO `-Djava.home`: the statically-linked VM
-/// derives it from the executable path (see module docs) and the bundle layout
-/// satisfies it.
-fn run_jvm(jar: &Path, data_dir: &Path) -> Result<(), String> {
-  let opt_strings: Vec<CString> = [
+/// # Safety
+/// `env` must be a valid `JNIEnv*` for the calling thread.
+unsafe fn invoke_main(env: *mut JNIEnv) -> Result<(), String> {
+  // Manifest Main-Class of Suwayomi-Server.jar v2.3.2243 (verified from
+  // META-INF/MANIFEST.MF): suwayomi.tachidesk.MainKt.
+  let main_cls_name = CString::new("suwayomi/tachidesk/MainKt").unwrap();
+  let main_cls = ((**env).FindClass.unwrap())(env, main_cls_name.as_ptr());
+  if main_cls.is_null() {
+    describe_exception(env);
+    return Err("FindClass suwayomi/tachidesk/MainKt failed (classpath?)".into());
+  }
+
+  let name = CString::new("main").unwrap();
+  let sig = CString::new("([Ljava/lang/String;)V").unwrap();
+  let mid = ((**env).GetStaticMethodID.unwrap())(env, main_cls, name.as_ptr(), sig.as_ptr());
+  if mid.is_null() {
+    describe_exception(env);
+    return Err("GetStaticMethodID main([Ljava/lang/String;)V failed".into());
+  }
+
+  let string_cls_name = CString::new("java/lang/String").unwrap();
+  let string_cls = ((**env).FindClass.unwrap())(env, string_cls_name.as_ptr());
+  if string_cls.is_null() {
+    describe_exception(env);
+    return Err("FindClass java/lang/String failed".into());
+  }
+  let argv = ((**env).NewObjectArray.unwrap())(env, 0, string_cls, ptr::null_mut());
+  if argv.is_null() {
+    describe_exception(env);
+    return Err("NewObjectArray(String[0]) failed".into());
+  }
+
+  log::info!(target: "suwayomi", "invoking suwayomi.tachidesk.MainKt.main");
+  let args = [jvalue { l: argv }];
+  ((**env).CallStaticVoidMethodA.unwrap())(env, main_cls, mid, args.as_ptr());
+  if let Some(check) = (**env).ExceptionCheck {
+    if check(env) == JNI_TRUE {
+      describe_exception(env);
+      return Err("Suwayomi main threw".into());
+    }
+  }
+  Ok(())
+}
+
+/// JVM options for the in-process engine, as plain strings (split out so the pinned
+/// sandbox paths are assertable in tests).
+///
+/// `-Xmx256m` is the jetsam-informed cap from the spike plan (§2 Q1);
+/// `JAVA_THREAD_STACK_OPT` sizes per-Java-thread stacks for the Zero interpreter. NO
+/// `-Djava.home`: the statically-linked VM derives it from the executable path (see
+/// module docs) and the bundle layout satisfies it.
+///
+/// `java.io.tmpdir` and `user.home` are pinned because their UNIX defaults (`/tmp`
+/// and the passwd home, `/var/mobile`) are outside the iOS app sandbox and not
+/// writable: the extension installer's temp files, H2 spill files and any library
+/// dotfile would fail with "Read-only file system" while the engine still reported
+/// `ready`. Both targets live under the app-data dir this process already owns.
+fn jvm_options(jar: &Path, data_dir: &Path) -> Vec<String> {
+  // `data_dir` is `<app_data_dir>/suwayomi`; hand `user.home` its parent so stray
+  // dotfiles land beside the engine's rootDir rather than inside it.
+  let user_home = data_dir.parent().unwrap_or(data_dir);
+  vec![
     format!("-Djava.class.path={}", jar.display()),
     format!(
       "-Dsuwayomi.tachidesk.config.server.rootDir={}",
       data_dir.display()
     ),
+    format!("-Djava.io.tmpdir={}", engine_tmp_dir(data_dir).display()),
+    format!("-Duser.home={}", user_home.display()),
     "-Djava.awt.headless=true".to_string(),
     "-Xmx256m".to_string(),
-    "-Xss1m".to_string(),
+    JAVA_THREAD_STACK_OPT.to_string(),
   ]
-  .into_iter()
-  .map(|s| CString::new(s).expect("jvm option contains NUL"))
-  .collect();
+}
+
+/// Create the in-process JVM and run the engine's `main` on THIS thread. Blocks
+/// for the lifetime of the engine (i.e. of the app) on success; returns `Err`
+/// only when the boot itself failed.
+fn run_jvm(jar: &Path, data_dir: &Path) -> Result<(), String> {
+  let opt_strings: Vec<CString> = jvm_options(jar, data_dir)
+    .into_iter()
+    .map(|s| CString::new(s).expect("jvm option contains NUL"))
+    .collect();
 
   let mut options: Vec<JavaVMOption> = opt_strings
     .iter()
@@ -417,45 +519,28 @@ fn run_jvm(jar: &Path, data_dir: &Path) -> Result<(), String> {
   );
 
   let env = env_ptr as *mut JNIEnv;
-  unsafe {
-    // Manifest Main-Class of Suwayomi-Server.jar v2.3.2243 (verified from
-    // META-INF/MANIFEST.MF): suwayomi.tachidesk.MainKt.
-    let main_cls_name = CString::new("suwayomi/tachidesk/MainKt").unwrap();
-    let main_cls = ((**env).FindClass.unwrap())(env, main_cls_name.as_ptr());
-    if main_cls.is_null() {
-      describe_exception(env);
-      return Err("FindClass suwayomi/tachidesk/MainKt failed (classpath?)".into());
-    }
-
-    let name = CString::new("main").unwrap();
-    let sig = CString::new("([Ljava/lang/String;)V").unwrap();
-    let mid = ((**env).GetStaticMethodID.unwrap())(env, main_cls, name.as_ptr(), sig.as_ptr());
-    if mid.is_null() {
-      describe_exception(env);
-      return Err("GetStaticMethodID main([Ljava/lang/String;)V failed".into());
-    }
-
-    let string_cls_name = CString::new("java/lang/String").unwrap();
-    let string_cls = ((**env).FindClass.unwrap())(env, string_cls_name.as_ptr());
-    if string_cls.is_null() {
-      describe_exception(env);
-      return Err("FindClass java/lang/String failed".into());
-    }
-    let argv = ((**env).NewObjectArray.unwrap())(env, 0, string_cls, ptr::null_mut());
-    if argv.is_null() {
-      describe_exception(env);
-      return Err("NewObjectArray(String[0]) failed".into());
-    }
-
-    log::info!(target: "suwayomi", "invoking suwayomi.tachidesk.MainKt.main");
-    let args = [jvalue { l: argv }];
-    ((**env).CallStaticVoidMethodA.unwrap())(env, main_cls, mid, args.as_ptr());
-    if let Some(check) = (**env).ExceptionCheck {
-      if check(env) == JNI_TRUE {
-        describe_exception(env);
-        return Err("Suwayomi main threw".into());
+  // `JNI_CreateJavaVM` attached THIS thread as the VM's primordial Java thread, and
+  // HotSpot never auto-detaches: a native thread that exits while attached leaves a
+  // JavaThread pointing at a stack the pthread has already unmapped, so the still-live
+  // VM faults on its next safepoint stack scan. Every failure path below therefore
+  // goes through one epilogue that detaches before this thread dies — including a
+  // panic, which `catch_unwind` converts into the same honest terminal degrade.
+  let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || unsafe {
+    invoke_main(env)
+  })) {
+    Ok(res) => res,
+    Err(_) => Err("Suwayomi main panicked in the VM thread".to_string()),
+  };
+  if let Err(e) = outcome {
+    unsafe {
+      if let Some(detach) = (**vm).DetachCurrentThread {
+        let drc = detach(vm);
+        if drc != JNI_OK {
+          log::warn!(target: "suwayomi", "DetachCurrentThread failed: rc={drc}");
+        }
       }
     }
+    return Err(e);
   }
 
   // main() returned; the engine's non-daemon server threads keep the VM alive.
@@ -507,9 +592,118 @@ fn check_bundled_runtime() -> Result<(), String> {
   }
 }
 
+/// Pre-VM boot steps, ALL of them retryable because they run before the
+/// irreversible `JNI_CreateJavaVM`. The jar and data-dir resolution are stable
+/// across attempts (resolve once); only the port acquisition — the sole
+/// TOCTOU-prone step — spins in `acquire_boot_port`.
+///
+/// Runs on the VM thread, never on the caller's: it hits the filesystem and, on the
+/// retry path, sleeps.
+fn boot(app: &AppHandle) -> Result<(PathBuf, PathBuf, u16), String> {
+  check_bundled_runtime()?;
+  let jar = resolve_jar(app)?;
+  let data_dir = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| format!("resolve app_data_dir: {e}"))?
+    .join("suwayomi");
+  // Bounded retry: broker a port, re-verify it's still free right before we commit
+  // to the irreversible VM creation, and retry with a fresh port on a transient
+  // steal. Only once a port is secured do we write the conf and boot the VM.
+  let port = acquire_boot_port(broker_port, port_is_bindable, |attempt| {
+    log::info!(
+      target: "suwayomi",
+      "retrying boot port acquisition (attempt {attempt} failed)"
+    );
+    std::thread::sleep(BOOT_RETRY_BACKOFF);
+  })?;
+  prepare_data_dir(&data_dir, port)?;
+  Ok((jar, data_dir, port))
+}
+
+/// Readiness gate on the async runtime, mirroring desktop's Status transitions.
+/// Hands off to `spawn_heartbeat` once the engine answers.
+fn spawn_readiness_gate(sup: Arc<SuwayomiSupervisor>, port: u16, boot_started: Instant) {
+  tauri::async_runtime::spawn(async move {
+    match poll_ready(&sup.client.clone(), port, READY_TIMEOUT).await {
+      Ok(version) => {
+        log::info!(
+          target: "suwayomi",
+          "engine ready ({version}) on port {port} — cold start {} ms",
+          boot_started.elapsed().as_millis()
+        );
+        sup.set_ready(port, version);
+        spawn_heartbeat(sup.clone(), port);
+      }
+      Err(e) => {
+        // Readiness failed after the retryable pre-VM steps were exhausted, so this
+        // means "genuinely couldn't boot," not "lost a port race once." Don't clobber
+        // a more precise error already recorded by the JVM thread.
+        let already_degraded = sup.status().state == "degraded";
+        log::error!(target: "suwayomi", "engine readiness failed: {e}");
+        if !already_degraded {
+          sup.degrade(e);
+        }
+      }
+    }
+  });
+}
+
+/// Liveness watch for a Ready engine. Desktop learns the engine died from
+/// `child.wait()`; the in-process VM has NO observable exit, so without this an
+/// engine that dies after readiness (OOM under `-Xmx`, an uncaught error in a
+/// Javalin thread, a Zero StackOverflowError) would leave `state=ready` forever
+/// while every request failed and the JS side quietly memoized each work as
+/// unusable. Only `HEARTBEAT_FAILURES_TO_DEGRADE` CONSECUTIVE misses degrade, and
+/// the task exits as soon as the state leaves Ready (stop, or a degrade from the VM
+/// thread) so it never resurrects or clobbers another transition.
+fn spawn_heartbeat(sup: Arc<SuwayomiSupervisor>, port: u16) {
+  tauri::async_runtime::spawn(async move {
+    let url = format!("http://127.0.0.1:{port}/api/graphql");
+    let body = json!({ "query": "{ aboutServer { version } }" }).to_string();
+    let mut failures: u32 = 0;
+    loop {
+      tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+      if !sup.is_ready() {
+        return;
+      }
+      // Any HTTP answer means the engine's server is alive; a GraphQL-level error
+      // is not our concern here.
+      let alive = sup
+        .client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .timeout(HEARTBEAT_TIMEOUT)
+        .body(body.clone())
+        .send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false);
+      if alive {
+        failures = 0;
+        continue;
+      }
+      failures += 1;
+      log::warn!(
+        target: "suwayomi",
+        "engine heartbeat missed ({failures}/{HEARTBEAT_FAILURES_TO_DEGRADE})"
+      );
+      if failures >= HEARTBEAT_FAILURES_TO_DEGRADE {
+        log::error!(target: "suwayomi", "engine stopped responding; degrading");
+        sup.degrade("engine stopped responding");
+        return;
+      }
+    }
+  });
+}
+
 /// Initialize and launch the in-process engine. Non-fatal by design: any
 /// resolution failure logs, sets `degraded`, and returns — app startup never
 /// aborts, and the JS fallback ladder routes to the hosted backend.
+///
+/// This is called from Tauri's `setup()` hook, i.e. the iOS MAIN thread, so it does
+/// nothing but spawn: the filesystem work and the port retry's backoff sleeps
+/// (worst case ≈0.6 s) belong on the VM thread, not in the app's launch path.
 pub fn start(app: AppHandle) {
   let sup = match app.try_state::<Arc<SuwayomiSupervisor>>() {
     Some(s) => s.inner().clone(),
@@ -524,59 +718,34 @@ pub fn start(app: AppHandle) {
     return;
   }
 
-  // Everything below runs BEFORE `JNI_CreateJavaVM`, so it is all retryable. The jar
-  // and data-dir resolution are stable across attempts (resolve once); only the port
-  // acquisition — the sole TOCTOU-prone step — spins in `acquire_boot_port`.
-  let boot = || -> Result<(PathBuf, PathBuf, u16), String> {
-    check_bundled_runtime()?;
-    let jar = resolve_jar(&app)?;
-    let data_dir = app
-      .path()
-      .app_data_dir()
-      .map_err(|e| format!("resolve app_data_dir: {e}"))?
-      .join("suwayomi");
-    // Bounded retry: broker a port, re-verify it's still free right before we commit
-    // to the irreversible VM creation, and retry with a fresh port on a transient
-    // steal. Only once a port is secured do we write the conf and boot the VM.
-    let port = acquire_boot_port(broker_port, port_is_bindable, |attempt| {
-      log::info!(
-        target: "suwayomi",
-        "retrying boot port acquisition (attempt {attempt} failed)"
-      );
-      std::thread::sleep(BOOT_RETRY_BACKOFF);
-    })?;
-    prepare_data_dir(&data_dir, port)?;
-    Ok((jar, data_dir, port))
-  };
-
-  let (jar, data_dir, port) = match boot() {
-    Ok(v) => v,
-    Err(e) => {
-      log::warn!(target: "suwayomi", "engine unavailable: {e}");
-      sup.degrade(e);
-      return;
-    }
-  };
-
-  log::info!(
-    target: "suwayomi",
-    "launching in-process engine on 127.0.0.1:{port} (jar: {}, rootDir: {})",
-    jar.display(),
-    data_dir.display()
-  );
-  let boot_started = Instant::now();
-
-  // The VM owner thread: creates the JVM, runs Java main, then parks for the
-  // app's lifetime. A boot error transitions to degraded immediately (the poll
-  // below would otherwise only report the generic timeout).
+  // The VM owner thread: resolves the boot inputs, creates the JVM, runs Java main,
+  // then parks for the app's lifetime. Any failure transitions to degraded here (the
+  // readiness poll would otherwise only report the generic timeout).
   let sup_jvm = sup.clone();
   let spawned = std::thread::Builder::new()
     .name("suwayomi-jvm".into())
     .stack_size(JVM_THREAD_STACK)
     .spawn(move || {
+      let boot_started = Instant::now();
+      let (jar, data_dir, port) = match boot(&app) {
+        Ok(v) => v,
+        Err(e) => {
+          log::warn!(target: "suwayomi", "engine unavailable: {e}");
+          sup_jvm.degrade(e);
+          return;
+        }
+      };
+      log::info!(
+        target: "suwayomi",
+        "launching in-process engine on 127.0.0.1:{port} (jar: {}, rootDir: {})",
+        jar.display(),
+        data_dir.display()
+      );
+      // Start watching before `run_jvm` blocks for the app's lifetime.
+      spawn_readiness_gate(sup_jvm.clone(), port, boot_started);
       if let Err(e) = run_jvm(&jar, &data_dir) {
-        // Failure here is AFTER `JNI_CreateJavaVM` (or a spawn/classpath fault) and
-        // is genuinely unrecoverable in-process — a terminal, actionable degrade.
+        // Failure here is AFTER `JNI_CreateJavaVM` (or a classpath fault) and is
+        // genuinely unrecoverable in-process — a terminal, actionable degrade.
         log::error!(target: "suwayomi", "engine boot failed: {e}");
         sup_jvm.degrade(e);
       }
@@ -585,32 +754,7 @@ pub fn start(app: AppHandle) {
     let msg = format!("spawn suwayomi-jvm thread: {e}");
     log::error!(target: "suwayomi", "{msg}");
     sup.degrade(msg);
-    return;
   }
-
-  // Readiness gate on the async runtime, mirroring desktop's Status transitions.
-  tauri::async_runtime::spawn(async move {
-    match poll_ready(&sup.client.clone(), port, READY_TIMEOUT).await {
-      Ok(version) => {
-        log::info!(
-          target: "suwayomi",
-          "engine ready ({version}) on port {port} — cold start {} ms",
-          boot_started.elapsed().as_millis()
-        );
-        sup.set_ready(port, version);
-      }
-      Err(e) => {
-        // Readiness failed after the retryable pre-VM steps were exhausted, so this
-        // means "genuinely couldn't boot," not "lost a port race once." Don't clobber
-        // a more precise error already recorded by the JVM thread.
-        let already_degraded = sup.status().state == "degraded";
-        log::error!(target: "suwayomi", "engine readiness failed: {e}");
-        if !already_degraded {
-          sup.degrade(e);
-        }
-      }
-    }
-  });
 }
 
 // ---- JS-facing commands (identical signatures/shapes to desktop) ------------
@@ -755,6 +899,26 @@ mod tests {
     assert!(conf.contains("server.port = 54321"));
     assert!(conf.contains("server.kcefEnabled = false"));
     assert!(conf.contains("server.flareSolverrEnabled = false"));
+  }
+
+  /// The JVM's UNIX defaults for these two properties point outside the iOS sandbox,
+  /// so both must be pinned inside the app-data dir, and the temp dir must be the one
+  /// `prepare_data_dir` creates.
+  #[test]
+  fn jvm_options_pin_sandbox_writable_dirs() {
+    let data_dir = Path::new("/var/mobile/Containers/Data/Application/ABC/suwayomi");
+    let opts = jvm_options(Path::new("/app/assets/suwayomi/Suwayomi-Server.jar"), data_dir);
+    let has = |v: &str| opts.iter().any(|o| o.as_str() == v);
+    assert!(
+      has(&format!("-Djava.io.tmpdir={}", engine_tmp_dir(data_dir).display())),
+      "opts: {opts:?}"
+    );
+    assert!(
+      has("-Duser.home=/var/mobile/Containers/Data/Application/ABC"),
+      "opts: {opts:?}"
+    );
+    assert!(has(JAVA_THREAD_STACK_OPT), "opts: {opts:?}");
+    assert!(!has("-Xss1m"), "the Zero interpreter needs more than the default stack");
   }
 
   #[test]

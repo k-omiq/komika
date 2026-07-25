@@ -6,7 +6,10 @@ authors = ["you"]
 license = "AGPL-3.0-only"
 repository = ""
 edition = "2021"
-rust-version = "1.77.2"
+# 1.78 is the floor for `cfg(target_abi)`, which src/lib.rs uses to split the REAL-iOS-device
+# engine from the simulator stub. Before 1.78 that cfg name was feature-gated (`cfg_target_abi`)
+# and is a hard E0658 on EVERY target, desktop included — not a silently-false predicate.
+rust-version = "1.78"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

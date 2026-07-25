@@ -1090,12 +1090,27 @@ async fn touch_feed_series_update(pool: &SqlitePool, series_id: &str, new_found:
 ///   did not exist when it ran, and a NULL type is invisible to the reader's format
 ///   filter — so a series whose FIRST-ever detection lands here would appear in the
 ///   unfiltered feed and vanish from every format tab until the next rebuild.
+/// * `status` / `content_rating` (migration 0068) ARE assigned on conflict, unlike every
+///   other display field, because they are properties of the WORK rather than of the half
+///   that published the row: both writers derive them from the same `work` row through the
+///   same `catalog::FSU_STATUS_SQL`, so `excluded` and the existing value always agree.
+///   They must not be left out: `status` is nullable, and a NULL is invisible to Browse's
+///   status filter for exactly the same reason a NULL `comic_type` is invisible to the
+///   format tabs — a series whose first detection lands here would otherwise sit in the
+///   unfiltered catalogue and vanish from every status filter until the next rebuild.
+/// * `en_chapter_count` cannot be expressed in the conflict clause at all and is filled by
+///   [`fill_feed_en_chapter_count`] immediately after; see there.
+///
+/// Finally, [`mirror_feed_row_into_browse_catalogue`] copies the finished row onto Browse's
+/// own table (migration 0069). Browse stopped reading THIS table, so without that copy the
+/// detection would be invisible on the surface that pages the whole catalogue.
 async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow::Result<u64> {
-    let n = sqlx::query(
+    let status_sql = crate::catalog::FSU_STATUS_SQL;
+    let n = sqlx::query(&format!(
         "INSERT INTO feed_series_updates \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
-              detected_at, is_nsfw) \
+              detected_at, is_nsfw, status, content_rating) \
          SELECT ss.work_id, CAST(sy.id AS TEXT), \
                 COALESCE(w.title_override, w.primary_title, sy.title), \
                 CASE WHEN w.cover_cached_version IS NOT NULL \
@@ -1105,7 +1120,8 @@ async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow
                 NULL, NULL, sy.chapter_count, \
                 MAX(CAST(sy.latest_chapter_at AS INTEGER)), \
                 sss.last_new_chapter_at, \
-                COALESCE(w.is_nsfw_override, w.is_nsfw) \
+                COALESCE(w.is_nsfw_override, w.is_nsfw), \
+                {status_sql}, COALESCE(w.content_rating, 'safe') \
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
@@ -1122,16 +1138,145 @@ async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow
              chapter_count = COALESCE(excluded.chapter_count, feed_series_updates.chapter_count), \
              cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
              suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
-             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw)",
-    )
+             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw), \
+             status = excluded.status, \
+             content_rating = excluded.content_rating"
+    ))
     .bind(series_id)
     .execute(pool)
     .await?
     .rows_affected();
     if n > 0 {
         fill_missing_feed_comic_type(pool, series_id).await?;
+        fill_feed_en_chapter_count(pool, series_id).await?;
+        mirror_feed_row_into_browse_catalogue(pool, series_id).await?;
     }
     Ok(n)
+}
+
+/// Propagate the feed row this scan just wrote into `browse_catalogue` (migration 0069).
+///
+/// WHY. Everything above keeps `/updates` fresh within one scan. Browse reads a DIFFERENT
+/// table as of 0069, rebuilt only at boot and once per catalogue-sync cycle — so without this
+/// the detection we just recorded would not move the series on Browse's "Recently updated"
+/// ordering (its DEFAULT sort's second phase) for up to a full sync interval. That is exactly
+/// the freshness regression `touch_feed_series_update`'s own doc argues against, transplanted
+/// onto the surface that pages the whole catalogue.
+///
+/// A COPY, not a second derivation. `catalog::refresh_browse_catalogue` takes every shared
+/// column verbatim from `feed_series_updates` for a work that has a row there, and this work
+/// does (we just wrote it), so copying is not an approximation of the rebuild — it IS the
+/// rebuild's rule, narrowed to one work. That is what keeps the two writers convergent without
+/// duplicating the `CASE`-per-column SELECT.
+///
+/// `comic_type` is deliberately absent from the conflict clause, matching the rebuild:
+/// `catalog::fill_comic_types` owns it. It IS carried on the INSERT path, where the row is new
+/// and would otherwise be untyped — a NULL type is invisible to Browse's format tabs, so a
+/// series whose first-ever detection lands here would sit in the unfiltered grid and vanish
+/// from every format chip until the next rebuild. The value is the one
+/// `fill_missing_feed_comic_type` just guaranteed, computed by the same function over the same
+/// title the type pass would have read.
+///
+/// `created_at` comes from `work`, the only column here the feed does not carry.
+async fn mirror_feed_row_into_browse_catalogue(
+    pool: &SqlitePool,
+    series_id: &str,
+) -> anyhow::Result<()> {
+    // Same 10 mutable columns, same "write only when something differs" guard as
+    // `catalog::refresh_browse_catalogue` — `IS NOT`, not `<>`, because three of them are
+    // nullable and `NULL <> NULL` is NULL, which would rewrite the row's index entries on
+    // every scan.
+    const MUT: &[&str] = &[
+        "reader_id",
+        "title",
+        "cover_url",
+        "suwayomi_thumbnail",
+        "status",
+        "content_rating",
+        "is_nsfw",
+        "en_chapter_count",
+        "released_at",
+        "created_at",
+    ];
+    let set = MUT
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = MUT
+        .iter()
+        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    sqlx::query(&format!(
+        "INSERT INTO browse_catalogue \
+             (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
+              content_rating, is_nsfw, en_chapter_count, released_at, created_at) \
+         SELECT f.work_id, f.reader_id, f.title, f.cover_url, f.suwayomi_thumbnail, \
+                f.comic_type, f.status, f.content_rating, f.is_nsfw, f.en_chapter_count, \
+                f.released_at, w.created_at \
+           FROM feed_series_updates f \
+           JOIN work w ON w.id = f.work_id \
+          WHERE f.work_id IN (SELECT work_id FROM source_series \
+                              WHERE source_type = 'suwayomi' AND source_key = ?) \
+         ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
+    ))
+    .bind(series_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Give a feed row this scan touched the `en_chapter_count` (migration 0068) the rebuild's
+/// phase 4 would have given it — Browse's CHAPTERS sort key and the number its cards print.
+///
+/// NOT expressible in the upsert's `ON CONFLICT` clause, which is why it is a separate pass.
+/// The rebuild's precedence is "the English MangaDex mirror count where it is non-zero, else
+/// the Suwayomi source count", and a conflict clause cannot tell which of those produced the
+/// value already stored: `excluded.<count>` would clobber a real mirror count with the
+/// Suwayomi one, while `CASE WHEN existing > 0 THEN existing` would freeze a
+/// scanner-half row at whatever the FIRST detection saw — the exact bug
+/// `incremental_write_converges_with_the_periodic_rebuild` was written for, where the card
+/// announces a new chapter while still printing the old count.
+///
+/// So this re-runs the rebuild's two statements verbatim, scoped to the one work. Both are
+/// indexed single-work lookups and this only runs on a scan that actually DETECTED something
+/// (~5% of ~475 scans/hr), so the cost is negligible; correctness here is the point, because
+/// the two writers are proven byte-identical by that same test.
+async fn fill_feed_en_chapter_count(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+    let scope = "work_id IN (SELECT work_id FROM source_series \
+                             WHERE source_type = 'suwayomi' AND source_key = ?)";
+    // The English mirror count. `COALESCE(…, 0)` and not a `WHERE EXISTS` guard: a work whose
+    // English chapters were all UNLINKED must fall back to 0 and then to the Suwayomi count
+    // below, exactly as a full rebuild would compute it from scratch.
+    sqlx::query(&format!(
+        "UPDATE feed_series_updates SET en_chapter_count = COALESCE( \
+             (SELECT COUNT(DISTINCT c.number) FROM chapter c \
+                JOIN source_series ss ON ss.id = c.source_series_id \
+               WHERE ss.work_id = feed_series_updates.work_id \
+                 AND ss.source_type = 'mangadex' AND c.lang = 'en'), 0) \
+         WHERE {scope}"
+    ))
+    .bind(series_id)
+    .execute(pool)
+    .await?;
+    // Then the Suwayomi fallback, which may only ever RAISE a zero.
+    sqlx::query(&format!(
+        "UPDATE feed_series_updates SET en_chapter_count = \
+             (SELECT MAX(sy.chapter_count) FROM source_series ss \
+                JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+               WHERE ss.work_id = feed_series_updates.work_id \
+                 AND ss.source_type = 'suwayomi') \
+         WHERE {scope} AND en_chapter_count = 0 \
+           AND COALESCE((SELECT MAX(sy.chapter_count) FROM source_series ss \
+                           JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                          WHERE ss.work_id = feed_series_updates.work_id \
+                            AND ss.source_type = 'suwayomi'), 0) > 0"
+    ))
+    .bind(series_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Give a feed row this scan just CREATED the `comic_type` the rebuild's
@@ -1200,17 +1345,14 @@ async fn fill_missing_feed_comic_type(pool: &SqlitePool, series_id: &str) -> any
         curated
     };
 
-    use crate::graphql::types::ComicType;
-    let word = match crate::graphql::types::resolve_comic_type(
-        override_word.as_deref(),
-        original_language.as_deref(),
-        &genres,
-        &title,
-    ) {
-        ComicType::Manhwa | ComicType::Webtoon => "MANHWA",
-        ComicType::Manhua => "MANHUA",
-        ComicType::Manga | ComicType::Comic => "MANGA",
-    };
+    let word = crate::graphql::types::collapsed_comic_type_word(
+        crate::graphql::types::resolve_comic_type(
+            override_word.as_deref(),
+            original_language.as_deref(),
+            &genres,
+            &title,
+        ),
+    );
     sqlx::query(
         "UPDATE feed_series_updates SET comic_type = ? WHERE work_id = ? AND comic_type IS NULL",
     )
@@ -3193,6 +3335,13 @@ mod tests {
     /// Every column of the fixture's feed row plus the sort key's STORAGE CLASS, as one
     /// comparable string. `~` stands in for NULL so a NULL never swallows the whole
     /// concatenation.
+    ///
+    /// EVERY column, deliberately — that is what makes the convergence proof below a proof
+    /// rather than a spot check. Migration 0068's three additions (`status`,
+    /// `content_rating`, `en_chapter_count`) are in here for the same reason the original
+    /// twelve are: two of them are Browse FILTER keys and one is a SORT key, so a row whose
+    /// value depends on which writer touched it last is a row that appears or disappears
+    /// from Browse depending on scan timing.
     async fn feed_digest(pool: &SqlitePool) -> Option<String> {
         sqlx::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
@@ -3202,7 +3351,29 @@ mod tests {
                  || '|' || COALESCE(chapter_count, '~') \
                  || '|' || released_at || '|' || typeof(released_at) \
                  || '|' || COALESCE(detected_at, '~') || '|' || is_nsfw \
+                 || '|' || COALESCE(status, '~') || '|' || content_rating \
+                 || '|' || en_chapter_count \
              FROM feed_series_updates WHERE work_id = 'w1'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The same digest over Browse's own table (migration 0069), which
+    /// `mirror_feed_row_into_browse_catalogue` writes incrementally and
+    /// `catalog::refresh_browse_catalogue` rebuilds. `comic_type` is included because a NULL
+    /// there is invisible to Browse's format tabs, and `typeof(released_at)` because a TEXT
+    /// sort key would sort the whole undated tail above every dated work.
+    async fn browse_digest(pool: &SqlitePool) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT work_id || '|' || reader_id || '|' || title \
+                 || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
+                 || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(status, '~') \
+                 || '|' || content_rating || '|' || is_nsfw || '|' || en_chapter_count \
+                 || '|' || COALESCE(released_at, -1) || '|' || typeof(released_at) \
+                 || '|' || created_at \
+             FROM browse_catalogue WHERE work_id = 'w1'",
         )
         .fetch_optional(pool)
         .await
@@ -3277,6 +3448,9 @@ mod tests {
         let incremental = feed_digest(&pool)
             .await
             .expect("two detections must publish");
+        let incremental_browse = browse_digest(&pool)
+            .await
+            .expect("a detection must reach Browse's table too — it no longer reads the feed");
         let (_, released_at, typ, .., chapter_count, _) = feed_row(&pool).await.unwrap();
         assert_eq!(
             chapter_count,
@@ -3302,6 +3476,16 @@ mod tests {
         assert_eq!(
             incremental, rebuilt,
             "the incremental writer and the periodic rebuild must not disagree about any column"
+        );
+        // And the same for `browse_catalogue`. Two writers, one table, again — and here the
+        // stakes are the DEFAULT Browse sort: a row the incremental path left behind would put
+        // a series with a brand-new chapter in the undated tail of "Recently updated".
+        let rebuilt_browse = browse_digest(&pool)
+            .await
+            .expect("the rebuild must produce the browse row too");
+        assert_eq!(
+            incremental_browse, rebuilt_browse,
+            "the incremental browse-row copy and the periodic rebuild must not disagree"
         );
     }
 

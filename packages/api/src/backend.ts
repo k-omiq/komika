@@ -79,10 +79,18 @@ export interface Backend {
 	 */
 	updates(page?: number): Promise<Paginated<Series>>;
 	/**
-	 * Catalogue search. An empty query serves the whole persisted catalogue; a text
-	 * query hits the live source index. `filters` (genres / rating range) are applied
-	 * server-side (genres match ANY, case-insensitive). Both are honoured on the
-	 * unified Komika API. (S4)
+	 * Catalogue search AND Browse. An EMPTY query browses the whole persisted canonical
+	 * catalogue; a text query runs full-text search over it. `filters` are applied
+	 * server-side — every filter and the ordering resolve in SQL, so `total` /
+	 * `hasNextPage` describe the FILTERED set, not the page. (S4)
+	 *
+	 * The two branches honour different filters. `genres` (match ANY, case-insensitive)
+	 * and the rating range apply to both; `types` / `status` / `sort` / `contentRating`
+	 * apply to the BROWSE branch ONLY — a text query is ordered by relevance and ignores
+	 * them. Callers must not present them as narrowing a search.
+	 *
+	 * BROWSE PAGES AT 30, not the API-wide 20 (server `BROWSE_PAGE_SIZE`); a pager built
+	 * on the wrong constant mis-computes the last page and clamps to it.
 	 *
 	 * `includeNsfw` is the ADMIN CONSOLE escape hatch: it overrides the caller's own
 	 * `show_nsfw` for this request only, and the server honours it solely for an admin
@@ -393,13 +401,59 @@ export interface Backend {
 	materializeCatalogueCovers?(): Promise<number>;
 }
 
+/**
+ * How Browse (an empty-query {@link Backend.search}) orders the catalogue.
+ *
+ * TRENDING is the server's default and degrades to newest-release for everything with
+ * no recent views, so a cold view table cannot render Browse empty; RATING likewise
+ * puts rated works first and falls through to newest for the unrated. NEWEST orders by
+ * newest upstream CHAPTER release, not by date-added — label it accordingly in a UI.
+ */
+export type BrowseSort = 'TRENDING' | 'NEWEST' | 'RATING' | 'CHAPTERS';
+
+/**
+ * The content-rating ceiling Browse filters by.
+ *
+ * The first five are CUMULATIVE — each admits everything the milder ones do
+ * (SAFE ⊂ SUGGESTIVE ⊂ EROTICA ⊂ PORNOGRAPHIC), and ALL/PORNOGRAPHIC are equivalent.
+ * `NSFW_ONLY` is the sole non-cumulative member: adult works only, which no tier can
+ * express (every tier admits `safe`).
+ *
+ * NONE OF THESE WIDEN THE VIEWER'S NSFW GATE. The server clamps the filter to what the
+ * viewer's stored `show_nsfw` already allows, so for an opted-out viewer the spicy
+ * tiers collapse to SUGGESTIVE and `NSFW_ONLY` returns an EMPTY page rather than
+ * revealing anything. Asking for a spicier tier is not a way to opt in — that lives on
+ * the profile screen.
+ */
+export type ContentRatingFilter =
+	'ALL' | 'SAFE' | 'SUGGESTIVE' | 'EROTICA' | 'PORNOGRAPHIC' | 'NSFW_ONLY';
+
 /** Server-side catalogue-search filters (S4). All optional; omit to not filter. */
 export interface SearchFilters {
-	/** Match any of these genres (case-insensitive). */
+	/** Match any of these genres (case-insensitive). Capped at 12 server-side. */
 	genres?: string[];
 	/** Inclusive rating bounds on the 0–10 scale. */
 	minRating?: number;
 	maxRating?: number;
+	/** Match any of these formats. BROWSE-only (see {@link Backend.search}). */
+	types?: ComicType[];
+	/** Publication status. BROWSE-only. */
+	status?: SeriesStatus;
+	/** Result ordering; the server defaults to TRENDING. BROWSE-only. */
+	sort?: BrowseSort;
+	/** Content-rating ceiling, clamped to the viewer's NSFW posture. BROWSE-only. */
+	contentRating?: ContentRatingFilter;
+	/**
+	 * Restrict to works we know a chapter for (`true`) or know none for (`false`).
+	 * BROWSE-only. OMIT for the whole browsable catalogue, which is the default.
+	 *
+	 * Browse pages every catalogued work, including the ~67k with no chapter yet:
+	 * MangaDex REMOVES chapters when a series is licensed or claimed, so "no chapters"
+	 * correlates with popular (Boku no Hero Academia, Nausicaä), and many of those works
+	 * already have a non-MangaDex source that will supply them. This filter is for a
+	 * reader who only wants what they can read right now; it is not a quality signal.
+	 */
+	hasChapters?: boolean;
 }
 
 export interface Session {

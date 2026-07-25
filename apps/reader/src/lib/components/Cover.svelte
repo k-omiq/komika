@@ -25,6 +25,7 @@
 
 	let resolved = $state(syncResolve(src));
 	let broken = $state(false);
+	let el = $state<HTMLImageElement | undefined>(undefined);
 
 	// A cover failure is usually TRANSIENT — a dropped request on a flaky connection,
 	// a cold proxy, a rate-limited upstream. `broken` was only ever cleared when `src`
@@ -111,7 +112,16 @@
 		images
 			.resolveCover(source)
 			.then((u) => {
-				if (alive) resolved = u;
+				// The provider mints the object URL before this settles, so a fetch that
+				// lands after unmount (or after `src` changed) has already pinned the
+				// cover's bytes to the document — and the teardown below never saw it, so
+				// nothing would ever release it. Scroll-flinging a grid abandons dozens of
+				// these; on iOS that is tens of MB held in a jetsam-limited process.
+				if (!alive) {
+					if (u && images.release) images.release(u);
+					return;
+				}
+				resolved = u;
 			})
 			.catch(() => {
 				if (alive) broken = true;
@@ -121,11 +131,39 @@
 			if (resolved && images.release) images.release(resolved);
 		};
 	});
+
+	// HYDRATION: Svelte deliberately never writes `src` (nor `srcset`) while hydrating —
+	// see `set_attribute` in svelte/internal/client/dom/elements/attributes.js, which
+	// records the SERVER's attribute and returns early to avoid a second network request,
+	// "assum[ing] they are the same between client and server".
+	//
+	// On this app they are routinely NOT the same. Edge SSR is always anonymous (the
+	// bearer token lives in localStorage; there is no hooks.server.ts forwarding it), so
+	// a signed-in viewer's feed is server-rendered WITHOUT their NSFW rows and up to
+	// `s-maxage` seconds stale, then the universal load re-runs at hydration WITH the
+	// token and returns a different, longer row set. Keyed `{#each}` blocks do not save
+	// us: hydration claims server nodes POSITIONALLY (`each.js`), keys are only consulted
+	// for later reconciliation. Titles, hrefs and text all get rewritten from client data
+	// because `set_text` has no such guard — only `src` is frozen. The visible result is
+	// covers that belong to a different row than their title, permanently, plus NSFW
+	// slots showing an unrelated SFW cover or a placeholder.
+	//
+	// So re-assert `src` from client state once the DOM is live. Guarded on inequality, so
+	// the overwhelmingly common case (server and client DID agree) costs one string
+	// compare and issues no request; only genuinely mismatched slots re-fetch, which is
+	// the whole point. Post-hydration `src` changes are handled by Svelte normally — this
+	// effect just no-ops on them.
+	$effect(() => {
+		const img = el;
+		if (!img || !resolved) return;
+		if (img.getAttribute('src') !== resolved) img.setAttribute('src', resolved);
+	});
 </script>
 
 {#if resolved && !broken}
 	{#key attempt}
 		<img
+			bind:this={el}
 			class="cover-img"
 			src={resolved}
 			{alt}

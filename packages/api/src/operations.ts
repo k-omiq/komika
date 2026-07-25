@@ -144,6 +144,20 @@ export const UPDATES = /* GraphQL */ `
 	}
 `;
 
+// Catalogue search AND Browse. `types`/`status`/`sort`/`contentRating` are BROWSE
+// arguments (the empty-query path); the server ignores them for a text query, which
+// ranks by FTS relevance.
+//
+// These four are HARD requirements of the deployed API, deliberately NOT in
+// OPTIONAL_ARGUMENTS: an unknown argument fails GraphQL validation and takes the whole
+// document with it, so a reader shipped ahead of the server would break Browse for
+// everyone rather than degrade it. Unlike `updatesFeed` — which is a whole optional
+// method behind `backend.updatesFeed?.()` with a two-feed fallback — Browse has NO
+// fallback path: there is exactly one `search` and every screen that browses goes
+// through it. This couples the reader to a server that knows these arguments. Deploy
+// the server first. (Listing them in OPTIONAL_ARGUMENTS would be worse than useless:
+// stripping `sort` silently returns TRENDING under a "Top rated" chip, i.e. a lie
+// instead of an error.)
 export const SEARCH = /* GraphQL */ `
 	${SERIES_FIELDS}
 	query Search(
@@ -152,7 +166,12 @@ export const SEARCH = /* GraphQL */ `
 		$genres: [String!]
 		$minRating: Float
 		$maxRating: Float
+		$types: [ComicType!]
+		$status: SeriesStatus
+		$sort: BrowseSort
+		$contentRating: ContentRatingFilter
 		$includeNsfw: Boolean
+		$hasChapters: Boolean
 	) {
 		search(
 			query: $query
@@ -160,7 +179,12 @@ export const SEARCH = /* GraphQL */ `
 			genres: $genres
 			minRating: $minRating
 			maxRating: $maxRating
+			types: $types
+			status: $status
+			sort: $sort
+			contentRating: $contentRating
 			includeNsfw: $includeNsfw
+			hasChapters: $hasChapters
 		) {
 			items {
 				...SeriesFields

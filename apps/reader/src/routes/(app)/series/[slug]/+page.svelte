@@ -338,7 +338,43 @@
 	const workId = $derived(view?.workId ?? null);
 	let switching = $state(false);
 
+	// The picker is a POPOVER rather than the flat button list it used to be. With a
+	// handful of sources the flat list pushed the chapter list a screen down the page, and
+	// it read as a set of tabs rather than "the source this list is coming from" — which
+	// is what it now literally controls (see `getSeries`: the selected source owns the
+	// chapter list). Same dismissal contract as `StatusMenu`: outside click on the capture
+	// phase, plus Escape.
+	let pickerOpen = $state(false);
+	let pickerRoot = $state<HTMLElement | null>(null);
+	const selectedTranslator = $derived(
+		translators.find((t) => t.key === selectedTranslatorKey) ?? translators[0] ?? null,
+	);
+	// One source is not a choice — render it as a static label, not a dead dropdown.
+	const pickerInteractive = $derived(translators.length > 1);
+
+	function togglePicker(): void {
+		if (switching || !pickerInteractive) return;
+		pickerOpen = !pickerOpen;
+	}
+
+	$effect(() => {
+		if (!pickerOpen) return;
+		const onDoc = (e: MouseEvent) => {
+			if (pickerRoot && !pickerRoot.contains(e.target as Node)) pickerOpen = false;
+		};
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') pickerOpen = false;
+		};
+		window.addEventListener('click', onDoc, true);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('click', onDoc, true);
+			window.removeEventListener('keydown', onKey);
+		};
+	});
+
 	async function selectTranslator(key: string): Promise<void> {
+		pickerOpen = false;
 		if (!workId || switching || key === selectedTranslatorKey) return;
 		setPreferredTranslator(workId, key);
 		switching = true;
@@ -696,51 +732,100 @@
 		</div>
 	</div>
 
-	<!-- translators (sources) -->
+	<!-- source picker — chooses WHICH source's chapters the list below shows -->
 	{#if translators.length}
 		<div class="translators k-gutter">
 			<div class="tr-head">
-				<span class="tr-label">Translation source</span>
+				<span class="tr-label">Source</span>
 				<span class="tr-sub"
 					>{translators.length === 1
 						? 'Only one source available'
-						: `${translators.length} sources · pick who you read from`}</span
+						: `${translators.length} sources · switch to re-list chapters`}</span
 				>
 			</div>
-			<div class="tr-list" class:switching>
-				{#each translators as t (t.key)}
-					<button
-						class="tr-opt"
-						class:on={t.key === selectedTranslatorKey}
-						disabled={switching}
-						onclick={() => selectTranslator(t.key)}
-						title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
-					>
-						{#if t.iconUrl}
+			<div class="tr-picker" class:open={pickerOpen} bind:this={pickerRoot}>
+				<button
+					type="button"
+					class="tr-trigger"
+					class:static={!pickerInteractive}
+					disabled={switching}
+					aria-haspopup="listbox"
+					aria-expanded={pickerOpen}
+					aria-label="Change source"
+					onclick={togglePicker}
+				>
+					{#if selectedTranslator}
+						{#if selectedTranslator.iconUrl}
 							<img
 								class="tr-logo"
-								src={t.iconUrl}
+								src={selectedTranslator.iconUrl}
 								alt=""
 								loading="lazy"
 								decoding="async"
 								referrerpolicy="no-referrer"
 							/>
 						{:else}
-							<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
+							<span class="tr-logo tr-initial"
+								>{selectedTranslator.name.charAt(0).toUpperCase()}</span
+							>
 						{/if}
 						<span class="tr-name">
 							<span class="tr-name-main"
-								>{t.name}{#if t.lang}<span class="tr-lang">{t.lang.toUpperCase()}</span>{/if}</span
+								>{selectedTranslator.name}{#if selectedTranslator.lang}<span class="tr-lang"
+										>{selectedTranslator.lang.toUpperCase()}</span
+									>{/if}</span
 							>
 							<span class="tr-count"
-								>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
+								>{selectedTranslator.chapterCount}
+								{selectedTranslator.chapterCount === 1 ? 'chapter' : 'chapters'}</span
 							>
 						</span>
-						{#if t.key === selectedTranslatorKey}
-							<Icon name="check" size={15} strokeWidth={2.6} />
-						{/if}
-					</button>
-				{/each}
+					{/if}
+					{#if pickerInteractive}
+						<Icon name="chevron-down" size={16} />
+					{/if}
+				</button>
+				{#if pickerOpen}
+					<div class="tr-menu" role="listbox" aria-label="Sources">
+						{#each translators as t (t.key)}
+							<button
+								type="button"
+								role="option"
+								aria-selected={t.key === selectedTranslatorKey}
+								class="tr-opt"
+								class:on={t.key === selectedTranslatorKey}
+								disabled={switching}
+								onclick={() => selectTranslator(t.key)}
+								title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
+							>
+								{#if t.iconUrl}
+									<img
+										class="tr-logo"
+										src={t.iconUrl}
+										alt=""
+										loading="lazy"
+										decoding="async"
+										referrerpolicy="no-referrer"
+									/>
+								{:else}
+									<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
+								{/if}
+								<span class="tr-name">
+									<span class="tr-name-main"
+										>{t.name}{#if t.lang}<span class="tr-lang">{t.lang.toUpperCase()}</span
+											>{/if}</span
+									>
+									<span class="tr-count"
+										>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
+									>
+								</span>
+								{#if t.key === selectedTranslatorKey}
+									<Icon name="check" size={15} strokeWidth={2.6} />
+								{/if}
+							</button>
+						{/each}
+					</div>
+				{/if}
 			</div>
 		</div>
 	{/if}
@@ -762,6 +847,24 @@
 			</div>
 		</div>
 		<div class="ch-list">
+			<!-- EMPTY STATE. There was none: the list simply rendered nothing under a
+			     "Chapters · 0 total" header, which reads as a page that failed to load. It is
+			     reachable in bulk now that Browse pages the whole catalogue (~67k works have
+			     no chapter yet), and the honest wording matters — MangaDex REMOVES chapters
+			     when a series is licensed or claimed, so this is usually a popular series
+			     whose chapters live on another source, not a broken one. The source picker
+			     above is the actual next step when there is more than one source, so the copy
+			     points at it only when it exists. -->
+			{#if chapters.length === 0}
+				<div class="ch-empty">
+					<div class="ch-empty-title">No chapters from any source yet</div>
+					<div class="ch-empty-desc">
+						{pickerInteractive
+							? 'Nothing is available from this source. Try another source above.'
+							: 'Nothing is available to read here yet — it may arrive from another source, or be licensed elsewhere.'}
+					</div>
+				</div>
+			{/if}
 			{#each chapters as c (c.id ?? c.n)}
 				<a class="ch-row" class:read={c.read} href={chapterHref(c.id, c.src)}>
 					<span class="ch-num">{c.n}</span>
@@ -1543,35 +1646,100 @@
 		font-size: 13px;
 		color: var(--k-text-faint);
 	}
-	.tr-list {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 12px;
+	.tr-picker {
+		position: relative;
+		display: inline-flex;
+		align-self: flex-start;
 	}
-	.tr-list.switching {
+	/* The trigger displays the CURRENT source, so it carries the same accent the chosen
+	   row in the menu does — control and value read as one thing, rather than a neutral
+	   button sitting above a highlighted list. */
+	.tr-trigger {
+		display: inline-flex;
+		align-items: center;
+		gap: 12px;
+		padding: 10px 14px 10px 12px;
+		border-radius: 12px;
+		background: rgba(224, 131, 105, 0.1);
+		border: 1px solid var(--k-primary);
+		color: var(--k-text-bright);
+		cursor: pointer;
+		transition: filter 0.15s;
+		text-align: left;
+		font-family: inherit;
+		min-width: 260px;
+	}
+	.tr-trigger:not(:disabled):hover {
+		filter: brightness(1.1);
+	}
+	.tr-trigger:disabled {
 		opacity: 0.6;
-		pointer-events: none;
+		cursor: default;
+	}
+	/* One source is not a choice: drop the accent and the affordance both. */
+	.tr-trigger.static {
+		cursor: default;
+		background: var(--k-surface);
+		border-color: var(--k-border-2);
+		color: var(--k-text-2);
+	}
+	.tr-trigger.static:hover {
+		filter: none;
+	}
+	/* The chevron/check are the only <svg> here; push the chevron to the far edge. */
+	.tr-trigger :global(svg) {
+		margin-left: auto;
+		flex: 0 0 auto;
+	}
+	.tr-menu {
+		position: absolute;
+		z-index: 40;
+		top: calc(100% + 6px);
+		left: 0;
+		min-width: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding: 6px;
+		border-radius: 12px;
+		background: var(--k-surface-3, var(--k-surface));
+		border: 1px solid var(--k-border-3);
+		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+		/* A work can carry a dozen sources; cap the popover and scroll rather than
+		   running it off the bottom of the viewport. */
+		max-height: 320px;
+		overflow-y: auto;
 	}
 	.tr-opt {
 		display: inline-flex;
 		align-items: center;
 		gap: 12px;
-		padding: 10px 16px 10px 12px;
-		border-radius: 12px;
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-2);
+		width: 100%;
+		padding: 9px 12px;
+		border-radius: 9px;
+		background: transparent;
+		border: 1px solid transparent;
 		color: var(--k-text-2);
 		cursor: pointer;
 		transition: all 0.15s;
 		text-align: left;
+		font-family: inherit;
 	}
 	.tr-opt:hover {
-		border-color: var(--k-border-strong);
+		background: var(--k-hover-fill, rgba(255, 255, 255, 0.06));
 	}
 	.tr-opt.on {
 		border-color: var(--k-primary);
 		background: rgba(224, 131, 105, 0.1);
 		color: var(--k-text-bright);
+	}
+	.tr-opt:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.tr-opt :global(svg) {
+		margin-left: auto;
+		flex: 0 0 auto;
 	}
 	.tr-logo {
 		width: 34px;
@@ -1615,6 +1783,22 @@
 	}
 	.tr-count {
 		font-size: 12px;
+		color: var(--k-text-faint);
+	}
+	.ch-empty {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 22px 2px;
+	}
+	.ch-empty-title {
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--k-text-1);
+	}
+	.ch-empty-desc {
+		font-size: 12.5px;
+		line-height: 1.5;
 		color: var(--k-text-faint);
 	}
 	.chapters {
@@ -1787,9 +1971,12 @@
 			justify-content: center;
 			min-width: 160px;
 		}
-		/* Give the translator picker + chapter rows comfortable one-handed targets. */
-		.tr-opt {
-			flex: 1 1 100%;
+		/* Give the source picker a full-width one-handed target; the popover it opens
+		   inherits the width via `.tr-menu { min-width: 100% }`. */
+		.tr-picker,
+		.tr-trigger {
+			width: 100%;
+			min-width: 0;
 		}
 		.covers-strip {
 			gap: 12px;

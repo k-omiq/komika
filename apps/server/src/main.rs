@@ -1,5 +1,6 @@
 mod auth;
 mod avatar;
+mod browse;
 mod catalog;
 mod config;
 mod cover;
@@ -1179,10 +1180,15 @@ async fn main() -> anyhow::Result<()> {
     // Populate the materialized updates feed at boot (migration 0051), off the request
     // path, so `canonicalUpdates` serves real rows immediately — even before the first
     // catalogue-sync cycle, and even when CATALOGUE_SYNC is off. Spawned so a slow
-    // rebuild (it's a ~3s, ~47k-row DELETE+INSERT) doesn't delay the listener coming
-    // up. Delayed ~20s so this heavy writer doesn't land in the same instant as the
+    // rebuild doesn't delay the listener coming up: measured on production data it is a
+    // ~13 s transaction for `feed_series_updates` (48.5k rows) followed by a ~6-7 s one for
+    // `browse_catalogue` (115.5k rows, migration 0069), which `refresh_feed_updates` chains.
+    // Delayed ~20s so this heavy writer doesn't land in the same instant as the
     // scanner's immediate first tick — the scanner would absorb the contention via its
     // lock-retry, but there's no reason to create it (mirrors the 2C boot stagger).
+    //
+    // Browse serves correct rows for that whole window regardless: migration 0069 backfills
+    // `browse_catalogue` itself, so the first request does not depend on this task.
     {
         let pool = pool.clone();
         tokio::spawn(async move {

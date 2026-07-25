@@ -1090,6 +1090,13 @@
 		display: block;
 		width: 100%;
 		background: var(--k-bg);
+		/* The cell's aspect-ratio is only a pre-load *reservation* (DEFAULT until the
+		   real ratio is measured on load). A loaded image renders at its natural
+		   height (see .strip-img), which for the ~1 frame before the measured ratio is
+		   applied can be taller than the DEFAULT 2:3 box — clip that overflow so it
+		   never overlaps the next page. Once the real ratio lands the box matches the
+		   image exactly and nothing is clipped. */
+		overflow: hidden;
 	}
 	.strip-ph {
 		position: absolute;
@@ -1103,8 +1110,13 @@
 	.strip-img {
 		display: block;
 		width: 100%;
-		height: 100%;
-		object-fit: contain;
+		/* Fill the cell width and let intrinsic height govern. The previous
+		   `height:100%; object-fit:contain` fitted every page into the cell's
+		   *reserved* 2:3 box — so a taller-than-2:3 page (most manga/webtoon pages)
+		   was shrunk to a narrow, letterboxed column until the real ratio was measured
+		   and the box reshaped ("zoomed out for a couple seconds"). Sizing by width
+		   with natural height renders the page correctly the instant it paints. */
+		height: auto;
 	}
 	/* Failed-page retry target (strip + paged share the look). */
 	.strip-err {

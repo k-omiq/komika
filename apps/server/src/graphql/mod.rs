@@ -9,6 +9,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::auth::{self, User};
+use crate::browse::BROWSE_PAGE_SIZE;
 use crate::catalog;
 use crate::scanner::scan_series;
 use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
@@ -681,14 +682,21 @@ async fn nsfw_work_ids(
     }
 }
 
-/// Re-derive the MATERIALIZED NSFW flag on both feed tables for the given works.
+/// Re-derive the MATERIALIZED NSFW flag on all three feed tables for the given works.
 ///
-/// `feed_updates` (migration 0051) and `feed_series_updates` (migration 0064) each store
-/// a COPY of `COALESCE(work.is_nsfw_override, work.is_nsfw)` so their resolvers can pin
-/// `is_nsfw = 0` as an index prefix instead of joining `work` per row. That copy is only
-/// rewritten by `catalog::refresh_feed_updates`, i.e. at boot and once per catalogue-sync
-/// cycle — so between refreshes an admin who marks a work NSFW keeps SERVING it to
-/// opted-out viewers on `updatesFeed` / `canonicalUpdates`, for hours.
+/// `feed_updates` (migration 0051), `feed_series_updates` (0064) and `browse_catalogue`
+/// (0069) each store a COPY of `COALESCE(work.is_nsfw_override, work.is_nsfw)` so their
+/// resolvers can pin `is_nsfw = 0` as an index prefix instead of joining `work` per row. That
+/// copy is only rewritten by `catalog::refresh_feed_updates`, i.e. at boot and once per
+/// catalogue-sync cycle — so between refreshes an admin who marks a work NSFW keeps SERVING
+/// it to opted-out viewers on `updatesFeed` / `canonicalUpdates` / Browse, for hours.
+///
+/// `browse_catalogue` is the one that matters most, and it is the reason this list is not
+/// two entries: it is the LARGEST of the three (115,567 rows against 48,567) and the only one
+/// that holds a work the moment it is catalogued, so a mis-flagged work that no feed carries
+/// is still on Browse. Its `total` is memoized too — but the memo is keyed on the viewer's
+/// posture and expires within `browse::COUNT_TTL`, whereas the flag would stay wrong until
+/// the next sync.
 ///
 /// That is a gap the pre-materialization feeds did not have: `graphql::updates` evaluates
 /// the same COALESCE live in SQL and has a Rust-side `filter_nsfw` backstop on top, and
@@ -712,13 +720,13 @@ async fn resync_feed_nsfw(pool: &SqlitePool, work_ids: &[String]) {
     // 32,766 bound-parameter limit.
     for chunk in work_ids.chunks(500) {
         let ph = in_placeholders(chunk.len());
-        for table in ["feed_updates", "feed_series_updates"] {
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
             // The outer COALESCE keeps the current value if the work row is somehow
-            // missing. It cannot be, on either table — `work_id` is a
+            // missing. It cannot be, on any of the three — `work_id` is a
             // `REFERENCES work(id) ON DELETE CASCADE` primary key, and the ids come from
             // `work`/`source_series` in the first place — but `is_nsfw` is NOT NULL, so
             // without it one impossible orphan would abort the statement and leave all
-            // 500 works in its chunk stale. `{table}` is one of the two literals below,
+            // 500 works in its chunk stale. `{table}` is one of the three literals above,
             // never input.
             let sql = format!(
                 "UPDATE {table} SET is_nsfw = COALESCE( \
@@ -1050,7 +1058,19 @@ async fn rating_summary_batch(pool: &SqlitePool, ids: &[String]) -> HashMap<Stri
         tracing::warn!(error = %e, "rating_summary_batch query failed");
         Vec::new()
     });
-    // (distribution[10], sum, count) per series — same fold as `rating_summary`.
+    fold_rating_rows(rows)
+}
+
+/// Fold `(key, score, votes)` groups into one [`RatingSummary`] per key — the same
+/// arithmetic `rating_summary` does for a single series.
+///
+/// Extracted so the two batch readers share it: [`rating_summary_batch`], which keys on
+/// whatever `reviews.series_id` literally holds, and [`rating_summary_by_work_batch`],
+/// which resolves both shapes of that column onto a work id. A duplicated fold would be a
+/// place for the star average on one surface to drift from the same work's average on
+/// another.
+fn fold_rating_rows(rows: Vec<(String, i64, i64)>) -> HashMap<String, RatingSummary> {
+    // (distribution[10], sum, count) per key.
     let mut acc: HashMap<String, (Vec<i32>, i64, i64)> = HashMap::new();
     for (sid, score, n) in rows {
         let e = acc
@@ -1073,6 +1093,50 @@ async fn rating_summary_batch(pool: &SqlitePool, ids: &[String]) -> HashMap<Stri
             )
         })
         .collect()
+}
+
+/// Review summaries for a page of canonical works, keyed by **work id** — resolving BOTH
+/// shapes of the polymorphic `reviews.series_id` in one query.
+///
+/// [`rating_summary_batch`] keys on the id `reviews` literally holds, which is correct for
+/// `updates_feed` (it asks with the same `reader_id` the reader would have posted under) but
+/// LOSES ratings for Browse: a MangaDex-anchored work carries a `w_…` `reader_id` while its
+/// review may have been filed under the numeric Suwayomi id of whichever source the reader
+/// had open. On production that is 2 of the 5 readable ratings. Rather than asking with a
+/// union of key shapes — which needs a second `source_series` lookup to even build, and then
+/// a fold in Rust to merge two keys onto one work — this pushes the resolution into the
+/// query, so it stays ONE round trip and the answer is per-work by construction.
+///
+/// The subquery is the same union `browse::RATED_PER_WORK_CTE` uses for the RATING sort;
+/// both arms yield a WORK id. Keeping them structurally identical is what makes "sorted by
+/// rating" agree with the star each card prints.
+async fn rating_summary_by_work_batch(
+    pool: &SqlitePool,
+    work_ids: &[String],
+) -> HashMap<String, RatingSummary> {
+    if work_ids.is_empty() {
+        return HashMap::new();
+    }
+    let ph = in_placeholders(work_ids.len());
+    let sql = format!(
+        "SELECT wid, score, COUNT(*) FROM ( \
+             SELECT r.series_id AS wid, r.score FROM reviews r \
+               WHERE r.series_id LIKE 'w!_%' ESCAPE '!' \
+           UNION ALL \
+             SELECT ss.work_id AS wid, r.score FROM reviews r \
+               JOIN source_series ss ON ss.source_key = r.series_id \
+                                    AND ss.source_type = 'suwayomi' \
+         ) WHERE wid IN ({ph}) GROUP BY wid, score"
+    );
+    let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+    for id in work_ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "rating_summary_by_work_batch query failed");
+        Vec::new()
+    });
+    fold_rating_rows(rows)
 }
 
 /// Batched read of the REAL newest-chapter time (`suwayomi_series.latest_chapter_at`,
@@ -1788,6 +1852,183 @@ async fn map_canonical_series(
         updated_at: latest_chapter_at.clone(),
         latest_chapter_at,
     }
+}
+
+/// The per-work `work` columns a Browse card needs that `browse_catalogue` does not store.
+/// Everything migration 0069 DOES store (title, cover, format, status, chapter count,
+/// release time, NSFW flag, catalogue-entry time) is read off the browse row and never
+/// looked up again — `created_at` moved onto that row in 0069, so it is no longer here.
+#[derive(sqlx::FromRow, Default, Clone)]
+struct BrowseWorkExtras {
+    id: String,
+    author: Option<String>,
+    artist: Option<String>,
+    description: Option<String>,
+    description_override: Option<String>,
+}
+
+/// Hydrate a page of `browse_catalogue` rows into `Series`, in FIVE grouped queries for
+/// the whole page.
+///
+/// WHY NOT `map_canonical_series`. That function costs 7-10 STRICTLY SERIAL queries per
+/// work (`load_canonical_work` alone is 3, plus chapters, plus
+/// `latest_english_chapter_at`, plus genres, plus the rating). At `BROWSE_PAGE_SIZE` = 30
+/// that is 210-300 serial round trips for one page; the FTS path, which does exactly that,
+/// measured 0.83-8.5 s cold. Migration 0064 exists precisely so a feed page does not have to
+/// re-derive per row, 0068 finished the job for the two columns Browse sorts and filters on,
+/// and 0069 extended the same row shape to the whole catalogue. So: 1 page scan + 1 memoized
+/// COUNT (both in `browse`) + the five below.
+///
+/// `Series.id` IS `browse_catalogue.reader_id`, NEVER `work_id`. 1,897 of the 115,567 rows
+/// have no MangaDex anchor, and `canonicalSeries` hard-rejects those
+/// (`if work.mangadex_id.is_none() { return Err("No such work") }`), so handing the grid a
+/// bare `w_…` for those works would produce 1,897 cards that 404 on click. 0064 chose
+/// `reader_id` for exactly this and 0069 keeps the rule: a MangaDex-anchored work carries its
+/// `w_…`, everything else its numeric Suwayomi id, and each opens the page that can actually
+/// serve it.
+async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> Vec<Series> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let work_ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
+    let ph = in_placeholders(work_ids.len());
+
+    // (1) Genres, with the admin > MangaDex > Suwayomi tier precedence already applied —
+    //     three grouped queries inside, and the only thing here that is not a single
+    //     statement. Same call every other batched feed makes, so a Browse card's chips
+    //     match the same work's chips on the home rows.
+    let genres = catalog::work_effective_genres_batch(&st.pool, &work_ids).await;
+    // (2) Ratings, keyed by work id across both `reviews.series_id` shapes.
+    let ratings = rating_summary_by_work_batch(&st.pool, &work_ids).await;
+    // (3) The `work` columns 0064 does not store.
+    let extras_sql = format!(
+        "SELECT id, author, artist, description, description_override \
+         FROM work WHERE id IN ({ph})"
+    );
+    let mut q = sqlx::query_as::<_, BrowseWorkExtras>(&extras_sql);
+    for id in &work_ids {
+        q = q.bind(id);
+    }
+    let extras: HashMap<String, BrowseWorkExtras> = q
+        .fetch_all(&st.pool)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "browse: work extras query failed"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.id.clone(), e))
+        .collect();
+    // (4) Alt titles. The reader's `SeriesFields` fragment selects `altTitles`, so dropping
+    //     them here would be a silent regression against the feed this replaces (which got
+    //     them from `map_series_batch`'s own alias batch).
+    let alias_sql =
+        format!("SELECT work_id, raw_title FROM work_alias WHERE work_id IN ({ph}) ORDER BY work_id, raw_title");
+    let mut qa = sqlx::query_as::<_, (String, String)>(&alias_sql);
+    for id in &work_ids {
+        qa = qa.bind(id);
+    }
+    let mut alts: HashMap<String, Vec<String>> = HashMap::new();
+    for (wid, raw) in qa
+        .fetch_all(&st.pool)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "browse: alt titles query failed"))
+        .unwrap_or_default()
+    {
+        alts.entry(wid).or_default().push(raw);
+    }
+
+    rows.into_iter()
+        .map(|r| {
+            let ex = extras.get(&r.work_id).cloned().unwrap_or_default();
+            // `cover_url` is a ready origin path; the Suwayomi fallback has to be
+            // absolutized at READ time because `image_base_url` is runtime config, not data
+            // (migration 0064). Same call `map_series` and `updates_feed` make.
+            let cover_url = match r.cover_url.as_deref() {
+                Some(u) if !u.is_empty() => u.to_string(),
+                _ => st.suwayomi.abs(r.suwayomi_thumbnail.as_deref()),
+            };
+            let mut alt_titles = alts.get(&r.work_id).cloned().unwrap_or_default();
+            alt_titles.retain(|t| t != &r.title);
+            // The card's recency label. `released_at` IS the newest real upstream release
+            // across both halves — the clock 0064 exists to normalize — so it is both
+            // `latestChapterAt` and `updatedAt` here, matching what
+            // `map_canonical_series` does (it sets `updated_at` to the same value so the
+            // existing `canonicalUpdates` ordering is unchanged).
+            //
+            // NULL for the 67,000 works with no dated chapter (migration 0069), which is a
+            // state the two fields express differently. `latestChapterAt` is documented as
+            // "empty when the series has no dated chapter cached yet", so it becomes `""` and
+            // the reader's `relTime` renders nothing rather than the epoch. `updatedAt` is
+            // `String!` and has no empty contract, so it falls back to the work's
+            // catalogue-entry time — which is the last thing we actually know about the work,
+            // and is why 0069 carries `created_at` on the row.
+            let released = r.released_at.map(epoch_ms_to_iso).unwrap_or_default();
+            Series {
+                // NEVER `work_id` — see the doc comment.
+                id: ID(r.reader_id.clone()),
+                title: r.title,
+                alt_titles,
+                author: ex.author,
+                artist: ex.artist,
+                description: ex.description_override.or(ex.description),
+                genres: genres.get(&r.work_id).cloned().unwrap_or_default(),
+                // A NULL `comic_type` cannot happen on a committed generation (the rebuild
+                // fills it inside its transaction and the scanner's incremental writer
+                // fills its own rows), but the column is nullable, so default rather than
+                // unwrap.
+                r#type: r
+                    .comic_type
+                    .as_deref()
+                    .and_then(comic_type_from_word)
+                    .unwrap_or(ComicType::Manga),
+                status: r
+                    .status
+                    .as_deref()
+                    .and_then(komika_status)
+                    .unwrap_or(SeriesStatus::Unknown),
+                cover_url,
+                // Derived from the id SHAPE, which is exactly what decides the destination:
+                // a `w_…` card opens the canonical (MangaDex-mirrored) page, a numeric one
+                // opens the Suwayomi path. The specific Suwayomi `source_id` is not stored
+                // on the feed row and is not worth a sixth query for a field the grid does
+                // not render.
+                source_id: if r.reader_id.starts_with("w_") {
+                    "mangadex".to_string()
+                } else {
+                    "suwayomi".to_string()
+                },
+                // THE SAME EXPRESSION the CHAPTERS sort orders by. If this came from
+                // anywhere else — `main_chapter_count`, the aggregate, `chapter_count` —
+                // then "sort by chapters" would visibly disagree with the badge on the card.
+                chapter_count: r.en_chapter_count as i32,
+                is_nsfw: r.is_nsfw,
+                rating: ratings
+                    .get(&r.work_id)
+                    .cloned()
+                    .unwrap_or_else(RatingSummary::empty),
+                // Not stored on the feed and not a Browse concern: scan policy belongs to
+                // the series page and the admin console. Same defaults
+                // `map_canonical_series` uses.
+                scan: ScanPolicy {
+                    avg_interval_hours: 0.0,
+                    override_interval_hours: None,
+                    poll_every_minutes: 30,
+                    paused: false,
+                    status_override: None,
+                    paused_override: None,
+                    poll_every_minutes_override: None,
+                    last_scanned_at: None,
+                    next_scan_at: None,
+                },
+                created_at: r.created_at.clone(),
+                updated_at: if released.is_empty() {
+                    r.created_at
+                } else {
+                    released.clone()
+                },
+                latest_chapter_at: released,
+            }
+        })
+        .collect()
 }
 
 /// Map a mirrored MangaDex chapter onto the shared `Chapter` shape. The chapter `id`
@@ -3029,19 +3270,37 @@ impl QueryRoot {
         Ok(groups)
     }
 
-    /// Catalogue search with optional genre + rating-range filters (S4 — drives the
-    /// refined UI's rating slider + genre chips). An empty query browses the
-    /// persisted catalogue from the DB cache (so filters apply across everything
-    /// materialized); a text query does a live source search. `genres` matches ANY
-    /// of the given genres; `minRating`/`maxRating` filter by the work's aggregate
-    /// user rating (0–10; a `minRating > 0` excludes unrated series). Filters are
-    /// applied to the result set (a text-query page is filtered post-fetch).
+    /// Catalogue search + Browse (S4).
     ///
-    /// `includeNsfw` is the admin-console escape hatch (see
-    /// `viewer_show_nsfw_or_admin`): honoured ONLY for an admin, ignored for everyone
-    /// else, so the reader's per-viewer gate is unchanged. Without it an opted-out admin
-    /// cannot find — let alone unflag — the ~2,500 mainstream works currently
-    /// mis-flagged NSFW.
+    /// An EMPTY query browses the whole BROWSABLE canonical catalogue — 115,567 works, from
+    /// the materialized `browse_catalogue` (migration 0069) — with every filter and sort
+    /// applied IN SQL, so `total` and `hasNextPage` describe the filtered set rather than a
+    /// slice of it. It used to read `suwayomi_series WHERE in_library = 1`, which was 13,847
+    /// works, keyed by numeric Suwayomi id, with one fixed ORDER BY and no format/status/
+    /// rating filter possible at all; then `feed_series_updates`, which was 48,567 — the
+    /// works with a chapter we can DATE.
+    ///
+    /// Those two numbers differ by 67,000 works and they are not the obscure tail: MangaDex
+    /// removes chapters when a series is licensed or claimed, so "no chapters upstream"
+    /// correlates with POPULAR (`Boku no Hero Academia`, `Nausicaä of the Valley of the Wind`,
+    /// `Houseki no Kuni`), and 3,239 of them already carry a Suwayomi source that will supply
+    /// chapters. `hasChapters: true` is the filter for a reader who only wants what they can
+    /// read right now; absent, they are included and sorted last on the recency ordering.
+    ///
+    /// A TEXT query does full-text search over the canonical `work` catalogue instead (see
+    /// below); the structural filters do not apply on that path.
+    ///
+    /// `genres` matches ANY of the given genres and is capped at
+    /// `browse::MAX_GENRE_FILTERS`. `minRating`/`maxRating` filter by the work's aggregate
+    /// user rating (0–10; `minRating > 0` excludes unrated works).
+    ///
+    /// NSFW: `contentRating` NARROWS within the viewer's NSFW posture and can never widen
+    /// it — for an opted-out viewer `EROTICA` and `PORNOGRAPHIC` return exactly the
+    /// `SUGGESTIVE` set. `includeNsfw` is the admin-console escape hatch (see
+    /// `viewer_show_nsfw_or_admin`): honoured ONLY for an admin, ignored for everyone else.
+    /// Without it an opted-out admin cannot find — let alone unflag — the ~2,500 mainstream
+    /// works currently mis-flagged NSFW.
+    #[allow(clippy::too_many_arguments)]
     async fn search(
         &self,
         ctx: &Context<'_>,
@@ -3051,38 +3310,90 @@ impl QueryRoot {
         min_rating: Option<f64>,
         max_rating: Option<f64>,
         #[graphql(
+            desc = "Browse only (empty query): restrict to these formats. WEBTOON folds \
+                    into MANHWA and COMIC into MANGA, matching how every reader surface \
+                    renders them. Applied over the WHOLE catalogue, so `total` describes \
+                    the filtered set."
+        )]
+        types: Option<Vec<ComicType>>,
+        #[graphql(desc = "Browse only (empty query): restrict to one publication status.")]
+        status: Option<SeriesStatus>,
+        #[graphql(
+            desc = "Browse only (empty query): ordering. Defaults to TRENDING (24h views), \
+                    which falls back to newest-first for everything unviewed."
+        )]
+        sort: Option<BrowseSort>,
+        #[graphql(
+            desc = "Browse only (empty query): the content-rating ceiling, cumulative. \
+                    The viewer's NSFW gate DOMINATES this: it can only narrow within \
+                    what the gate already allows, never widen past it, so for an \
+                    opted-out viewer EROTICA and PORNOGRAPHIC return the SUGGESTIVE set."
+        )]
+        content_rating: Option<ContentRatingFilter>,
+        #[graphql(
             desc = "Admin console only: include NSFW-flagged works regardless of the \
                     admin's own show_nsfw preference. Ignored for non-admin viewers."
         )]
         include_nsfw: Option<bool>,
+        #[graphql(
+            desc = "Browse only (empty query): `true` returns only works we know a chapter \
+                    for, `false` only works we know none for. Omit for the whole browsable \
+                    catalogue, which is the default and includes the 67k works whose \
+                    chapters were removed upstream (a licensed series) or come from a \
+                    non-MangaDex source."
+        )]
+        has_chapters: Option<bool>,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
         let trimmed = query.trim();
         let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await;
         if trimmed.is_empty() {
-            // F2: empty query → the filters are applied in SQL across the ENTIRE
-            // persisted catalogue and paginated, so `search(genres:["Action"])`
-            // returns the full catalogue-wide Action set (paged), not a slice of the
-            // first N. `total` is the filtered catalogue-wide count.
-            let genres_v = genres.unwrap_or_default();
-            let (total, mangas) = crate::series_cache::search_catalogue(
-                &st.pool,
-                &genres_v,
+            // Collapse to the three words `feed_series_updates.comic_type` stores. Asking
+            // for WEBTOON returns the manhwa set rather than nothing, which is the useful
+            // reading of the request — the refresh stores the collapsed word precisely so
+            // the filter is one indexed equality. Only the FIRST format is honoured: the
+            // column holds one value, so an OR over several would forfeit the index prefix
+            // (the exact degradation migration 0064's header is about), and the argument is
+            // a list only so the client does not need a schema change to gain multi-select
+            // once a strategy for it exists.
+            let type_word = types
+                .as_deref()
+                .and_then(|t| t.first().copied())
+                .map(collapsed_comic_type_word);
+            let status_word = status.map(status_word);
+            let rating_filter = content_rating.unwrap_or(ContentRatingFilter::All);
+            let tier = content_rating_tier(rating_filter);
+            let nsfw_only = content_rating_nsfw_only(rating_filter);
+            let genre_list = crate::browse::canonical_genres(&genres.unwrap_or_default());
+            let bq = crate::browse::BrowseQuery {
+                show_nsfw,
+                type_word,
+                status_word,
+                ratings: tier,
+                nsfw_only,
+                genres: &genre_list,
                 min_rating,
                 max_rating,
-                show_nsfw,
-                page.max(1) as i64,
-                PAGE_SIZE,
-            )
-            .await
-            .map_err(gql_err)?;
-            // Rust-side backstop mirroring `discovery`: `search_catalogue` gates in SQL,
-            // but that gate is a different expression in a file this resolver doesn't
-            // own — re-filtering on the already-resolved `Series.is_nsfw` (which uses
-            // COALESCE(is_nsfw_override, is_nsfw)) means an admin-marked work cannot leak
-            // to an opted-out viewer even if the SQL gate misses it.
-            let items = filter_nsfw(show_nsfw, map_series_list(st, mangas).await);
-            let has_next = (page.max(1) as i64) * PAGE_SIZE < total;
+                has_chapters,
+                // TRENDING by default — the only ordering that reflects what people are
+                // reading. It degrades to NEWEST for everything unviewed, so a cold view
+                // table cannot render Browse empty.
+                sort: sort.unwrap_or(BrowseSort::Trending),
+                page: page.max(1) as i64,
+            };
+            let (total, rows) = crate::browse::browse_catalogue(&st.pool, &bq)
+                .await
+                .map_err(gql_err)?;
+            // Rust-side backstop mirroring `discovery`. The SQL gate is `is_nsfw = 0` on a
+            // MATERIALIZED copy of `COALESCE(is_nsfw_override, is_nsfw)` in a file this
+            // resolver doesn't own, kept live by `resync_feed_nsfw`; re-filtering on the
+            // resolved `Series.is_nsfw` means an admin-marked work cannot leak to an
+            // opted-out viewer even if that copy is momentarily stale. There is a VERIFIED
+            // past leak on the sibling FTS branch below.
+            let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
+            // From `total`, not from a short page: the LIMIT is exactly BROWSE_PAGE_SIZE (no
+            // +1 probe row) and the COUNT shares the page query's WHERE verbatim.
+            let has_next = (page.max(1) as i64) * BROWSE_PAGE_SIZE < total;
             return Ok(SeriesPage {
                 items,
                 page,
@@ -3103,10 +3414,32 @@ impl QueryRoot {
         // post-fetch genre filter would wrongly empty the results, and any post-fetch
         // filter would corrupt the SQL-computed `total`/pagination. Title-match is the
         // dominant intent of a text query; the browse (empty-query) path keeps filters.
-        let (total, ids) =
-            catalog::search_works_fts(&st.pool, trimmed, show_nsfw, page.max(1) as i64, PAGE_SIZE)
-                .await
-                .map_err(gql_err)?;
+        //
+        // SAME `BROWSE_PAGE_SIZE` as the browse branch, and every `has_next` below uses it
+        // too. Both branches answer the same `search` field, so the client pages them with
+        // one pager and one page number — if they diverged, page 2 of a text search would
+        // start 10 rows past where page 1 ended.
+        //
+        // Interaction with `catalog::RANK_WINDOW` (500), VERIFIED: `search_works_fts` caps
+        // `total` at the window and binds `page_size.min(RANK_WINDOW)`, and its `cand` CTE
+        // takes the 500 bm25-best matches before the ranking re-sort. So the LAST reachable
+        // page is the one whose offset is still inside the window, and it is SHORT because
+        // 500 is not a multiple of 30: offset 480 returns rows 481..500, i.e. exactly 20
+        // rows on page 17, after which `has_next` is false (17*30 = 510 > 500) and page 18
+        // early-returns empty. At the old page size of 20 the same thing happened at page
+        // 25 (offset 480, 20 rows) — 500 is a multiple of 20, so the last page was FULL
+        // rather than short. Nothing breaks: `total` still bounds `has_next`, so the pager
+        // never offers page 18, and a short final page is a state it already handles (the
+        // over-range contract is "echo the page, return no rows").
+        let (total, ids) = catalog::search_works_fts(
+            &st.pool,
+            trimmed,
+            show_nsfw,
+            page.max(1) as i64,
+            BROWSE_PAGE_SIZE,
+        )
+        .await
+        .map_err(gql_err)?;
         // Mapping one result costs ~7 serial queries (`load_canonical_work` alone is 3),
         // so a 20-result page used to issue ~140 STRICTLY SERIAL round-trips — measured
         // at 0.83–8.5s cold on the anonymous path. A true batch would need grouped
@@ -3145,7 +3478,7 @@ impl QueryRoot {
         // `COALESCE(is_nsfw_override, is_nsfw)` (see `map_canonical_series`), so this
         // catches admin-marked works the FTS SQL gate misses.
         let items = filter_nsfw(show_nsfw, items);
-        let has_next = (page.max(1) as i64) * PAGE_SIZE < total;
+        let has_next = (page.max(1) as i64) * BROWSE_PAGE_SIZE < total;
         Ok(SeriesPage {
             items,
             page,
@@ -3154,12 +3487,25 @@ impl QueryRoot {
         })
     }
 
-    /// The available genre/tag facets across the persisted catalogue (S4), most
-    /// common first — the full set the sources provide, for the search UI's genre
-    /// filter. Empty until the catalogue has been persisted (ingest/scan/persistCatalogue).
+    /// The genre facets Browse renders as filter chips (S4), most common first then
+    /// alphabetical — read from the materialized `feed_genre_facet` table (migration 0068)
+    /// and gated by the viewer's own NSFW posture.
+    ///
+    /// EACH COUNT IS NOW THE COUNT THE FILTER RETURNS. It was not: the facets came from
+    /// JSON-parsing all 13,847 `suwayomi_series.genre` blobs on every request (300-465 ms,
+    /// 301 distinct entries, top entry literally "Japanese", no NSFW gate) while the genre
+    /// FILTER ran against `work_tag` over the canonical catalogue — so a chip labelled
+    /// "Action · 4,102" returned a different number of results. Both sides now derive from
+    /// `work_tag` joined to `feed_series_updates`, in the same transaction that rebuilds the
+    /// feed.
+    ///
+    /// Empty until MangaDex tags are ingested into `work_tag` (migration 0066 added the
+    /// column and the reverse index; the table holds 0 rows in production today). An empty
+    /// chip list is the deliberate choice over 301 wrong ones.
     async fn genre_facets(&self, ctx: &Context<'_>) -> Result<Vec<GenreFacet>> {
         let st = state(ctx);
-        Ok(crate::series_cache::genre_facets(&st.pool)
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        Ok(crate::browse::genre_facets(&st.pool, show_nsfw)
             .await
             .map_err(gql_err)?
             .into_iter()
@@ -11834,6 +12180,823 @@ mod tests {
              `total` must agree with the empty page"
         );
         assert!(d["items"].as_array().unwrap().is_empty());
+    }
+
+    // ---- Browse / search(query: "") over the canonical catalogue (migration 0068) -----
+    //
+    // Browse used to read `suwayomi_series WHERE in_library = 1` (13,847 of 48,526
+    // readable works) with a fixed ORDER BY and no format/status/rating filter. It now
+    // pages `feed_series_updates`. Every test below builds the table through the real
+    // `refresh_feed_updates`, so the SQL that ships is the SQL under test.
+
+    /// Seed one canonical work with the columns Browse filters and sorts on, plus `chapters`
+    /// English chapters so `en_chapter_count` is a real number.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_browse_work(
+        pool: &SqlitePool,
+        md_id: &str,
+        title: &str,
+        lang: &str,
+        status: &str,
+        content_rating: &str,
+        nsfw: bool,
+        chapters: usize,
+        tags: &[&str],
+    ) -> String {
+        let work_id = crate::catalog::upsert_work_from_mangadex(
+            pool,
+            md_id,
+            &crate::catalog::WorkInput {
+                primary_title: Some(title.to_string()),
+                original_language: Some(lang.to_string()),
+                status: Some(status.to_string()),
+                content_rating: Some(content_rating.to_string()),
+                is_nsfw: nsfw,
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(pool, "mangadex", "mangadex", md_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for i in 1..=chapters {
+            crate::catalog::upsert_chapter(
+                pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: format!("{md_id}-{i}"),
+                    number: Some(i.to_string()),
+                    lang: Some("en".into()),
+                    // Distinct, ordered publish times so `released_at` is deterministic.
+                    published_at: Some(format!("2026-07-{:02}T00:00:00Z", (i % 27) + 1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        work_id
+    }
+
+    /// PAGE SIZE. Browse pages at 30 while the rest of the API stays at 20 — the two are
+    /// separate constants because `PAGE_SIZE` is shared by ~24 unrelated sites (and asserted
+    /// as 20 by their own tests). The grid needs a page that fills a wide viewport; the
+    /// admin lists and social feeds do not.
+    ///
+    /// Both branches of `search` use the SAME size, which is the part that can silently
+    /// break: they answer one field, so the client drives them with one pager and one page
+    /// number — if they diverged, page 2 of a text search would start 10 rows past where
+    /// page 1 ended.
+    #[tokio::test]
+    async fn browse_pages_at_thirty_while_the_rest_of_the_api_stays_at_twenty() {
+        assert_eq!(BROWSE_PAGE_SIZE, 30);
+        assert_eq!(PAGE_SIZE, 20, "shared page size must not move");
+        let (s, pool) = setup_full(100).await;
+        let n = BROWSE_PAGE_SIZE + 5;
+        for i in 0..n {
+            seed_canonical(
+                &pool,
+                &format!("md-b{i:03}"),
+                &format!("Browse {i:03}"),
+                false,
+                "1",
+            )
+            .await;
+        }
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        // `setup_full` also seeds the two `w_s1`/`w_s2` comment-target works, which have a
+        // `source_series` and NO chapter — so they are absent from `feed_series_updates` and
+        // PRESENT in `browse_catalogue` (migration 0069). Browse is the whole browsable
+        // catalogue now, so they count. That is the behaviour change, not an artefact: before
+        // 0069 this total was `n`.
+        let total = n + 2;
+
+        let page = |p: i64| {
+            let s = &s;
+            async move {
+                let q = format!(
+                    r#"{{ search(query: "", page: {p}, sort: NEWEST) {{ total hasNextPage items {{ id }} }} }}"#
+                );
+                let r = exec(s, &q, Some("bobtok"), "1.1.1.1").await;
+                assert!(r.errors.is_empty(), "page {p}: {:?}", r.errors);
+                r.data.into_json().unwrap()["search"].clone()
+            }
+        };
+        let p1 = page(1).await;
+        assert_eq!(p1["total"], serde_json::json!(total));
+        assert_eq!(
+            p1["items"].as_array().unwrap().len() as i64,
+            BROWSE_PAGE_SIZE
+        );
+        assert_eq!(p1["hasNextPage"], serde_json::json!(true));
+        let p2 = page(2).await;
+        assert_eq!(
+            p2["items"].as_array().unwrap().len() as i64,
+            total - BROWSE_PAGE_SIZE
+        );
+        assert_eq!(p2["hasNextPage"], serde_json::json!(false));
+
+        // Pages are DISJOINT and cover the set exactly — the each_key_duplicate trap.
+        let mut ids: Vec<String> = [p1, p2]
+            .iter()
+            .flat_map(|p| {
+                p["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids.len() as i64, total);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len() as i64, total, "a work appeared on both pages");
+
+        // The `updatesFeed` page size is untouched at PAGE_SIZE.
+        let r = exec(
+            &s,
+            r#"{ updatesFeed { items { id } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            r.data.into_json().unwrap()["updatesFeed"]["items"]
+                .as_array()
+                .unwrap()
+                .len() as i64,
+            PAGE_SIZE
+        );
+    }
+
+    /// `Series.id` MUST be `browse_catalogue.reader_id`, never `work_id`.
+    ///
+    /// 1,897 of the 115,567 browse rows have no MangaDex anchor, and `canonicalSeries`
+    /// rejects those outright (`if work.mangadex_id.is_none() { Err("No such work") }`) — so
+    /// returning `work_id` would put 1,897 cards on the grid that 404 the moment they are
+    /// clicked. 0064 stores `reader_id` for exactly this reason and 0069 keeps the rule: such
+    /// a work is reachable only by its numeric Suwayomi id.
+    #[tokio::test]
+    async fn browse_id_is_the_reader_id_so_an_unanchored_work_stays_openable() {
+        let (s, pool) = setup_full(100).await;
+        // A work with NO MangaDex source — only a scanner-detected Suwayomi one.
+        let wid = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Suwayomi Only".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        seed_suwayomi_half(
+            &pool,
+            &wid,
+            4242,
+            "Suwayomi Only",
+            Some("1784937600000"),
+            Some("2026-07-25T00:00:00+00:00"),
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ search(query: "", sort: NEWEST) { items { id title } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let items = r.data.into_json().unwrap()["search"]["items"].clone();
+        assert_eq!(items[0]["title"], serde_json::json!("Suwayomi Only"));
+        assert_eq!(
+            items[0]["id"],
+            serde_json::json!("4242"),
+            "an unanchored work must be handed out under its numeric Suwayomi id"
+        );
+
+        // And the proof that the alternative would 404: the canonical path refuses the
+        // work id for exactly this work.
+        let q = format!(r#"{{ canonicalSeries(workId: "{wid}") {{ id }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "No such work");
+    }
+
+    /// `browse_catalogue` must hold EVERY browsable work — one row per `work` that has at
+    /// least one `source_series` — and nothing else.
+    ///
+    /// The membership rule is the whole contract of migration 0069, and both halves of it are
+    /// easy to break in the same edit: a stricter join silently re-shrinks Browse to the works
+    /// with chapters (which is what it was), and a missing exclusion puts a card on the grid
+    /// that opens nothing on either the canonical or the Suwayomi path (2 such works in
+    /// production).
+    #[tokio::test]
+    async fn browse_catalogue_holds_every_browsable_work_and_excludes_the_sourceless() {
+        let (_s, pool) = setup_full(100).await;
+        // One of each kind: MangaDex-anchored WITH chapters, MangaDex-anchored WITHOUT,
+        // Suwayomi-only, and a work with no source at all.
+        seed_canonical(&pool, "md-has", "Has Chapters", false, "1").await;
+        seed_browse_work(
+            &pool,
+            "md-none",
+            "No Chapters",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            0,
+            &[],
+        )
+        .await;
+        let suw = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Suwayomi Only".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        seed_suwayomi_half(&pool, &suw, 4242, "Suwayomi Only", None, None).await;
+        let orphan = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("No Source At All".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let browsable = count(
+            "SELECT COUNT(*) FROM work w WHERE EXISTS \
+                 (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)",
+        )
+        .await;
+        assert_eq!(
+            count("SELECT COUNT(*) FROM browse_catalogue").await,
+            browsable,
+            "one row per work with a source — no more (a sourceless work leaked in) and no \
+             fewer (the chapter join came back)"
+        );
+        // And the excluded work really is the sourceless one.
+        let has_orphan: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE work_id = ?")
+                .bind(&orphan)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            has_orphan, 0,
+            "a work with nothing to open must not be a card"
+        );
+        // The feed remains the strictly smaller set, which is what makes this table exist.
+        assert!(
+            count("SELECT COUNT(*) FROM feed_series_updates").await < browsable,
+            "the updates feed must stay the subset it is defined as"
+        );
+    }
+
+    /// A chapterless work must be BROWSABLE and its card must OPEN.
+    ///
+    /// This is the entire user-visible point of migration 0069, and the failure mode it is
+    /// guarding is specific: `browse_catalogue.reader_id` is what the grid navigates to, and
+    /// `canonicalSeries` hard-rejects a work with no MangaDex anchor — so a chapterless
+    /// MangaDex work MUST be handed out as its `w_…` id (which resolves) and a chapterless
+    /// Suwayomi-only work as its numeric id (which the canonical path would 404).
+    #[tokio::test]
+    async fn a_chapterless_work_is_browsable_and_its_card_opens() {
+        let (s, pool) = setup_full(100).await;
+        // The real-world shape: a licensed series MangaDex has removed every chapter from.
+        // Anchored, catalogued, zero chapters.
+        let wid = seed_browse_work(
+            &pool,
+            "md-licensed",
+            "Boku no Hero Academia",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            0,
+            &[],
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ search(query: "", sort: NEWEST) { total items { id title chapterCount latestChapterAt updatedAt } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = r.data.into_json().unwrap()["search"].clone();
+        let card = d["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["title"] == serde_json::json!("Boku no Hero Academia"))
+            .expect("a chapterless work must appear in Browse")
+            .clone();
+        assert_eq!(card["id"], serde_json::json!(wid), "anchored → its `w_` id");
+        assert_eq!(card["chapterCount"], serde_json::json!(0));
+        assert_eq!(
+            card["latestChapterAt"],
+            serde_json::json!(""),
+            "`latestChapterAt` is documented as EMPTY when nothing is dated — never the epoch"
+        );
+        let entered: String = sqlx::query_scalar("SELECT created_at FROM work WHERE id = ?")
+            .bind(&wid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            card["updatedAt"],
+            serde_json::json!(entered),
+            "`updatedAt` is String! and has no empty contract, so it falls back to the work's \
+             catalogue-entry time — the last thing we actually know about the work"
+        );
+
+        // The click. Anything less than this passing means 67,000 cards that 404.
+        let q = format!(r#"{{ canonicalSeries(workId: "{wid}") {{ id title }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(
+            r.errors.is_empty(),
+            "a chapterless work's card must open: {:?}",
+            r.errors
+        );
+    }
+
+    /// REGRESSION GUARD, the one that matters most about migration 0069: Browse's move to a
+    /// wider table must NOT have leaked chapterless works into the UPDATES feed.
+    ///
+    /// `feed_series_updates.released_at` is NOT NULL by contract — "a work with no dated
+    /// chapter is not an update, so it is EXCLUDED" (0064's header) — and the pager's
+    /// arithmetic on `/updates` is only honest if every counted row is a placeable row. 0069
+    /// deliberately built a second table instead of widening this one; this test is what says
+    /// so in executable form.
+    #[tokio::test]
+    async fn chapterless_works_stay_out_of_the_updates_feed() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-dated", "Dated Work", false, "1").await;
+        seed_browse_work(
+            &pool,
+            "md-undated",
+            "Undated Work",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            0,
+            &[],
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        // The table: present in Browse's, absent from the feed's, and the feed still has no
+        // NULL sort key anywhere.
+        let one = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            one("SELECT COUNT(*) FROM browse_catalogue WHERE released_at IS NULL").await,
+            3,
+            "the undated work plus `setup_full`'s two chapterless comment targets"
+        );
+        assert_eq!(
+            one(
+                "SELECT COUNT(*) FROM feed_series_updates \
+                 WHERE work_id IN (SELECT work_id FROM browse_catalogue WHERE released_at IS NULL)"
+            )
+            .await,
+            0,
+            "a chapterless work must never gain a feed row"
+        );
+
+        // And the resolver: `updatesFeed` shows only the dated work.
+        let r = exec(
+            &s,
+            r#"{ updatesFeed { total items { title } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = r.data.into_json().unwrap()["updatesFeed"].clone();
+        let titles: Vec<&str> = d["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            ["Dated Work"],
+            "the updates feed is unchanged by 0069"
+        );
+        assert_eq!(d["total"], serde_json::json!(1));
+    }
+
+    /// Format / status / content-rating filters narrow the WHOLE catalogue, so `total`
+    /// describes the filtered set rather than a slice of it — the thing the old
+    /// `suwayomi_series` path could not do at all (it had no column for any of the three).
+    #[tokio::test]
+    async fn browse_filters_narrow_the_whole_catalogue_and_total_follows() {
+        let (s, pool) = setup_full(100).await;
+        // ja/ONGOING/safe, ko/COMPLETED/suggestive, zh/ON_HIATUS/erotica(+nsfw).
+        seed_browse_work(
+            &pool,
+            "md-f1",
+            "Alpha",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            3,
+            &["Action"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-f2",
+            "Beta",
+            "ko",
+            "COMPLETED",
+            "suggestive",
+            false,
+            5,
+            &["Romance"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-f3",
+            "Gamma",
+            "zh",
+            "ON_HIATUS",
+            "erotica",
+            true,
+            2,
+            &["Action"],
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let ask = |args: String| {
+            let s = &s;
+            async move {
+                let q = format!(r#"{{ search(query: "", {args}) {{ total items {{ title }} }} }}"#);
+                let r = exec(s, &q, Some("bobtok"), "1.1.1.1").await;
+                assert!(r.errors.is_empty(), "{q}: {:?}", r.errors);
+                let d = r.data.into_json().unwrap()["search"].clone();
+                let titles: Vec<String> = d["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["title"].as_str().unwrap().to_string())
+                    .collect();
+                (d["total"].as_i64().unwrap(), titles)
+            }
+        };
+        // bobtok is opted OUT, so Gamma (nsfw) is invisible from the start. The other two
+        // rows are `setup_full`'s chapterless `w_s1`/`w_s2` comment-target works: they have a
+        // `source_series` and no chapter, so they are absent from `feed_series_updates` and
+        // PRESENT in `browse_catalogue` (migration 0069) — before it, this total was 2. Every
+        // per-facet assertion below therefore says `hasChapters: true`, which scopes it back
+        // to the three works this test seeds rather than re-baselining nine expectations
+        // against a shared fixture.
+        assert_eq!(ask("sort: NEWEST".into()).await.0, 4);
+        // ...and `hasChapters: true` is what recovers the readable-only view.
+        assert_eq!(
+            ask("hasChapters: true, sort: NEWEST".into()).await,
+            (2, vec!["Beta".to_string(), "Alpha".to_string()]),
+            "hasChapters must narrow to the works with a known chapter, total included"
+        );
+        assert_eq!(
+            ask("hasChapters: false, sort: NEWEST".into()).await.0,
+            2,
+            "and its complement is the chapterless half, which is the new part of Browse"
+        );
+        // Format: `original_language` drives `comic_type`, collapsed at write time.
+        assert_eq!(
+            ask("types: [MANHWA], hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Beta"]
+        );
+        assert_eq!(
+            ask("types: [MANGA], hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Alpha"]
+        );
+        // WEBTOON folds into MANHWA rather than returning nothing.
+        assert_eq!(
+            ask("types: [WEBTOON], hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Beta"]
+        );
+        // Status, over the NORMALIZED vocabulary. Gamma's upstream `ON_HIATUS` is stored as
+        // `HIATUS`, which is the only word the enum can even express — un-normalized it
+        // would be unreachable by every filter value.
+        assert_eq!(
+            ask("status: COMPLETED, hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Beta"]
+        );
+        assert_eq!(
+            ask("status: ONGOING, hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Alpha"]
+        );
+        let hiatus_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates WHERE status = 'HIATUS'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hiatus_rows, 1, "ON_HIATUS must be stored as HIATUS");
+        // Content-rating tiers are cumulative, and cannot widen past the NSFW gate: the
+        // erotica work stays hidden from this opted-out viewer at EVERY tier.
+        assert_eq!(
+            ask("contentRating: SAFE, hasChapters: true, sort: NEWEST".into())
+                .await
+                .1,
+            ["Alpha"]
+        );
+        assert_eq!(
+            ask("contentRating: SUGGESTIVE, hasChapters: true, sort: NEWEST".into())
+                .await
+                .0,
+            2
+        );
+        assert_eq!(
+            ask("contentRating: PORNOGRAPHIC, hasChapters: true, sort: NEWEST".into()).await,
+            ask("contentRating: SUGGESTIVE, hasChapters: true, sort: NEWEST".into()).await,
+            "a rating tier must never widen the viewer's NSFW gate"
+        );
+        // Opted IN, the erotica work appears — and only then.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            ask("contentRating: EROTICA, hasChapters: true, sort: NEWEST".into())
+                .await
+                .0,
+            3
+        );
+    }
+
+    /// The `chapterCount` a card prints and the key the CHAPTERS sort orders by must be the
+    /// SAME expression (`en_chapter_count`), or "sort by chapters" visibly disagrees with
+    /// the badge on the card it just ordered.
+    #[tokio::test]
+    async fn browse_chapter_count_is_the_chapters_sort_key() {
+        let (s, pool) = setup_full(100).await;
+        for (md, title, n) in [
+            ("md-c1", "Few", 2),
+            ("md-c2", "Many", 9),
+            ("md-c3", "Some", 5),
+        ] {
+            seed_browse_work(&pool, md, title, "ja", "ONGOING", "safe", false, n, &[]).await;
+        }
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        let r = exec(
+            &s,
+            r#"{ search(query: "", sort: CHAPTERS) { items { title chapterCount } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let items = r.data.into_json().unwrap()["search"]["items"].clone();
+        let pairs: Vec<(String, i64)> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["title"].as_str().unwrap().to_string(),
+                    i["chapterCount"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("Many".to_string(), 9),
+                ("Some".to_string(), 5),
+                ("Few".to_string(), 2),
+                // `setup_full`'s two chapterless comment-target works, which Browse carries
+                // as of migration 0069. They print 0 and sort LAST under `en_chapter_count
+                // DESC` — where a work we know no chapter for belongs — and the reader turns
+                // that 0 into "No chapters yet" rather than "Ch. 0" (see the browse page's
+                // `cardSub`). `w_s2` before `w_s1` is the mandatory `work_id DESC` tiebreak.
+                ("Fixture s2".to_string(), 0),
+                ("Fixture s1".to_string(), 0),
+            ],
+            "the printed count must be the very key the order was computed from"
+        );
+    }
+
+    /// The feed stores a COPY of the effective NSFW flag so Browse can pin `is_nsfw = 0` as
+    /// an index prefix. `resync_feed_nsfw` rewrites that copy on every admin mark; without
+    /// it, an admin's "mark NSFW" would leave the work on Browse — and counted in `total` —
+    /// for up to a full sync cycle. This is the Browse half of the guarantee
+    /// `updates_feed_honours_an_admin_nsfw_mark_before_the_next_rebuild` pins for Updates,
+    /// and it is what `series_cache`'s override test used to cover through
+    /// `search_catalogue`'s own `total`.
+    #[tokio::test]
+    async fn browse_total_and_page_follow_an_admin_nsfw_mark() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-mark", "Reclassified", false, "1").await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        let wid = work_id_of(&pool, "md-mark").await;
+
+        let browse = || {
+            let s = &s;
+            async move {
+                let r = exec(
+                    s,
+                    r#"{ search(query: "", sort: NEWEST) { total items { title } } }"#,
+                    Some("bobtok"),
+                    "1.1.1.1",
+                )
+                .await;
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                r.data.into_json().unwrap()["search"].clone()
+            }
+        };
+        // 3 = the marked work plus `setup_full`'s two chapterless comment-target works, which
+        // Browse carries as of migration 0069.
+        assert_eq!(browse().await["total"], serde_json::json!(3));
+
+        let m = format!(
+            r#"mutation {{ updateSeriesMetadata(input: {{ seriesId: "{wid}", isNsfw: true }}) {{ id }} }}"#
+        );
+        let r = exec(&s, &m, Some("admintok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "mark failed: {:?}", r.errors);
+
+        let d = browse().await;
+        assert_eq!(
+            d["total"],
+            serde_json::json!(2),
+            "an opted-out viewer must not see a work the admin just marked NSFW, and \
+             `total` must agree with the shortened page"
+        );
+        let titles: Vec<&str> = d["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap())
+            .collect();
+        assert!(
+            !titles.contains(&"Reclassified"),
+            "the marked work is still on the page: {titles:?} — `resync_feed_nsfw` must \
+             rewrite `browse_catalogue.is_nsfw`, not just the two feed tables"
+        );
+    }
+
+    /// A facet's COUNT must equal the number of results clicking that chip returns.
+    ///
+    /// It never did before: facets came from JSON-parsing 13,847 `suwayomi_series.genre`
+    /// blobs per request (301 entries, no NSFW gate, top entry literally "Japanese") while
+    /// the genre FILTER ran against `work_tag` over the canonical catalogue. Both sides now
+    /// derive from `work_tag` joined to `feed_series_updates`, in the transaction that
+    /// rebuilds the feed — so this equality is structural, and this test is what keeps the
+    /// two statements from drifting.
+    #[tokio::test]
+    async fn genre_facet_counts_equal_what_the_genre_filter_returns() {
+        let (s, pool) = setup_full(100).await;
+        seed_browse_work(
+            &pool,
+            "md-g1",
+            "One",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            1,
+            &["Action", "Drama"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-g2",
+            "Two",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            1,
+            &["Action"],
+        )
+        .await;
+        // NSFW, and the only carrier of "Ecchi" — so an opted-out viewer must not be offered
+        // that chip at all (a chip that returns an empty page is worse than no chip).
+        seed_browse_work(
+            &pool,
+            "md-g3",
+            "Three",
+            "ja",
+            "ONGOING",
+            "erotica",
+            true,
+            1,
+            &["Action", "Ecchi"],
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let facets = |tok: &'static str| {
+            let s = &s;
+            async move {
+                let r = exec(
+                    s,
+                    r#"{ genreFacets { genre count } }"#,
+                    Some(tok),
+                    "1.1.1.1",
+                )
+                .await;
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                r.data.into_json().unwrap()["genreFacets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| {
+                        (
+                            f["genre"].as_str().unwrap().to_string(),
+                            f["count"].as_i64().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<(String, i64)>>()
+            }
+        };
+        // Opted out: Action counts 2 (the NSFW carrier is excluded) and Ecchi is absent.
+        let anon = facets("bobtok").await;
+        assert_eq!(
+            anon[0],
+            ("Action".to_string(), 2),
+            "most common first: {anon:?}"
+        );
+        assert!(
+            !anon.iter().any(|(g, _)| g == "Ecchi"),
+            "a tag only NSFW works carry must not be offered: {anon:?}"
+        );
+        // THE equality: every chip's count is the filter's `total`.
+        for (genre, count) in &anon {
+            let q = format!(
+                r#"{{ search(query: "", genres: ["{genre}"], sort: NEWEST) {{ total }} }}"#
+            );
+            let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+            assert!(r.errors.is_empty(), "{q}: {:?}", r.errors);
+            assert_eq!(
+                r.data.into_json().unwrap()["search"]["total"]
+                    .as_i64()
+                    .unwrap(),
+                *count,
+                "facet {genre} promised {count}"
+            );
+        }
+        // Opted in: the same chips carry the wider counts, Ecchi included.
+        exec(
+            &s,
+            r#"mutation { setShowNsfw(value: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let opted = facets("bobtok").await;
+        assert_eq!(opted[0], ("Action".to_string(), 3));
+        assert!(opted.contains(&("Ecchi".to_string(), 1)));
     }
 
     /// `released_at` is stored as epoch millis and converted back to ISO on the wire.

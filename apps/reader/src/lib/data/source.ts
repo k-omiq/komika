@@ -13,6 +13,7 @@ import type {
 	Chapter,
 	ComicType as DomainComicType,
 	DiscoveryFeed,
+	Page,
 	Series,
 	SeriesProgress,
 	SeriesStatus,
@@ -20,6 +21,10 @@ import type {
 	UpdateFeedRow,
 	WorkSource,
 } from '@komika/types';
+// The two Browse enums are wire vocabulary with no reader-side equivalent (there is no
+// "sort" or "content rating" in the view model), so they travel as the API's own tokens
+// rather than being mirrored into a view type that would only ever be mapped 1:1.
+import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 import { backend, images } from '$lib/context';
 import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
 import { config } from '$lib/config';
@@ -317,6 +322,13 @@ function toFeedCard(u: UpdateFeedRow): Card {
 	};
 }
 
+/** A `Series` → grid card fields.
+ *
+ *  `ch` is the server's `chapterCount`, which is legitimately **0** now that Browse pages
+ *  the whole catalogue (the ~67k works whose chapters MangaDex removed on licensing, or
+ *  that will get them from another source). It is a NUMBER here on purpose — the label is
+ *  the caller's, because "0" has to read as "No chapters yet" on a browse card and as
+ *  nothing at all in a progress line. See `cardSub` in the browse route. */
 function toCatalogEntry(s: Series, i: number): CatalogEntry {
 	// `added` stays the positional (backend-order) index for back-compat; `addedAt`
 	// carries the real catalogue-entry timestamp so Browse "Newest" can sort by
@@ -745,21 +757,57 @@ export async function getFederatedSearch(query: string): Promise<SearchOutcome> 
 	}
 }
 
-/** Browse-search filters applied server-side where supported (S4). */
+/**
+ * Browse-search filters applied server-side (S4).
+ *
+ * `types` / `status` are in the READER's vocabulary ('Manhwa', 'ongoing') because that
+ * is what the Browse rail holds; {@link getNativeSearch} translates them to the wire
+ * enums through the same bridges the rest of this module uses, so there is exactly one
+ * place where 'Manhwa' becomes 'MANHWA'.
+ *
+ * `types` / `status` / `sort` / `contentRating` are honoured on the BROWSE (empty-query)
+ * path ONLY — the server orders a text query by relevance and ignores them. Passing
+ * them alongside a query is harmless but does nothing; callers must not tell the viewer
+ * otherwise.
+ */
 export interface CatalogFilters {
 	/** Match any of these genres (case-insensitive). Empty → no genre filter. */
 	genres?: string[];
 	/** Inclusive rating bounds on the 0–10 scale. */
 	minRating?: number;
 	maxRating?: number;
+	/** Match any of these formats. Empty → no format filter. */
+	types?: ComicType[];
+	/** Publication status; omit for any. */
+	status?: Status;
+	/** Result ordering. Omit to take the server's default (TRENDING). */
+	sort?: BrowseSort;
+	/** Content-rating ceiling. The server clamps it to the viewer's NSFW posture, so it
+	 *  can only ever narrow — it is not an opt-in. */
+	contentRating?: ContentRatingFilter;
+	/**
+	 * Restrict to series we know a chapter for. OMIT (not `false`) for everything —
+	 * `false` is a meaningful value on the wire (only series with NO chapters).
+	 *
+	 * Browse pages the whole catalogue, including the ~67k works with no chapter yet:
+	 * MangaDex removes chapters when a series is licensed, so "no chapters" tracks
+	 * POPULAR, not obscure, and those works get their chapters from another source.
+	 * This is the switch for a reader who only wants what they can open right now.
+	 */
+	hasChapters?: boolean;
 }
 
 /**
  * Native (public) catalogue search — the pre-federation path, available to
- * anonymous viewers, and the whole-catalogue browse when `query` is empty. Genre
- * / rating `filters` are applied server-side (S4). Rows carry no translator tags
- * (single source). Never rejects; `error` is true only on a genuine backend
- * failure (an empty query with no error is an honest "no results").
+ * anonymous viewers, and the whole-catalogue browse when `query` is empty. ALL
+ * `filters` are applied server-side (S4), including format/status/sort/content-rating
+ * on the browse path, so `total` and `hasNext` describe the filtered catalogue rather
+ * than the page. Rows carry no translator tags (single source). Never rejects; `error`
+ * is true only on a genuine backend failure (an empty query with no error is an honest
+ * "no results").
+ *
+ * Browse pages at 30 rows, not the API-wide 20 — see `BROWSE_PAGE_SIZE` in
+ * `$lib/data/paging`, which the caller's pager arithmetic must use.
  */
 export async function getNativeSearch(
 	query: string,
@@ -781,6 +829,16 @@ export async function getNativeSearch(
 			genres: filters.genres,
 			minRating: filters.minRating,
 			maxRating: filters.maxRating,
+			// View → wire, through the SAME bridges the domain→view mappers invert. An
+			// empty selection is left `undefined`, not `[]`: the resolver reads `[]` as an
+			// empty IN (…) and returns nothing, so "no format chosen" would empty the grid.
+			types: filters.types?.length ? filters.types.map((t) => VIEW_TO_DOMAIN_TYPE[t]) : undefined,
+			status: filters.status ? VIEW_TO_DOMAIN_STATUS[filters.status] : undefined,
+			sort: filters.sort,
+			contentRating: filters.contentRating,
+			// Passed through as-is, `undefined` included: absent is "no clause" and `false`
+			// means "only series with no chapters", so they cannot be conflated.
+			hasChapters: filters.hasChapters,
 		});
 		hasNext = res.hasNextPage ?? false;
 		total = res.total ?? null;
@@ -996,10 +1054,7 @@ async function fetchUpdatesFeed(
 }> {
 	if (backend.updatesFeed) {
 		try {
-			return await backend.updatesFeed(
-				page,
-				type ? (VIEW_TO_DOMAIN_TYPE[type] as DomainComicType) : undefined,
-			);
+			return await backend.updatesFeed(page, type ? VIEW_TO_DOMAIN_TYPE[type] : undefined);
 		} catch {
 			// Fall through. Deliberately silent: `live()` already reports backend failure
 			// to the screen, and this path is a successful degradation, not an error.
@@ -1028,7 +1083,7 @@ async function fetchUpdatesFeed(
 		workId: c.id ?? '',
 		title: c.title,
 		coverUrl: c.cover ?? null,
-		type: c.type ? (VIEW_TO_DOMAIN_TYPE[c.type] as DomainComicType) : null,
+		type: c.type ? VIEW_TO_DOMAIN_TYPE[c.type] : null,
 		latestChapter: c.ch ? c.ch.replace(/^Ch\.\s*/, '') : null,
 		latestChapterTitle: null,
 		chapterCount: null,
@@ -1056,11 +1111,29 @@ function unratedToNull(rating: string): number | null {
 
 /** Reader format label → the domain enum the API takes. Inverse of {@link toViewType},
  *  which collapses WEBTOON→Manhwa and COMIC→Manga; the server applies the same collapse
- *  to its materialized `comic_type`, so these three words round-trip exactly. */
-const VIEW_TO_DOMAIN_TYPE: Record<ComicType, string> = {
+ *  to its materialized `comic_type`, so these three words round-trip exactly.
+ *
+ *  Typed to `DomainComicType` rather than `string` so callers can hand the result
+ *  straight to an API argument — it used to need an `as DomainComicType` at every use,
+ *  which is a cast that would have kept compiling had a value here gone wrong. */
+const VIEW_TO_DOMAIN_TYPE: Record<ComicType, DomainComicType> = {
 	Manga: 'MANGA',
 	Manhwa: 'MANHWA',
 	Manhua: 'MANHUA',
+};
+
+/** Reader status word → the domain enum the API takes; the exact inverse of
+ *  {@link toViewStatus} over the four statuses the reader can express.
+ *
+ *  Deliberately NOT `STATUS_WORD` (below), which looks similar but runs the other way
+ *  (domain → display label) and folds UNKNOWN into ONGOING — feeding view words into it
+ *  would not type-check, and folding is wrong in this direction: the reader has no
+ *  "unknown" chip, so there is nothing to fold. */
+const VIEW_TO_DOMAIN_STATUS: Record<Status, SeriesStatus> = {
+	ongoing: 'ONGOING',
+	completed: 'COMPLETED',
+	hiatus: 'HIATUS',
+	cancelled: 'CANCELLED',
 };
 
 export interface LibraryRowView {
@@ -1507,12 +1580,28 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 				},
 				resolved.canonSeries,
 			);
-			// S2: render the UNION of chapters across every source (fixes works whose
-			// spine has 0 chapters but another source has them, e.g. Solo Leveling →
-			// Asura's 201). Falls back to the single-translator list when aggregation
-			// is unavailable/empty.
+			// THE SELECTED SOURCE OWNS THE CHAPTER LIST. `mapSeriesView` above was
+			// already given `resolved.chapters` — the selected translator's OWN chapters
+			// — so switching source in the picker now visibly re-lists.
+			//
+			// This used to unconditionally overwrite `view.chapters` with the cross-source
+			// UNION (S2), which made the picker look broken: you could switch between
+			// sources with 201 and 7 chapters and the list never changed, because the
+			// union won every time. The source picker is the control the reader reaches
+			// for to answer "show me THIS source's chapters", and it has to actually do
+			// that.
+			//
+			// S2's motivating case survives without the union: it was works whose MangaDex
+			// spine has 0 chapters while another source has them (Solo Leveling → Asura's
+			// 201), and `resolveWork` already DEFAULTS the selection to the source with
+			// the most chapters, so that work still opens on Asura's 201.
+			//
+			// The union is kept as a FALLBACK for the one case the default can't cover: a
+			// PERSISTED preference pointing at a source that has since lost its chapters.
+			// Rather than show an empty chapter list, fall back to everything we know
+			// exists across sources.
 			const agg = await aggP;
-			if (agg.length) {
+			if (agg.length && !view.chapters.length) {
 				const rows = buildAggregatedChapters(agg, resolved);
 				view.chapters = rows;
 				view.detail.totalCh = rows.length;
@@ -1524,13 +1613,23 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			return view;
 		}
 		// A numeric Suwayomi series is a single source — no translator picker. Fetch a
-		// candidate pool (Popular) alongside it to seed related-by-genre. A pool
-		// failure just yields no related — it never fails the page.
+		// candidate pool alongside it to seed related-by-genre. A pool failure just
+		// yields no related — it never fails the page.
+		//
+		// The sort is PINNED rather than left to the server's default. This call is not a
+		// browse: it wants a stable, cheap slab of recent catalogue rows to intersect
+		// genres against, and it runs on EVERY Suwayomi series view. Left unpinned it
+		// would silently inherit TRENDING — whose 24h-view ranking makes the "related"
+		// strip change under the reader between two visits to the same series for reasons
+		// that have nothing to do with the series — and would follow any future change of
+		// the default. NEWEST is deterministic over a fixed catalogue. (Page size is the
+		// server's to choose: this path now receives 30 rows rather than 20, which only
+		// widens the pool `relatedFor` picks its 8 from.)
 		const [s, chs, pool] = await Promise.all([
 			backend.series(id),
 			backend.chapters(id),
 			backend
-				.search('')
+				.search('', 1, { sort: 'NEWEST' })
 				.then((r) => r.items)
 				.catch(() => [] as Series[]),
 		]);
@@ -1722,6 +1821,27 @@ function emptyReader(seriesId: string, tmeta: TranslatorMeta = NO_TRANSLATORS): 
 	};
 }
 
+/**
+ * Resolve a chapter's pages to displayable URLs, tolerating per-page failures.
+ *
+ * On web this is a pure URL rewrite that cannot reject, but the native provider
+ * actually pulls the bytes through Rust, so a single page can fail on an upstream
+ * 502/403, a timeout, the size cap or the SSRF guard. Under `Promise.all` that
+ * first rejection propagates out of {@link live}, which swallows it and hands back
+ * `emptyReader` — one bad page out of forty and the reader claims the WHOLE chapter
+ * has none. Settle instead and give the failures an empty `url`: they keep their
+ * index and label in {@link buildReaderView}, so the reader renders its per-page
+ * placeholder for exactly those slots and every other page reads normally.
+ */
+async function resolvePageUrls(domainPages: Page[]): Promise<string[]> {
+	const settled = await Promise.allSettled(domainPages.map((p) => images.resolvePage(p)));
+	return settled.map((r, i) => {
+		if (r.status === 'fulfilled') return r.value;
+		console.warn(`[komika] page ${i + 1} failed to resolve:`, r.reason);
+		return '';
+	});
+}
+
 /** Assemble a ReaderView from a resolved chapter list + target chapter's pages. */
 function buildReaderView(
 	seriesId: string,
@@ -1814,7 +1934,7 @@ export function getReaderChapter(
 				spine && backend.canonicalPages
 					? await backend.canonicalPages(target.id)
 					: await backend.pages(target.id);
-			const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
+			const urls = await resolvePageUrls(domainPages);
 			const readingSrc = readFromSrc
 				? (srcParam as string)
 				: (resolved.selected.suwayomiMangaId ?? null);
@@ -1836,7 +1956,7 @@ export function getReaderChapter(
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
 		if (!target) target = asc.find((c) => !c.read) ?? asc[0];
 		const domainPages = await backend.pages(target.id);
-		const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)));
+		const urls = await resolvePageUrls(domainPages);
 		const series = await backend.series(seriesId).catch(() => null);
 		return buildReaderView(
 			seriesId,

@@ -636,17 +636,21 @@ impl From<ChapterRow> for SuwayomiChapter {
 ///
 /// `suwayomi_series` carries no NSFW column of its own — the flag lives on the
 /// canonical `work` it is linked to — so the gate is a NOT EXISTS against that
-/// link. Takes one bind: `show_nsfw as i64`. Used verbatim by the unaliased feed
-/// queries (`library`, `recently_added`). `search_catalogue` aliases the table `s`
-/// and so must spell out an equivalent predicate inline (this constant hard-codes
-/// `suwayomi_series.id`); keep the two in sync by hand.
+/// link. Takes one bind: `show_nsfw as i64`. Used verbatim by both remaining callers,
+/// `library` and `recently_added`, which reference the table unaliased.
 ///
 /// The EFFECTIVE flag is `COALESCE(is_nsfw_override, is_nsfw)`, not `is_nsfw`: both
 /// admin "mark NSFW" mutations write ONLY the override column, so testing the raw
 /// column let an admin override be ignored here. Production carries 3 works whose
-/// override disagrees with the crawled flag (2 forced on, 1 forced off) — enough to
-/// skew `search_catalogue`'s `total`, and with it the page count and `hasNext` the
-/// reader paginates on.
+/// override disagrees with the crawled flag (2 forced on, 1 forced off).
+///
+/// This gate no longer has anything to do with Browse. Browse moved onto
+/// `browse_catalogue`, whose `is_nsfw` column is a MATERIALIZED copy of the same
+/// COALESCE (migration 0069) kept live by `graphql::resync_feed_nsfw` — a different
+/// mechanism with its own tests, precisely so this correlated anti-join is not on a paged
+/// hot path. The `(? = 1 OR …)` shape survives here only because these two callers have a
+/// small fixed `LIMIT` and no ORDER BY the OR can spoil; it is exactly the shape
+/// `browse::build_where` documents as forbidden for a paged query.
 const NSFW_GATE_SQL: &str = "(? = 1 OR NOT EXISTS ( \
         SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
         WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
@@ -698,255 +702,11 @@ pub async fn recently_added(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-/// How long a memoized `search_catalogue` total stays usable. Short enough that a
-/// sync cycle's additions show up within a page refresh or two, long enough that a
-/// reader paging through Browse pays the 73 ms count once, not once per page.
-#[cfg(not(test))]
-const COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Zero under test: the memo is a process-wide static, but every test builds its own
-/// in-memory DB, so two tests whose filters hash to the same key would otherwise read
-/// each other's totals depending on scheduling. A zero TTL makes `search_catalogue`
-/// compute exactly, always. The memo logic itself is covered directly, via
-/// `cached_count_with`.
-#[cfg(test)]
-const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
-
-/// Ceiling on distinct memoized filter combinations. Genre/rating filters come from
-/// the client, so the key space is attacker-influenced (a count is always re-derivable,
-/// so dropping an entry is free — the only question is WHICH). See [`store_count`].
-const COUNT_CACHE_CAP: usize = 512;
-
-/// Build the `LIKE` patterns for a genre ANY-match against the JSON `genre` column.
-///
-/// Extracted from `search_catalogue` so [`count_key`]'s injectivity is testable rather
-/// than merely asserted in prose. Each genre becomes exactly `%"<escaped>"%`: the
-/// surrounding quotes make it an exact JSON-element match ("Drama" doesn't match
-/// "Melodrama"), and `\`, `%`, `_` are escaped so a genre containing a LIKE
-/// metacharacter matches literally (the clause uses `ESCAPE '\'`). Empty/whitespace
-/// genres are dropped.
-///
-/// The escaping is also what makes the memo key safe: a produced pattern can never
-/// contain a BARE `%`, so the `%\u{1}%` boundary [`count_key`] leaves between two
-/// patterns cannot be forged from inside a single genre name.
-fn genre_patterns(genres: &[String]) -> Vec<String> {
-    genres
-        .iter()
-        .map(|g| g.trim())
-        .filter(|g| !g.is_empty())
-        .map(|g| {
-            let esc = g
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            format!("%\"{esc}\"%")
-        })
-        .collect()
-}
-
-/// The memo key for one filter combination.
-///
-/// Extracted so its completeness is directly testable: under `cfg(test)` [`COUNT_TTL`]
-/// is zero, so `search_catalogue` never reads the memo and no end-to-end test can catch
-/// a key that omits a filter the COUNT depends on. The key must cover every input to
-/// that COUNT — `show_nsfw`, the genre patterns, and both rating bounds — and nothing
-/// else (`page`/`page_size` do not change a total).
-///
-/// `\u{1}` joins the genre patterns rather than a printable character because a pattern
-/// is `%"<escaped genre>"%` and `search_catalogue` escapes `%`, `_` and `\` in the genre
-/// before wrapping — so no pattern can contain a bare `%`, and the `%\u{1}%` boundary
-/// between two patterns is unforgeable from inside one. That is what makes the joined
-/// segment injective, i.e. `["a","b"]` and `["a\u{1}b"]` cannot collide.
-fn count_key(
-    show_nsfw: bool,
-    genre_patterns: &[String],
-    min_rating: Option<f64>,
-    max_rating: Option<f64>,
-) -> String {
-    format!(
-        "{}|{}|{}|{}",
-        show_nsfw as i64,
-        genre_patterns.join("\u{1}"),
-        min_rating.map(|v| v.to_string()).unwrap_or_default(),
-        max_rating.map(|v| v.to_string()).unwrap_or_default(),
-    )
-}
-
-/// Memoized `search_catalogue` totals, keyed by the filter signature.
-#[allow(clippy::type_complexity)]
-static COUNT_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (i64, std::time::Instant)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-fn cached_count(key: &str) -> Option<i64> {
-    cached_count_with(key, COUNT_TTL)
-}
-
-fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
-    let cache = COUNT_CACHE.lock().ok()?;
-    let (total, at) = cache.get(key)?;
-    (at.elapsed() < ttl).then_some(*total)
-}
-
-fn store_count(key: String, total: i64) {
-    store_count_with(key, total, COUNT_TTL)
-}
-
-/// Evict EXPIRED entries first, and only fall back to a wholesale clear if that frees
-/// nothing.
-///
-/// The cap is reached by cycling distinct filter signatures, which a client controls —
-/// so clearing unconditionally hands anyone a way to evict the hot anonymous-Browse key
-/// on demand and make every page load pay the 73 ms COUNT again. Dropping expired
-/// entries first means a flood slower than [`COUNT_TTL`] never touches a live entry, and
-/// a faster one degrades to "no memo" (each miss still computes exactly) rather than to
-/// something worse. Bounded either way: the map never exceeds the cap.
-fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
-    let Ok(mut cache) = COUNT_CACHE.lock() else {
-        return; // poisoned → just stop memoizing; every count is still computed exactly
-    };
-    if cache.len() >= COUNT_CACHE_CAP {
-        cache.retain(|_, (_, at)| at.elapsed() < ttl);
-        if cache.len() >= COUNT_CACHE_CAP {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (total, std::time::Instant::now()));
-}
-
-/// Catalogue-wide search over the persisted cache with genre + rating filters,
-/// applied in SQL and paginated (F2) — so `search(genres:["Action"])` returns the
-/// FULL Action set (paged), not a slice of the first N. Returns `(total, page)`.
-///
-/// Genres are stored as a JSON array string in `suwayomi_series.genre`; a genre
-/// matches via a `LIKE '%"<genre>"%'` on that column (LIKE is ASCII
-/// case-insensitive, and the surrounding quotes make it an exact element match, so
-/// "Drama" doesn't match "Melodrama"). `genres` matches ANY. Rating filters against
-/// the per-series user-review average (`reviews`, keyed by the Suwayomi id as text).
-/// NSFW series are excluded unless `show_nsfw`. For the small cached catalogue a
-/// scan is fine; at scale a normalized `series_genre(series_id, genre)` index table
-/// would replace the LIKE scan.
-#[allow(clippy::too_many_arguments)]
-pub async fn search_catalogue(
-    pool: &SqlitePool,
-    genres: &[String],
-    min_rating: Option<f64>,
-    max_rating: Option<f64>,
-    show_nsfw: bool,
-    page: i64,
-    page_size: i64,
-) -> Result<(i64, Vec<SuwayomiManga>)> {
-    // Build the shared WHERE + its bind values.
-    // COALESCE(is_nsfw_override, is_nsfw) — the effective flag; see NSFW_GATE_SQL, of
-    // which this is the `s`-aliased twin.
-    let mut where_sql = String::from(
-        "s.in_library = 1 \
-         AND (? = 1 OR NOT EXISTS ( \
-            SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
-            WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(s.id AS TEXT) \
-              AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))",
-    );
-    // Genre ANY-match.
-    let genre_patterns = genre_patterns(genres);
-    if !genre_patterns.is_empty() {
-        let ors = std::iter::repeat_n("s.genre LIKE ? ESCAPE '\\'", genre_patterns.len())
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        where_sql.push_str(&format!(" AND ({ors})"));
-    }
-    // Rating range against the review average (0 when unrated).
-    if min_rating.is_some() {
-        where_sql.push_str(" AND COALESCE(r.avg, 0) >= ?");
-    }
-    if max_rating.is_some() {
-        where_sql.push_str(" AND COALESCE(r.avg, 0) <= ?");
-    }
-
-    let join = "LEFT JOIN (SELECT series_id, AVG(score) AS avg FROM reviews GROUP BY series_id) r \
-                ON r.series_id = CAST(s.id AS TEXT)";
-
-    // total (filtered, catalogue-wide). Memoized for COUNT_TTL: the page query itself
-    // is 0.2 ms (it reads idx_suwayomi_series_latest_chapter in order), but this COUNT
-    // re-runs the correlated NSFW anti-join over all 13,802 in-library rows on EVERY
-    // page load — measured 73 ms warm / 92 ms cold on production data. The catalogue
-    // only changes on a sync cycle, so a few seconds of staleness in a page count is
-    // invisible, while paging through a result set now pays it once instead of per page.
-    let count_key = count_key(show_nsfw, &genre_patterns, min_rating, max_rating);
-    let total: i64 = match cached_count(&count_key) {
-        Some(t) => t,
-        None => {
-            let count_sql =
-                format!("SELECT COUNT(*) FROM suwayomi_series s {join} WHERE {where_sql}");
-            let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(show_nsfw as i64);
-            for p in &genre_patterns {
-                cq = cq.bind(p);
-            }
-            if let Some(v) = min_rating {
-                cq = cq.bind(v);
-            }
-            if let Some(v) = max_rating {
-                cq = cq.bind(v);
-            }
-            let t: i64 = cq.fetch_one(pool).await?;
-            store_count(count_key, t);
-            t
-        }
-    };
-
-    // page
-    let offset = (page.max(1) - 1) * page_size;
-    let rows_sql = format!(
-        "SELECT s.id, s.title, s.thumbnail_url, s.author, s.artist, s.description, s.genre, \
-                s.status, s.in_library, s.in_library_at, s.last_fetched_at, s.latest_chapter_at, \
-                s.source_id, s.lang, s.chapter_count \
-         FROM suwayomi_series s {join} WHERE {where_sql} \
-         ORDER BY s.latest_chapter_at DESC, s.id DESC LIMIT ? OFFSET ?"
-    );
-    let mut rq = sqlx::query_as::<_, SeriesRow>(&rows_sql).bind(show_nsfw as i64);
-    for p in &genre_patterns {
-        rq = rq.bind(p);
-    }
-    if let Some(v) = min_rating {
-        rq = rq.bind(v);
-    }
-    if let Some(v) = max_rating {
-        rq = rq.bind(v);
-    }
-    let rows = rq.bind(page_size).bind(offset).fetch_all(pool).await?;
-    Ok((total, rows.into_iter().map(Into::into).collect()))
-}
-
 /// How many series are cached (any). Lets `discovery` decide DB-vs-live.
 pub async fn count(pool: &SqlitePool) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
         .fetch_one(pool)
         .await?)
-}
-
-/// Distinct genre/tag facets across the cached catalogue with per-genre series
-/// counts, most common first (S4). Powers the search UI's genre filter — the FULL
-/// set the sources provide, not a hardcoded list. Genres are stored as JSON arrays,
-/// so they're parsed + counted in Rust (one scan of the cache).
-pub async fn genre_facets(pool: &SqlitePool) -> Result<Vec<(String, i64)>> {
-    let genres: Vec<Option<String>> =
-        sqlx::query_scalar("SELECT genre FROM suwayomi_series WHERE genre IS NOT NULL")
-            .fetch_all(pool)
-            .await?;
-    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for g in genres.into_iter().flatten() {
-        if let Ok(list) = serde_json::from_str::<Vec<String>>(&g) {
-            for name in list {
-                let name = name.trim();
-                if !name.is_empty() {
-                    *counts.entry(name.to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-    let mut out: Vec<(String, i64)> = counts.into_iter().collect();
-    // Most common first, then alphabetical for stable ties.
-    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -1093,74 +853,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_chapters(&pool, 99).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn search_catalogue_filters_in_sql_across_whole_cache() {
-        let pool = pool().await;
-        // 5 Action series + 2 non-Action, all in library.
-        for i in 1..=5 {
-            put_series(&pool, &manga(i, &format!("Action {i}")))
-                .await
-                .unwrap(); // Action, Comedy
-        }
-        for i in 6..=7 {
-            let mut m = manga(i, &format!("Drama {i}"));
-            m.genre = vec!["Drama".into()];
-            put_series(&pool, &m).await.unwrap();
-        }
-
-        // Genre filter spans the whole cache with page-2 pagination (page_size 2).
-        let (total, page1) = search_catalogue(&pool, &["Action".into()], None, None, true, 1, 2)
-            .await
-            .unwrap();
-        assert_eq!(total, 5, "catalogue-wide Action total, not a slice");
-        assert_eq!(page1.len(), 2);
-        let (_t, page3) = search_catalogue(&pool, &["Action".into()], None, None, true, 3, 2)
-            .await
-            .unwrap();
-        assert_eq!(page3.len(), 1, "page 3 has the 5th Action series");
-
-        // Case-insensitive + exact element (Drama, not a substring of another).
-        let (dt, _) = search_catalogue(&pool, &["drama".into()], None, None, true, 1, 20)
-            .await
-            .unwrap();
-        assert_eq!(dt, 2);
-
-        // Rating filter: seed a review so one series has avg 8; minRating 5 keeps only it.
-        sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('u1','u','u@e','h','t')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-             VALUES ('rv1', '1', 'u1', 8, 'ok', 't', 't')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let (rt, rows) = search_catalogue(&pool, &[], Some(5.0), None, true, 1, 20)
-            .await
-            .unwrap();
-        assert_eq!(rt, 1, "only the reviewed (avg 8) series clears minRating 5");
-        assert_eq!(rows[0].id, 1);
-    }
-
-    #[tokio::test]
-    async fn genre_facets_counts_across_catalogue() {
-        let pool = pool().await;
-        // Two series share "Action"; one has "Comedy".
-        put_series(&pool, &manga(1, "A")).await.unwrap(); // Action, Comedy
-        let mut m2 = manga(2, "B");
-        m2.genre = vec!["Action".into(), "Drama".into()];
-        put_series(&pool, &m2).await.unwrap();
-        let facets = genre_facets(&pool).await.unwrap();
-        // Action (2) first, then Comedy/Drama (1) alphabetically.
-        assert_eq!(facets[0], ("Action".to_string(), 2));
-        assert!(facets.contains(&("Comedy".to_string(), 1)));
-        assert!(facets.contains(&("Drama".to_string(), 1)));
     }
 
     #[tokio::test]
@@ -1689,118 +1381,23 @@ mod tests {
             "override-off must reveal a crawled-NSFW work"
         );
 
-        // The paginated `total` is the thing that stayed wrong after the resolvers got
-        // their Rust-side backstop: a skewed count means wrong page counts / hasNext.
-        let (total, _) = search_catalogue(&pool, &[], None, None, false, 1, 20)
+        // `recently_added` shares the exact same gate constant, so it must agree — the two
+        // are the only remaining callers, and a divergence between them would mean one home
+        // row honoured the admin and the other did not.
+        let added: Vec<i64> = recently_added(&pool, 10, false)
             .await
-            .unwrap();
-        assert_eq!(total, 2, "total counts the effective flag, not the raw one");
-    }
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(!added.contains(&2) && added.contains(&3));
 
-    /// P1-2: the catalogue-wide `total` is memoized per filter signature, so paging
-    /// through Browse pays the 73 ms NSFW anti-join once instead of once per page.
-    #[test]
-    fn search_count_is_memoized_per_filter_signature() {
-        // Unique keys: the memo is a process-wide static shared with every other test.
-        let ttl = std::time::Duration::from_secs(60);
-        let anon = "memo-test|0|||";
-        let opted_in = "memo-test|1|||";
-        assert_eq!(cached_count_with(anon, ttl), None, "cold");
-        store_count(anon.to_string(), 11_382);
-        assert_eq!(cached_count_with(anon, ttl), Some(11_382));
-        // A different signature (here: NSFW opted in) is a different entry.
-        assert_eq!(cached_count_with(opted_in, ttl), None);
-        // An expired entry is ignored rather than served stale.
-        assert_eq!(cached_count_with(anon, std::time::Duration::ZERO), None);
-    }
-
-    /// The memo key must separate EVERY input the memoized COUNT depends on. Nothing
-    /// end-to-end can catch a gap here: `COUNT_TTL` is zero under `cfg(test)`, so
-    /// `search_catalogue` never reads the memo and would happily pass with a key that
-    /// ignored, say, `max_rating`. Test the key directly instead.
-    #[test]
-    fn count_key_separates_every_filter_dimension() {
-        let g = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let base = count_key(false, &[], None, None);
-        let variants = [
-            count_key(true, &[], None, None),                    // show_nsfw
-            count_key(false, &g(&["%\"Action\"%"]), None, None), // genres
-            count_key(false, &[], Some(3.0), None),              // min_rating
-            count_key(false, &[], None, Some(4.0)),              // max_rating
-            count_key(false, &[], Some(3.0), Some(4.0)),         // both bounds
-        ];
-        for v in &variants {
-            assert_ne!(&base, v, "a filter dimension collapsed into the base key");
-        }
-        let mut all: Vec<&String> = variants.iter().collect();
-        all.push(&base);
-        all.sort();
-        let before = all.len();
-        all.dedup();
-        assert_eq!(before, all.len(), "two distinct filter sets share a key");
-
-        // Rating bounds are positionally distinct: "min 5, no max" is not "no min, max
-        // 5", which a naive concatenation would conflate.
-        assert_ne!(
-            count_key(false, &[], Some(5.0), None),
-            count_key(false, &[], None, Some(5.0))
-        );
-        // Order matters, because the SQL binds the patterns in order.
-        assert_ne!(
-            count_key(false, &g(&["%\"a\"%", "%\"b\"%"]), None, None),
-            count_key(false, &g(&["%\"b\"%", "%\"a\"%"]), None, None)
-        );
-    }
-
-    /// Genre filters are client-supplied, so the joined genre segment of the memo key
-    /// must be injective over patterns the real builder can produce — otherwise a
-    /// crafted genre name serves another filter's `total` (and with it the wrong page
-    /// count / `hasNext`). The `\u{1}` join is safe only because `genre_patterns`
-    /// escapes `%`, so no single pattern can contain the `%\u{1}%` boundary; this pins
-    /// that dependency down.
-    #[test]
-    fn count_key_cannot_be_forged_by_a_crafted_genre_name() {
-        let k = |v: &[&str]| {
-            let owned: Vec<String> = v.iter().map(|s| s.to_string()).collect();
-            count_key(false, &genre_patterns(&owned), None, None)
-        };
-        // A separator smuggled into a genre name does not look like two genres.
-        assert_ne!(k(&["a", "b"]), k(&["a\u{1}b"]));
-        // Nor does a name that tries to reproduce the whole `%"a"%\u{1}%"b"%` boundary:
-        // its `%` characters are escaped to `\%` before the join.
-        assert_ne!(k(&["a", "b"]), k(&["a\"%\u{1}%\"b"]));
-        // And the escaping itself keeps two different genres distinct.
-        assert_ne!(k(&["a%b"]), k(&["a\\%b"]));
-        assert_ne!(k(&["a_b"]), k(&["a\\_b"]));
-        // Sanity: the builder drops blanks and trims, so these agree.
-        assert_eq!(k(&["Action"]), k(&["  Action  ", "", "   "]));
-    }
-
-    /// The count memo is capped, and the cap must not be a client-triggerable flush of
-    /// LIVE entries: genre filters come from the request, so an attacker who can cycle
-    /// `COUNT_CACHE_CAP` distinct signatures could otherwise evict the hot Browse key on
-    /// demand and force the 73 ms COUNT on every page load. Expired entries go first.
-    #[test]
-    fn count_cache_evicts_expired_entries_before_live_ones() {
-        let ttl = std::time::Duration::from_secs(60);
-        let hot = "evict-test|hot";
-        // Fill past the cap with entries that are already expired (stored under a ZERO
-        // ttl they are dead on arrival), plus the hot key stored last.
-        for i in 0..COUNT_CACHE_CAP + 8 {
-            store_count_with(format!("evict-test|cold-{i}"), i as i64, ttl);
-        }
-        store_count_with(hot.to_string(), 12_345, ttl);
-        assert_eq!(cached_count_with(hot, ttl), Some(12_345));
-
-        // Now flood with fresh keys. Eviction prefers entries past `ttl`; passing a ZERO
-        // ttl marks everything already-stored as expired, so the flood reclaims THOSE
-        // rather than clearing wholesale...
-        for i in 0..COUNT_CACHE_CAP {
-            store_count_with(format!("evict-test|flood-{i}"), i as i64, ttl);
-        }
-        // ...and the map stays bounded regardless of which path ran.
-        let len = COUNT_CACHE.lock().unwrap().len();
-        assert!(len <= COUNT_CACHE_CAP, "memo must stay bounded (len {len})");
+        // Browse used to be the third caller, and its paginated `total` was the thing that
+        // stayed wrong after the resolvers got their Rust-side backstop (a skewed count means
+        // wrong page counts / `hasNext`). Browse now reads `browse_catalogue.is_nsfw`, a
+        // MATERIALIZED copy of this same COALESCE that `graphql::resync_feed_nsfw` rewrites on
+        // every admin mark — covered by `browse_total_and_page_follow_an_admin_nsfw_mark`, not
+        // from here.
     }
 
     /// `CHAPTER_FETCH_MEMO`'s cap has to be a HARD bound. Expiring entries older than

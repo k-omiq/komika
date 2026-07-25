@@ -15,7 +15,6 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::graphql::types::ComicType;
 use normalize::normalize_title;
 
 /// A single alt-title with its language tag (from MangaDex `altTitles`).
@@ -64,6 +63,11 @@ pub struct WorkInput {
     /// Full credit list as `(role, name)` with role `author`/`artist` (S2). The
     /// singular `author`/`artist` above keep the first of each.
     pub credits: Vec<(String, String)>,
+    /// Upstream genre/theme tags, already ordered (migration 0066). Written as the
+    /// `source = 'mangadex'` half of `work_tag`; the admin-curated half is never
+    /// touched. Empty for a Tier-2 work with no upstream tag list, which is a
+    /// legitimate state — see `replace_source_tags`.
+    pub tags: Vec<String>,
     /// Covers to store for this work (F2). Empty leaves any existing covers
     /// untouched; non-empty REPLACES the work's cover set (the sweep passes just
     /// the primary, the enrichment path passes the full `/cover` set).
@@ -355,16 +359,25 @@ pub struct CanonicalChapter {
     pub published_at: Option<String>,
 }
 
-/// The effective genre/tag list for a canonical work: the admin-curated `work_tag`
-/// set when present, else the distinct genres of its linked Suwayomi source series
-/// (parsed from the cached JSON `genre` arrays). Empty when neither exists. Best-effort
-/// — any query/parse failure just contributes nothing.
+/// The effective genre/tag list for a canonical work, in strict precedence order:
+///   1. the admin-curated `work_tag` half (`source = 'admin'`),
+///   2. the upstream MangaDex half (`source = 'mangadex'`, migration 0066),
+///   3. the distinct genres of its linked Suwayomi source series (parsed from the
+///      cached JSON `genre` arrays).
+/// Empty when none exists. Best-effort — any query/parse failure just contributes
+/// nothing.
+///
+/// Tier 2 is what makes a catalogue-wide genre filter possible at all: tier 1 is empty
+/// in production (curation is opt-in and rare) and tier 3 reaches only the ~13.8k works
+/// with a Suwayomi link, so before MangaDex tags were ingested ~101k works had no genre.
+/// The tiers do NOT merge: mixing a human's deliberate short list with ~6 upstream tags
+/// would make curation unable to REMOVE a tag, which is most of what it is for.
 ///
 /// A page of feed items should use [`work_effective_genres_batch`] instead: this issues
-/// two round-trips per work.
+/// up to three round-trips per work.
 pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<String> {
     let curated = sqlx::query_scalar::<_, String>(
-        "SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag",
+        "SELECT tag FROM work_tag WHERE work_id = ? AND source = 'admin' ORDER BY ord, tag",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -372,6 +385,18 @@ pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<Stri
     .unwrap_or_default();
     if !curated.is_empty() {
         return curated;
+    }
+    // `ord` is the group ranking `mangadex::tag_names` assigned (genre, theme, format,
+    // content), so this preserves "the axes a reader browses by, first".
+    let upstream = sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM work_tag WHERE work_id = ? AND source = 'mangadex' ORDER BY ord, tag",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if !upstream.is_empty() {
+        return upstream;
     }
     // The cast is on `ss.source_key` (a TEXT column with no usable index for this
     // join), NOT on `sw.id`. Casting the INDEXED side — `CAST(sw.id AS TEXT)` — makes
@@ -403,16 +428,17 @@ pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<Stri
     out
 }
 
-/// Batched [`work_effective_genres`]: two grouped queries for a whole page instead of
-/// two per work. Byte-identical per-work output (same curated-wins rule, same
-/// first-seen ordering); works with neither curated tags nor source genres are simply
-/// absent from the map and the caller defaults them to empty.
+/// Batched [`work_effective_genres`]: three grouped queries for a whole page instead of
+/// three per work. Byte-identical per-work output (same tier precedence, same first-seen
+/// ordering); works with no genre on any tier are simply absent from the map and the
+/// caller defaults them to empty.
 ///
 /// `map_series_batch` calls this once per feed page. Per-item it was ~15 ms × 25 items
 /// = ~375 ms of pure genre lookup on a browse page — the single largest cost there,
 /// despite a comment claiming the branch was "rare" (it is not: 13,789 of 13,802
-/// Suwayomi series are catalogued, and `work_tag` is EMPTY in production, so the
-/// curated early-return never fires and every item reaches the join).
+/// Suwayomi series are catalogued, and the CURATED half of `work_tag` is empty in
+/// production, so tier 1 never fires). Since migration 0066 most works are answered by
+/// tier 2, an indexed (work_id, source) seek, and never reach the Suwayomi join at all.
 pub async fn work_effective_genres_batch(
     pool: &SqlitePool,
     work_ids: &[String],
@@ -427,7 +453,8 @@ pub async fn work_effective_genres_batch(
 
     // 1) Admin-curated tags win outright wherever they exist.
     let curated_sql = format!(
-        "SELECT work_id, tag FROM work_tag WHERE work_id IN ({ph}) ORDER BY work_id, ord, tag"
+        "SELECT work_id, tag FROM work_tag WHERE work_id IN ({ph}) AND source = 'admin' \
+         ORDER BY work_id, ord, tag"
     );
     let mut q = sqlx::query_as::<_, (String, String)>(&curated_sql);
     for id in work_ids {
@@ -437,7 +464,27 @@ pub async fn work_effective_genres_batch(
         out.entry(wid).or_default().push(tag);
     }
 
-    // 2) Source genres for everything the curated set didn't cover. Same
+    // 2) Upstream MangaDex tags for everything curation didn't cover (migration 0066).
+    //    Bound to the works still missing so a fully-curated page costs nothing here.
+    let uncurated: Vec<&String> = work_ids.iter().filter(|w| !out.contains_key(*w)).collect();
+    if !uncurated.is_empty() {
+        let ph_up = std::iter::repeat_n("?", uncurated.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let up_sql = format!(
+            "SELECT work_id, tag FROM work_tag WHERE work_id IN ({ph_up}) AND source = 'mangadex' \
+             ORDER BY work_id, ord, tag"
+        );
+        let mut qu = sqlx::query_as::<_, (String, String)>(&up_sql);
+        for id in &uncurated {
+            qu = qu.bind(*id);
+        }
+        for (wid, tag) in qu.fetch_all(pool).await.unwrap_or_default() {
+            out.entry(wid).or_default().push(tag);
+        }
+    }
+
+    // 3) Source genres for everything neither tag half covered. Same
     //    cast-the-non-indexed-side join as the single-work path above.
     let remaining: Vec<&String> = work_ids.iter().filter(|w| !out.contains_key(*w)).collect();
     if remaining.is_empty() {
@@ -616,10 +663,11 @@ pub async fn latest_english_chapter_at(pool: &SqlitePool, work_id: &str) -> Resu
 /// reclassification until the next full sync.
 ///
 /// ALSO refreshes [`refresh_feed_series_updates`] (the reader's merged Updates feed,
-/// migration 0064), which is derived from this table plus the scanner's half. Folded in
-/// here rather than wired separately so every existing call site — boot and each
-/// post-sync pass — covers both, and the two feeds can never drift apart in freshness.
-/// The return value stays the `feed_updates` row count.
+/// migration 0064), which is derived from this table plus the scanner's half — and that in
+/// turn refreshes [`refresh_browse_catalogue`] (Browse's table, migration 0069), which is
+/// derived from IT. Folded into one chain rather than wired separately so every existing
+/// call site — boot and each post-sync pass — covers all three, and they can never drift
+/// apart in freshness. The return value stays the `feed_updates` row count.
 pub async fn refresh_feed_updates(pool: &SqlitePool) -> Result<u64> {
     let now = Utc::now().to_rfc3339();
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -720,20 +768,21 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     //     * `title_override` is honoured. `refresh_feed_updates` copies bare
     //       `primary_title`, so an admin-retitled work reads under its old name on the
     //       canonical feed; this feed does not inherit that.
-    let mirror = sqlx::query(
+    let mirror = sqlx::query(&format!(
         "INSERT INTO feed_series_updates \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
-              detected_at, is_nsfw) \
+              detected_at, is_nsfw, status, content_rating) \
          SELECT fu.work_id, fu.work_id, COALESCE(w.title_override, fu.title), \
                 fu.cover_url, NULL, NULL, \
                 fu.latest_chapter, fu.latest_chapter_title, NULL, \
                 CAST(strftime('%s', fu.latest_at) AS INTEGER) * 1000, \
-                NULL, fu.is_nsfw \
+                NULL, fu.is_nsfw, \
+                {FSU_STATUS_SQL}, COALESCE(w.content_rating, 'safe') \
          FROM feed_updates fu \
          JOIN work w ON w.id = fu.work_id \
-         WHERE strftime('%s', fu.latest_at) IS NOT NULL",
-    )
+         WHERE strftime('%s', fu.latest_at) IS NOT NULL"
+    ))
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -755,10 +804,10 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     //     honest: an undated series is not an update. Neither excludes anything today —
     //     all 1,316 detected in-library series have a release time and a work mapping.
     let scanner = sqlx::query(
-        "INSERT INTO feed_series_updates \
+        &format!("INSERT INTO feed_series_updates \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
-              detected_at, is_nsfw) \
+              detected_at, is_nsfw, status, content_rating) \
          SELECT ss.work_id, CAST(sy.id AS TEXT), \
                 COALESCE(w.title_override, w.primary_title, sy.title), \
                 CASE WHEN w.cover_cached_version IS NOT NULL \
@@ -768,7 +817,8 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
                 NULL, NULL, sy.chapter_count, \
                 MAX(CAST(sy.latest_chapter_at AS INTEGER)), \
                 sss.last_new_chapter_at, \
-                COALESCE(w.is_nsfw_override, w.is_nsfw) \
+                COALESCE(w.is_nsfw_override, w.is_nsfw), \
+                {FSU_STATUS_SQL}, COALESCE(w.content_rating, 'safe') \
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
@@ -783,8 +833,10 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
              chapter_count = COALESCE(feed_series_updates.chapter_count, excluded.chapter_count), \
              cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
              suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
-             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw)",
-    )
+             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw), \
+             status = excluded.status, \
+             content_rating = excluded.content_rating",
+    ))
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -797,6 +849,14 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     // page. Consequence to know: for a merged work whose Suwayomi source is ahead of the
     // mirror, the card's release time can be newer than the newest chapter the canonical
     // page lists, until the next MangaDex sync mirrors it.
+    //
+    // `status` / `content_rating` (migration 0068) are the exception to that mirror-wins
+    // rule, and it costs nothing: both halves derive them from the SAME `work` row via the
+    // same expression, so `excluded` and the existing value are always equal here. They are
+    // assigned rather than omitted so the clause states the intent — these are properties
+    // of the WORK, not of whichever half published the row — which is what keeps this
+    // statement convergent with `scanner::upsert_feed_series_update`, whose pre-existing row
+    // may be its own earlier write rather than a mirror row.
 
     // (3) `comic_type`, which cannot be done in SQL: `resolve_comic_type` is a
     //     five-step derivation ending in Unicode script tests on the title. Running the
@@ -807,14 +867,76 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     //     comment. It reads the rows the two INSERTs above just wrote, which are visible
     //     to this connection and to nobody else until the commit below, so the new
     //     generation becomes visible fully typed or not at all.
-    let typed = fill_feed_series_updates_types(&mut tx).await?;
+    let typed = fill_comic_types(&mut tx, "feed_series_updates").await?;
+
+    // (4) `en_chapter_count` (migration 0068) — Browse's CHAPTERS sort key and the number
+    //     its cards print. Two statements, in this order, because the fallback must only
+    //     ever RAISE a zero: the English mirror count is authoritative where it exists, and
+    //     the Suwayomi count is the only thing available for a work whose MangaDex spine has
+    //     no English chapter (the same precedence `map_canonical_series` applies between its
+    //     English count and `aggregate_chapter_count`).
+    //
+    //     STILL INSIDE the transaction, for the reason the doc comment gives about
+    //     `comic_type`: this is a SORT KEY, and a committed generation where every row reads
+    //     0 would make `sort: CHAPTERS` degenerate to the `work_id DESC` tiebreaker — a
+    //     silently wrong ordering rather than a visibly empty one, which is worse.
+    let counted = sqlx::query(
+        "UPDATE feed_series_updates SET en_chapter_count = en.n \
+             FROM (SELECT ss.work_id AS work_id, COUNT(DISTINCT c.number) AS n \
+                     FROM chapter c \
+                     JOIN source_series ss ON ss.id = c.source_series_id \
+                    WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
+                    GROUP BY ss.work_id) AS en \
+            WHERE en.work_id = feed_series_updates.work_id",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE feed_series_updates SET en_chapter_count = sw.n \
+             FROM (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
+                     FROM source_series ss \
+                     JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                    WHERE ss.source_type = 'suwayomi' \
+                    GROUP BY ss.work_id) AS sw \
+            WHERE sw.work_id = feed_series_updates.work_id \
+              AND feed_series_updates.en_chapter_count = 0 \
+              AND sw.n > 0",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
+
+    // Browse's own table (migration 0069), which is DERIVED FROM the generation we just
+    // committed — for a work with a feed row it copies that row's columns verbatim, so it has
+    // to run after this commit, not before. Best-effort for the same reason
+    // `refresh_feed_updates` treats this function as best-effort: a Browse rebuild failing
+    // must not make the updates feed's rebuild look like it failed.
+    //
+    // A SEPARATE TRANSACTION, and that is a measured decision rather than a stylistic one.
+    // 0064 folded the type fill into the rebuild's transaction so no reader could see a
+    // half-typed generation, and the same argument holds WITHIN `refresh_browse_catalogue`
+    // (which owns its own transaction for exactly that). What does not hold is sharing THIS
+    // one: no query reads both tables (Browse reads only `browse_catalogue`, `updatesFeed`
+    // only `feed_series_updates`), so cross-table atomicity buys nothing — and it costs
+    // everything. Measured on a copy of production: the transaction above is already
+    // ~12.0 s of SQL (`DELETE` 4.7 s + mirror INSERT 3.1 s + `en_chapter_count` 3.3 s + the
+    // rest) plus ~0.6 s of type fill and a ~0.5 s commit, and Browse's rebuild adds ~6 s.
+    // One shared transaction would therefore hold the write lock for ~19 s against the
+    // pool's 15 s `busy_timeout` (db.rs) — past that ceiling the scanner's concurrent writes
+    // stop being a wait and start being `SQLITE_BUSY` failures. Two transactions of ~13 s and
+    // ~6 s each stay inside it.
+    if let Err(e) = refresh_browse_catalogue(pool).await {
+        tracing::warn!(error = %e, "browse_catalogue: refresh failed");
+    }
 
     // Give the planner statistics for a table that did not exist when the periodic
     // `ANALYZE` list in `db.rs` was written. Without a `sqlite_stat1` row the planner
     // assumes ~1M rows for it (see the note on that list). Run AFTER the rebuild so the
     // stats describe a populated table, and outside the transaction so it never extends
-    // the write lock.
+    // the write lock. `feed_genre_facet` is ~100 rows and always read in full, so it needs
+    // no statistics of its own.
     if let Err(e) = sqlx::query("ANALYZE feed_series_updates")
         .execute(pool)
         .await
@@ -825,43 +947,300 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
         mirror,
         scanner,
         typed,
+        counted,
         "feed_series_updates: rebuilt merged updates feed"
     );
     Ok(mirror + scanner)
 }
 
-/// Materialize `feed_series_updates.comic_type` by running the real
-/// [`crate::graphql::types::resolve_comic_type`] over every feed row.
+/// The SELECT behind `browse_catalogue` (migration 0069): one row per BROWSABLE work,
+/// including the 67,000 that have no dated chapter and are therefore absent from
+/// `feed_series_updates`.
 ///
-/// Batched, not per-row: three grouped reads (base fields, curated tags, source genres)
-/// and then one `UPDATE … WHERE work_id IN (…)` per (type, chunk) — five distinct type
-/// values, so ~100 statements for 48k rows rather than 48k.
+/// A function rather than a `const` only because it interpolates [`FSU_STATUS_SQL`] — the
+/// status normalization has to be the SAME expression the feed uses or one upstream word
+/// would mean two different things on two Komika surfaces. Migration 0069's backfill mirrors
+/// this text BY HAND, the same arrangement 0068's backfill has with the statements above.
+/// Column order matches [`BROWSE_CATALOGUE_COLUMNS`].
+///
+/// EVERY column a work's `feed_series_updates` row already carries is COPIED VERBATIM from
+/// it, NULLs included, rather than re-derived: the derivations there are already reviewed
+/// (effective-NSFW, the epoch-millis clock, the mirror-wins merge of the two halves), and a
+/// Browse card must not disagree with the same work's Updates card. Verified on a copy of
+/// production — 0 of the 48,567 shared rows differ on any copied column. `comic_type` is the
+/// one exception and is deliberately absent: [`fill_comic_types`] owns it (see below).
+///
+/// The two exclusions are the WHERE: a work with no `source_series` at all has nothing to
+/// open on either path (2 works in production), and a work with no title would render a card
+/// with no label and no href (0 works; the guard is also what makes `title NOT NULL` safe).
+fn browse_catalogue_select() -> String {
+    format!(
+        "SELECT w.id, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.reader_id \
+                 WHEN md.work_id IS NOT NULL THEN w.id \
+                 ELSE sw.source_key END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.title \
+                 ELSE COALESCE(w.title_override, w.primary_title, sw.title) END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.cover_url \
+                 WHEN w.cover_cached_version IS NOT NULL \
+                      THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
+                 WHEN w.cover_file_name IS NOT NULL THEN '/covers/' || w.id || '.webp' END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.suwayomi_thumbnail \
+                 ELSE sw.thumbnail_url END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.status ELSE {FSU_STATUS_SQL} END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.content_rating \
+                 ELSE COALESCE(w.content_rating, 'safe') END, \
+            CASE WHEN f.work_id IS NOT NULL THEN f.is_nsfw \
+                 ELSE COALESCE(w.is_nsfw_override, w.is_nsfw) END, \
+            COALESCE(NULLIF(en.n, 0), NULLIF(swc.n, 0), 0), \
+            f.released_at, \
+            w.created_at \
+       FROM work w \
+       LEFT JOIN feed_series_updates f ON f.work_id = w.id \
+       LEFT JOIN (SELECT work_id FROM source_series \
+                   WHERE source_type = 'mangadex' GROUP BY work_id) md ON md.work_id = w.id \
+       LEFT JOIN (SELECT ss.work_id AS work_id, ss.source_key AS source_key, \
+                         sy.title AS title, sy.thumbnail_url AS thumbnail_url, MIN(ss.id) \
+                    FROM source_series ss \
+                    LEFT JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                   WHERE ss.source_type = 'suwayomi' \
+                   GROUP BY ss.work_id) sw ON sw.work_id = w.id \
+       LEFT JOIN (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
+                    FROM source_series ss \
+                    JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                   WHERE ss.source_type = 'suwayomi' \
+                   GROUP BY ss.work_id) swc ON swc.work_id = w.id \
+       LEFT JOIN (SELECT ss.work_id AS work_id, COUNT(DISTINCT c.number) AS n \
+                    FROM chapter c \
+                    JOIN source_series ss ON ss.id = c.source_series_id \
+                   WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
+                   GROUP BY ss.work_id) en ON en.work_id = w.id \
+      WHERE (md.work_id IS NOT NULL OR sw.work_id IS NOT NULL) \
+        AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''"
+    )
+}
+
+/// The `browse_catalogue` columns [`browse_catalogue_select`] produces, in its order.
+/// `comic_type` is absent on purpose — see [`fill_comic_types`].
+const BROWSE_CATALOGUE_COLUMNS: &str = "work_id, reader_id, title, cover_url, \
+     suwayomi_thumbnail, status, content_rating, is_nsfw, en_chapter_count, released_at, \
+     created_at";
+
+/// The columns the UPSERT re-assigns on conflict, i.e. everything except the primary key and
+/// `comic_type`.
+const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
+    "reader_id",
+    "title",
+    "cover_url",
+    "suwayomi_thumbnail",
+    "status",
+    "content_rating",
+    "is_nsfw",
+    "en_chapter_count",
+    "released_at",
+    "created_at",
+];
+
+/// Rebuild `browse_catalogue` (migration 0069) — the table Browse pages.
+///
+/// Called from [`refresh_feed_series_updates`] right after its commit, because every column
+/// this table shares with `feed_series_updates` is copied from it. So the cadence is the
+/// existing one: boot (`main`) and once per catalogue-sync cycle (`mangadex`).
+///
+/// UPSERT + PRUNE, NOT `DELETE` + `INSERT`, which is where this diverges from every other
+/// feed rebuild in this file — and the reason is measured. `DELETE FROM` + `INSERT` of
+/// 115,567 rows across eight indices costs 14.0 s on a copy of production (the `INSERT` alone
+/// is 4.5 s into an unindexed table; the other 9.5 s is index maintenance on random
+/// `work_id`s). The upsert's `WHERE <any column differs>` makes a no-op cycle 4.9 s with
+/// ZERO index writes, and a cycle that really changed 269 rows the same 5.0 s — the SELECT is
+/// the floor and the writes are proportional to the change. It also never leaves the table
+/// empty, which `DELETE` + `INSERT` does for the length of the transaction.
+///
+/// `IS NOT`, not `<>`, in that guard: three of the columns are nullable and `NULL <> NULL` is
+/// NULL, so `<>` would treat "unchanged NULL" as "changed" and rewrite every such row's index
+/// entries on every cycle.
+///
+/// THE PRUNE is what the missing `DELETE` costs us. Two disqualifications exist and they are
+/// handled differently:
+///
+/// * The work row is GONE (a dedup merge deletes the loser). `work_id`'s foreign key is
+///   `ON DELETE CASCADE` and `db.rs` enables `foreign_keys`, so that row is already gone —
+///   nothing to do, and it is why 0 merge-retired works can linger here.
+/// * The work LOST its last `source_series`. Nothing cascades, so it is deleted explicitly
+///   (204 ms, an index seek per row). The full re-evaluation of the SELECT's WHERE as a
+///   `NOT IN` measured 1,628 ms for the same 0 rows, and the extra 1.4 s only buys the
+///   title-went-empty case — where the upsert already does the safe thing by leaving the row
+///   at its last known title rather than writing a NULL into a `NOT NULL` column.
+pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let set = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let select = browse_catalogue_select();
+    let upserted = sqlx::query(&format!(
+        "INSERT INTO browse_catalogue ({BROWSE_CATALOGUE_COLUMNS}) {select} \
+         ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
+    ))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    let pruned = sqlx::query(
+        "DELETE FROM browse_catalogue WHERE NOT EXISTS \
+             (SELECT 1 FROM source_series ss WHERE ss.work_id = browse_catalogue.work_id)",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    // `comic_type`, INSIDE this transaction for the reason 0064 gives about the feed's own
+    // type fill: a committed generation whose rows have `comic_type IS NULL` is invisible to
+    // Browse's format tabs (the filter is a single equality), and a NULL type is exactly what
+    // the upsert leaves on a row it has just inserted. Running it here means the new
+    // generation becomes visible fully typed or not at all, and a failure rolls back the
+    // whole rebuild rather than publishing an untyped one.
+    let typed = fill_comic_types(&mut tx, "browse_catalogue").await?;
+
+    // The genre facet list Browse renders as chips (migration 0068), MOVED here from the feed
+    // rebuild, because the chips must count the table the chip's filter actually queries.
+    // That equality is the whole reason the facets stopped coming from `suwayomi_series`'
+    // JSON blobs: a chip labelled "Action · 4,102" that returns a different number of results
+    // is worse than no chip. Now that clicking a genre filters `browse_catalogue` (115,567
+    // works), counting `feed_series_updates` (48,567) would re-introduce that gap at 2.4x.
+    //
+    // DELETE + INSERT in the same transaction as the table it counts, so a chip's number can
+    // never describe a generation that no longer exists.
+    //
+    // NO `source` PREDICATE, matching `browse::build_where`'s genre clause exactly: the filter
+    // matches ANY tag a work carries on any tier, so the count must too. (Tier PRECEDENCE is
+    // `work_effective_genres`' rule for choosing what to DISPLAY, a different question.) The
+    // two would drift the moment one grew the predicate and the other did not.
+    sqlx::query("DELETE FROM feed_genre_facet")
+        .execute(&mut *tx)
+        .await?;
+    let facets = sqlx::query(
+        "INSERT INTO feed_genre_facet(tag, safe_count, all_count) \
+         SELECT t.tag, SUM(CASE WHEN b.is_nsfw = 0 THEN 1 ELSE 0 END), COUNT(*) \
+           FROM work_tag t JOIN browse_catalogue b ON b.work_id = t.work_id \
+          GROUP BY t.tag",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    tx.commit().await?;
+
+    // Browse's `total` is memoized for up to `browse::COUNT_TTL`, and we have just rewritten
+    // the table those totals counted. A surviving entry would promise a page that no longer
+    // exists — `hasNextPage: true` on the last page, or a pager rendering
+    // "showing 115,531-115,560 of 115,530". One `HashMap::clear`, twice a day.
+    crate::browse::clear_count_cache();
+
+    // Statistics for a table `db.rs`' periodic `ANALYZE` list predates. Without a
+    // `sqlite_stat1` row the planner assumes ~1M rows for it and can pick the wrong index of
+    // the eight. AFTER the rebuild so the stats describe the current generation, and outside
+    // the transaction so it never extends the write lock.
+    if let Err(e) = sqlx::query("ANALYZE browse_catalogue").execute(pool).await {
+        tracing::warn!(error = %e, "browse_catalogue: ANALYZE failed");
+    }
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM browse_catalogue")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    tracing::info!(
+        total,
+        upserted,
+        pruned,
+        typed,
+        facets,
+        "browse_catalogue: rebuilt browse catalogue"
+    );
+    Ok(total as u64)
+}
+
+/// The normalized `feed_series_updates.status` expression, over a `work` row aliased `w`.
+///
+/// Shared by the rebuild's two INSERTs, by `scanner::upsert_feed_series_update`, and — by
+/// hand, the way 0050's backfill mirrors `series_cache::derive_latest_chapter_at` — by
+/// migration 0068's backfill. If they disagreed, a row's filterability would depend on which
+/// writer created it.
+///
+/// The fold is `graphql::types::status_from`'s: `ON_HIATUS` -> `HIATUS`,
+/// `PUBLISHING_FINISHED`/`LICENSED` -> `COMPLETED`. It exists because `komika_status` — the
+/// only parser of this column — returns `None` for the long forms and the `SeriesStatus` enum
+/// has no such members, so un-normalized those rows are unreachable by EVERY value a client
+/// can send for `status:` (8 feed rows today; 201 across all works, growing as more of the
+/// catalogue becomes readable).
+pub const FSU_STATUS_SQL: &str = "CASE w.status \
+        WHEN 'ON_HIATUS' THEN 'HIATUS' \
+        WHEN 'PUBLISHING_FINISHED' THEN 'COMPLETED' \
+        WHEN 'LICENSED' THEN 'COMPLETED' \
+        ELSE COALESCE(w.status, 'UNKNOWN') END";
+
+/// Materialize a feed table's `comic_type` by running the real
+/// [`crate::graphql::types::resolve_comic_type`] over every one of its rows.
+///
+/// `table` is one of two hard-coded identifiers — `feed_series_updates` (migration 0064) or
+/// `browse_catalogue` (0069) — never input. One function for both because the word WRITTEN
+/// here is the word the `updatesFeed` AND Browse format filters look for; two copies of this
+/// derivation would let a work's format differ between the two surfaces.
+///
+/// Batched, not per-row: four grouped reads (curated tags, upstream tags, source genres, base
+/// fields) and then one `UPDATE … WHERE work_id IN (…)` per (type, chunk) — five distinct type
+/// values, so ~100 statements for 48k rows and ~240 for 115k, rather than one per row. The
+/// reads measure 568 ms over the 48,567-row feed and 823 ms over the 115,567-row browse table.
 ///
 /// The stored word is COLLAPSED to the reader's three-way vocabulary
 /// (`WEBTOON → MANHWA`, `COMIC → MANGA`), matching the reader's `toViewType`, so the
 /// resolver's format filter can stay a single indexed equality. See the migration.
 ///
-/// Takes a CONNECTION, not the pool, because it must run inside
-/// [`refresh_feed_series_updates`]' rebuild transaction: it reads the rows that
-/// transaction has just written (uncommitted, so only this connection can see them), and
-/// committing the rebuild without it would publish a generation whose every row has
-/// `comic_type IS NULL` — an empty `updatesFeed(type:)` for the duration of the fill.
-async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
+/// Takes a CONNECTION, not the pool, because it must run inside the caller's rebuild
+/// transaction: it reads the rows that transaction has just written (uncommitted, so only this
+/// connection can see them), and committing the rebuild without it would publish a generation
+/// whose every row has `comic_type IS NULL` — an empty `updatesFeed(type:)` / Browse format
+/// tab for the duration of the fill.
+async fn fill_comic_types(conn: &mut sqlx::SqliteConnection, table: &'static str) -> Result<u64> {
     use std::collections::HashMap;
 
     // Curated tags win outright wherever they exist — the same rule
     // `work_effective_genres` applies. (Empty in production today, but an admin can
     // populate it, and this feed must not be the one surface that ignores that.)
     let mut genres: HashMap<String, Vec<String>> = HashMap::new();
-    for (wid, tag) in sqlx::query_as::<_, (String, String)>(
+    for (wid, tag) in sqlx::query_as::<_, (String, String)>(&format!(
         "SELECT wt.work_id, wt.tag FROM work_tag wt \
-         JOIN feed_series_updates f ON f.work_id = wt.work_id \
-         ORDER BY wt.work_id, wt.ord, wt.tag",
-    )
+         JOIN {table} f ON f.work_id = wt.work_id \
+         WHERE wt.source = 'admin' \
+         ORDER BY wt.work_id, wt.ord, wt.tag"
+    ))
     .fetch_all(&mut *conn)
     .await?
     {
         genres.entry(wid).or_default().push(tag);
+    }
+    // Tier 2: upstream MangaDex tags (migration 0066). This is what actually makes the
+    // `comic_type` derivation below work for MangaDex-only works — `resolve_comic_type`
+    // reads genre STRINGS to spot "Manhwa"/"Manhua"/"Long Strip", and before these tags
+    // existed the ~101k works with no Suwayomi link reached it with an EMPTY genre slice
+    // and fell all the way through to the title-script heuristic.
+    let mut upstream_genres: HashMap<String, Vec<String>> = HashMap::new();
+    for (wid, tag) in sqlx::query_as::<_, (String, String)>(&format!(
+        "SELECT wt.work_id, wt.tag FROM work_tag wt \
+         JOIN {table} f ON f.work_id = wt.work_id \
+         WHERE wt.source = 'mangadex' \
+         ORDER BY wt.work_id, wt.ord, wt.tag"
+    ))
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        upstream_genres.entry(wid).or_default().push(tag);
     }
     // Source genres, kept separate so the curated-wins rule stays a single lookup below
     // rather than a "did this key come from tags or from genres" question. The CAST is on
@@ -870,13 +1249,13 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
     // (`work_effective_genres` measured 14.98 ms → 0.01 ms on exactly that change).
     let mut source_genres: HashMap<String, Vec<String>> = HashMap::new();
     let mut seen: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
-    for (wid, json) in sqlx::query_as::<_, (String, String)>(
+    for (wid, json) in sqlx::query_as::<_, (String, String)>(&format!(
         "SELECT ss.work_id, sw.genre FROM source_series ss \
          JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
-         JOIN feed_series_updates f ON f.work_id = ss.work_id \
+         JOIN {table} f ON f.work_id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL \
-         ORDER BY ss.work_id, ss.id",
-    )
+         ORDER BY ss.work_id, ss.id"
+    ))
     .fetch_all(&mut *conn)
     .await?
     {
@@ -891,10 +1270,10 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
         }
     }
 
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(
+    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(&format!(
         "SELECT f.work_id, w.content_type_override, w.original_language, f.title \
-         FROM feed_series_updates f JOIN work w ON w.id = f.work_id",
-    )
+         FROM {table} f JOIN work w ON w.id = f.work_id"
+    ))
     .fetch_all(&mut *conn)
     .await?;
 
@@ -902,6 +1281,7 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
     for (work_id, override_word, original_language, title) in rows {
         let g = genres
             .get(&work_id)
+            .or_else(|| upstream_genres.get(&work_id))
             .or_else(|| source_genres.get(&work_id))
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
@@ -911,12 +1291,10 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
             g,
             &title,
         );
-        // Collapse to the reader's three formats, exactly as its `toViewType` does.
-        let word = match t {
-            ComicType::Manhwa | ComicType::Webtoon => "MANHWA",
-            ComicType::Manhua => "MANHUA",
-            ComicType::Manga | ComicType::Comic => "MANGA",
-        };
+        // Collapse to the reader's three formats, exactly as its `toViewType` does. One
+        // shared function, so the word WRITTEN here and the word the `updatesFeed` / Browse
+        // filters look for cannot drift apart.
+        let word = crate::graphql::types::collapsed_comic_type_word(t);
         by_type.entry(word).or_default().push(work_id);
     }
 
@@ -924,6 +1302,17 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
     // small enough that one statement's prepared-plan cost stays trivial. The caller owns
     // the transaction — these UPDATEs commit with the rest of the rebuild, never on their
     // own.
+    //
+    // `AND comic_type IS NOT ?` makes an unchanged row a no-op rather than a rewrite, which
+    // matters only for `browse_catalogue`: that table is UPSERTED rather than
+    // DELETE+INSERTed, so on a steady-state cycle almost every row already holds the word we
+    // just computed, and `comic_type` is a key column of four of its eight indices. Writing
+    // it anyway would put 115k index rewrites into every cycle — the exact cost the upsert
+    // exists to avoid. Measured: a 500-id chunk with 306 real changes takes 8 ms.
+    // `IS NOT`, not `<>`, because the column is nullable and `NULL <> 'MANGA'` is NULL, which
+    // would make a freshly-inserted (NULL-typed) row fail the guard and never get typed.
+    // On `feed_series_updates` the guard is free: the rebuild DELETEs first, so every row is
+    // NULL-typed and the counts are unchanged.
     const CHUNK: usize = 500;
     let mut n = 0u64;
     for (word, ids) in &by_type {
@@ -931,13 +1320,15 @@ async fn fill_feed_series_updates_types(conn: &mut sqlx::SqliteConnection) -> Re
             let ph = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql =
-                format!("UPDATE feed_series_updates SET comic_type = ? WHERE work_id IN ({ph})");
+            let sql = format!(
+                "UPDATE {table} SET comic_type = ? \
+                 WHERE work_id IN ({ph}) AND comic_type IS NOT ?"
+            );
             let mut q = sqlx::query(&sql).bind(*word);
             for id in chunk {
                 q = q.bind(id);
             }
-            n += q.execute(&mut *conn).await?.rows_affected();
+            n += q.bind(*word).execute(&mut *conn).await?.rows_affected();
         }
     }
     Ok(n)
@@ -1357,6 +1748,7 @@ pub async fn upsert_work_from_mangadex(
 
     insert_aliases(&mut tx, &work_id, &input.aliases).await?;
     insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
+    replace_source_tags(&mut tx, &work_id, &input.tags).await?;
     ensure_source_series(
         &mut tx,
         &work_id,
@@ -1521,6 +1913,69 @@ async fn insert_descriptions_and_credits(
         .execute(&mut **tx)
         .await?;
     }
+    Ok(())
+}
+
+/// Replace the INGEST half of a work's `work_tag` rows (migration 0066).
+///
+/// REPLACE, not accumulate (unlike `work_cover` above): a tag removed upstream must
+/// disappear here too, or the genre facet list slowly fills with tags no work actually
+/// carries any more — and a facet that returns zero results is worse than a missing one.
+///
+/// Scoped to `source = 'mangadex'`, which is the entire reason that column exists: an
+/// admin's curated rows survive every re-sync untouched, so "curated wins outright"
+/// stays true (see `work_effective_genres`).
+///
+/// `INSERT OR IGNORE` rather than a plain INSERT because the primary key is
+/// (work_id, tag): a tag the admin ALSO curated collides. Ignoring keeps the admin's row
+/// — and crucially its `source = 'admin'` — so the work stays on the curated tier
+/// instead of being quietly demoted to the upstream one.
+async fn replace_source_tags(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work_id: &str,
+    tags: &[String],
+) -> Result<()> {
+    // Deletes UNCONDITIONALLY rather than early-returning on an empty list. An empty
+    // upstream tag list is a legitimate state, and a work whose tags were all removed
+    // upstream must end up with none here — an early return would keep them forever.
+    sqlx::query("DELETE FROM work_tag WHERE work_id = ? AND source = 'mangadex'")
+        .bind(work_id)
+        .execute(&mut **tx)
+        .await?;
+    for (ord, tag) in tags.iter().enumerate() {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source) \
+             VALUES (?, ?, ?, 'mangadex')",
+        )
+        .bind(work_id)
+        .bind(tag)
+        .bind(ord as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Rewrite just the upstream (`source = 'mangadex'`) half of an EXISTING work's tags
+/// (migration 0066), in a transaction of its own.
+///
+/// The backfill's genre top-up path: a work already in the spine is skipped for the full
+/// `upsert_work_from_mangadex`, but its genres may never have been written at all, and
+/// re-running the whole upsert to get them would rewrite every column, every alias, every
+/// credit and every cover for 113k works — vastly more write amplification (and
+/// SQLITE_BUSY exposure) than the one thing that is actually missing.
+///
+/// IMMEDIATE for the same reason the other write paths take it: this shares the single
+/// writer with the sync/scan/cover tasks, and grabbing the lock up front keeps a
+/// contended run out of the un-retryable `SQLITE_BUSY_SNAPSHOT` class.
+pub async fn refresh_source_tags(pool: &SqlitePool, work_id: &str, tags: &[String]) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    replace_source_tags(&mut tx, work_id, tags).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2038,10 +2493,18 @@ pub async fn merge_works_checked(
     .await?;
     // Folded tags are appended AFTER the target's own (ord is the admin's ordering,
     // and the two works numbered theirs independently from 0).
+    //
+    // CURATED HALF ONLY (migration 0066). Folding the upstream half would be pointless
+    // and harmful: pointless because `replace_source_tags` rebuilds the survivor's
+    // `source = 'mangadex'` rows wholesale on its very next sync, and harmful because
+    // until then the survivor's genre list would be the UNION of two works' upstream
+    // tags — a blob no single work carries. Human curation is the only half worth
+    // rescuing from a work that is about to stop existing.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_tag (work_id, tag, ord) \
-         SELECT ?, tag, ord + (SELECT COALESCE(MAX(ord), -1) + 1 FROM work_tag WHERE work_id = ?) \
-         FROM work_tag WHERE work_id = ?",
+        "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source) \
+         SELECT ?, tag, ord + (SELECT COALESCE(MAX(ord), -1) + 1 FROM work_tag WHERE work_id = ?), \
+                'admin' \
+         FROM work_tag WHERE work_id = ? AND source = 'admin'",
     )
     .bind(target_work)
     .bind(target_work)
