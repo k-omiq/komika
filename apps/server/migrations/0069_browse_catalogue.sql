@@ -311,3 +311,18 @@ CREATE INDEX IF NOT EXISTS idx_bc_all_chapters
 CREATE INDEX IF NOT EXISTS idx_bc_type_all_chapters
     ON browse_catalogue(comic_type, en_chapter_count DESC, work_id DESC,
                         status, content_rating);
+
+-- Give the planner statistics for the table it has the most choices about, NOW rather
+-- than in five minutes.
+--
+-- The 13 query plans this migration's header reports were measured on an ANALYZEd copy.
+-- Without `sqlite_stat1` rows SQLite assumes ~1M rows for a table and can pick the wrong
+-- one of the eight indices above for a given filter combination — reintroducing the
+-- full-table temp-B-tree sort they exist to prevent. `db::ANALYZE_TABLES` now includes
+-- this table, but that pass is deliberately offset 300s past boot to stay clear of the
+-- boot write burst, so without this statement the very first Browse requests after a
+-- deploy — the ones a cache-cold edge sends straight through — would plan blind.
+--
+-- Costs a single-table scan on a table that was just written in this same transaction,
+-- so its pages are already hot.
+ANALYZE browse_catalogue;

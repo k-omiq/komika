@@ -1900,6 +1900,27 @@ async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> 
     let genres = catalog::work_effective_genres_batch(&st.pool, &work_ids).await;
     // (2) Ratings, keyed by work id across both `reviews.series_id` shapes.
     let ratings = rating_summary_by_work_batch(&st.pool, &work_ids).await;
+    // (2b) The LIVE NSFW flag, re-read from `work` rather than trusted from the row.
+    //
+    // `browse_catalogue.is_nsfw` is a MATERIALIZED copy of
+    // `COALESCE(is_nsfw_override, is_nsfw)`, and the SQL gate gates on that copy. Taking
+    // the copy's value here too made `filter_nsfw` on the browse branch a TAUTOLOGY: it
+    // re-tested the very column the WHERE had already pinned, so it could never drop a
+    // row, and the comment there claiming it catches a "momentarily stale" copy was
+    // false. That matters because the copy really can go stale — `catalog::mark_work_nsfw`
+    // escalates `work.is_nsfw` from a source-level signal on the ingest/link path without
+    // a `resync_feed_nsfw` follow-up (now added), leaving up to one catalogue-sync
+    // interval, 6h by default, in which an opted-out viewer would be served the work.
+    //
+    // Reading `work` restores the defence the FTS branch already has (its rows go through
+    // `map_canonical_series`, which reads the live COALESCE). `nsfw_work_ids` fails
+    // CLOSED — a query error yields an empty set, so this cannot itself unmask anything
+    // — and the SQL gate remains the primary filter; this only catches the stale window.
+    //
+    // Costs one indexed `IN` query per page, and can leave a page shorter than `total`
+    // when it does fire. That is the right trade for a content gate: the alternative is
+    // serving the row.
+    let nsfw_live = nsfw_work_ids(&st.pool, &work_ids).await;
     // (3) The `work` columns 0064 does not store.
     let extras_sql = format!(
         "SELECT id, author, artist, description, description_override \
@@ -2000,7 +2021,10 @@ async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> 
                 // anywhere else — `main_chapter_count`, the aggregate, `chapter_count` —
                 // then "sort by chapters" would visibly disagree with the badge on the card.
                 chapter_count: r.en_chapter_count as i32,
-                is_nsfw: r.is_nsfw,
+                // LIVE flag, not `r.is_nsfw` — see `nsfw_live` above. The OR keeps the
+                // materialized value authoritative when it is the stricter of the two, so
+                // this can only ever ADD a flag, never clear one.
+                is_nsfw: r.is_nsfw || nsfw_live.contains(&r.work_id),
                 rating: ratings
                     .get(&r.work_id)
                     .cloned()
@@ -3385,11 +3409,16 @@ impl QueryRoot {
                 .await
                 .map_err(gql_err)?;
             // Rust-side backstop mirroring `discovery`. The SQL gate is `is_nsfw = 0` on a
-            // MATERIALIZED copy of `COALESCE(is_nsfw_override, is_nsfw)` in a file this
-            // resolver doesn't own, kept live by `resync_feed_nsfw`; re-filtering on the
-            // resolved `Series.is_nsfw` means an admin-marked work cannot leak to an
-            // opted-out viewer even if that copy is momentarily stale. There is a VERIFIED
-            // past leak on the sibling FTS branch below.
+            // MATERIALIZED copy of `COALESCE(is_nsfw_override, is_nsfw)`; this re-filters
+            // on `Series.is_nsfw`, which `map_browse_rows` resolves from the LIVE `work`
+            // row (`nsfw_work_ids`) precisely so that this is a real check and not a
+            // restatement of the WHERE clause.
+            //
+            // It was the latter until 2026-07-27: `map_browse_rows` copied the row's own
+            // materialized flag, so this filter re-tested the column the gate had already
+            // pinned and could not drop anything — while the copy genuinely could be stale
+            // (see `mark_work_nsfw`'s callers). There is a VERIFIED past leak on the
+            // sibling FTS branch below; this is the same class.
             let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
             // From `total`, not from a short page: the LIMIT is exactly BROWSE_PAGE_SIZE (no
             // +1 probe row) and the COUNT shares the page query's WHERE verbatim.
@@ -8598,6 +8627,13 @@ async fn add_source_series_core_ex(
             .await?;
             if source_nsfw {
                 crate::catalog::mark_work_nsfw(pool, &work_id).await?;
+                // Push the escalation into the materialized feed copies immediately.
+                // Without this the flag reaches `work` but not `browse_catalogue`, and
+                // Browse gates on the copy — so an opted-out viewer keeps being served
+                // this work until the next rebuild (one catalogue-sync interval, 6h by
+                // default; boot-only if the sync is disabled). The admin mark paths have
+                // always done this; the ingest/link path did not.
+                resync_feed_nsfw(pool, std::slice::from_ref(&work_id)).await;
             }
             // Adopt the AUTHORITATIVE stored linkage (H6): if a concurrent add via the
             // fuzzy path won the natural-key claim and linked this series to a different
@@ -8748,6 +8784,11 @@ async fn add_source_series_core_ex(
     // an `auto_merge` reuses an existing (possibly SFW) work, so OR the flag in there.
     if source_nsfw {
         crate::catalog::mark_work_nsfw(pool, &work_id).await?;
+        // Same reason as the other `mark_work_nsfw` site: `work` is the authoritative
+        // column, but Browse and the feeds gate on a materialized copy, so the escalation
+        // has to be pushed there in the same breath or it is invisible to the gate for up
+        // to a full sync interval.
+        resync_feed_nsfw(pool, std::slice::from_ref(&work_id)).await;
     }
 
     // Enqueue a review row whenever we took the PROVISIONAL review path (decision
@@ -12883,6 +12924,73 @@ mod tests {
             "the marked work is still on the page: {titles:?} — `resync_feed_nsfw` must \
              rewrite `browse_catalogue.is_nsfw`, not just the two feed tables"
         );
+    }
+
+    /// The one above covers the path that DOES resync the copy. This covers the path that
+    /// does not.
+    ///
+    /// `catalog::mark_work_nsfw` escalates `work.is_nsfw` from a source-level signal on the
+    /// ingest/link path. Until 2026-07-27 neither of its callers followed up with
+    /// `resync_feed_nsfw`, so `browse_catalogue.is_nsfw` stayed 0 until the next rebuild —
+    /// one catalogue-sync interval, 6h by default — and Browse gates on that copy.
+    ///
+    /// The Rust backstop was supposed to catch exactly this, but it re-tested
+    /// `Series.is_nsfw`, which `map_browse_rows` had copied FROM the same materialized
+    /// column the WHERE had already pinned: a tautology that could not drop a row. So the
+    /// two defences failed together and an opted-out viewer was served the work.
+    ///
+    /// This drives the copy stale DIRECTLY rather than through the ingest path, so it pins
+    /// the invariant itself — a stale copy must never surface the work — independently of
+    /// which callers remember to resync.
+    #[tokio::test]
+    async fn a_stale_nsfw_copy_still_cannot_surface_the_work_on_browse() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-stale", "Stale Copy", false, "1").await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        let wid = work_id_of(&pool, "md-stale").await;
+
+        // The authoritative column says NSFW; the materialized copy still says SFW. This is
+        // precisely the state `mark_work_nsfw` used to leave behind.
+        sqlx::query("UPDATE work SET is_nsfw = 1 WHERE id = ?")
+            .bind(&wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale: i64 =
+            sqlx::query_scalar("SELECT is_nsfw FROM browse_catalogue WHERE work_id = ?")
+                .bind(&wid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stale, 0,
+            "the copy must still be stale for this test to mean anything"
+        );
+
+        let r = exec(
+            &s,
+            r#"{ search(query: "", sort: NEWEST) { total items { title } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = r.data.into_json().unwrap()["search"].clone();
+        let titles: Vec<&str> = d["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap())
+            .collect();
+        assert!(
+            !titles.contains(&"Stale Copy"),
+            "an opted-out viewer was served a work whose LIVE flag is NSFW: {titles:?} — the \
+             backstop must read `work`, not the row's own materialized copy"
+        );
+        // `total` is deliberately NOT asserted here. It comes from the SQL COUNT, which
+        // shares the page query's WHERE and therefore also reads the stale copy, so it
+        // over-counts by one until the next resync/rebuild. Serving a correct page with a
+        // slightly high count is the right trade against serving the row.
     }
 
     /// A facet's COUNT must equal the number of results clicking that chip returns.

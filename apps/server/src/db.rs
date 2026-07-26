@@ -131,6 +131,19 @@ const ANALYZE_TABLES: &[&str] = &[
     "series_scan_state",
     "merge_candidate",
     "notifications",
+    // Browse's own table (migration 0069) and the updates feed's (0064). Both are
+    // wholesale-rebuilt on every sync cycle, so their stats go stale by construction.
+    //
+    // `browse_catalogue` matters most: it is the largest table the planner has to choose
+    // an index for (115,567 rows across eight indices), and 0069's query plans were
+    // verified on an ANALYZEd copy. Without stat rows the planner falls back to its
+    // ~1M-row default and can miss the intended index for a filter combination —
+    // reintroducing exactly the temp-B-tree sort over the whole table that those eight
+    // indices exist to prevent. That is the regression this list's own doc comment
+    // describes ("leaving the newest tables with no stat rows at all"), repeated on the
+    // newest table again.
+    "browse_catalogue",
+    "feed_series_updates",
 ];
 
 /// How often stats are refreshed. Well under the rate at which these tables change
