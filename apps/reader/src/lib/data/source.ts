@@ -609,10 +609,25 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 	const spineChapters: Chapter[] = spineRes.status === 'fulfilled' ? spineRes.value : [];
 	const canonSeries: Series | null = canonRes.status === 'fulfilled' ? canonRes.value : null;
 
-	// Candidate translators: canonical spine first (when the mirror has chapters),
-	// then each distinct suwayomi source mapping.
+	// Candidate translators: the canonical spine first, then each distinct suwayomi
+	// source mapping.
+	//
+	// The spine is offered whenever the work HAS a MangaDex mapping — NOT only when that
+	// mapping currently carries chapters. Gating on `spineChapters.length` was wrong for
+	// this catalogue in the exact case the picker matters most: MangaDex strips chapters
+	// on a licensing takedown, so a title like Boku no Hero Academia has three source
+	// mappings and zero spine chapters. The old test dropped MangaDex, leaving a single
+	// candidate, which renders as a static "Only one source available" label — a source
+	// picker that looks missing, on a page whose whole purpose is "this work exists
+	// elsewhere, go find it". A source you cannot read from is still a source you must be
+	// able to SEE, and its `chapterCount` of 0 says so honestly.
+	// Keyed on `canonSeries`, not on the raw MangaDex mapping: the spine's metadata comes
+	// from it below (`meta = canonSeries`), so offering a spine we have no series row for
+	// would hand `getSeries` a null `meta` and 404 the page. A work whose mapping exists
+	// but whose `canonicalSeries` refused (NSFW gate) correctly keeps its suwayomi
+	// sources only.
 	const candidates: { view: Omit<TranslatorOption, 'chapterCount'>; chapters: Chapter[] }[] = [];
-	if (spineChapters.length) {
+	if (spineChapters.length || canonSeries) {
 		candidates.push({
 			view: {
 				key: translatorKey('mangadex', null),
