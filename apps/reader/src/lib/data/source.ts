@@ -1627,9 +1627,38 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			}
 			return view;
 		}
-		// A numeric Suwayomi series is a single source — no translator picker. Fetch a
-		// candidate pool alongside it to seed related-by-genre. A pool failure just
-		// yields no related — it never fails the page.
+		// A numeric Suwayomi id addresses ONE source mapping — but the WORK behind it
+		// may have several, and then this page owes the reader a source picker.
+		//
+		// This branch used to assume "numeric ⇒ single source, no picker", which was
+		// wrong for every Suwayomi-ANCHORED work: `browse_catalogue.reader_id` links
+		// those by their numeric id (a work with no MangaDex mapping has no `w_` id to
+		// link), so a work like `A Wimp's Strategy Guide to Conquer the Tower` — three
+		// Suwayomi sources — opened at `/series/241` and rendered as if it had one. The
+		// id on the URL was the only thing single about it.
+		//
+		// So: resolve the owning work and hand the page to the canonical branch above,
+		// which already builds the translator list, honours the persisted preference and
+		// keys library/progress writes to the work rather than to one of its mirrors.
+		// The recursion terminates — a `w_` id can only take the canonical branch.
+		//
+		// `chapters`/`pool` are kicked off ALONGSIDE the series rather than after it, so
+		// the fall-through path below costs exactly what it did before; when we delegate
+		// they are simply discarded (pre-`catch`ed, so a discarded rejection can't
+		// surface as an unhandled one).
+		//
+		// Falling THROUGH on a null/failed canonical view is deliberate: a work we can't
+		// resolve is still a series we can render from this one source. The picker is
+		// worth a round trip, never the page.
+		const chaptersP = backend.chapters(id);
+		// A DISCARDED rejection (delegate path) must not surface as an unhandled one —
+		// but this must not become a `.catch(() => [])` fallback either: on the
+		// fall-through path a chapters outage still has to fail the page honestly rather
+		// than render a real series as having no chapters. Handling it on a SEPARATE
+		// branch leaves `chaptersP` itself rejecting for the awaiter below.
+		void chaptersP.catch(() => {});
+		// A candidate pool to seed related-by-genre. A pool failure just yields no
+		// related — it never fails the page.
 		//
 		// The sort is PINNED rather than left to the server's default. This call is not a
 		// browse: it wants a stable, cheap slab of recent catalogue rows to intersect
@@ -1640,14 +1669,16 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 		// the default. NEWEST is deterministic over a fixed catalogue. (Page size is the
 		// server's to choose: this path now receives 30 rows rather than 20, which only
 		// widens the pool `relatedFor` picks its 8 from.)
-		const [s, chs, pool] = await Promise.all([
-			backend.series(id),
-			backend.chapters(id),
-			backend
-				.search('', 1, { sort: 'NEWEST' })
-				.then((r) => r.items)
-				.catch(() => [] as Series[]),
-		]);
+		const poolP = backend
+			.search('', 1, { sort: 'NEWEST' })
+			.then((r) => r.items)
+			.catch(() => [] as Series[]);
+		const s = await backend.series(id);
+		if (s.workId && isCanonicalId(s.workId)) {
+			const canonical = await getSeries(s.workId);
+			if (canonical.view) return canonical.view;
+		}
+		const [chs, pool] = await Promise.all([chaptersP, poolP]);
 		return mapSeriesView(s, chs, pool);
 	}, null);
 	return { view: r.data, error: r.error };

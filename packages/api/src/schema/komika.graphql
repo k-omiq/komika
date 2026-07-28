@@ -193,6 +193,7 @@ type Series {
 	latestChapterAt: String! # [komika] real newest-chapter time (ISO); empty when no dated chapter cached. The field feeds/cards should sort and label by.
 	detectedAt: String # [komika] when WE detected that newest chapter (discovery time) — the third clock, distinct from updatedAt (poll touch) and latestChapterAt (upstream publish). Decides Updates-feed MEMBERSHIP but does NOT order it. Always carries a UTC offset, so Date.parse can't read it as local time. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts, the client drops it against a server that predates it.
 	views: SeriesViews! # [komika] per-series view (chapter-read) counts — the popularity signal; resolver field, selected only by the series-detail queries
+	workId: ID # [komika] the canonical work this series belongs to (null when uncatalogued). Lets the reader get from a numeric Suwayomi id to the work whose SIBLING source mappings the source picker must offer. Resolver field — one query per series, so like `views` it is selected only by the single-series detail query, never by the shared SeriesFields fragment (per-card N+1)
 	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
 	localizedDescriptions: [LocalizedDescription!]! # every-language MangaDex descriptions (singular `description` stays the English-preferred primary)
 	credits: [Credit!]! # full author/artist list (singular `author`/`artist` keep only the first of each)

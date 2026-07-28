@@ -347,6 +347,24 @@ impl Series {
         })
     }
 
+    /// The canonical `work` this series belongs to, or null when the catalogue has no
+    /// mapping for it yet.
+    ///
+    /// A numeric Suwayomi id addresses ONE source mapping, but the work behind it may
+    /// carry several — and the reader has no other way to get from the id on the URL to
+    /// the work whose sibling sources it must offer in the source picker. Browse links a
+    /// Suwayomi-anchored work by its numeric `reader_id`, so without this field those
+    /// pages silently render as single-source (see `getSeries` in the reader's
+    /// `data/source.ts`).
+    ///
+    /// A RESOLVER field, not a column on the row: it costs a query per series, so it is
+    /// selected ONLY by the single-series detail query, never by the shared
+    /// `SeriesFields` fragment that feeds/browse grids spread — that would be a per-card
+    /// N+1. For a `w_` id it is just an existence check and answers with the id itself.
+    async fn work_id(&self, ctx: &Context<'_>) -> Result<Option<ID>> {
+        Ok(resolve_work_id(&state(ctx).pool, &self.id.0).await.map(ID))
+    }
+
     /// When OUR scanner first detected this series' newest chapter
     /// (`series_scan_state.last_new_chapter_at`) — discovery time, not upstream release
     /// time. Membership in the Updates feed is decided by this column, but the feed is
@@ -13418,6 +13436,109 @@ mod tests {
         );
         assert_eq!(rows[1]["extension"]["versionCode"], serde_json::json!(7));
         assert_eq!(rows[1]["lang"], serde_json::json!("en"));
+    }
+
+    /// `Series.workId` is the reader's only bridge from a numeric Suwayomi id to the
+    /// work behind it — and therefore to that work's SIBLING sources. Browse links a
+    /// Suwayomi-anchored work by its numeric `reader_id`, so without this the series
+    /// page rendered a three-source work as single-source (no picker at all).
+    ///
+    /// Asserts the whole bridge, not just the field: numeric id → work → siblings.
+    #[tokio::test]
+    async fn series_work_id_bridges_a_numeric_id_to_its_sibling_sources() {
+        let (s, pool) = setup_full(100).await;
+        // Cached, so `series(id:)` resolves without a Suwayomi round trip.
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (777, 'Multi Source', 'ONGOING', 'src-a', 0, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-multi",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Multi Source".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-multi'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Two Suwayomi mirrors of the one work; `777` is the id the reader arrives with.
+        for (source_id, source_key) in [("src-a", "777"), ("src-b", "888")] {
+            crate::catalog::upsert_source_series(
+                &pool, &work_id, "suwayomi", source_id, source_key, None, false,
+            )
+            .await
+            .unwrap();
+        }
+
+        let r = exec(
+            &s,
+            r#"{ series(id: "777") { id workId } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let resolved = r.data.into_json().unwrap()["series"]["workId"].clone();
+        assert_eq!(
+            resolved,
+            serde_json::json!(work_id),
+            "a numeric id must report the work it belongs to"
+        );
+
+        // The point of the bridge: that work carries the sources the picker needs.
+        let q = format!(r#"{{ workSources(workId: "{work_id}") {{ sourceKey }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let mut keys: Vec<String> = r.data.into_json().unwrap()["workSources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["sourceKey"].as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["777", "888", "md-multi"],
+            "the work behind `777` exposes every sibling source, not just the one asked for"
+        );
+    }
+
+    /// The fall-through case: a cached Suwayomi series the catalogue has no mapping for
+    /// reports a null `workId`, so the reader renders it from that one source rather
+    /// than chasing a work that doesn't exist.
+    #[tokio::test]
+    async fn series_work_id_is_null_for_an_uncatalogued_series() {
+        let (s, pool) = setup_full(100).await;
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (778, 'Orphan', 'ONGOING', 'src-a', 0, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ series(id: "778") { id workId } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["series"]["workId"],
+            serde_json::Value::Null
+        );
     }
 
     #[tokio::test]

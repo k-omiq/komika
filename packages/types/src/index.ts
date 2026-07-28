@@ -436,6 +436,17 @@ export interface Series {
 	 * `showNsfw` preference server-side — this lets the UI badge/flag it too.
 	 */
 	isNsfw: boolean;
+	/**
+	 * The canonical `w_` work this series belongs to, or null when the catalogue has
+	 * no mapping for it.
+	 *
+	 * Only meaningful — and only selected — on the single-series detail query: it is a
+	 * resolver field costing a query per series, so feeds and browse grids omit it and
+	 * see `undefined`. The reader uses it to turn a numeric Suwayomi id (which browse
+	 * links for Suwayomi-anchored works) into the work whose sibling source mappings
+	 * the source picker offers.
+	 */
+	workId?: Id | null;
 	scan: ScanPolicy;
 	createdAt: string;
 	updatedAt: string;

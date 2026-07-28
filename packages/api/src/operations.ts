@@ -26,7 +26,7 @@
  * unchanged rather than emit invalid GraphQL) but it silently disables the fallback,
  * so the query just fails against an older server.
  */
-export const OPTIONAL_SERIES_FIELDS = ['detectedAt'] as const;
+export const OPTIONAL_SERIES_FIELDS = ['detectedAt', 'workId'] as const;
 
 /**
  * Query ARGUMENTS the client passes OPPORTUNISTICALLY — same deploy-ordering hazard
@@ -232,6 +232,12 @@ export const SERIES = /* GraphQL */ `
 			...SeriesFields
 			libraryStatus
 			isFavorite
+			# The canonical work behind a numeric Suwayomi id — how the reader finds the
+			# work whose SIBLING sources belong in the source picker. Selected here and
+			# nowhere else: it is a resolver field (one query per series), so putting it
+			# on SeriesFields would make every browse card pay for it. Keep it on its own
+			# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
+			workId
 			views {
 				total
 				last7d
