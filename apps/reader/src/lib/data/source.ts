@@ -26,6 +26,8 @@ import type {
 // rather than being mirrored into a view type that would only ever be mapped 1:1.
 import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 import { backend, images } from '$lib/context';
+import { findChapterOwner } from './chapter-owner';
+import type { ChapterCandidate } from './chapter-owner';
 import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
 import { config } from '$lib/config';
 import * as content from './content';
@@ -566,6 +568,15 @@ interface ResolvedWork {
 	canonicalId: string | null;
 	/** Whether `chapters` are already server-ordered (the canonical spine). */
 	preserveOrder: boolean;
+	/**
+	 * EVERY source's chapters, not just the selected one's, in picker order.
+	 *
+	 * The fan-out below already fetches all of them to compute the per-source counts,
+	 * so exposing them is free — and it is what lets the reader open a `?ch=` that
+	 * belongs to a source other than the default instead of rendering an empty view.
+	 * See {@link findChapterOwner}.
+	 */
+	candidates: ChapterCandidate<Chapter>[];
 }
 
 /**
@@ -720,6 +731,11 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 		canonSeries,
 		canonicalId,
 		preserveOrder: selected.suwayomiMangaId === null,
+		candidates: ordered.map((c) => ({
+			key: c.view.key,
+			suwayomiMangaId: c.view.suwayomiMangaId,
+			chapters: c.chapters,
+		})),
 	};
 }
 
@@ -1962,31 +1978,69 @@ export function getReaderChapter(
 			const chs = readFromSrc
 				? await backend.chapters(srcParam as string).catch(() => [] as Chapter[])
 				: resolved.chapters;
-			if (!chs.length) {
+			// An empty ACTIVE source is only a dead end when there is no `?ch=` for
+			// another source to satisfy — the picker deliberately offers sources that
+			// carry no chapters (a MangaDex takedown leaves exactly that), so bailing
+			// here unconditionally would reproduce the blank reader the lookup below
+			// exists to prevent.
+			if (!chs.length && !chParam) {
 				const empty = emptyReader(effectiveId, tmeta);
 				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 			}
-			const preserveOrder = readFromSrc ? false : resolved.preserveOrder;
-			const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
+			let preserveOrder = readFromSrc ? false : resolved.preserveOrder;
+			let activeChs = chs;
+			let activeSpine = spine;
+			let activeSrc = readFromSrc
+				? (srcParam as string | null)
+				: (resolved.selected.suwayomiMangaId ?? null);
 			let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
-			// A requested chapter not carried by this source degrades honestly to the
-			// no-pages state (don't silently open a different chapter).
+			// A `?ch=` the ACTIVE source doesn't carry is routine, not corrupt: sources
+			// don't share chapter ids, and a "new chapter" notification links whichever
+			// source the scanner saw it on (`notifications.ts` has no `src` to attach)
+			// while the reader defaults to the source with the most chapters. This used
+			// to return the no-pages state, which renders a blank reader that requests
+			// ZERO images — indistinguishable, from the outside, from a broken image
+			// proxy. Open the chapter from the source that actually has it instead.
+			//
+			// Matching is by chapter ID only, so the original invariant is intact: it is
+			// still impossible to silently open a DIFFERENT chapter. Finding the same id
+			// under another source isn't a substitution — it's the same chapter, located.
 			if (chParam && !target) {
-				const empty = emptyReader(effectiveId, tmeta);
-				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+				const owner = findChapterOwner(
+					resolved.candidates,
+					chParam,
+					readFromSrc ? (srcTranslator?.key ?? null) : resolved.selected.key,
+				);
+				// Genuinely unknown to every source — stay honest and render empty.
+				if (!owner) {
+					const empty = emptyReader(effectiveId, tmeta);
+					return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+				}
+				target = owner.chapter;
+				activeChs = owner.candidate.chapters;
+				activeSrc = owner.candidate.suwayomiMangaId;
+				// The spine is the only server-ordered list, and only IT reads through
+				// `canonicalPages` — both track the source we actually landed on.
+				activeSpine = owner.candidate.suwayomiMangaId === null;
+				preserveOrder = activeSpine;
+				// Reflect the real source in the picker, so the switcher doesn't claim a
+				// source that isn't the one being read.
+				tmeta.selectedTranslatorKey = owner.candidate.key;
 			}
+			const asc = preserveOrder ? activeChs : [...activeChs].sort((a, b) => a.number - b.number);
 			if (!target) target = asc.find((c) => !c.read) ?? asc[0];
 			const domainPages =
-				spine && backend.canonicalPages
+				activeSpine && backend.canonicalPages
 					? await backend.canonicalPages(target.id)
 					: await backend.pages(target.id);
 			const urls = await resolvePageUrls(domainPages);
-			const readingSrc = readFromSrc
-				? (srcParam as string)
-				: (resolved.selected.suwayomiMangaId ?? null);
+			const readingSrc = activeSrc;
+			// `activeChs`, not `chs`: the list, the prev/next links and the target must
+			// all describe the SAME source, or navigation walks a list the reader is
+			// not actually on.
 			return buildReaderView(
 				effectiveId,
-				chs,
+				activeChs,
 				preserveOrder,
 				target,
 				urls,

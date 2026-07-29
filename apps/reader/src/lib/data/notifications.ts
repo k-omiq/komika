@@ -10,7 +10,10 @@ import { auth } from '$lib/auth.svelte';
 
 export function notificationsLive(): boolean {
 	return (
-		config.backendEnabled && config.backendKind === 'komika' && !!auth.user && !!backend.notifications
+		config.backendEnabled &&
+		config.backendKind === 'komika' &&
+		!!auth.user &&
+		!!backend.notifications
 	);
 }
 
@@ -55,7 +58,14 @@ function messageFor(n: Notification): string {
 
 /** Deep-link to the thread: a series discussion opens the series page; a chapter thread
  *  opens the reader at that chapter (the server resolves the owning `seriesId`). Null
- *  when it can't be resolved (non-navigating). */
+ *  when it can't be resolved (non-navigating).
+ *
+ *  Deliberately carries NO `src`: a notification is raised for whichever source the
+ *  scanner saw the chapter on, which is often not the source the reader defaults to,
+ *  and `Notification` has no field naming it. That mismatch used to render a blank
+ *  reader; `getReaderChapter` now locates the chapter's owning source itself (see
+ *  `findChapterOwner`), which also repairs every link already sent. Adding `src` here
+ *  would need a server schema change and would buy nothing the reader can't derive. */
 function hrefFor(n: Notification): string | null {
 	if (n.targetType === 'series' && n.targetId) return `/series/${n.targetId}`;
 	if (n.targetType === 'chapter' && n.seriesId && n.targetId) {
