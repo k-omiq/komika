@@ -28,6 +28,7 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 import { backend, images } from '$lib/context';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
+import { isRedundantMangadexExt, pickDefaultKey, MANGADEX_EXT_PKG } from './translator-select';
 import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
 import { config } from '$lib/config';
 import * as content from './content';
@@ -637,7 +638,17 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 	// would hand `getSeries` a null `meta` and 404 the page. A work whose mapping exists
 	// but whose `canonicalSeries` refused (NSFW gate) correctly keeps its suwayomi
 	// sources only.
-	const candidates: { view: Omit<TranslatorOption, 'chapterCount'>; chapters: Chapter[] }[] = [];
+	const candidates: {
+		view: Omit<TranslatorOption, 'chapterCount'>;
+		chapters: Chapter[];
+		/**
+		 * The all.mangadex extension shadowing a readable direct spine — the same MangaDex
+		 * content by the slow `api.komiq.cc` route. Hidden from the default selection and the
+		 * picker (the spine represents it via `mangadex.network`), but kept in the list so
+		 * {@link findChapterOwner} can still resolve a `?ch=` naming one of its chapters.
+		 */
+		redundant?: boolean;
+	}[] = [];
 	if (spineChapters.length || canonSeries) {
 		candidates.push({
 			view: {
@@ -645,34 +656,48 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 				sourceType: 'mangadex',
 				name: 'MangaDex',
 				lang: null,
-				iconUrl: iconForPkg('eu.kanade.tachiyomi.extension.all.mangadex'),
+				iconUrl: iconForPkg(MANGADEX_EXT_PKG),
 				suwayomiMangaId: null,
 			},
 			chapters: spineChapters,
 		});
 	}
+	// A direct spine that actually carries chapters is the fast (mangadex.network) route
+	// for this MangaDex work; when present, the all.mangadex Suwayomi extension below is a
+	// redundant duplicate of it and must not be served over api.komiq.cc in its place.
+	const hasReadableSpine = spineChapters.length > 0;
 
 	const seenIds = new Set<string>();
-	const suwViews: Omit<TranslatorOption, 'chapterCount'>[] = [];
+	const suwViews: { view: Omit<TranslatorOption, 'chapterCount'>; redundant: boolean }[] = [];
 	for (const ws of wsList) {
 		if (ws.sourceType === 'mangadex') continue; // spine handled above
 		const id = ws.sourceKey;
 		if (!id || seenIds.has(id)) continue;
 		seenIds.add(id);
 		suwViews.push({
-			key: translatorKey(ws.sourceType, id),
-			sourceType: ws.sourceType,
-			name: prettySourceName(ws.extension?.pkgName) ?? `Source ${ws.sourceId}`,
-			lang: langLabel(ws.lang),
-			iconUrl: iconForPkg(ws.extension?.pkgName),
-			suwayomiMangaId: id,
+			view: {
+				key: translatorKey(ws.sourceType, id),
+				sourceType: ws.sourceType,
+				name: prettySourceName(ws.extension?.pkgName) ?? `Source ${ws.sourceId}`,
+				lang: langLabel(ws.lang),
+				iconUrl: iconForPkg(ws.extension?.pkgName),
+				suwayomiMangaId: id,
+			},
+			// The MangaDex extension duplicates the direct spine; flag it redundant only when
+			// the spine can serve the content itself. Non-MangaDex extensions are never
+			// redundant — they are the sole source of their content.
+			redundant: isRedundantMangadexExt(ws.extension?.pkgName, hasReadableSpine),
 		});
 	}
 	// Fetch each suwayomi translator's chapters (bounded — a work has few mappings).
 	const suwChapters = await Promise.all(
-		suwViews.map((v) => backend.chapters(v.suwayomiMangaId as string).catch(() => [] as Chapter[])),
+		suwViews.map((v) =>
+			backend.chapters(v.view.suwayomiMangaId as string).catch(() => [] as Chapter[]),
+		),
 	);
-	suwViews.forEach((v, i) => candidates.push({ view: v, chapters: suwChapters[i] }));
+	suwViews.forEach((v, i) =>
+		candidates.push({ view: v.view, chapters: suwChapters[i], redundant: v.redundant }),
+	);
 
 	if (!candidates.length) return null;
 
@@ -688,20 +713,27 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 			return a.i - b.i;
 		});
 
-	const translators: TranslatorOption[] = ordered.map((c) => ({
-		...c.view,
-		chapterCount: c.chapters.length,
-	}));
+	// Picker list EXCLUDES a redundant all.mangadex extension: MangaDex must not appear
+	// twice, and a manual pick must not be able to route MangaDex content onto the slow
+	// api.komiq.cc proxy when the direct spine serves it via mangadex.network.
+	const translators: TranslatorOption[] = ordered
+		.filter((c) => !c.redundant)
+		.map((c) => ({ ...c.view, chapterCount: c.chapters.length }));
 
 	// Selection: honour a valid persisted preference, else the candidate carrying
 	// the MOST chapters (so a work whose spine has few/none but another source is
 	// complete — e.g. Solo Leveling → Asura — defaults to the readable source),
-	// else the first candidate.
-	const byMostChapters = [...ordered].sort((a, b) => b.chapters.length - a.chapters.length)[0];
-	let pick =
-		(preferredKey && ordered.find((c) => c.view.key === preferredKey)) ||
-		byMostChapters ||
-		ordered[0];
+	// else the first candidate. A redundant all.mangadex extension is never eligible —
+	// its content is the direct spine, so a stale persisted preference to it heals here.
+	const pickKey = pickDefaultKey(
+		ordered.map((c) => ({
+			key: c.view.key,
+			chapterCount: c.chapters.length,
+			redundant: !!c.redundant,
+		})),
+		preferredKey,
+	);
+	const pick = ordered.find((c) => c.view.key === pickKey) ?? ordered[0];
 
 	const selected = translators.find((t) => t.key === pick.view.key) as TranslatorOption;
 
@@ -2024,8 +2056,14 @@ export function getReaderChapter(
 				activeSpine = owner.candidate.suwayomiMangaId === null;
 				preserveOrder = activeSpine;
 				// Reflect the real source in the picker, so the switcher doesn't claim a
-				// source that isn't the one being read.
-				tmeta.selectedTranslatorKey = owner.candidate.key;
+				// source that isn't the one being read. If the owning source is HIDDEN from
+				// the picker — a redundant all.mangadex extension the direct spine stands in
+				// for — highlight the spine instead of a key the picker never renders (else no
+				// chip shows as selected). The content is MangaDex either way, so the spine is
+				// the honest highlight.
+				const ownerKey = owner.candidate.key;
+				const ownerVisible = resolved.translators.some((t) => t.key === ownerKey);
+				tmeta.selectedTranslatorKey = ownerVisible ? ownerKey : translatorKey('mangadex', null);
 			}
 			const asc = preserveOrder ? activeChs : [...activeChs].sort((a, b) => a.number - b.number);
 			if (!target) target = asc.find((c) => !c.read) ?? asc[0];

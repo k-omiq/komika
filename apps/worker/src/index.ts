@@ -144,7 +144,9 @@ export default {
 		// poisoning) — see I3. Reject anything that isn't `image/*`.
 		const contentType = originResp.headers.get('Content-Type') ?? '';
 		if (!isImageContentType(contentType)) {
-			console.error(`img proxy: non-image Content-Type "${contentType}" for ${upstream.toString()}`);
+			console.error(
+				`img proxy: non-image Content-Type "${contentType}" for ${upstream.toString()}`,
+			);
 			return errorResponse(502, 'Upstream is not an image');
 		}
 
@@ -153,7 +155,9 @@ export default {
 		// absent or lies.
 		const declaredLen = originResp.headers.get('Content-Length');
 		if (declaredLen && Number(declaredLen) > MAX_IMAGE_BYTES) {
-			console.error(`img proxy: upstream Content-Length ${declaredLen} exceeds cap for ${upstream.toString()}`);
+			console.error(
+				`img proxy: upstream Content-Length ${declaredLen} exceeds cap for ${upstream.toString()}`,
+			);
 			return errorResponse(502, 'Upstream image too large');
 		}
 
@@ -172,7 +176,10 @@ export default {
  * non-allowlisted host (or non-http(s) scheme) rejects — this is what keeps a
  * 3xx from turning the proxy into an SSRF/open-proxy primitive.
  */
-async function fetchFollowingRedirects(start: URL, allowRaw: string | undefined): Promise<Response> {
+async function fetchFollowingRedirects(
+	start: URL,
+	allowRaw: string | undefined,
+): Promise<Response> {
 	let current = start;
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
 		const resp = await fetch(current.toString(), {
@@ -223,10 +230,30 @@ function finalizeImage(source: Response, contentType: string | null): Response {
 	headers.set('X-Content-Type-Options', 'nosniff');
 	headers.set('Content-Disposition', 'inline');
 	for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-	// Do NOT forward the upstream Content-Length: the body is re-streamed through
-	// a size cap (and a stale/incorrect length can truncate or hang the response).
-	// Let the runtime compute the length for the body we actually emit.
-	const body = capStream(source.body as ReadableStream<Uint8Array>, MAX_IMAGE_BYTES);
+	// Do NOT forward the upstream Content-Length: a stale/incorrect length can truncate
+	// or hang the response; let the runtime compute the length for the body we emit.
+	//
+	// Stream the body NATIVELY when the upstream declared a length within the cap. Piping
+	// a large body through a JS TransformStream (`capStream`) runs JS for every chunk, and
+	// that per-byte CPU on a multi-MB image can exceed the Worker's CPU limit and kill the
+	// response mid-stream. Pass a trustworthy length-framed body through untouched; fall
+	// back to the JS byte-cap whenever the length can't be trusted.
+	//
+	// Trust requires ALL of: a present, finite, POSITIVE length (`Number('')` is 0, a JS
+	// footgun, so `> 0` keeps an empty/whitespace header on the capped path); within the
+	// cap (re-checked here so this and the pre-fetch gate share one predicate); and NO
+	// `Transfer-Encoding` — per RFC 7230 chunked framing wins over `Content-Length`, so a
+	// response carrying both is chunked-and-unbounded and must stay capped.
+	const declaredLen = source.headers.get('Content-Length');
+	const len = Number(declaredLen);
+	const trustedLen =
+		declaredLen !== null &&
+		Number.isFinite(len) &&
+		len > 0 &&
+		len <= MAX_IMAGE_BYTES &&
+		source.headers.get('Transfer-Encoding') === null;
+	const raw = source.body as ReadableStream<Uint8Array>;
+	const body = trustedLen ? raw : capStream(raw, MAX_IMAGE_BYTES);
 	return new Response(body, { status: 200, headers });
 }
 

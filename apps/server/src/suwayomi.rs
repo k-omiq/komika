@@ -62,6 +62,30 @@ const COVER_TIMEOUT_SECS: u64 = 8;
 /// first chunk that crosses the line instead of buffering a hostile body.
 pub const MAX_COVER_SOURCE_BYTES: usize = 24 * 1024 * 1024;
 
+/// Max concurrent in-flight PAGE fetches to Suwayomi. Pages are the read critical path
+/// and arrive in bursts (a chapter is tens of pages), so this is more generous than the
+/// cover pool — but still bounded, so a slow source (Suwayomi proxies to scraped sites,
+/// often via FlareSolverr, which routinely stalls) can't pile unbounded fetches onto the
+/// engine and starve the scanner. A SEPARATE pool from covers so page bursts and cover
+/// demand never evict each other.
+pub const PAGE_FETCH_CONCURRENCY: usize = 16;
+
+/// How long a page fetch will WAIT for a pool permit before shedding with a retryable
+/// 503. Covers fail fast (a background warmer converges out-of-band), but a page has no
+/// such materializer — a hard failure is a visibly broken page needing a manual tap — so
+/// we ride out a transient burst briefly instead of breaking. Bounded so saturation
+/// degrades to a short wait, never the 30 s pile-up the unbounded path allowed.
+const PAGE_ACQUIRE_WAIT_SECS: u64 = 6;
+
+/// Request timeout for a PAGE fetch. Below the 30 s scan timeout (a hung page must fail
+/// retryably, not freeze a slot for 30 s) but above the 8 s cover timeout — a
+/// full-resolution page over a slow source legitimately takes longer than a thumbnail.
+const PAGE_TIMEOUT_SECS: u64 = 20;
+
+/// Hard cap on a single page source body, mirroring the image Worker's `MAX_IMAGE_BYTES`.
+/// Streamed via [`read_capped`] so a hostile/oversized body is refused, not buffered.
+pub const MAX_PAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Why an on-demand cover fetch didn't produce bytes.
 #[derive(Debug)]
 pub enum CoverFetchError {
@@ -82,20 +106,41 @@ impl std::fmt::Display for CoverFetchError {
     }
 }
 
+/// Why an on-demand page fetch didn't produce bytes. Mirrors [`CoverFetchError`] but
+/// kept distinct: pages use their own pool/timeout and a saturated page is handled
+/// differently (a short wait, then a retryable 503) from a saturated cover (fail fast).
+#[derive(Debug)]
+pub enum PageFetchError {
+    /// The bounded page-fetch pool stayed saturated past [`PAGE_ACQUIRE_WAIT_SECS`].
+    /// Callers should return a retryable status rather than queue indefinitely.
+    Busy,
+    /// A real upstream failure (network, non-2xx, over-cap or truncated body).
+    Upstream(anyhow::Error),
+}
+
+impl std::fmt::Display for PageFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(f, "page fetch pool saturated"),
+            Self::Upstream(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Read a response body into memory, streamed, refusing anything past `cap` bytes.
 /// `Response::bytes()` is unbounded (only the request timeout bounds it), so a huge or
 /// hostile body could otherwise balloon the process. Mirrors `mangadex::read_capped`.
 async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
     if let Some(len) = res.content_length() {
         if len > cap as u64 {
-            return Err(anyhow!("cover body exceeds cap ({len} > {cap})"));
+            return Err(anyhow!("response body exceeds cap ({len} > {cap})"));
         }
     }
     let mut out: Vec<u8> =
         Vec::with_capacity(res.content_length().unwrap_or(0).min(1 << 20) as usize);
     while let Some(chunk) = res.chunk().await? {
         if out.len() + chunk.len() > cap {
-            return Err(anyhow!("cover body exceeds cap ({cap})"));
+            return Err(anyhow!("response body exceeds cap ({cap})"));
         }
         out.extend_from_slice(&chunk);
     }
@@ -293,6 +338,12 @@ pub struct SuwayomiClient {
     cover_sem: Arc<Semaphore>,
     /// Bound on detached background materializations (see [`BG_MATERIALIZE_CONCURRENCY`]).
     bg_sem: Arc<Semaphore>,
+    /// Separate HTTP client for PAGE fetches — its own timeout ([`PAGE_TIMEOUT_SECS`]),
+    /// between the cover and scan clients.
+    page_http: reqwest::Client,
+    /// Global bound on in-flight upstream PAGE fetches (see [`PAGE_FETCH_CONCURRENCY`]).
+    /// Shared by every clone of the client; separate from `cover_sem`.
+    page_sem: Arc<Semaphore>,
 }
 
 impl SuwayomiClient {
@@ -323,6 +374,13 @@ impl SuwayomiClient {
             .timeout(std::time::Duration::from_secs(COVER_TIMEOUT_SECS))
             .build()
             .unwrap_or_else(|_| http.clone());
+        // Page client: full-resolution content, so more patient than covers but still
+        // short of the scan client, and bounded by its own pool below.
+        let page_http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(PAGE_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| http.clone());
         Self {
             base_url,
             image_base_url,
@@ -332,6 +390,8 @@ impl SuwayomiClient {
             cover_http,
             cover_sem: Arc::new(Semaphore::new(COVER_FETCH_CONCURRENCY)),
             bg_sem: Arc::new(Semaphore::new(BG_MATERIALIZE_CONCURRENCY)),
+            page_http,
+            page_sem: Arc::new(Semaphore::new(PAGE_FETCH_CONCURRENCY)),
         }
     }
 
@@ -403,7 +463,7 @@ impl SuwayomiClient {
     }
 
     /// Fetch a cover image from the internal Suwayomi REST path for an ON-DEMAND
-    /// request. Unlike [`Self::fetch_image`] this:
+    /// request. Unlike a plain unbounded fetch this:
     ///
     /// * takes a permit from the bounded cover pool with `try_acquire` and returns
     ///   [`CoverFetchError::Busy`] immediately when saturated — no queueing, which is
@@ -456,21 +516,46 @@ impl SuwayomiClient {
         Ok((bytes, content_type))
     }
 
-    /// Fetch a Suwayomi image (a cover thumbnail or a chapter page) by its internal
-    /// REST path, from the INTERNAL loopback host (`base_url`, e.g. localhost:4567) —
-    /// NOT `image_base_url`. Suwayomi is not publicly exposed, so the browser can't
-    /// reach `:4567`; instead the public cover/page URLs are built against our own
-    /// origin (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and this method fetches the
-    /// bytes server-side so `serve_suwayomi_image` can re-serve them. Fetching against
-    /// `image_base_url` would loop back into ourselves — always use `base_url`.
+    /// Fetch a chapter PAGE from the internal Suwayomi REST path for an ON-DEMAND
+    /// request. Like [`Self::fetch_cover_now`] this bounds concurrency (own pool,
+    /// [`PAGE_FETCH_CONCURRENCY`]), uses a page-specific timeout ([`PAGE_TIMEOUT_SECS`])
+    /// and streams under a byte cap ([`MAX_PAGE_SOURCE_BYTES`]) — so a slow source can
+    /// neither freeze a slot for 30 s nor pile unbounded fetches onto the engine.
     ///
-    /// `path` is a server-validated image path (see `main::is_suwayomi_image_path`),
-    /// so it is trusted. Returns the raw bytes + upstream `Content-Type`.
-    pub async fn fetch_image(&self, path: &str) -> Result<(Vec<u8>, String)> {
+    /// Unlike covers it WAITS up to [`PAGE_ACQUIRE_WAIT_SECS`] for a permit before
+    /// shedding with [`PageFetchError::Busy`]: a page has no background warmer, so
+    /// riding out a transient burst beats a broken page the reader can only recover with
+    /// a manual retry. Sustained saturation still sheds (retryable) rather than queueing
+    /// into the 30 s pile-up the old unbounded path produced.
+    pub async fn fetch_page_now(
+        &self,
+        path: &str,
+    ) -> std::result::Result<(Vec<u8>, String), PageFetchError> {
+        // Held for the whole fetch below (bound to a named local, not `_`, so it is not
+        // dropped early) — that is what makes the concurrency bound effective.
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(PAGE_ACQUIRE_WAIT_SECS),
+            self.page_sem.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            // Semaphore closed (shutdown) — treat as an upstream failure, not a retry.
+            Ok(Err(e)) => return Err(PageFetchError::Upstream(anyhow!(e))),
+            // Waited past the cap without a slot — shed, retryably.
+            Err(_) => return Err(PageFetchError::Busy),
+        };
+        self.fetch_page_inner(path)
+            .await
+            .map_err(PageFetchError::Upstream)
+    }
+
+    /// Shared body of the page fetcher. Assumes the caller holds a page-pool permit.
+    async fn fetch_page_inner(&self, path: &str) -> Result<(Vec<u8>, String)> {
         let url = format!("{}{}", self.base_url, path);
-        let res = self.http.get(url).send().await?;
+        let res = self.page_http.get(url).send().await?;
         if !res.status().is_success() {
-            return Err(anyhow!("Suwayomi image error {}", res.status()));
+            return Err(anyhow!("Suwayomi page error {}", res.status()));
         }
         let content_type = res
             .headers()
@@ -479,7 +564,7 @@ impl SuwayomiClient {
             .filter(|ct| ct.starts_with("image/"))
             .unwrap_or("image/jpeg")
             .to_string();
-        let bytes = res.bytes().await?.to_vec();
+        let bytes = read_capped(res, MAX_PAGE_SOURCE_BYTES).await?;
         Ok((bytes, content_type))
     }
 

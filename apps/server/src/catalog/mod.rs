@@ -808,7 +808,11 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
               detected_at, is_nsfw, status, content_rating) \
-         SELECT ss.work_id, CAST(sy.id AS TEXT), \
+         SELECT ss.work_id, \
+                CASE WHEN EXISTS (SELECT 1 FROM source_series md \
+                                   WHERE md.work_id = ss.work_id \
+                                     AND md.source_type = 'mangadex') \
+                     THEN ss.work_id ELSE CAST(sy.id AS TEXT) END, \
                 COALESCE(w.title_override, w.primary_title, sy.title), \
                 CASE WHEN w.cover_cached_version IS NOT NULL \
                      THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
@@ -849,6 +853,13 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     // page. Consequence to know: for a merged work whose Suwayomi source is ahead of the
     // mirror, the card's release time can be newer than the newest chapter the canonical
     // page lists, until the next MangaDex sync mirrors it.
+    //
+    // The scanner half's INSERT above now derives that same canonical `w_` id itself
+    // (via the mangadex-anchor test), so a mangadex-anchored work whose MIRROR half never
+    // fired — a licensing takedown leaves the spine with no dated chapter, so only the
+    // Suwayomi half publishes a row — still navigates to its canonical page instead of the
+    // Suwayomi one. Leaving `reader_id` off the conflict clause therefore no longer depends
+    // on the mirror having won the insert race; both halves independently agree on the id.
     //
     // `status` / `content_rating` (migration 0068) are the exception to that mirror-wins
     // rule, and it costs nothing: both halves derive them from the SAME `work` row via the
@@ -976,8 +987,13 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
 fn browse_catalogue_select() -> String {
     format!(
         "SELECT w.id, \
-            CASE WHEN f.work_id IS NOT NULL THEN f.reader_id \
-                 WHEN md.work_id IS NOT NULL THEN w.id \
+            -- The ANCHOR decides first: a MangaDex-anchored work navigates to its canonical
+            -- `w_` page regardless of which feed half published its row, so a takedown work
+            -- (mirror empty, feed row from the Suwayomi half) no longer inherits a numeric id
+            -- that would send it to the Suwayomi page. The feed's id is only copied for a
+            -- non-anchored work; the numeric Suwayomi id is the last resort.
+            CASE WHEN md.work_id IS NOT NULL THEN w.id \
+                 WHEN f.work_id IS NOT NULL THEN f.reader_id \
                  ELSE sw.source_key END, \
             CASE WHEN f.work_id IS NOT NULL THEN f.title \
                  ELSE COALESCE(w.title_override, w.primary_title, sw.title) END, \

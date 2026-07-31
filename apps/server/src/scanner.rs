@@ -1064,9 +1064,10 @@ async fn touch_feed_series_update(pool: &SqlitePool, series_id: &str, new_found:
 ///   the entire mirror half above the entire scanner half. See migration 0064.
 /// * `MAX(existing, excluded)` on `released_at`: an incremental write may only move a row
 ///   FORWARD in time, and can never pull it back below a fresher mirror-half value.
-/// * `reader_id` is the numeric Suwayomi id on INSERT and is left untouched on CONFLICT,
-///   which preserves an existing canonical `w_…` id — a mangadex-anchored work must keep
-///   navigating to its canonical page.
+/// * `reader_id` is the canonical `w_…` id when the work is mangadex-anchored (the anchor
+///   test in the SELECT) and the numeric Suwayomi id otherwise, and is left untouched on
+///   CONFLICT — so a mangadex-anchored work navigates to its canonical page whether the
+///   mirror half won the insert race or (a takedown) never fired at all.
 /// * rows with no release time are excluded (`latest_chapter_at IS NOT NULL`) rather than
 ///   inserted with a NULL into a NOT NULL column.
 ///
@@ -1111,7 +1112,11 @@ async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
               detected_at, is_nsfw, status, content_rating) \
-         SELECT ss.work_id, CAST(sy.id AS TEXT), \
+         SELECT ss.work_id, \
+                CASE WHEN EXISTS (SELECT 1 FROM source_series md \
+                                   WHERE md.work_id = ss.work_id \
+                                     AND md.source_type = 'mangadex') \
+                     THEN ss.work_id ELSE CAST(sy.id AS TEXT) END, \
                 COALESCE(w.title_override, w.primary_title, sy.title), \
                 CASE WHEN w.cover_cached_version IS NOT NULL \
                      THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
@@ -3592,6 +3597,83 @@ mod tests {
             comic_type.as_deref(),
             Some("MANGA"),
             "type is never rewritten"
+        );
+    }
+
+    /// A mangadex-anchored work whose MIRROR half never fires — a licensing takedown leaves
+    /// the spine with no dated chapter, so only the Suwayomi scanner half publishes its feed
+    /// row — must still navigate to its canonical `w_…` page, not the numeric Suwayomi one.
+    /// This is the regression the 293-row `reader_id` heal (migration 0070) targets, pinned
+    /// across all three writers: the incremental upsert, the periodic feed rebuild, and Browse.
+    #[tokio::test]
+    async fn feed_reader_id_is_canonical_for_a_takedown_anchored_work() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        // Give the work a MangaDex ANCHOR but NO mirror feed row (the takedown case): the
+        // spine has no dated chapter, so the rebuild's mirror half skips it and only the
+        // Suwayomi scanner half below publishes a row.
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ssmd', 'w1', 'mangadex', 'uuid-abc', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let admin = ScanAdmin::default();
+
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let found = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(found);
+        touch_feed_series_update(&pool, "7", found).await;
+
+        // (1) Incremental writer (`upsert_feed_series_update`): the anchor test wins on INSERT.
+        let (reader_id, ..) = feed_row(&pool).await.expect("detection must publish a row");
+        assert_eq!(
+            reader_id, "w1",
+            "an anchored work must navigate to its canonical page even when only the Suwayomi \
+             half publishes its feed row"
+        );
+
+        // (2) Periodic rebuild agrees (both derivations carry the same anchor test).
+        crate::catalog::refresh_feed_series_updates(&pool)
+            .await
+            .unwrap();
+        let (rebuilt, ..) = feed_row(&pool)
+            .await
+            .expect("the rebuild must publish a row");
+        assert_eq!(
+            rebuilt, "w1",
+            "the periodic rebuild must derive the canonical id too"
+        );
+
+        // (3) Browse's table (rebuilt by the call above) carries the canonical id — the card's
+        // link — so a Browse card and the same work's Updates card agree.
+        let browse_reader_id: String =
+            sqlx::query_scalar("SELECT reader_id FROM browse_catalogue WHERE work_id = 'w1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            browse_reader_id, "w1",
+            "Browse must navigate to the canonical page too"
         );
     }
 

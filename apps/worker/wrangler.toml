@@ -55,11 +55,22 @@ ALLOWED_ORIGINS = "https://komiq.cc,https://www.komiq.cc"
 # on the client IP. `limit` requests are allowed per `period` SECONDS per key
 # (Cloudflare supports period = 10 or 60); a burst beyond that gets a 429.
 # The limit/period live here, so no dashboard/API step is required.
+#
+# SIZING (the number is chapter-aware, not arbitrary): the limiter fires only on a
+# cache MISS, and one read of a cold chapter is ~40 page misses; a reader turns
+# through several chapters a minute, and Suwayomi-source works also miss their
+# cover thumbnails. The old 200/60s throttled ordinary reading the moment the edge
+# cache was cold (e.g. right after a deploy that shifts page URLs to a new host),
+# surfacing as "images get blocked". Worse, the key is CF-Connecting-IP, so an
+# entire NAT/office/campus shares ONE bucket. 600/60s comfortably covers a single
+# reader's cold-cache session while still capping true bandwidth abuse — the host
+# allowlist (ALLOWED_SOURCE_HOSTS) remains the primary open-proxy guard, this is
+# only the egress cap. Raise further if shared-IP populations still see 429s.
 [[unsafe.bindings]]
 name = "IMG_RATE_LIMITER"
 type = "ratelimit"
 namespace_id = "1001"
-simple = { limit = 200, period = 60 }
+simple = { limit = 600, period = 60 }
 
 # ---------------------------------------------------------------------------
 # The Worker needs no secrets: it proxies + edge-caches only. There is no

@@ -82,7 +82,12 @@ export class WebImageProvider implements ImageProvider {
 	private isOwnAsset(url: string): boolean {
 		if (OWN_ASSET_PREFIXES.some((p) => url.startsWith(p))) return true;
 		const origin = this.config.apiOrigin;
-		return !!origin && url.startsWith(origin);
+		if (!origin) return false;
+		// Match on an ORIGIN BOUNDARY, not a bare prefix: `startsWith(origin)` alone would
+		// treat `https://api.komiq.cc.evil.com/…` as own-origin. Require the URL to be the
+		// origin exactly or continue with a path separator.
+		const trimmed = origin.replace(/\/$/, '');
+		return url === trimmed || url.startsWith(`${trimmed}/`);
 	}
 
 	/** Resolve an own-origin asset to a loadable absolute URL (prefix relative
@@ -111,7 +116,30 @@ export class WebImageProvider implements ImageProvider {
 	}
 
 	async resolvePage(page: Page): Promise<string> {
-		return this.resolve(page.sourceUrl);
+		return this.resolvePageSync(page.sourceUrl);
+	}
+
+	/**
+	 * Resolve a page image URL. A page already on our own API origin — a Suwayomi-source
+	 * chapter page proxied by `api.komiq.cc` (`/api/v1/manga/.../page/...`) — is served
+	 * DIRECTLY, exactly like an own-origin cover, and NOT laundered through the Worker.
+	 *
+	 * The Worker exists only to bypass CORS/hotlink protection on foreign CDNs (MangaDex);
+	 * an `<img src>` needs neither for our own origin, which already sends immutable cache
+	 * headers. Routing our own pages back through it is pure overhead AND a real failure
+	 * mode: Suwayomi serves RAW full-resolution pages (multi-MB), and the Worker streams
+	 * every byte through a JS transform + tees the whole body for its edge cache — enough
+	 * per-request CPU on a large page to exceed the Worker's CPU limit and kill the
+	 * response mid-stream (the "images partially load then break" report). Foreign hosts
+	 * (MangaDex `*.mangadex.network`) still go through the Worker, where the proxy is
+	 * actually required.
+	 */
+	private resolvePageSync(sourceUrl: string): string {
+		if (!sourceUrl) return '';
+		if (!this.config.direct && this.isOwnAsset(sourceUrl)) {
+			return this.toAbsoluteOwn(sourceUrl);
+		}
+		return this.resolve(sourceUrl);
 	}
 
 	/** Synchronous cover resolution (web is pure URL rewriting — no I/O). */

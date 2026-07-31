@@ -587,11 +587,12 @@ fn is_suwayomi_image_path(rest: &str) -> bool {
 ///
 /// Suwayomi (`localhost:4567`) is not publicly exposed, so the browser can't reach its
 /// image endpoints. Cover/page URLs are built against THIS origin (set
-/// `SUWAYOMI_PUBLIC_URL=https://api.komiq.cc`) and we fetch the bytes internally
-/// (`suwayomi.fetch_image`, which uses the loopback host) and re-serve them with an
-/// immutable cache — covers load directly from here in the admin + reader, and page
-/// images ride the image Worker's edge cache (which allowlists this host). Only the two
-/// numeric image paths above are honoured (`is_suwayomi_image_path`); anything else 404s.
+/// `SUWAYOMI_PUBLIC_URL=https://api.komiq.cc`) and we fetch the bytes internally over the
+/// loopback host (`fetch_cover_now` / `fetch_page_now`, each bounded by its own pool) and
+/// re-serve them with an immutable cache. Both covers and pages load DIRECTLY from this
+/// origin in the reader — the image Worker is for foreign CDNs (MangaDex) only, never our
+/// own origin. Only the two numeric image paths above are honoured
+/// (`is_suwayomi_image_path`); anything else 404s.
 async fn serve_suwayomi_image(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(covers)): State<CoverDb>,
@@ -608,13 +609,43 @@ async fn serve_suwayomi_image(
         return serve_suwayomi_cover(&app, &covers, manga_id).await;
     }
     let path = format!("/api/v1/manga/{rest}");
-    match app.suwayomi.fetch_image(&path).await {
+    // Bounded + timed page fetch (own pool, page timeout, byte cap). The old path called
+    // the unbounded `fetch_image`, which shared the 30 s scan timeout and no concurrency
+    // bound, so a burst of page requests (a chapter is tens of pages) could pile onto the
+    // engine behind the scanner and each pay the full 30 s ceiling.
+    match app.suwayomi.fetch_page_now(&path).await {
         Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
-        Err(e) => {
+        Err(crate::suwayomi::PageFetchError::Busy) => {
+            // Saturated past the short wait — shed with a retryable 503 rather than queue.
+            // `info`, not `warn`: a steady stream is the operator's signal that page demand
+            // is outrunning the engine, not an error per request.
+            tracing::info!(path = %path, "suwayomi page: pool saturated, 503");
+            page_busy_response()
+        }
+        Err(crate::suwayomi::PageFetchError::Upstream(e)) => {
             tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// Retryable, uncacheable 503 for a page whose fetch pool is saturated. Recovery is the
+/// reader's per-page "failed — tap to retry" affordance, which fires on any non-image
+/// response (browsers do NOT honour `Retry-After` for an `<img>` load, so there is no
+/// automatic re-request storm); `Retry-After` stays advisory for non-browser clients, and
+/// `no-store` keeps the transient failure out of every cache.
+fn page_busy_response() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, must-revalidate"),
+            ),
+            (header::RETRY_AFTER, HeaderValue::from_static("2")),
+        ],
+    )
+        .into_response()
 }
 
 /// Numeric manga id if `rest` (the tail after `/api/v1/manga/`) is a cover-thumbnail
