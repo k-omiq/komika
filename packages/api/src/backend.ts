@@ -32,6 +32,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	UpdateFeedRow,
+	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -295,6 +296,11 @@ export interface Backend {
 	 * true when the row was closed. Optional: only the unified Komika API
 	 * implements it. */
 	resolveMergeCandidate?(id: Id, accept: boolean): Promise<boolean>;
+	/** Expand one side of a dedup candidate: metadata, cover, alt titles and source
+	 * mappings for a single work. Reads the canonical work directly, so it also
+	 * resolves the Suwayomi-only / NSFW works the public series path refuses.
+	 * Optional: only the unified Komika API implements it. */
+	workReviewDetail?(workId: Id): Promise<WorkReviewDetail>;
 	/** Run the Tier-2 dedup add flow for a Suwayomi manga: link it to a canonical
 	 * work (auto-merge / queue for review / create new), idempotently. Optional:
 	 * only the unified Komika API implements it. */

@@ -70,12 +70,19 @@ export interface AdminUser {
  */
 export interface MergeCandidate {
 	id: Id;
+	/** A `source_series` row id — NOT a work id; it cannot be looked up as one. */
 	sourceSeriesId: Id;
+	/** The work the source series belongs to — what the console links/expands on. */
+	sourceWorkId: Id;
 	candidateWorkId: Id;
 	/** Title of the canonical work the matcher proposes merging into. */
 	candidateTitle: string | null;
 	/** Current title of the source series' own (provisional) work. */
 	sourceTitle: string | null;
+	/** Cover of the source work; empty when it has none to show. */
+	sourceCoverUrl: string;
+	/** Cover of the candidate work; empty when it has none to show. */
+	candidateCoverUrl: string;
 	/** Confidence score in [0,1] that produced the review verdict. */
 	score: number;
 	/** Which signal produced the match (e.g. `title_corroborated`, `fuzzy`). */
@@ -83,6 +90,33 @@ export interface MergeCandidate {
 	/** Lifecycle: `pending` until an admin resolves it. */
 	status: string;
 	createdAt: string;
+}
+
+/**
+ * One side of a dedup decision, expanded — what the review panel shows when an
+ * admin clicks a candidate's title or cover. Admin-only, and read straight off the
+ * canonical work rather than through the public series path, so a Suwayomi-only or
+ * NSFW entry still expands (those are most of the review queue).
+ */
+export interface WorkReviewDetail {
+	workId: Id;
+	title: string | null;
+	/** Empty when the work has no cover to show. */
+	coverUrl: string;
+	author: string | null;
+	artist: string | null;
+	year: number | null;
+	status: string | null;
+	contentRating: string | null;
+	originalLanguage: string | null;
+	isNsfw: boolean;
+	description: string | null;
+	/** Distinct mirrored chapter numbers — a coarse completeness signal. */
+	chapterCount: number;
+	/** Alternative titles, capped server-side. */
+	altTitles: string[];
+	/** Every catalogued source mapping, NSFW included. */
+	sources: WorkSource[];
 }
 
 /**

@@ -31,6 +31,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	UpdateFeedRow,
+	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
 } from '@komika/types';
@@ -491,6 +492,13 @@ export class GraphQLBackend implements Backend {
 			accept,
 		});
 		return d.resolveMergeCandidate;
+	}
+
+	async workReviewDetail(workId: Id): Promise<WorkReviewDetail> {
+		const d = await this.gql<{ workReviewDetail: WorkReviewDetail }>(ops.WORK_REVIEW_DETAIL, {
+			workId,
+		});
+		return d.workReviewDetail;
 	}
 
 	async addSourceSeries(suwayomiMangaId: Id): Promise<MatchResult> {

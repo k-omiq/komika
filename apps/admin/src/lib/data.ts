@@ -20,6 +20,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	WorkReviewDetail,
 	WorkSource,
 } from '@komika/types';
 import type {
@@ -153,6 +154,19 @@ export async function resolveMergeCandidate(id: string, accept: boolean): Promis
 	if (!backend.resolveMergeCandidate)
 		throw new Error('Dedup review is unavailable on this backend.');
 	return backend.resolveMergeCandidate(id, accept);
+}
+
+/**
+ * Expand one side of a dedup candidate for the review panel. Deliberately NOT
+ * {@link loadSeriesDetail}: that routes `w_` ids through `canonicalSeries`, which
+ * errors on any work without a MangaDex anchor and hides NSFW works — between them
+ * that is most of the review queue, so the rows needing the closest look are exactly
+ * the ones it would refuse.
+ */
+export async function loadWorkReviewDetail(workId: string): Promise<WorkReviewDetail> {
+	if (!backend.workReviewDetail)
+		throw new Error('Work review detail is unavailable on this backend.');
+	return backend.workReviewDetail(workId);
 }
 
 /** Cover "Bugs" panel: works whose cover the crawl couldn't process, paginated. */

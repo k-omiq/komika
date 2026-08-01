@@ -53,6 +53,28 @@ want to decouple. The Updates reader changes cannot.
 
 Restarting the server interrupts ingest — expected, and the backfill is resumable by design.
 
+### Confirmed against the running binary, 2026-07-27
+
+Server-first is **not** optional, and the blast radius is wider than `updatesFeed`. Probing the
+deployed server directly shows it also rejects the Browse arguments the reader already ships:
+
+```
+{"errors":[{"message":"Unknown type \"BrowseSort\""},
+           {"message":"Unknown argument \"sort\" on field \"search\" of type \"QueryRoot\""},
+           {"message":"Unknown argument \"hasChapters\" on field \"search\" of type \"QueryRoot\""}]}
+```
+
+`types`, `status` and `contentRating` are rejected too. The live surface is only
+`query`, `page`, `genres`, `includeNsfw`.
+
+This matters more than a missing resolver: an unknown argument fails GraphQL **validation**
+and takes the whole document with it, and — per the `SEARCH` comment in
+`packages/api/src/operations.ts` — Browse has **no fallback path**. Shipping the reader first
+does not degrade Browse, it **breaks it for everyone**.
+
+(Surfaced while validating load-test queries against the live schema; see
+`docs/plans/2026-07-27-performance-investigation.md` §4.6.)
+
 ---
 
 ## A — covers: many not loading, some rendering "half broken"

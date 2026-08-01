@@ -37,9 +37,9 @@
 //
 // USAGE
 //   node loadtest.mjs --list
-//   node loadtest.mjs --scenario health --vus 1,4,16,64 --duration 10
-//   node loadtest.mjs --scenario browse --rate 200 --duration 30
-//   node loadtest.mjs --scenario mixed  --vus 1,2,4,8,16,32,64,128 --duration 15 --json out.json
+//   node loadtest.mjs --scenario health    --vus 1,4,16,64 --duration 10
+//   node loadtest.mjs --scenario discovery --rate 40 --duration 30
+//   node loadtest.mjs --scenario mixed     --vus 1,2,4,8,16,32 --duration 15 --json out.json
 
 import http from 'node:http';
 import https from 'node:https';
@@ -151,11 +151,6 @@ query Search($query: String!, $page: Int, $genres: [String!], $includeNsfw: Bool
   facets: `query GenreFacets { genreFacets { genre count } }`,
 };
 
-// Series slugs to spread `series` load across. Overridable via --slugs.
-let SLUGS = ['one-piece'];
-
-const pick = (a) => a[(Math.random() * a.length) | 0];
-
 // ---------------------------------------------------------------------------
 // Arg parsing
 // ---------------------------------------------------------------------------
@@ -189,7 +184,6 @@ function parseArgs(argv) {
       case '--json': out.json = next(); break;
       case '--think': out.think = parseFloat(next()); break;
       case '--queries': Q = { ...Q, ...JSON.parse(readFileSync(next(), 'utf8')) }; break;
-      case '--slugs': SLUGS = readFileSync(next(), 'utf8').split('\n').map((s) => s.trim()).filter(Boolean); break;
       case '--list': out.list = true; break;
       case '-h': case '--help': usage(); process.exit(0);
       default: die(`unknown arg: ${a}`);
@@ -212,7 +206,6 @@ function usage() {
   --think <sec>        seconds between requests per real user, for the
                        req/s -> concurrent-users conversion (default 5)
   --queries <file>     JSON overriding the GraphQL operation text
-  --slugs <file>       newline-separated series slugs
   --json <file>        write full results as JSON
   --list               print scenarios and exit`);
 }

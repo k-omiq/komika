@@ -2460,17 +2460,97 @@ fn epoch_ms_to_iso(ms: i64) -> String {
 }
 
 /// A pending mid-confidence match awaiting manual admin review.
-#[derive(SimpleObject, sqlx::FromRow)]
+///
+/// `sourceSeriesId` is a `source_series` row id, NOT a work id — it is useless for
+/// looking the entry up. `sourceWorkId` is the work that series belongs to, and is
+/// what the console links/expands on. Both sides carry a cover URL so the reviewer
+/// can eyeball the pair before deciding; either may be empty (a Suwayomi-only work
+/// with no cached cover has nothing to show).
+#[derive(SimpleObject)]
 pub struct MergeCandidate {
     pub id: String,
     pub source_series_id: String,
+    pub source_work_id: String,
     pub candidate_work_id: String,
     pub candidate_title: Option<String>,
     pub source_title: Option<String>,
+    pub source_cover_url: String,
+    pub candidate_cover_url: String,
     pub score: f64,
     pub method: String,
     pub status: String,
     pub created_at: String,
+}
+
+/// Raw `merge_queue` row: both works' cover inputs, resolved to URLs on the way out
+/// (the same shape `cover_issues` uses — `work_cover_url` needs the cached version,
+/// the MangaDex anchor and the cover file name, none of which belong in the GraphQL
+/// type).
+#[derive(sqlx::FromRow)]
+struct MergeCandidateRow {
+    id: String,
+    source_series_id: String,
+    source_work_id: String,
+    candidate_work_id: String,
+    candidate_title: Option<String>,
+    source_title: Option<String>,
+    source_cover_version: Option<i64>,
+    source_cover_file_name: Option<String>,
+    source_mangadex_id: Option<String>,
+    candidate_cover_version: Option<i64>,
+    candidate_cover_file_name: Option<String>,
+    candidate_mangadex_id: Option<String>,
+    score: f64,
+    method: String,
+    status: String,
+    created_at: String,
+}
+
+/// One side of a dedup decision, expanded — everything the reviewer needs to tell
+/// two similar-looking entries apart without leaving the queue. Admin-only, and
+/// deliberately NOT `canonicalSeries`: that resolver refuses any work without a
+/// MangaDex anchor and NSFW-gates on viewer prefs, which is most of what lands in
+/// this queue. Reads straight off `work` so a Suwayomi-only entry still expands.
+#[derive(SimpleObject)]
+pub struct WorkReviewDetail {
+    pub work_id: ID,
+    pub title: Option<String>,
+    pub cover_url: String,
+    pub author: Option<String>,
+    pub artist: Option<String>,
+    /// `Int` (i32); the DB column is INTEGER — cast on read.
+    pub year: Option<i32>,
+    pub status: Option<String>,
+    pub content_rating: Option<String>,
+    pub original_language: Option<String>,
+    pub is_nsfw: bool,
+    pub description: Option<String>,
+    /// Distinct chapter numbers mirrored across every source of this work — a
+    /// coarse "how much is here" signal, not the reader's chapter count.
+    pub chapter_count: i32,
+    /// Alternative titles from `work_alias`, capped: a heavily-merged work can
+    /// carry hundreds and the panel only needs enough to recognise the entry.
+    pub alt_titles: Vec<String>,
+    /// Every catalogued source mapping, NSFW included (admin-gated resolver).
+    pub sources: Vec<WorkSource>,
+}
+
+/// Raw `work_review_detail` row (the computed cover URL and the joined lists are
+/// assembled by the resolver).
+#[derive(sqlx::FromRow)]
+struct WorkReviewDetailRow {
+    title: Option<String>,
+    author: Option<String>,
+    artist: Option<String>,
+    year: Option<i64>,
+    status: Option<String>,
+    content_rating: Option<String>,
+    original_language: Option<String>,
+    is_nsfw: i64,
+    description: Option<String>,
+    cover_cached_version: Option<i64>,
+    cover_file_name: Option<String>,
+    mangadex_id: Option<String>,
 }
 
 /// A page of dedup review candidates (mirrors the other admin `*Page` envelopes).
@@ -4071,9 +4151,23 @@ impl QueryRoot {
         // `mc.id` breaks ties so paging is stable: score+created_at alone are not
         // unique across ~10k rows, and an unstable order duplicates/skips rows at page
         // boundaries.
-        let rows = sqlx::query_as::<_, MergeCandidate>(&format!(
-            "SELECT mc.id, mc.source_series_id, mc.candidate_work_id, \
+        //
+        // The two correlated subqueries fetch each side's MangaDex anchor, which
+        // `work_cover_url` needs for the lazy-fetch fallback on an uncached work. They
+        // run at most 2×50 times per page — an admin panel, not a hot path.
+        let rows = sqlx::query_as::<_, MergeCandidateRow>(&format!(
+            "SELECT mc.id, mc.source_series_id, sw.id AS source_work_id, mc.candidate_work_id, \
                     cw.primary_title AS candidate_title, sw.primary_title AS source_title, \
+                    sw.cover_cached_version AS source_cover_version, \
+                    sw.cover_file_name AS source_cover_file_name, \
+                    (SELECT s2.source_key FROM source_series s2 \
+                     WHERE s2.work_id = sw.id AND s2.source_type = 'mangadex' \
+                     ORDER BY s2.created_at ASC, s2.id ASC LIMIT 1) AS source_mangadex_id, \
+                    cw.cover_cached_version AS candidate_cover_version, \
+                    cw.cover_file_name AS candidate_cover_file_name, \
+                    (SELECT c2.source_key FROM source_series c2 \
+                     WHERE c2.work_id = cw.id AND c2.source_type = 'mangadex' \
+                     ORDER BY c2.created_at ASC, c2.id ASC LIMIT 1) AS candidate_mangadex_id, \
                     mc.score, mc.method, mc.status, mc.created_at \
              {FROM_WHERE} \
              ORDER BY mc.score DESC, mc.created_at DESC, mc.id ASC \
@@ -4086,11 +4180,132 @@ impl QueryRoot {
         .map_err(gql_err)?;
 
         let has_next_page = rows.len() as i64 > per;
+        let items = rows
+            .into_iter()
+            .take(per as usize)
+            .map(|r| MergeCandidate {
+                source_cover_url: crate::cover::work_cover_url(
+                    &r.source_work_id,
+                    r.source_cover_version,
+                    r.source_mangadex_id.as_deref(),
+                    r.source_cover_file_name.as_deref(),
+                ),
+                candidate_cover_url: crate::cover::work_cover_url(
+                    &r.candidate_work_id,
+                    r.candidate_cover_version,
+                    r.candidate_mangadex_id.as_deref(),
+                    r.candidate_cover_file_name.as_deref(),
+                ),
+                id: r.id,
+                source_series_id: r.source_series_id,
+                source_work_id: r.source_work_id,
+                candidate_work_id: r.candidate_work_id,
+                candidate_title: r.candidate_title,
+                source_title: r.source_title,
+                score: r.score,
+                method: r.method,
+                status: r.status,
+                created_at: r.created_at,
+            })
+            .collect();
         Ok(MergeQueuePage {
-            items: rows.into_iter().take(per as usize).collect(),
+            items,
             page,
             has_next_page,
             total: Some(total as i32),
+        })
+    }
+
+    /// Admin: expand one work for dedup review — metadata, cover, alt titles and
+    /// source mappings, for the panel behind a row's title/cover in the review queue.
+    ///
+    /// Reads `work` directly rather than routing through `canonicalSeries` ON PURPOSE.
+    /// `canonicalSeries` errors on any work with no MangaDex anchor and hides NSFW works
+    /// from an opted-out viewer — between them that is most of this queue (Suwayomi-only
+    /// entries are exactly the ones whose identity is unclear enough to need review), so
+    /// reusing it would leave the reviewer staring at "No such work" on the rows that
+    /// most need a look. Admin-gated, so NSFW sources are returned unfiltered.
+    ///
+    /// A merged-away id resolves through the redirect table, the same way the reader's
+    /// paths do: a row can be stale by the time it's clicked (another admin, or a
+    /// consolidation run, may have folded that work away mid-review).
+    async fn work_review_detail(&self, ctx: &Context<'_>, work_id: ID) -> Result<WorkReviewDetail> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        const SELECT: &str = "SELECT COALESCE(w.title_override, w.primary_title) AS title, \
+                    w.author, w.artist, w.year, w.status, w.content_rating, \
+                    w.original_language, \
+                    COALESCE(w.is_nsfw_override, w.is_nsfw) AS is_nsfw, \
+                    COALESCE(w.description_override, w.description) AS description, \
+                    w.cover_cached_version, w.cover_file_name, \
+                    (SELECT ss.source_key FROM source_series ss \
+                     WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                     ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id \
+             FROM work w WHERE w.id = ?";
+
+        let mut id = work_id.0.clone();
+        let mut row = sqlx::query_as::<_, WorkReviewDetailRow>(SELECT)
+            .bind(&id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        if row.is_none() {
+            if let Ok(Some(new_id)) = catalog::redirect_work_id(&st.pool, &id).await {
+                row = sqlx::query_as::<_, WorkReviewDetailRow>(SELECT)
+                    .bind(&new_id)
+                    .fetch_optional(&st.pool)
+                    .await
+                    .map_err(gql_err)?;
+                id = new_id;
+            }
+        }
+        let row = row.ok_or_else(|| Error::new("No such work."))?;
+
+        const MAX_ALT_TITLES: i64 = 24;
+        let alt_titles: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = ? \
+             ORDER BY raw_title LIMIT ?",
+        )
+        .bind(&id)
+        .bind(MAX_ALT_TITLES)
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default();
+
+        // DISTINCT number: the same chapter mirrored from three sources is one
+        // chapter to a reviewer comparing how complete two entries are.
+        let chapter_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT c.number) FROM chapter c \
+             JOIN source_series ss ON ss.id = c.source_series_id \
+             WHERE ss.work_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or(0);
+
+        let sources = load_work_sources(&st.pool, &id, true).await?;
+
+        Ok(WorkReviewDetail {
+            cover_url: crate::cover::work_cover_url(
+                &id,
+                row.cover_cached_version,
+                row.mangadex_id.as_deref(),
+                row.cover_file_name.as_deref(),
+            ),
+            work_id: ID(id),
+            title: row.title,
+            author: row.author,
+            artist: row.artist,
+            year: row.year.map(|y| y as i32),
+            status: row.status,
+            content_rating: row.content_rating,
+            original_language: row.original_language,
+            is_nsfw: row.is_nsfw != 0,
+            description: row.description,
+            chapter_count: chapter_count as i32,
+            alt_titles,
+            sources,
         })
     }
 
@@ -15568,6 +15783,116 @@ mod tests {
             resolved_at2.as_deref(),
             Some(resolved_at.as_str()),
             "resolved_at is untouched — the guarded UPDATE claimed nothing the second time"
+        );
+    }
+
+    /// The review queue has to be reviewable: each row carries the WORK behind the
+    /// source series (`sourceSeriesId` is a mapping id and cannot be looked up as a
+    /// work) plus a cover for each side, and clicking either side must expand — even
+    /// for a Suwayomi-only work, which is what most of this queue is and which
+    /// `canonicalSeries` refuses outright.
+    #[tokio::test]
+    async fn merge_queue_rows_carry_covers_and_expand_for_suwayomi_only_works() {
+        let (s, pool) = setup_full(100).await;
+
+        // The source side: Suwayomi-only, no cached cover and no MangaDex anchor, so
+        // there is nothing to point a cover URL at.
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
+             VALUES ('w_prov', 'Provisional Title', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The candidate side: a cached cover, so it resolves to the versioned path.
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, author, is_nsfw, cover_cached_version, \
+                               created_at, updated_at) \
+             VALUES ('w_canon', 'Canonical Title', 'Some Author', 0, 3, \
+                     '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss1', 'w_prov', 'suwayomi', 'k1', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO merge_candidate \
+             (id, source_series_id, candidate_work_id, score, method, status, created_at) \
+             VALUES ('mc1', 'ss1', 'w_canon', 0.8, 'title_exact', 'pending', '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ mergeQueue { items { sourceSeriesId sourceWorkId candidateWorkId
+                 sourceCoverUrl candidateCoverUrl } total } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "mergeQueue failed: {:?}", r.errors);
+        let json = data_json(&r);
+        assert!(
+            json.contains("\"sourceWorkId\":\"w_prov\""),
+            "the row must expose the source's WORK, not just the mapping id: {json}"
+        );
+        assert!(
+            json.contains("\"sourceSeriesId\":\"ss1\""),
+            "the mapping id stays available: {json}"
+        );
+        assert!(
+            json.contains("\"candidateCoverUrl\":\"/covers/w_canon.webp?v=3\""),
+            "a cached cover resolves to its versioned path: {json}"
+        );
+        assert!(
+            json.contains("\"sourceCoverUrl\":\"\""),
+            "a work with no cached cover and no MangaDex anchor has no cover to show: {json}"
+        );
+
+        // Clicking the source side expands it. This is the whole reason the panel does
+        // not reuse `canonicalSeries` — asserted directly below.
+        let d = exec(
+            &s,
+            r#"{ workReviewDetail(workId: "w_prov") { workId title coverUrl chapterCount
+                 sources { sourceType sourceKey } } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            d.errors.is_empty(),
+            "workReviewDetail failed: {:?}",
+            d.errors
+        );
+        let dj = data_json(&d);
+        assert!(
+            dj.contains("\"title\":\"Provisional Title\"") && dj.contains("\"sourceKey\":\"k1\""),
+            "a Suwayomi-only work expands with its title and source mapping: {dj}"
+        );
+        assert!(
+            dj.contains("\"coverUrl\":\"\"") && dj.contains("\"chapterCount\":0"),
+            "nothing is invented for a work with no cover and no mirrored chapters: {dj}"
+        );
+
+        let refused = exec(
+            &s,
+            r#"{ canonicalSeries(workId: "w_prov") { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&refused),
+            "No such work",
+            "the premise: canonicalSeries refuses the un-anchored work the panel must show"
         );
     }
 

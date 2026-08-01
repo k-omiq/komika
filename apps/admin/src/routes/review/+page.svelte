@@ -1,9 +1,11 @@
 <script lang="ts">
-	import type { MergeCandidate } from '@komika/types';
+	import type { MergeCandidate, WorkReviewDetail } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
+	import { assetSrc } from '$lib/config';
 	import {
 		consolidateDuplicates,
 		loadMergeQueue,
+		loadWorkReviewDetail,
 		MERGE_QUEUE_PAGE_SIZE,
 		resolveMergeCandidate,
 	} from '$lib/data';
@@ -168,6 +170,58 @@
 		if (queue.length === 0 && total != null && total > 0) await refresh(page);
 	}
 
+	// ---- detail panel ----------------------------------------------------------
+	// Clicking either side's cover or title expands that WORK — deciding a merge means
+	// looking at two entries, and title-plus-id is not enough to tell "Blue Lock" from
+	// "Blue Lock: Episode Nagi". Opened as an overlay rather than a navigation so the
+	// reviewer keeps their page position in a ~10k-row offset-paged backlog.
+	let detailFor = $state<{ workId: string; label: string; side: 'source' | 'candidate' } | null>(
+		null,
+	);
+	let detail = $state<WorkReviewDetail | null>(null);
+	let detailLoading = $state(false);
+	let detailError = $state<string | null>(null);
+
+	async function openDetail(
+		workId: string,
+		label: string,
+		side: 'source' | 'candidate',
+	): Promise<void> {
+		detailFor = { workId, label, side };
+		detail = null;
+		detailError = null;
+		detailLoading = true;
+		try {
+			const res = await loadWorkReviewDetail(workId);
+			// Clicking a second row before the first resolves must not paint the stale
+			// work into the open panel — only accept the response still being asked for.
+			if (detailFor?.workId !== workId) return;
+			detail = res;
+		} catch (err) {
+			if (detailFor?.workId !== workId) return;
+			detailError = err instanceof Error ? err.message : 'Failed to load this work.';
+		} finally {
+			if (detailFor?.workId === workId) detailLoading = false;
+		}
+	}
+
+	function closeDetail(): void {
+		detailFor = null;
+		detail = null;
+		detailError = null;
+		detailLoading = false;
+	}
+
+	/**
+	 * `/series/{id}` loads through `canonicalSeries`, which REFUSES a work with no
+	 * MangaDex anchor — and Suwayomi-only entries are exactly what fills this queue. Only
+	 * offer the link when the work has a MangaDex mapping, rather than sending the
+	 * reviewer to a "No such work" page.
+	 */
+	const editorHref = $derived(
+		detail?.sources.some((s) => s.sourceType === 'mangadex') ? `/series/${detail.workId}` : null,
+	);
+
 	function fmtDate(iso: string): string {
 		const t = Date.parse(iso);
 		return Number.isNaN(t) ? '—' : new Date(t).toLocaleDateString();
@@ -268,13 +322,52 @@
 			</div>
 			{#each queue as c (c.id)}
 				<div class="row" role="row">
-					<span class="work" role="cell">
-						<span class="wtitle">{c.sourceTitle ?? '(untitled)'}</span>
-						<span class="wid">{c.sourceSeriesId}</span>
+					<span class="work-cell" role="cell">
+						<button
+							class="work"
+							title="Source series {c.sourceSeriesId} — click for details"
+							onclick={() => openDetail(c.sourceWorkId, c.sourceTitle ?? '(untitled)', 'source')}
+						>
+							{#if c.sourceCoverUrl}
+								<img
+									class="thumb"
+									src={assetSrc(c.sourceCoverUrl)}
+									alt=""
+									loading="lazy"
+									referrerpolicy="no-referrer"
+								/>
+							{:else}
+								<span class="thumb none" aria-hidden="true"></span>
+							{/if}
+							<span class="wtext">
+								<span class="wtitle">{c.sourceTitle ?? '(untitled)'}</span>
+								<span class="wid">{c.sourceWorkId}</span>
+							</span>
+						</button>
 					</span>
-					<span class="work" role="cell">
-						<span class="wtitle">{c.candidateTitle ?? '(untitled)'}</span>
-						<span class="wid">{c.candidateWorkId}</span>
+					<span class="work-cell" role="cell">
+						<button
+							class="work"
+							title="Candidate work {c.candidateWorkId} — click for details"
+							onclick={() =>
+								openDetail(c.candidateWorkId, c.candidateTitle ?? '(untitled)', 'candidate')}
+						>
+							{#if c.candidateCoverUrl}
+								<img
+									class="thumb"
+									src={assetSrc(c.candidateCoverUrl)}
+									alt=""
+									loading="lazy"
+									referrerpolicy="no-referrer"
+								/>
+							{:else}
+								<span class="thumb none" aria-hidden="true"></span>
+							{/if}
+							<span class="wtext">
+								<span class="wtitle">{c.candidateTitle ?? '(untitled)'}</span>
+								<span class="wid">{c.candidateWorkId}</span>
+							</span>
+						</button>
 					</span>
 					<span role="cell">
 						<span class="badge" class:strong={c.score >= 0.75}>{pct(c.score)}</span>
@@ -312,6 +405,101 @@
 		{/if}
 	{/if}
 </div>
+
+<!-- Top level: `<svelte:window>` cannot live inside a block. -->
+<svelte:window
+	onkeydown={(e) => {
+		if (e.key === 'Escape' && detailFor) closeDetail();
+	}}
+/>
+
+{#if detailFor}
+	<button class="scrim" aria-label="Close details" onclick={closeDetail}></button>
+	<div class="modal" role="dialog" aria-modal="true" aria-label="Work details">
+		<div class="modal-head">
+			<div class="modal-kicker">
+				{detailFor.side === 'source' ? 'SOURCE SERIES' : 'CANDIDATE WORK'}
+			</div>
+			<h2>{detail?.title ?? detailFor.label}</h2>
+			<button class="act close" onclick={closeDetail}>Close</button>
+		</div>
+
+		{#if detailError}
+			<div class="notice error">{detailError}</div>
+		{:else if detailLoading || !detail}
+			<div class="notice">Loading…</div>
+		{:else}
+			<div class="detail">
+				{#if detail.coverUrl}
+					<img
+						class="cover"
+						src={assetSrc(detail.coverUrl)}
+						alt="Cover of {detail.title ?? 'this work'}"
+						referrerpolicy="no-referrer"
+					/>
+				{:else}
+					<div class="cover none">no cover</div>
+				{/if}
+				<div class="facts">
+					<div class="chips">
+						<span class="chip mono">{detail.workId}</span>
+						{#if detail.isNsfw}<span class="chip nsfw">NSFW</span>{/if}
+						{#if detail.status}<span class="chip">{detail.status}</span>{/if}
+						{#if detail.year}<span class="chip">{detail.year}</span>{/if}
+						{#if detail.contentRating}<span class="chip">{detail.contentRating}</span>{/if}
+						{#if detail.originalLanguage}<span class="chip">{detail.originalLanguage}</span>{/if}
+						<span class="chip">{detail.chapterCount} ch</span>
+					</div>
+					{#if detail.author || detail.artist}
+						<p class="by">
+							{detail.author ?? '—'}{detail.artist && detail.artist !== detail.author
+								? ` · art by ${detail.artist}`
+								: ''}
+						</p>
+					{/if}
+					{#if detail.description}
+						<p class="desc">{detail.description}</p>
+					{/if}
+					{#if detail.altTitles.length > 0}
+						<div class="facet">
+							<span class="facet-label">Also known as</span>
+							<div class="chips">
+								{#each detail.altTitles as t (t)}
+									<span class="chip alt">{t}</span>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					<div class="facet">
+						<span class="facet-label">Sources ({detail.sources.length})</span>
+						{#if detail.sources.length === 0}
+							<span class="muted">No catalogued source mappings.</span>
+						{:else}
+							<div class="chips">
+								{#each detail.sources as s (`${s.sourceType}:${s.sourceId}:${s.sourceKey}`)}
+									<span class="chip mono" title="{s.sourceType} · {s.sourceKey}">
+										{s.extension?.pkgName?.split('.').pop() ?? s.sourceType}{s.lang
+											? ` (${s.lang})`
+											: ''}
+									</span>
+								{/each}
+							</div>
+						{/if}
+					</div>
+					{#if editorHref}
+						<a class="editor-link" href={editorHref} target="_blank" rel="noreferrer">
+							Open in the catalogue editor ↗
+						</a>
+					{:else}
+						<span class="muted small">
+							No MangaDex mapping — the catalogue editor can't open this work.
+						</span>
+					{/if}
+				</div>
+			</div>
+		{/if}
+	</div>
+{/if}
 
 <style>
 	.page {
@@ -373,7 +561,44 @@
 		text-transform: uppercase;
 		color: var(--k-text-faint);
 	}
+	/* The grid item, not the button, is what a `2fr` track sizes — without this it
+	   defaults to min-width:auto and a long title widens the column instead of
+	   ellipsising inside it. */
+	.work-cell {
+		min-width: 0;
+	}
 	.work {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		width: 100%;
+		min-width: 0;
+		padding: 0;
+		background: none;
+		border: none;
+		text-align: left;
+		font-family: inherit;
+		cursor: pointer;
+		border-radius: var(--k-radius-sm);
+	}
+	.work:hover .wtitle,
+	.work:focus-visible .wtitle {
+		color: var(--k-accent-teal);
+		text-decoration: underline;
+	}
+	.thumb {
+		flex: none;
+		width: 38px;
+		height: 54px;
+		object-fit: cover;
+		border-radius: var(--k-radius-sm);
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border);
+	}
+	.thumb.none {
+		display: block;
+	}
+	.wtext {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
@@ -488,5 +713,149 @@
 		color: var(--k-hiatus);
 		border-bottom: 1px dotted var(--k-border-4);
 		cursor: help;
+	}
+
+	/* ---- detail overlay ---- */
+	.scrim {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+		border: none;
+		background: rgba(6, 6, 7, 0.6);
+		cursor: default;
+	}
+	.modal {
+		position: fixed;
+		top: 50%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		z-index: 41;
+		width: 720px;
+		max-width: 94vw;
+		max-height: 90vh;
+		overflow-y: auto;
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-lg);
+		box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+		padding: var(--k-space-6);
+		display: flex;
+		flex-direction: column;
+		gap: var(--k-space-4);
+	}
+	.modal-head {
+		display: grid;
+		grid-template-columns: 1fr auto;
+		align-items: center;
+		gap: 12px;
+	}
+	.modal-kicker {
+		grid-column: 1 / -1;
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.08em;
+		color: var(--k-accent);
+	}
+	.modal-head h2 {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 22px;
+		color: var(--k-text-bright);
+		min-width: 0;
+	}
+	.act.close {
+		height: 30px;
+	}
+	.detail {
+		display: grid;
+		grid-template-columns: 150px 1fr;
+		gap: var(--k-space-5);
+		align-items: start;
+	}
+	.cover {
+		width: 150px;
+		aspect-ratio: 2 / 3;
+		object-fit: cover;
+		border-radius: var(--k-radius-md);
+		border: 1px solid var(--k-border);
+		background: var(--k-surface-4);
+	}
+	.cover.none {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 12px;
+		color: var(--k-text-faint);
+	}
+	.facts {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		min-width: 0;
+	}
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.chip {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 3px 8px;
+		border-radius: var(--k-radius-sm);
+		background: var(--k-surface-4);
+		color: var(--k-text-2);
+		border: 1px solid var(--k-border);
+	}
+	.chip.mono {
+		font-family: var(--k-font-mono, monospace);
+		font-weight: 500;
+	}
+	.chip.nsfw {
+		border-color: rgba(240, 128, 138, 0.45);
+		color: #f0808a;
+	}
+	.chip.alt {
+		font-weight: 500;
+		color: var(--k-text-dim);
+	}
+	.by {
+		font-size: 13px;
+		color: var(--k-text-1);
+	}
+	.desc {
+		font-size: 13px;
+		line-height: 1.55;
+		color: var(--k-text-dim);
+		/* A synopsis is context, not the point — cap it so the sources and alt titles
+		   below stay visible without scrolling past a wall of text. */
+		max-height: 9.5em;
+		overflow-y: auto;
+		white-space: pre-wrap;
+	}
+	.facet {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.facet-label {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+	}
+	.muted.small {
+		font-size: 12px;
+	}
+	.editor-link {
+		align-self: flex-start;
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-accent-teal);
+		text-decoration: none;
+	}
+	.editor-link:hover {
+		text-decoration: underline;
 	}
 </style>

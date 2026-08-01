@@ -55,6 +55,7 @@ type Query {
 	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
 	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
 	mergeQueue(page: Int = 1, limit: Int = 50): MergeQueuePage! # [komika] dedup review queue — pending mid-confidence matches, highest score first, PAGINATED (`limit` clamped to 1..=200). Was an unbounded `[MergeCandidate!]!`: the backlog is ~10.4k rows now that refused consolidation pairs land here, so clients must page (requires isAdmin)
+	workReviewDetail(workId: ID!): WorkReviewDetail! # [komika] expand one side of a dedup candidate — metadata, cover, alt titles and source mappings for a single work; reads the canonical work directly so it also resolves the Suwayomi-only / NSFW works `canonicalSeries` refuses (requires isAdmin)
 	coverIssues(page: Int = 1): CoverIssuePage! # [komika] admin "Bugs" panel — works whose cover the crawl could not process, most recent first; each carries the failure reason + a best-effort current cover URL (requires isAdmin)
 	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
@@ -731,14 +732,38 @@ type BulkAddResult {
 # [komika] A pending mid-confidence match awaiting manual admin review.
 type MergeCandidate {
 	id: String!
-	sourceSeriesId: String!
+	sourceSeriesId: String! # a source_series row id — NOT a work id; it cannot be looked up as one
+	sourceWorkId: String! # the work that source series belongs to — what the console links/expands on
 	candidateWorkId: String!
 	candidateTitle: String
 	sourceTitle: String
+	sourceCoverUrl: String! # empty when the source work has no cover to show
+	candidateCoverUrl: String! # empty when the candidate work has no cover to show
 	score: Float!
 	method: String!
 	status: String!
 	createdAt: String!
+}
+
+# [komika] One side of a dedup decision, expanded for the review panel. Read straight
+# off the canonical work rather than through canonicalSeries, which refuses a work
+# with no MangaDex anchor and NSFW-gates on viewer prefs — between them that is most
+# of the review queue.
+type WorkReviewDetail {
+	workId: ID!
+	title: String
+	coverUrl: String! # empty when there is no cover to show
+	author: String
+	artist: String
+	year: Int
+	status: String
+	contentRating: String
+	originalLanguage: String
+	isNsfw: Boolean!
+	description: String
+	chapterCount: Int! # distinct mirrored chapter numbers — a coarse completeness signal
+	altTitles: [String!]! # capped server-side
+	sources: [WorkSource!]! # every catalogued mapping, NSFW included (admin-gated)
 }
 
 # [komika] A page of dedup review candidates (mirrors the other admin *Page envelopes).

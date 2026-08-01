@@ -672,9 +672,12 @@ export const MERGE_QUEUE = /* GraphQL */ `
 			items {
 				id
 				sourceSeriesId
+				sourceWorkId
 				candidateWorkId
 				candidateTitle
 				sourceTitle
+				sourceCoverUrl
+				candidateCoverUrl
 				score
 				method
 				status
@@ -1038,6 +1041,35 @@ export const WORK_SOURCES_BATCH = /* GraphQL */ `
 	query WorkSourcesBatch($workIds: [ID!]!) {
 		workSourcesBatch(workIds: $workIds) {
 			workId
+			sources {
+				...WorkSourceFields
+			}
+		}
+	}
+`;
+
+/**
+ * Admin dedup-review expansion for one side of a candidate row. Lives here, below
+ * {@link WORK_SOURCE_FIELDS}, because it reuses that fragment — these consts are
+ * interpolated at module-eval time, so it cannot be declared beside MERGE_QUEUE.
+ */
+export const WORK_REVIEW_DETAIL = /* GraphQL */ `
+	${WORK_SOURCE_FIELDS}
+	query WorkReviewDetail($workId: ID!) {
+		workReviewDetail(workId: $workId) {
+			workId
+			title
+			coverUrl
+			author
+			artist
+			year
+			status
+			contentRating
+			originalLanguage
+			isNsfw
+			description
+			chapterCount
+			altTitles
 			sources {
 				...WorkSourceFields
 			}
