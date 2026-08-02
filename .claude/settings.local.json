@@ -1,5 +1,8 @@
 {
-	"permissions": {
-		"allow": ["Bash(git -C /Users/caved/dev/komika status)"]
-	}
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/caved/dev/komika status)",
+      "Bash(git log *)"
+    ]
+  }
 }

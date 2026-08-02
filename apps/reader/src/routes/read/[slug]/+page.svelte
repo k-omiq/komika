@@ -324,9 +324,9 @@
 		>
 		<div class="titlebox">
 			<a class="series" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
-			{#if data.chapterId}
-				<div class="chsub">Ch. {chNum} · {chTitle}</div>
-			{/if}
+			<!-- Series title only. The chapter is already named twice on this screen —
+			     the picker at top-right and the chapter heading below — so repeating it
+			     under the series title was pure noise. -->
 		</div>
 	</div>
 	<div class="top-right">
@@ -456,8 +456,9 @@
 <!-- reading area -->
 <main style="--w:{width}px">
 	{#if data.chapterId}
+		<!-- Heading only: the kicker above it restated the same chapter number the
+		     heading already carries, one line apart. -->
 		<div class="chapter-header">
-			<div class="chapter-kicker">CHAPTER {chNum}</div>
 			<h1>{chTitle}</h1>
 		</div>
 	{/if}
@@ -702,13 +703,6 @@
 		font-size: 14.5px;
 		color: var(--k-text);
 		text-decoration: none;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.chsub {
-		font-size: 12px;
-		color: var(--k-text-faint);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -1021,12 +1015,6 @@
 		max-width: var(--w);
 		padding: 32px 20px 22px;
 		text-align: center;
-	}
-	.chapter-kicker {
-		font-size: 12px;
-		letter-spacing: 0.2em;
-		color: var(--k-text-disabled);
-		margin-bottom: 10px;
 	}
 	.chapter-header h1 {
 		font-size: 30px;

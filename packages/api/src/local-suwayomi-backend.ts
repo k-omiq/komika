@@ -12,12 +12,14 @@ const MANGADEX_PKG = 'eu.kanade.tachiyomi.extension.all.mangadex';
 
 /**
  * The curated Keiyoushi extension-store index url the engine installs MangaDex from.
- * The engine canonicalizes this to its `.pb` form internally; adding the store is
- * idempotent. This mirrors Komika's hardcoded two-tier source strategy — MangaDex
+ * Adding the store is idempotent. This is the `index.pb` URL Keiyoushi publishes;
+ * the older `index.min.json` on the same branch still resolves but was reduced to
+ * two "update your app" stubs when they migrated, so it would seed an empty
+ * catalogue. This mirrors Komika's hardcoded two-tier source strategy — MangaDex
  * provisioning coords are supplied by the client, not by `workSources` (whose
  * `extension` is null for MangaDex works).
  */
-const KEIYOUSHI_REPO = 'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
+const KEIYOUSHI_REPO = 'https://github.com/keiyoushi/extensions/raw/repo/index.pb';
 
 /**
  * The minimal structural view of a hosted `WorkSource` that {@link LocalSuwayomiBackend.refFor}

@@ -1,0 +1,448 @@
+{
+ "groups": [
+  {
+   "id": "ios-jni",
+   "files": [
+    "apps/reader/src-tauri/src/suwayomi_ios.rs"
+   ],
+   "findings": [
+    {
+     "id": "ios-jvm-thread-detach-leak",
+     "title": "run_jvm exits the VM-owning thread while still attached to the JVM on every post-create error path",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 427,
+     "severity": "high",
+     "category": "correctness",
+     "detail": "`JNI_CreateJavaVM` (suwayomi_ios.rs:403-409) attaches the calling thread as the VM's primordial Java thread. After that point, five paths `return Err(..)` without ever calling `DetachCurrentThread` or `DestroyJavaVM`: :427 (FindClass MainKt), :435 (GetStaticMethodID), :442 (FindClass java/lang/String), :447 (NewObjectArray), :456 (main threw). The Err propagates to the closure at :577-582, the closure returns, and the spawned `suwayomi-jvm` thread (:573-576) exits. The JNI spec requires an attached native thread to detach before exiting; HotSpot does not auto-detach, so the JavaThread keeps a pointer to a stack region the pthread has just unmapped. The VM itself is left running (non-daemon Java threads may already exist) with a dangling primordial thread and no owner. This is also the only path where a *terminal* degrade is reported, so it is exactly the state the engine ends in when the classpath/jar is wrong — i.e. the most likely first-run failure on a real device.",
+     "failure_scenario": "Bundle regression drops Suwayomi-Server.jar from the classpath (or the jar's Main-Class differs from the hardcoded `suwayomi/tachidesk/MainKt` at :423): FindClass returns null, run_jvm returns Err at :427, the attached thread exits, and the still-live VM's next safepoint/GC stack-scan walks the freed stack → SIGSEGV in a JVM thread, which on iOS is an app crash rather than the intended clean `degraded` + hosted fallback.",
+     "fix_sketch": "Restructure run_jvm so the post-create body is a closure whose result is handled by a single cleanup epilogue that calls `((**vm).DetachCurrentThread.unwrap())(vm)` (and logs) before returning Err; on the success path keep DestroyJavaVM. Wrap the closure in `std::panic::catch_unwind` for the same reason.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-xss-1m-under-zero",
+     "title": "-Xss1m contradicts the module's own Zero-stack reasoning and applies to every engine worker thread",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 379,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "The module gives its own VM thread a 16 MiB native stack precisely because \"the Zero interpreter burns C stack per Java frame, so give it far more than -Xss\" (:69-71, JVM_THREAD_STACK). It then passes `-Xss1m` (:379), which is at or below the HotSpot default and applies to every thread the JVM creates itself — i.e. all of Suwayomi's Javalin/OkHttp/Kotlin-coroutine workers, the extension installer (dex2jar), and the class loaders that actually run deep recursive Java code under the interpreter. Under Zero every Java frame consumes a C frame of the bytecode interpreter, so 1 MiB buys a fraction of the Java depth it buys on a JIT VM. Desktop's JIT sidecar sets no -Xss at all (suwayomi.rs:259-266).",
+     "failure_scenario": "First MangaDex extension install on device: dex2jar / the ASM class-writer recursion runs on a Javalin worker with a 1 MiB Zero stack and throws StackOverflowError. The engine returns a GraphQL error, `refFor` throws, and CompositeBackend memoizes every affected work as `localUnusable` — the on-device engine appears to 'work' (status ready) but never serves a chapter.",
+     "fix_sketch": "Either drop `-Xss1m` (let the VM default apply) or raise it to a Zero-appropriate value (e.g. `-Xss4m`/`-Xss8m`) and record the measured peak thread count so the RSS impact is bounded deliberately rather than by accident; add a note that this value is an N4.3 measurement input.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-no-tmpdir-or-userhome-pinned",
+     "title": "No -Djava.io.tmpdir / -Duser.home passed; the JVM's defaults are not sandbox-writable on iOS",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 371,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "The option list (:371-383) sets only class.path, the Suwayomi rootDir, headless, -Xmx and -Xss. On a desktop Unix JVM `java.io.tmpdir` defaults to `/tmp` and `user.home` to the passwd entry; inside the iOS app sandbox `/tmp` is not writable and the passwd home (`/var/mobile`) is not app-writable — the writable temp dir is the container's own `tmp/`. Whether the pinned openjdk/mobile tree derives these from `confstr(_CS_DARWIN_USER_TEMP_DIR)` under `__IOS__` is unverified anywhere in the repo (n4.1-ios-jvm-findings.md §7 explicitly lists on-device boot as unproven), and the data-dir code (`prepare_data_dir`, :298-306) only guarantees the Suwayomi rootDir. Pinning both properties is a one-line, zero-risk removal of an unverified dependency.",
+     "failure_scenario": "Suwayomi's extension installer downloads the MangaDex APK/jar and calls `File.createTempFile` (or H2/OkHttp create a temp/spill file); with `java.io.tmpdir=/tmp` the write throws `IOException: Read-only file system`, extension provisioning fails permanently, and every work is memoized `localUnusable` — engine reports `ready` while serving nothing.",
+     "fix_sketch": "In run_jvm, add `-Djava.io.tmpdir=<data_dir>/tmp` (created by prepare_data_dir) and `-Duser.home=<app_data_dir>`, and extend prepare_data_dir to `create_dir_all` that tmp dir.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-no-post-ready-liveness",
+     "title": "No liveness check after Ready — a dead in-process engine still reports state \"ready\" forever",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 592,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "Once `poll_ready` succeeds the readiness task ends (:592-613) and nothing ever re-checks the engine. Desktop supervises the JVM continuously (`suwayomi.rs:421` `status = child.wait()` → transitions to Degraded), but the in-process VM has no observable exit: if the engine's HTTP server dies (OutOfMemoryError under the 256 MB heap, an uncaught error in a Javalin thread, or a Zero StackOverflowError), `Inner.state` stays `Ready` and `base_url`/`ready_endpoint` keep handing out the dead port. JS `isReady()` (local-suwayomi-backend.ts:117-118) therefore keeps returning true.",
+     "failure_scenario": "The engine OOMs mid-session under -Xmx256m (desktop uses 512m, suwayomi.rs:261). Every subsequent `suwayomi_gql` returns a connection-refused string; CompositeBackend catches each one and adds the work to `localUnusable` (composite-backend.ts:403-406), so the entire session silently and permanently degrades to hosted content while `suwayomi_status` still reports `ready` and `lastError: null` — no signal to the user, the logs, or the runbook.",
+     "fix_sketch": "Spawn a low-frequency (e.g. 30 s) `aboutServer` heartbeat after set_ready; on N consecutive failures call `degrade(\"engine stopped responding\")` so the UI/ladder sees the terminal state and stops paying the per-work failure cost.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-unbounded-non-heap-memory",
+     "title": "Only -Xmx is capped; metaspace, direct buffers and code cache are unbounded in a jetsam-limited process",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 378,
+     "severity": "medium",
+     "category": "perf",
+     "detail": "`-Xmx256m` (:378) bounds only the Java heap. Metaspace (large: Kotlin + Suwayomi + every dynamically converted extension classloader), NIO direct buffers used by OkHttp/Netty for image streaming, and per-thread stacks are all outside it, and none of `-XX:MaxMetaspaceSize`, `-XX:MaxDirectMemorySize`, `-XX:+UseSerialGC` or a thread-count bound is set. On top of that the Rust side allows 6 concurrent 32 MiB image buffers (lib.rs:40, and suwayomi_ios.rs:713-716 shares the same pool) plus the ~149 MB jimage mapping. The plan's R4 risk (\"Memory on 4 GB devices ... safe with -Xmx256m\") is therefore only half-implemented, and N4.3's RSS gate has never been measured.",
+     "failure_scenario": "A prefetch burst of 6 large pages (192 MB native) coincides with extension class loading (metaspace growth) and OkHttp direct buffers; total RSS crosses the foreground jetsam ceiling on a 4 GB iPhone and the OS kills the app mid-read, with no crash report attributable to the engine.",
+     "fix_sketch": "Add `-XX:MaxMetaspaceSize=128m -XX:MaxDirectMemorySize=64m -XX:+UseSerialGC` to the option list, and consider lowering MAX_CONCURRENT_IMAGE_FETCHES on iOS (a `#[cfg(target_os=\"ios\")]` constant in lib.rs) so the native buffer ceiling is ~64 MB rather than 192 MB.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-boot-blocks-main-thread",
+     "title": "Engine boot prologue (fs writes + up to 600 ms of sleeps) runs on the iOS main thread in setup()",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 546,
+     "severity": "low",
+     "category": "robustness",
+     "detail": "`suwayomi::start` is called from Tauri's `.setup()` hook (lib.rs:255-256), which runs on the main (UI) thread. Before spawning the JVM thread it does `current_exe` + `exists` checks (:493-508), resource resolution, `create_dir_all` + `write` of server.conf (:298-305), and — on a contended-port retry — up to four `std::thread::sleep(150 ms)` calls (:546) on that same thread. Only the JVM creation itself is moved off-main (:573-583).",
+     "failure_scenario": "On a cold launch where the ephemeral port is repeatedly stolen, the iOS main thread blocks ~600 ms plus filesystem latency during app initialization, delaying first paint and, in the worst case (slow container I/O plus retries), contributing to the UIApplication launch watchdog budget.",
+     "fix_sketch": "Move the whole `boot()` closure (:530-550) into the spawned thread (or a `tauri::async_runtime::spawn_blocking`) and have it publish the degrade via the supervisor, leaving `start()` as a pure spawn.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-jvm-thread-panic-leaves-starting",
+     "title": "A panic in the JVM thread closure records no degrade; status sits at \"starting\" for the full 300 s budget",
+     "file": "apps/reader/src-tauri/src/suwayomi_ios.rs",
+     "line": 576,
+     "severity": "low",
+     "category": "robustness",
+     "detail": "The spawned closure (:576-583) has no `catch_unwind`. Any panic inside it — e.g. `CString::new(..).expect(\"jvm option contains NUL\")` (:382), or the `.unwrap()`s on the JNI function pointers at :424/:432/:439/:444/:452 if a fn pointer is null in a mis-linked VM — kills the thread without calling `sup_jvm.degrade`. The supervisor then reports `starting` until `poll_ready`'s 300 s READY_TIMEOUT (:62) finally degrades it. (Panicking through JNI frames is not a risk here since no Rust code is invoked from Java.)",
+     "failure_scenario": "A mis-staged runtime leaves `(**env).FindClass` null; the closure panics; the UI shows the engine as `starting` for five minutes with no error, then a generic \"engine did not become ready within 300s\" instead of the real cause, which was only printed to the device console.",
+     "fix_sketch": "Wrap the closure body in `std::panic::catch_unwind(AssertUnwindSafe(..))` and `degrade(\"engine thread panicked\")` on Err; replace the JNI fn-pointer `.unwrap()`s with null checks that return a descriptive Err.",
+     "host_fixable": true,
+     "lane": "ios"
+    }
+   ]
+  },
+  {
+   "id": "desktop-sup",
+   "files": [
+    "apps/reader/src-tauri/src/suwayomi.rs"
+   ],
+   "findings": [
+    {
+     "id": "desktop-stale-lock-bricks-engine",
+     "title": "Stale lockfile after any abnormal exit permanently disables the engine",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 539,
+     "severity": "high",
+     "category": "robustness",
+     "detail": "`acquire_lock` (suwayomi.rs:539-557) uses `create_new` and writes the PID but never validates the holder's liveness; the file is removed only by `LockGuard::drop` (98-102), which runs solely on a clean process exit. `start()` treats a taken lock as fatal for the session (581-588): it logs, sets Degraded and returns — with no retry, no takeover, and no UI affordance to clear it. The code comment at 535-538 admits this is PARTIAL.",
+     "failure_scenario": "App is SIGKILLed / the machine loses power / the WebView crashes -> `komika-suwayomi.lock` survives in `<app_data_dir>/suwayomi/` -> every subsequent launch, forever, reports `another Komika instance holds the engine lock` and the engine stays Degraded until the user manually deletes a file inside an OS-specific app-data directory.",
+     "fix_sketch": "Replace the create_new marker with a real advisory lock (`fs2`/`fd-lock`, or an OS file lock) so the OS releases it on process death; failing that, read the stored PID and take over the lock when the PID is not alive (cfg-gated `kill(pid,0)` / `OpenProcess`), and re-arm a takeover attempt on a timer instead of one-shot Degraded.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-engine-unauthenticated",
+     "title": "Embedded engine runs with no authentication; any local process gets full GraphQL control (arbitrary extension install)",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 231,
+     "severity": "high",
+     "category": "security",
+     "detail": "`render_server_conf` (suwayomi.rs:231-241) writes ip/port/webUI/tray/kcef/flareSolverr but enables no authentication, so `http://127.0.0.1:<port>/api/graphql` is fully open to every process running as (or alongside) the user. Loopback-only binding is not an authorization boundary on a multi-process desktop. The engine's GraphQL surface includes repo/extension mutations — the app itself uses them (local-suwayomi-backend.ts provisioning) — so an unauthenticated caller can point the engine at an arbitrary extension repo and get arbitrary JVM code executed in-process. `suwayomi_gql` (suwayomi.rs:619-641) also forwards any query/mutation verbatim with no allowlist, so the same power is one XSS away inside the WebView.",
+     "failure_scenario": "Any unprivileged local process scans 127.0.0.1 for a Suwayomi `aboutServer` response, then POSTs `updateExtensionRepos`/`installExternalExtension` pointing at an attacker-hosted jar -> arbitrary code runs inside the Komika-launched JVM with the user's privileges and full access to the app data dir.",
+     "fix_sketch": "Generate a random per-boot credential, write it into server.conf (the pinned build's auth keys — `server.basicAuth*` / `server.authMode`+`authUsername`/`authPassword`; confirm names against v2.3.2243), attach the matching `Authorization` header in `poll_ready`, `suwayomi_gql`, `suwayomi_image` and `cloudflare::apply_settings`, and add a mutation allowlist (or at least a repo/extension-install denylist) to `suwayomi_gql`.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-boot-ignores-child-exit",
+     "title": "Readiness gate never observes child exit — a JVM that dies instantly still burns the full 30 s timeout",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 339,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "`boot_engine` (suwayomi.rs:339-356) spawns the child then awaits `poll_ready` only; it never `select!`s on `child.wait()`. A JVM that exits in under a second (corrupt/incompatible jar, wrong JRE module set, port stolen, OOM) is not noticed, so every failed attempt costs the whole `READY_TIMEOUT` (31) and reports the misleading 'engine did not become ready within 30s' instead of the child's exit status — while the real stderr is discarded in release builds (see desktop-no-release-logging). It also breaks the restart-storm accounting: each cycle takes >=30 s + backoff, so the `>5 restarts in 60 s` window (42, 437-453) can never trip for boot failures and the app retries a hopeless boot indefinitely.",
+     "failure_scenario": "Ship a JRE whose module set is missing a class Suwayomi needs -> JVM throws and exits in ~1 s -> supervisor waits 30 s, reports a timeout error, sleeps 2 s, repeats forever, with no exit-status diagnostic anywhere and no storm cap ever engaging.",
+     "fix_sketch": "In `boot_engine`, `tokio::select!` the `poll_ready` future against `child.wait()`; on early exit return an error carrying the exit status (and the last N captured stderr lines), and count consecutive boot failures separately from the 60 s crash window.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-sigkill-only-shutdown",
+     "title": "Shutdown SIGKILLs the JVM with no SIGTERM, so H2 is never closed cleanly",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 360,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "`stop_child` (suwayomi.rs:360-366) calls `child.start_kill()`, which is SIGKILL on Unix / TerminateProcess on Windows — the JVM's shutdown hooks never run, on every single quit. The same happens on the mid-boot stop path, which just `break`s and relies on `kill_on_drop` (398-402, 272). Per §0a the engine's embedded DB is H2, which relies on shutdown hooks to close its store and lock files cleanly.",
+     "failure_scenario": "Normal quit -> JVM killed mid-write -> next launch H2 must recover, or refuses with 'Database may be already in use'/locked-file errors -> boot fails, and because boot failure is only visible as a 30 s readiness timeout the user sees an engine that is silently degraded after a routine restart.",
+     "fix_sketch": "Send a graceful signal first: on unix `libc::kill(child.id(), SIGTERM)` (or the engine's own shutdown mutation over the existing loopback client), wait the existing `GRACE` window, and only then `start_kill()`; keep the current behaviour on Windows.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-runtime-artifacts-unverified-and-env-overridable",
+     "title": "`KOMIKA_JAVA_BIN`/`KOMIKA_SUWAYOMI_JAR` are honoured in release builds and the bundled artifacts are never re-verified at launch",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 485,
+     "severity": "medium",
+     "category": "security",
+     "detail": "`resolve_java` (suwayomi.rs:485-502) returns any path from `KOMIKA_JAVA_BIN` before probing the bundle, and `resolve_jar` (505-518) does the same with `KOMIKA_SUWAYOMI_JAR`; neither is gated on `cfg!(debug_assertions)`. Neither path re-checks the artifact against the SHA-256 pin that fetch-suwayomi-jar.sh enforced at build time (suwayomi/VERSION:5), so the bundled jar is trusted purely on location.",
+     "failure_scenario": "A per-user install (Linux tarball/AppImage extraction, Windows per-user install dir) or any process able to set the app's environment (a user LaunchAgent/.desktop wrapper, a systemd user unit) points `KOMIKA_JAVA_BIN` at an arbitrary executable or swaps the on-disk jar -> Komika launches attacker-controlled code as the user with no integrity check and no warning.",
+     "fix_sketch": "Gate both env overrides behind `#[cfg(debug_assertions)]` (or a `KOMIKA_DEV_ENGINE=1` opt-in), and verify the bundled jar's SHA-256 against a digest compiled in via `env!`/`include_str!` from suwayomi/VERSION on first boot (cache the result keyed on mtime+len to keep restarts cheap).",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-port-broker-toctou",
+     "title": "Brokered port is released before the JVM binds it — a racing process makes the boot fail as an opaque 30 s timeout",
+     "file": "apps/reader/src-tauri/src/suwayomi.rs",
+     "line": 220,
+     "severity": "low",
+     "category": "robustness",
+     "detail": "`broker_port` (suwayomi.rs:220-225) binds 127.0.0.1:0, reads the port and immediately drops the listener; the port then sits unowned for the whole `prepare_data_dir` + `spawn` + JVM-startup window (344-347), seconds during which any other process can claim it. `poll_ready` (299-334) treats every non-conforming response as 'not ready yet' and cannot tell 'engine still booting' from 'a foreign service owns this port'.",
+     "failure_scenario": "Another app (or a second Komika data dir) grabs the ephemeral port between the broker and the JVM bind -> the JVM fails to bind and exits, but the supervisor polls a stranger's HTTP service for 30 s and reports 'engine did not become ready within 30s', then retries with the same class of failure.",
+     "fix_sketch": "Detect the collision instead of guessing: pair the child-exit `select!` from desktop-boot-ignores-child-exit with a re-broker on failure, and/or verify the readiness response really is Suwayomi (already checks `data.aboutServer.version`) before declaring the port ours — plus log the child's bind error.",
+     "host_fixable": true,
+     "lane": "desktop"
+    }
+   ]
+  },
+  {
+   "id": "lib-rs",
+   "files": [
+    "apps/reader/src-tauri/src/lib.rs"
+   ],
+   "findings": [
+    {
+     "id": "desktop-quit-hangs-6s-when-engine-absent",
+     "title": "Every app quit blocks the UI thread for 6 s when the engine never started",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 272,
+     "severity": "high",
+     "category": "correctness",
+     "detail": "`RunEvent::Exit` does `block_on(sup.stop_and_wait())` on the main thread (lib.rs:272-280). `stop_and_wait` (suwayomi.rs:198-210) polls for `state == Stopped` for a full 6 s. But when `start()` bails early — no JRE/jar resolved (572-579) or lock refused (581-588) — no supervision task exists, so nothing ever sets `Stopped` and the loop always burns the entire 6 s before the backstop transition at 209. That early-bail state is the DEFAULT for any build produced by the current pipeline (see desktop-no-release-bundling-pipeline) and for every `tauri dev` run without a local JRE.",
+     "failure_scenario": "User quits the desktop app on a build without the bundled engine -> the window disappears but the process hangs on the main thread for 6 s; on Windows/macOS the OS shows a beachball/'not responding', and a second launch during that window hits the still-held lockfile.",
+     "fix_sketch": "Track whether the supervision task was actually spawned (e.g. an `AtomicBool started` set right before `tauri::async_runtime::spawn(run_supervisor(...))`) and return immediately from `stop_and_wait` when it is false or when the state is already Degraded/Stopped with no task; alternatively have `start()` set `Stopped` instead of `Degraded` on its early-bail paths.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-engine-always-spawned-regardless-of-flag",
+     "title": "The JVM and the Cloudflare loopback listener start for every desktop user even when the native-engine flag is off",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 255,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "`run()`'s setup unconditionally manages the supervisor and calls `suwayomi::start(...)` (lib.rs:255-256); `start()` in turn always launches the loopback Cloudflare shim listener (suwayomi.rs:594-597) and spawns the supervision loop (599). The feature gate is frontend-only (`PUBLIC_KOMIKA_NATIVE_ENGINE`, apps/reader/src/lib/config.ts:60, default `off` per apps/reader/.env:19) and is never communicated to Rust. The comment at 559-562 asserts 'an unused engine is harmless'.",
+     "failure_scenario": "A shipped desktop build with the flag off still spawns a `-Xmx512m` JVM at every launch, writes/refreshes an H2 data dir, holds a lockfile, binds a second loopback listener for the CF shim, and burns cold-start CPU — all for a subsystem no code path uses; on a laptop this is battery/RAM cost plus two extra local attack surfaces per the auth finding.",
+     "fix_sketch": "Make the engine lazily started: expose a `suwayomi_start` command (or read a `KOMIKA_NATIVE_ENGINE` compile-time/env value in Rust) and have `context.ts` invoke it only when `config.nativeEngine && isTauri()`; keep `start()`'s current body behind that trigger.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-no-release-logging",
+     "title": "Release builds install no logger, so all engine diagnostics are read and discarded",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 241,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "`tauri_plugin_log` is registered only inside `if cfg!(debug_assertions)` (lib.rs:241-247). The supervisor's stdout/stderr pumps (suwayomi.rs:278-293) faithfully read every JVM line and hand it to `log::info!`/`log::warn!` targeted at `suwayomi`, where in a release build it goes nowhere. Same for every `log::error!` on boot failure (428) and the restart/storm transitions (445-448).",
+     "failure_scenario": "A user's engine is stuck Degraded in production. The only signal available is `suwayomi_status.lastError`, which for the dominant failure mode says exactly 'engine did not become ready within 30s' (suwayomi.rs:327-331) — the JVM's actual stack trace was read from the pipe and dropped. The bug is undiagnosable without asking the user to run a debug build.",
+     "fix_sketch": "Register `tauri_plugin_log` unconditionally with a rotating file target (Info in release, Debug in dev) so the `suwayomi` target lands on disk; additionally retain the last N stderr lines in the supervisor and attach them to `lastError` on boot failure.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "ios-macabi-resolves-to-device-module",
+     "title": "Mac Catalyst (target_abi=\"macabi\") resolves to the device JNI module and the device JVM link",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 20,
+     "severity": "low",
+     "category": "packaging",
+     "detail": "Verified with `rustc --print cfg`: aarch64-apple-ios-macabi reports `target_os=\"ios\", target_abi=\"macabi\"`. lib.rs:20 selects suwayomi_ios.rs for any iOS triple that is not `sim`, and build.rs:47-50 applies the same `abi != \"sim\"` test before linking the device-only `jre-ios/aarch64-ios` static libs. Catalyst is not a current target, so this is latent, not live — the two simulator triples (aarch64-apple-ios-sim and x86_64-apple-ios, both abi=\"sim\") and the device triple (aarch64-apple-ios, abi=\"\") all resolve correctly.",
+     "failure_scenario": "Someone adds a Mac Catalyst build: cargo pulls in the in-process JNI module and build.rs feeds it iOS-device .a files, so the link fails with mach-o platform mismatches (or, worse, appears to link and aborts at JNI_CreateJavaVM) instead of falling back to the mobile stub.",
+     "fix_sketch": "Change the two conditions to an explicit allowlist of the device ABI, e.g. `all(target_os = \"ios\", target_abi = \"\")` in lib.rs and `target_abi.is_empty()` in build.rs, so any future Apple ABI defaults to the stub.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "imagefetch-no-retry-and-no-fallback-telemetry",
+     "title": "No retry/backoff on the native byte path, and nothing anywhere logs that native is using the hosted proxy instead of the engine",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 109,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "`fetch_image` issues exactly one request per hop and surfaces the first error (lib.rs:109-133); `suwayomi_image` likewise (suwayomi.rs:721-745). `NativeImageProvider` contains zero logging — no counterpart to `WebImageProvider.warnIfProxyRequired` (image-provider.ts:96-111) — so there is no signal at all distinguishing 'bytes came from the embedded engine' from 'bytes came from api.komiq.cc'. `CompositeBackend` warns only on local-path failures (composite-backend.ts:426), and `nativeEngine`/`imgDirect` are build-time `$env/static/public` constants (apps/reader/src/lib/config.ts:53,60) with no runtime override or settings UI, so a user cannot see or change which path they are on. Worst case on latency: the redirect loop is `0..=MAX_REDIRECTS` = 6 requests x 30 s = 180 s while holding 1 of 6 permits.",
+     "failure_scenario": "Product ships 'native, no proxy' and it silently regresses: a bad `.env.production`, a degraded engine, or a source that only resolves hosted-side sends 100% of image traffic back through api.komiq.cc, and neither the user nor the team sees anything — the app looks identical. Separately, a single transient DNS blip on one page (no retry) becomes an empty chapter.",
+     "fix_sketch": "Add a bounded jittered retry (2 attempts) for idempotent GETs in `fetch_image`; emit a one-line `log::info!(target: \"images\", route = engine|cdn|hosted)` per resolution and surface a counter in `suwayomi_status`; expose an `imageMode`/`nativeEngine` runtime override in localStorage so device verification can flip paths without a rebuild.",
+     "host_fixable": true,
+     "lane": "imagefetch"
+    },
+    {
+     "id": "imagefetch-ssrf-guard-blocks-own-api-origin",
+     "title": "fetch_image's SSRF guard blocks the app's own API origin, breaking every image in `tauri dev` and LAN self-hosts",
+     "file": "apps/reader/src-tauri/src/lib.rs",
+     "line": 159,
+     "severity": "high",
+     "category": "correctness",
+     "detail": "`NativeImageProvider.resolve` sends own-origin assets through `fetch_image`: `/covers/…` and `/avatars/…` are prefixed with `apiOrigin` (image-provider.ts:218-221) and absolute hosted proxy URLs fall through to `resolveViaLocalProxy` -> `fetch_image` (image-provider.ts:204-206, 222-224). `validate_image_url` then rejects any host resolving to a non-public address (lib.rs:159-161 with the predicate at lib.rs:170-217), which includes 127.0.0.1 and RFC1918. The dev build's `PUBLIC_KOMIKA_API=http://localhost:8080/graphql` (apps/reader/.env:15) and the Docker self-host default `http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}` (deploy/docker-compose.yml:186) both land squarely in the blocked set. There is no exemption for the configured API origin anywhere in the Rust side.",
+     "failure_scenario": "Developer runs `pnpm desktop:dev`. Every cover calls fetch_image(\"http://localhost:8080/covers/x.webp\") -> Err(\"host resolves to a non-public address: 127.0.0.1\") -> Cover.svelte sets `broken` and shows a grey placeholder for the whole app. A self-hoster whose server is at http://192.168.1.20:8080 gets the identical total image blackout in the shipped desktop app, plus (per the finding above) \"No pages available\" for every chapter.",
+     "fix_sketch": "Plumb the configured API origin host into Rust (a `tauri.conf.json` value, a `setup`-time `manage`d String, or a dedicated `komika_asset(path)` command that only ever fetches `<configured origin><path>`) and exempt exactly that host:port from `is_blocked_ip` — mirroring the deliberate narrow loopback exemption already used by `suwayomi_image`/`validate_image_path` (suwayomi.rs:643-670).",
+     "host_fixable": false,
+     "lane": "imagefetch"
+    }
+   ]
+  },
+  {
+   "id": "packaging",
+   "files": [
+    "apps/reader/src-tauri/tauri.conf.json",
+    "apps/reader/src-tauri/tauri.ios.conf.json",
+    "apps/reader/src-tauri/Cargo.toml",
+    "apps/reader/src-tauri/scripts/build-jre.sh",
+    "apps/reader/src-tauri/scripts/stage-ios-jvm-runtime.sh"
+   ],
+   "findings": [
+    {
+     "id": "desktop-no-release-bundling-pipeline",
+     "title": "Nothing builds/bundles the engine artifacts — a real desktop build ships an empty jre/ and no jar",
+     "file": "apps/reader/src-tauri/tauri.conf.json",
+     "line": 9,
+     "severity": "blocker",
+     "category": "packaging",
+     "detail": "`beforeBuildCommand` is only `pnpm build` (tauri.conf.json:9-10) — it never runs `scripts/fetch-suwayomi-jar.sh` or `scripts/build-jre.sh`. `.github/workflows/native-sidecar.yml:96-156` builds the JRE and verifies the jar but stops at `cargo test` + `upload-artifact`; no job anywhere runs `tauri build` (the only reference is the manual `desktop:build` script in apps/reader/package.json:16). Both artifact dirs are gitignored (apps/reader/src-tauri/.gitignore: `/jre/*`, `/suwayomi/Suwayomi-Server.jar`), leaving only `jre/.gitkeep`. So the bundle wiring in tauri.linux/macos/windows.conf.json:4-7 copies an empty directory and `resolve_java` (suwayomi.rs:485-502) / `resolve_jar` (505-518) both fail at runtime.",
+     "failure_scenario": "Fresh clone -> `pnpm desktop:build` -> installer builds green -> user launches the app -> `resolve_config` fails -> `start()` logs 'engine unavailable' and sets Degraded (suwayomi.rs:572-579) -> the native engine never runs and every read silently falls back to the hosted backend, i.e. the entire Phase-1 feature is absent from the shipped product with no build-time error.",
+     "fix_sketch": "Chain the artifact scripts into `beforeBuildCommand` (or a `tauri build` wrapper script) and add a CI job that runs build-jre.sh + fetch-suwayomi-jar.sh + `tauri build` per desktop target and asserts the produced bundle contains `jre/<slug>/bin/java*` and `suwayomi/Suwayomi-Server.jar`.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-jre-not-pinned-or-verified",
+     "title": "The bundled JRE is unpinned and unverified — only the jar is a real supply-chain pin",
+     "file": "apps/reader/src-tauri/scripts/build-jre.sh",
+     "line": 18,
+     "severity": "medium",
+     "category": "packaging",
+     "detail": "build-jre.sh only checks that `${JAVA_HOME}/bin/jlink` is executable (18-24); it asserts no JDK version, vendor or checksum despite the header claiming 'Requires JDK 21', and it records no digest of its output. CI feeds it `actions/setup-java` with `java-version: '21'` (.github/workflows/native-sidecar.yml:76-80), i.e. a floating Temurin patch release. Contrast with suwayomi/VERSION:4-6 + fetch-suwayomi-jar.sh:53-101, where the jar hash is genuinely enforced. So half the shipped runtime (the half that executes the other half) is reproducible only by luck.",
+     "failure_scenario": "A runner (or a maintainer's laptop with `JAVA_HOME` pointing at JDK 17 or 24) produces a JRE whose module set/class files differ from the one the `MODULES` list at build-jre.sh:57 was validated against -> the bundle boots on the builder's machine but the module set is subtly wrong for the pinned jar, and nothing in the pipeline detects the drift because no digest is recorded or compared.",
+     "fix_sketch": "Assert `\"${JAVA_HOME}/bin/java\" -version` reports the pinned feature+vendor (fail otherwise), pin the exact Temurin version in the workflow, and emit/record a manifest digest of the jlink output (e.g. sorted `sha256sum` over the tree) into `suwayomi/VERSION`-style pin file that CI re-verifies.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "desktop-csp-dead-worker-and-dev-origins",
+     "title": "Desktop CSP still allows img.komiq.cc and dev localhost origins that the native build never uses",
+     "file": "apps/reader/src-tauri/tauri.conf.json",
+     "line": 25,
+     "severity": "low",
+     "category": "security",
+     "detail": "The Tauri CSP allows `https://img.komiq.cc` in both `img-src` and `connect-src`, plus `http://localhost:8080` and `ws://localhost:5173` (tauri.conf.json:25). Under Tauri, `createImageProvider` always returns `NativeImageProvider` (image-provider.ts:240-242), which never constructs a Worker URL — `workerBaseUrl` is read only by `WebImageProvider.resolve` (image-provider.ts:76) — and the SPA build never server-renders (apps/reader/src/routes/+layout.ts:11-12), so no Worker URL can be baked into the HTML either. The Worker allowance is therefore dead, and the two localhost entries are dev-only.",
+     "failure_scenario": "No functional failure today; the cost is that the CSP no longer documents the real dependency set, and it silently keeps a path open for a future regression that reintroduces Worker URLs on desktop (exactly the dependency the product goal forbids) without any gate noticing.",
+     "fix_sketch": "Drop `https://img.komiq.cc` from both directives in the desktop CSP (keep it only in the web/Cloudflare build's headers) and move the `localhost:8080` / `ws://localhost:5173` entries into a dev-only config override.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "ios-gen-apple-unreproducible",
+     "title": "The entire iOS link recipe lives in a gitignored, hand-edited gen/apple/project.yml with no tracked template",
+     "file": "apps/reader/src-tauri/scripts/stage-ios-jvm-runtime.sh",
+     "line": 60,
+     "severity": "high",
+     "category": "packaging",
+     "detail": "build.rs:20-40 documents that the 13 dlsym-only JDK static libs (libjava, libnio, libnet, libzip, libjimage, …) CANNOT be bundled by cargo and must be `-Wl,-force_load`ed from `gen/apple/project.yml`, together with `-lz -liconv -lc++`, the CoreFoundation/Foundation frameworks, `DEAD_CODE_STRIPPING=false`, and the `jvm-runtime/lib` folder reference that puts the jimage at the bundle root. `gen/` is gitignored (.gitignore:13) and `git ls-files | grep project.yml` returns nothing — there is no template, no generator, and no CI. The only guard is stage-ios-jvm-runtime.sh:60-75, which greps the generated file for three substrings (`jvm-runtime/lib`, `force_load`, `CoreFoundation.framework`) and can neither restore them nor verify the other required settings (dead-code stripping, the per-lib force_load list, the system libs).",
+     "failure_scenario": "A developer (or a future release job) runs `pnpm exec tauri ios init` to regenerate gen/apple. The app still links — `JNI_CreateJavaVM` is bundled into libapp.a by build.rs — but the dlsym-only `Java_*`/`JNI_OnLoad_*` members of libjava/libnio/libzip are dropped, so `JNI_CreateJavaVM` fails during java.base bootstrap (or the VM aborts) on device, producing an unexplained permanent `degraded`. If the developer skips stage-ios-jvm-runtime.sh, `check_bundled_runtime` (:493-508) at least degrades cleanly, but the force_load loss has no such guard.",
+     "fix_sketch": "Track a `src-tauri/ios/project.yml.patch` (or a full templated project.yml plus a `scripts/apply-ios-project.sh` that re-applies it idempotently after `tauri ios init`), and extend stage-ios-jvm-runtime.sh to assert every required setting (each of the 13 force_load entries, DEAD_CODE_STRIPPING=false, -lz/-liconv/-lc++) rather than three substrings.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-bundle-size-and-desktop-jre-leak-ungated",
+     "title": "iOS bundle contents/size are unverified: the 218 MB desktop-JRE leak has no in-repo guard and the real payload is ~340 MB",
+     "file": "apps/reader/src-tauri/tauri.ios.conf.json",
+     "line": 1,
+     "severity": "medium",
+     "category": "packaging",
+     "detail": "n4-ios-build-attempt.md:26-30 records the 218 MB .ipa caused by the desktop jar+JRE being baked into the Xcode resource-copy phase at first `tauri ios init`, explicitly noting the `resources` override does not fix an already-generated project. The only in-repo remedy is tauri.ios.conf.json narrowing resources to `suwayomi/Suwayomi-Server.jar` — which is inert unless gen/apple was regenerated after it existed, and gen/apple is gitignored with no verification step. Meanwhile the intended iOS payload is itself unbounded: a 174 MB jar (per apps/reader/src-tauri/.gitignore:7) plus the ~169 MB jre-ios runtime (n4.1-ios-jvm-findings.md §5), and no script enforces a ceiling — in contrast to the desktop path, where scripts/build-jre.sh has a 150 MB hard ceiling enforced in CI (native-sidecar.yml:96-107).",
+     "failure_scenario": "Someone regenerates gen/apple on a machine whose jre/ was populated by build-jre.sh; the iOS copy phase re-includes `jre/aarch64-macos` (macOS mach-o binaries), producing an oversized .ipa that either fails codesign or ships 62 MB of unusable macOS executables — the exact failure already observed once, with nothing in the repo to catch a recurrence.",
+     "fix_sketch": "Add a `scripts/verify-ios-bundle.sh` invoked after `tauri ios build` that asserts the .app contains `assets/suwayomi/Suwayomi-Server.jar` and `lib/lib/modules`, contains NO `assets/jre/`, and is under an explicit size ceiling; call it from stage-ios-jvm-runtime.sh's checks and from any future iOS CI job. Separately, trim the jimage with a Suwayomi-tailored `--add-modules` set (already flagged in n4.1-ios-jvm-findings.md §5).",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "ios-msrv-vs-cfg-target-abi",
+     "title": "Cargo.toml pins rust-version 1.77.2 but lib.rs uses cfg(target_abi), stabilized in 1.78",
+     "file": "apps/reader/src-tauri/Cargo.toml",
+     "line": 9,
+     "severity": "low",
+     "category": "packaging",
+     "detail": "`rust-version = \"1.77.2\"` (Cargo.toml:9) while lib.rs:20/25 use `target_abi = \"sim\"` in `cfg`. `cfg(target_abi)` was feature-gated (`cfg_target_abi`) until Rust 1.78; on a 1.77 toolchain the gated cfg name is an E0658 error, not a silently-false predicate. Cargo.toml:41-42 also comments that \"cargo target cfg tables can't express target_abi reliably across toolchains\" — the same caveat applies to the source cfgs and is not reflected in the MSRV.",
+     "failure_scenario": "A contributor (or a distro/CI image) pinned to the declared MSRV 1.77.2 gets a hard compile error on lib.rs:20 for every target, including the desktop build that has nothing to do with iOS.",
+     "fix_sketch": "Bump `rust-version` to at least 1.78 (the crate already builds with 1.95 here) and note the target_abi requirement next to the cfg block.",
+     "host_fixable": true,
+     "lane": "ios"
+    },
+    {
+     "id": "imagefetch-csp-missing-api-origin-img-src",
+     "title": "Native CSP omits the API origin from img-src, so avatars and comment media never render in the app",
+     "file": "apps/reader/src-tauri/tauri.conf.json",
+     "line": 25,
+     "severity": "high",
+     "category": "correctness",
+     "detail": "The Tauri CSP is `img-src 'self' blob: data: https://img.komiq.cc` (tauri.conf.json:25) — it whitelists the Worker (which native never uses) but NOT `https://api.komiq.cc` or `http://localhost:8080`. Meanwhile `avatarSrc`/`apiAssetSrc` return raw `apiOrigin + '/avatars/…'` strings (apps/reader/src/lib/config.ts:91-95) that go straight into `<img {src}>` in Avatar.svelte:48, and comment attachments do the same via `apiAssetSrc(c.mediaUrl)` (lib/data/social-repo.ts:163) rendered at CommentThread.svelte:359. These bypass the `images` provider entirely, so they are never converted to blobs and are hard-blocked by CSP in every native build.",
+     "failure_scenario": "Signed-in user opens any comment thread or review in the desktop/iOS app: every avatar and every attached comment image is refused by the renderer (\"Refused to load the image … violates Content Security Policy\"), falling back to initials/broken tiles. Web is unaffected because the web CSP is not this one.",
+     "fix_sketch": "Either add the API origin(s) to `img-src` in tauri.conf.json (and the dev localhost origin for `tauri dev`), or — better for the no-remote-origin posture — route avatar/comment media through `images.resolveCover` so they become blob: URLs like every other native image.",
+     "host_fixable": true,
+     "lane": "imagefetch"
+    }
+   ]
+  },
+  {
+   "id": "reader-ui",
+   "files": [
+    "apps/reader/src/lib/data/source.ts",
+    "apps/reader/src/lib/components/Cover.svelte"
+   ],
+   "findings": [
+    {
+     "id": "desktop-eager-whole-chapter-image-fetch",
+     "title": "Native reader downloads every page of a chapter before showing page 1",
+     "file": "apps/reader/src/lib/data/source.ts",
+     "line": 1833,
+     "severity": "high",
+     "category": "perf",
+     "detail": "The reader load resolves all pages up front: `await Promise.all(domainPages.map((p) => images.resolvePage(p)))` (source.ts:1833, same at 1855). On web that is a free URL rewrite (image-provider.ts:113-115 -> 70-78), but on desktop `NativeImageProvider.resolvePage` actually pulls the bytes — `/api/…` -> `suwayomi_image` -> loopback engine -> source CDN (image-provider.ts:213-225, 163-166; suwayomi.rs:706-746) — throttled to 6 concurrent fetches by the shared semaphore (lib.rs:40-48). Nothing renders until the LAST page of the chapter has been downloaded through the engine.",
+     "failure_scenario": "Open a 40-page chapter with the native engine on: the reader route awaits ~40 engine-proxied downloads (~7 sequential batches of 6, each a live source fetch) before the first byte is painted — tens of seconds of blank screen — and a single slow/failing page stalls the whole chapter instead of one image.",
+     "fix_sketch": "Make the native provider lazy: hand the reader page descriptors and resolve bytes per-page on demand (or resolve only the first N and prefetch the rest in the background), keeping the existing blob-revoke logic in routes/read/[slug]/+page.svelte:104-112.",
+     "host_fixable": true,
+     "lane": "desktop"
+    },
+    {
+     "id": "imagefetch-one-page-failure-empties-chapter",
+     "title": "A single failed page image collapses the entire chapter to \"No pages available\" on native",
+     "file": "apps/reader/src/lib/data/source.ts",
+     "line": 1833,
+     "severity": "blocker",
+     "category": "correctness",
+     "detail": "`const urls = await Promise.all(domainPages.map((p) => images.resolvePage(p)))` (source.ts:1833 and again at 1855) runs inside `live(fn, emptyReader(seriesId))` (source.ts:43-51), which swallows ANY throw and returns the empty reader view. On web `WebImageProvider.resolvePage` is a pure string rewrite that cannot reject (image-provider.ts:113-115), so this is safe. On native `NativeImageProvider.resolvePage` awaits a Rust `invoke` that rejects on any non-2xx, timeout, DNS failure, size-cap trip, or SSRF-guard rejection (lib.rs:109-133). `Promise.all` rejects on the first such page, so ONE 502/403/slow page destroys the whole chapter. The reader's per-page retry (`retryImage`, routes/read/[slug]/+page.svelte:257-260) cannot help: it only remounts an `<img>` around an already-resolved blob URL, and in this failure mode no URL was ever produced.",
+     "failure_scenario": "User opens a 40-page chapter on desktop/iOS. Page 17's CDN returns 502 (or the hosted /api/v1/... proxy answers 502 from `serve_suwayomi_image`, apps/server/src/main.rs:612-616). `fetch_image` returns Err(\"upstream returned 502\"), `Promise.all` rejects, `live()` catches and returns `emptyReader`. The user sees \"No pages available\" for a chapter where 39/40 pages were fine, and refreshing re-runs the same all-or-nothing fetch.",
+     "fix_sketch": "Replace `Promise.all` with `Promise.allSettled` and map rejections to a null/empty `url` so the reader renders a per-page error tile (the `pageError`/`retryImage` UI already exists at routes/read/[slug]/+page.svelte:243-260); make `retryImage` re-invoke `images.resolvePage(page)` for that index instead of only remounting the `<img>`.",
+     "host_fixable": true,
+     "lane": "imagefetch"
+    },
+    {
+     "id": "imagefetch-cover-blob-leak-on-in-flight-unmount",
+     "title": "In-flight native cover fetches that settle after unmount leak their object URL forever",
+     "file": "apps/reader/src/lib/components/Cover.svelte",
+     "line": 112,
+     "severity": "medium",
+     "category": "robustness",
+     "detail": "Cover.svelte's native branch calls `images.resolveCover(source)` and only assigns the result when `alive` is still true (Cover.svelte:112-119). The teardown releases `resolved` (Cover.svelte:120-123), but `NativeImageProvider.resolveCover` has ALREADY called `URL.createObjectURL` inside `toBlobUrl` (image-provider.ts:168-172) by the time the promise settles. If the component unmounted or `src` changed first, `alive` is false, the URL is never stored, and `release()` (image-provider.ts:235-237) is never reachable for it. Object URLs are pinned to the document, so the bytes stay resident for the app session.",
+     "failure_scenario": "User scroll-flings a discovery grid on iOS. Dozens of `Cover` components mount, kick off a `fetch_image`, and unmount before the (semaphore-queued, up to 30 s) fetch returns. Each late-settling fetch leaks one blob of the full cover bytes. A few minutes of browsing pins tens/hundreds of MB in a jetsam-limited process that also hosts a 256 MB-heap JVM.",
+     "fix_sketch": "In the `.then`, revoke immediately when `!alive` (`images.release?.(u)`) instead of silently dropping it; equivalently have the provider accept an AbortSignal.",
+     "host_fixable": true,
+     "lane": "imagefetch"
+    }
+   ]
+  },
+  {
+   "id": "api-pkg",
+   "files": [
+    "packages/api/src/local-suwayomi-backend.ts"
+   ],
+   "findings": [
+    {
+     "id": "android-isready-ipc-per-call",
+     "title": "isReady() issues an IPC round-trip per content call for an answer that is a compile-time constant on Android",
+     "file": "packages/api/src/local-suwayomi-backend.ts",
+     "line": 113,
+     "severity": "low",
+     "category": "perf",
+     "detail": "`isReady()` dynamically imports `@tauri-apps/api/core` and `invoke('suwayomi_status')` on every call with no memoization (`local-suwayomi-backend.ts:113-122`). `CompositeBackend.localReady()` wraps it unmemoized (`composite-backend.ts:168-169`) and is called from `canonicalChapters` (`:352`) and `canonicalPages` (`:421`). On Android the Rust side answers from a hard-coded literal (`suwayomi_mobile.rs:84-91`) — the same `degraded` forever — so each of those is a guaranteed-useless serialize/IPC/deserialize hop on the reader's hot path. The existing `localUnusable` memo (`composite-backend.ts:352`) only short-circuits provisioning, not the readiness probe.",
+     "failure_scenario": "Opening a 37-page chapter on Android: `canonicalChapters` + `canonicalPages` each pay an IPC round-trip whose result is statically known to be false, adding latency to the first paint of every chapter open on the platform where the answer can never change within a process lifetime.",
+     "fix_sketch": "Memoize the negative in `CompositeBackend`: cache the first `false` from `local.isReady()` for the session (a `degraded`/`stopped` engine cannot become ready on Android or the iOS stub), or cache the promise with a short TTL and only re-probe while the reported state is `starting`.",
+     "host_fixable": true,
+     "lane": "android"
+    }
+   ]
+  }
+ ],
+ "orphan": []
+}

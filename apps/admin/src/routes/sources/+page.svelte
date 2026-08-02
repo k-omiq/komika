@@ -97,8 +97,9 @@
 	let rowMsg = $state<Record<string, string>>({});
 
 	// One-time "add repo" affordance shown when nothing is seeded.
-	const KEIYOUSHI_URL =
-		'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
+	// `index.pb` is the URL Keiyoushi publishes; the older `index.min.json` on the
+	// same branch still resolves but now holds only two "update your app" stubs.
+	const KEIYOUSHI_URL = 'https://github.com/keiyoushi/extensions/raw/repo/index.pb';
 	let repoUrl = $state(KEIYOUSHI_URL);
 	let addingRepo = $state(false);
 	let repoMsg = $state<string | null>(null);

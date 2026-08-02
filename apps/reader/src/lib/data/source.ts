@@ -30,7 +30,7 @@ import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { isRedundantMangadexExt, pickDefaultKey, MANGADEX_EXT_PKG } from './translator-select';
 import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
-import { config } from '$lib/config';
+import { config, apiAssetSrc } from '$lib/config';
 import * as content from './content';
 import { FLAG, FORMAT_CARDS } from './types';
 import type { Card, CatalogEntry, ComicType, Shelf, Status } from './types';
@@ -503,9 +503,18 @@ function prettySourceName(pkg: string | null | undefined): string | null {
 	return seg.charAt(0).toUpperCase() + seg.slice(1);
 }
 
-/** The store-hosted icon URL Keiyoushi publishes for an extension package. */
+/** Icon URL for an extension package, served from OUR origin.
+ *
+ *  Komika used to link Keiyoushi's `extensions/repo/icon/{pkg}.png` directly.
+ *  They emptied that directory when they migrated their index to `index.pb`, so
+ *  every icon in the product 404'd at once; the set is now vendored in
+ *  `assets/ext-icons/` and served at `/ext-icons/{pkg}.png`. The package-name
+ *  shape is checked here so a non-Keiyoushi package renders the UI's
+ *  initial-letter placeholder instead of requesting a path we can't have.
+ *  Mirrors `keiyoushi_icon_url` in the server's `graphql/mod.rs` — keep in sync. */
 function iconForPkg(pkg: string | null | undefined): string | null {
-	return pkg ? `https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/${pkg}.png` : null;
+	if (!pkg || !/^eu\.kanade\.tachiyomi\.extension\.[^.]+\.[^.]+$/.test(pkg)) return null;
+	return apiAssetSrc(`/ext-icons/${pkg}.png`);
 }
 
 /** A normalized language label, dropping Suwayomi's catch-all "all". */

@@ -11,7 +11,9 @@ import type { Backend } from '@komika/api';
 const PORT = process.env.SUWA_PORT || '4572';
 const BASE = `http://127.0.0.1:${PORT}`;
 const MANGADEX_PKG = 'eu.kanade.tachiyomi.extension.all.mangadex';
-const KEIYOUSHI = 'https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json';
+// `index.pb`: the older `index.min.json` on the same branch now holds only two
+// "update your app" stubs, so the harness would never find MangaDex in it.
+const KEIYOUSHI = 'https://github.com/keiyoushi/extensions/raw/repo/index.pb';
 
 // --- ground-truth GraphQL (direct to engine, bypassing the code under test) ---
 async function gql<T = any>(query: string, variables?: Record<string, unknown>): Promise<T> {

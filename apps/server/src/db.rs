@@ -116,6 +116,27 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+    // Extension icons Keiyoushi published AFTER the vendored snapshot in
+    // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
+    // The baked-in set is authoritative and answers essentially every request;
+    // this table only backfills extensions added upstream since, so the icons
+    // don't go stale between snapshot refreshes. Same rationale as the cover
+    // tables for living here: re-derivable from Keiyoushi, so deliberately
+    // excluded from Litestream backup.
+    //
+    // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
+    // in either source, and without a recorded miss every request for one would
+    // re-fetch from Keiyoushi. `serve_ext_icon` serves 404 for a tombstone and
+    // only re-checks upstream once it ages past its TTL.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS extension_icon_blob (\
+             pkg_name   TEXT PRIMARY KEY,\
+             png        BLOB NOT NULL,\
+             updated_at TEXT NOT NULL\
+         )",
+    )
+    .execute(&pool)
+    .await?;
     Ok(pool)
 }
 

@@ -6,6 +6,7 @@ mod config;
 mod cover;
 mod db;
 mod dedup;
+mod ext_icon;
 mod gc;
 mod graphql;
 mod ingest;
@@ -462,6 +463,61 @@ async fn upload_cover(
         None => format!("/covers/{work_id}.webp"),
     };
     Json(serde_json::json!({ "coverUrl": url })).into_response()
+}
+
+/// `GET /ext-icons/{file}` — serve an extension's icon from our own origin.
+/// `{file}` is `<pkgName>.png`.
+///
+/// Three tiers, cheapest first (see `ext_icon` for why we host these at all):
+///   1. the vendored snapshot baked into the image (`assets/ext-icons/`) — this
+///      answers essentially every request, with no DB or network work;
+///   2. `extension_icon_blob`, holding icons for extensions Keiyoushi added
+///      since that snapshot, plus tombstones for the ~41 that have no icon;
+///   3. a one-time fetch from Keiyoushi, cached into (2) for next time.
+///
+/// The package name is validated before it is joined onto a path or a URL
+/// (`ext_icon::is_valid_pkg` rejects `/`, `\` and `..`), so a bad shape 404s
+/// rather than escaping the icons directory.
+async fn serve_ext_icon(
+    State(app): State<Arc<graphql::AppState>>,
+    State(CoverDb(pool)): State<CoverDb>,
+    UrlPath(file): UrlPath<String>,
+) -> axum::response::Response {
+    let Some(pkg) = file
+        .strip_suffix(".png")
+        .filter(|p| ext_icon::is_valid_pkg(p))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Tier 1: the vendored snapshot.
+    if let Ok(bytes) = tokio::fs::read(app.ext_icons_dir.join(format!("{pkg}.png"))).await {
+        return png_icon_response(bytes);
+    }
+    // Tier 2: previously fetched, or a live "no icon exists" tombstone.
+    match ext_icon::cached(&pool, pkg).await {
+        Ok(Some(bytes)) => return png_icon_response(bytes),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(()) => {}
+    }
+    // Tier 3: ask Keiyoushi once, then serve from tier 2 forever after.
+    match ext_icon::fetch_and_cache(&pool, pkg).await {
+        Some(bytes) => png_icon_response(bytes),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Extension icons are content-addressed by package name and effectively never
+/// change, so they carry the same immutable year-long cache as avatars/covers —
+/// the browser and any edge cache in front of us should ask exactly once.
+fn png_icon_response(bytes: Vec<u8>) -> axum::response::Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// `GET /avatars/{file}` — serve a stored avatar from `user_avatars`. Immutable +
@@ -1197,6 +1253,7 @@ async fn main() -> anyhow::Result<()> {
         chapters_inflight: KeyedLocks::default(),
         cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_cover_phash: cfg.catalogue_cover_phash,
+        ext_icons_dir: std::path::PathBuf::from(&cfg.ext_icons_dir),
     });
 
     // Startup recovery: an ingest job still `running` was interrupted by the
@@ -1381,6 +1438,11 @@ async fn main() -> anyhow::Result<()> {
         // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
         // (admin `materializeCatalogueCovers`).
         .route("/covers/{file}", get(serve_cover))
+        // Public serve of extension icons from the vendored snapshot baked into
+        // this image, with a lazy Keiyoushi backfill for extensions added since.
+        // Hosted here because Keiyoushi's own icon directory was emptied in their
+        // `index.pb` migration (see the `ext_icon` module).
+        .route("/ext-icons/{file}", get(serve_ext_icon))
         // Admin: replace ONE work's cover from an uploaded image (the "Bugs" panel's
         // manual-upload action for covers the crawl can't process). Same multipart
         // model as avatars; body limit raised above the raw-image cap.

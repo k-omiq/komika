@@ -183,6 +183,9 @@ pub struct AppState {
     /// sweep (`Config::catalogue_cover_phash`). Threaded here so the admin
     /// `resyncCatalogue` kicks a cycle with the same setting as the recurring loop.
     pub catalogue_cover_phash: bool,
+    /// Directory of vendored extension icons served by `serve_ext_icon`
+    /// (`Config::ext_icons_dir`).
+    pub ext_icons_dir: std::path::PathBuf,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -4719,13 +4722,15 @@ impl QueryRoot {
 
 /// The curated Keiyoushi extension index — the hardcoded default store
 /// (CATALOGUE.md §Tier-2: curated, not crawled; `keiyoushi.github.io` 404s, the
-/// raw `repo` branch is the working host).
-const KEIYOUSHI_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json";
+/// raw `repo` branch is the working host). This is the `index.pb` URL Keiyoushi's
+/// README publishes: the older `index.min.json` on the same branch still
+/// resolves but was reduced to two "update your app" stub entries when they
+/// migrated, so seeding it would yield an empty catalogue.
+const KEIYOUSHI_INDEX_URL: &str = "https://github.com/keiyoushi/extensions/raw/repo/index.pb";
 
 /// Seed the Keiyoushi index as the default extension store when the engine has
 /// NONE configured. Presence can't be checked by URL equality (Suwayomi
-/// canonicalizes `index.min.json` → `index.pb` on add), so "any store exists"
+/// canonicalizes the index URL on add), so "any store exists"
 /// is the idempotency signal — an operator who removed the default on purpose
 /// and added another store is left alone.
 async fn ensure_default_extension_store(st: &AppState) -> Result<()> {
@@ -4741,13 +4746,39 @@ async fn ensure_default_extension_store(st: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// The `repo` branch base every Keiyoushi index URL canonicalizes to, once
+/// `github.com/…/raw/…` is rewritten to the direct raw host.
+const KEIYOUSHI_REPO_BASE: &str = "https://raw.githubusercontent.com/keiyoushi/extensions/repo";
+
+/// Our own icon URL for a Keiyoushi extension: `/ext-icons/{pkgName}.png`,
+/// served by `serve_ext_icon` from the snapshot vendored in `assets/ext-icons/`.
+///
+/// We host these rather than link Keiyoushi's because Keiyoushi emptied the
+/// `icon/` directory on their `repo` branch during the `index.pb` migration —
+/// only two stub entries remain, so the `repo/icon/{pkgName}.png` URL this used
+/// to emit now 404s for every real extension. Pointing at their replacement
+/// layout would work today but leaves the product one upstream reshuffle away
+/// from losing every icon again.
+///
+/// Relative on purpose: the caller absolutizes it against the public image base
+/// (`SUWAYOMI_PUBLIC_URL`), which is the browser-reachable origin this server is
+/// behind — the same treatment Suwayomi cover/page URLs get.
+///
+/// `None` for a package that isn't a Keiyoushi one (e.g. a locally-built apk):
+/// the snapshot won't contain it, so the caller falls back to the engine icon
+/// endpoint, which CAN serve it by unpacking the installed apk.
+fn keiyoushi_icon_url(pkg_name: &str) -> Option<String> {
+    crate::ext_icon::keiyoushi_source_url(pkg_name)?;
+    Some(format!("/ext-icons/{pkg_name}.png"))
+}
+
 /// Derive a browser-reachable, store-hosted icon URL for an extension from its
-/// repo index URL: the Mihon/Keiyoushi repo layout hosts icons next to the index
-/// at `icon/{pkgName}.png` (verified live: 200 image/png for installed and
-/// not-installed extensions alike). GitHub `/raw/` paths are rewritten to the
-/// direct `raw.githubusercontent.com` host to skip the 302 redirect. `None` when
-/// the repo URL doesn't end in an index file (unknown layout — caller falls back
-/// to the engine icon endpoint).
+/// repo index URL. GitHub `/raw/` paths are rewritten to the direct
+/// `raw.githubusercontent.com` host to skip the 302 redirect. Keiyoushi — the
+/// default store — is served from our own origin (see `keiyoushi_icon_url`);
+/// other Mihon-format repos keep hosting icons next to their index at
+/// `icon/{pkgName}.png`. `None` when the repo URL doesn't end in an index file
+/// (unknown layout — caller falls back to the engine icon endpoint).
 fn store_icon_url(repo: &str, pkg_name: &str) -> Option<String> {
     let (base, index) = repo.rsplit_once('/')?;
     if !index.starts_with("index.") {
@@ -4760,21 +4791,27 @@ fn store_icon_url(repo: &str, pkg_name: &str) -> Option<String> {
         ),
         _ => base.to_string(),
     };
+    if base == KEIYOUSHI_REPO_BASE {
+        return keiyoushi_icon_url(pkg_name);
+    }
     Some(format!("{base}/icon/{pkg_name}.png"))
 }
 
 /// Map a Suwayomi extension row onto the GraphQL `ExtensionInfo`. The icon URL
-/// prefers the STORE-hosted icon (derived from the repo index URL): the engine's
-/// own `/api/v1/extension/icon/…` endpoint serves them too, but only where the
-/// engine host is browser-reachable — in deployments where Suwayomi stays
-/// internal, those icons never load in the admin UI. The engine URL (absolutized
-/// against the public image base) remains the fallback for extensions without a
-/// derivable store icon (e.g. locally-uploaded APKs).
+/// prefers the STORE-hosted icon (derived from the repo index URL — for the
+/// default Keiyoushi store that is our own `/ext-icons/…`): the engine's own
+/// `/api/v1/extension/icon/…` endpoint serves icons too, but only for INSTALLED
+/// extensions and only where the engine host is browser-reachable — in
+/// deployments where Suwayomi stays internal, those icons never load in the
+/// admin UI. The engine URL remains the fallback for extensions without a
+/// derivable store icon (e.g. locally-uploaded APKs). Both are absolutized
+/// against the public image base.
 fn map_extension_info(st: &AppState, mut e: crate::suwayomi::ExtensionListEntry) -> ExtensionInfo {
     let store_icon = e
         .repo
         .as_deref()
-        .and_then(|r| store_icon_url(r, &e.pkg_name));
+        .and_then(|r| store_icon_url(r, &e.pkg_name))
+        .map(|u| st.suwayomi.abs(Some(&u)));
     let icon = store_icon.or_else(|| {
         // L1: `store_icon_url` only knows the GitHub raw / `index.*` layout. For a
         // repo it can't map, we fall back to the engine icon endpoint — which only
@@ -5082,6 +5119,7 @@ fn work_sources_to_translators(
                 .extension
                 .as_ref()
                 .and_then(|e| store_icon_url(&e.repo_url, &e.pkg_name))
+                .map(|u| st.suwayomi.abs(Some(&u)))
                 .or_else(|| {
                     live.and_then(|s| s.icon_url.as_deref())
                         .map(|u| st.suwayomi.abs(Some(u)))
@@ -10169,6 +10207,7 @@ mod tests {
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
         });
         (build_schema(state, false), pool)
     }
@@ -11146,6 +11185,7 @@ mod tests {
                 chapters_inflight: KeyedLocks::default(),
                 cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 catalogue_cover_phash: false,
+                ext_icons_dir: std::path::PathBuf::new(),
             })
         };
         const Q: &str = "{ __schema { queryType { name } } }";
@@ -11255,6 +11295,7 @@ mod tests {
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
         });
         let s = build_schema(state, false);
         // A configured admin name is reserved (case-insensitive) — open
@@ -15249,6 +15290,7 @@ mod tests {
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
         });
         let s = build_schema(state, false);
         let r = exec(
@@ -15514,6 +15556,7 @@ mod tests {
             chapters_inflight: KeyedLocks::default(),
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
         })
     }
 
@@ -16184,25 +16227,44 @@ mod tests {
 
     #[test]
     fn store_icon_url_derives_store_hosted_icons() {
-        // Keiyoushi's canonicalized repo URL → the direct raw.githubusercontent icon.
+        // Keiyoushi's canonicalized repo URL → OUR origin-relative icon path
+        // (their `repo/icon/` dir is now empty; we serve the vendored snapshot).
+        // The caller absolutizes against the public image base.
         assert_eq!(
             store_icon_url(
                 "https://github.com/keiyoushi/extensions/raw/repo/index.pb",
                 "eu.kanade.tachiyomi.extension.en.foo"
             )
             .as_deref(),
-            Some(
-                "https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/eu.kanade.tachiyomi.extension.en.foo.png"
-            )
+            Some("/ext-icons/eu.kanade.tachiyomi.extension.en.foo.png")
         );
-        // The pre-canonicalization min.json form works too.
+        // The pre-canonicalization min.json form resolves to the same base.
         assert_eq!(
             store_icon_url(
                 "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json",
-                "pkg.x"
+                "eu.kanade.tachiyomi.extension.all.mangadex"
             )
             .as_deref(),
-            Some("https://raw.githubusercontent.com/keiyoushi/extensions/repo/icon/pkg.x.png")
+            Some("/ext-icons/eu.kanade.tachiyomi.extension.all.mangadex.png")
+        );
+        // A Keiyoushi package that doesn't split into `{lang}.{dir}` → None, so the
+        // caller falls back to the engine icon rather than emitting a bogus path.
+        assert_eq!(
+            store_icon_url(
+                "https://github.com/keiyoushi/extensions/raw/repo/index.pb",
+                "com.example.custom"
+            ),
+            None
+        );
+        assert_eq!(keiyoushi_icon_url("eu.kanade.tachiyomi.extension.en"), None);
+        assert_eq!(
+            keiyoushi_icon_url("eu.kanade.tachiyomi.extension.en.foo.bar"),
+            None
+        );
+        // A non-Keiyoushi Mihon-format repo keeps the icons-next-to-index layout.
+        assert_eq!(
+            store_icon_url("https://example.com/repo/index.min.json", "pkg.x").as_deref(),
+            Some("https://example.com/repo/icon/pkg.x.png")
         );
         // A repo URL that doesn't end in an index file → None (fall back to engine).
         assert_eq!(store_icon_url("https://example.com/store", "pkg.x"), None);

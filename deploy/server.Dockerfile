@@ -41,6 +41,11 @@ RUN apt-get update \
     && chown komika:komika /data
 
 COPY --from=builder /build/apps/server/target/release/komika-server /usr/local/bin/komika-server
+# Vendored extension icons (~11 MB), served at /ext-icons/{pkgName}.png. Baked in
+# rather than fetched at runtime because Keiyoushi emptied the icon directory we
+# used to link (see apps/server/src/ext_icon.rs); refresh with
+# `node scripts/fetch-ext-icons.mjs`. Read-only to the runtime user.
+COPY assets/ext-icons/ /srv/ext-icons/
 COPY deploy/litestream.yml /etc/litestream.yml
 COPY deploy/server-entrypoint.sh /usr/local/bin/komika-entrypoint.sh
 RUN chmod +x /usr/local/bin/komika-entrypoint.sh

@@ -25,6 +25,12 @@ pub struct Config {
     /// NOT Litestream-replicated (only `database_url` is). Defaults to a
     /// `covers.sqlite3` sibling of the main DB; override with `COVERS_DATABASE_URL`.
     pub covers_database_url: String,
+    /// Directory holding the vendored extension icons served at
+    /// `/ext-icons/{pkgName}.png`. Populated from `assets/ext-icons/` in the repo
+    /// (see `scripts/fetch-ext-icons.mjs`) and copied into the image by
+    /// `deploy/server.Dockerfile`. Override with `EXT_ICONS_DIR`; a missing
+    /// directory is not fatal — the route falls back to its lazy Keiyoushi fetch.
+    pub ext_icons_dir: String,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -126,6 +132,8 @@ impl Config {
         // `database_url`) never ships cover bytes to R2.
         let covers_database_url =
             env::var("COVERS_DATABASE_URL").unwrap_or_else(|_| derive_covers_url(&database_url));
+        let ext_icons_dir =
+            env::var("EXT_ICONS_DIR").unwrap_or_else(|_| "/srv/ext-icons".to_string());
         let suwayomi_url =
             env::var("SUWAYOMI_URL").unwrap_or_else(|_| "http://localhost:4567".to_string());
         let suwayomi_public_url = env::var("SUWAYOMI_PUBLIC_URL")
@@ -317,6 +325,7 @@ impl Config {
             cover_cache_interval_secs,
             cover_cache_batch,
             covers_database_url,
+            ext_icons_dir,
         }
     }
 }
