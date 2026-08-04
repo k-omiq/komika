@@ -29,3 +29,9 @@ e2e/test-results/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+merge_plan.json
+
+merge_review.json
+
+merge-suwayomi-duplicates.done.log

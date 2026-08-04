@@ -127,6 +127,52 @@ impl std::fmt::Display for PageFetchError {
     }
 }
 
+/// Where a fetched value actually came from — the fresh source, or Suwayomi's local DB.
+///
+/// WHY THIS EXISTS (F11). Every fetch path in this client falls back to a plain
+/// `manga(id:)` / `chapters(condition:)` QUERY when its `fetch*` MUTATION fails. Those
+/// queries read Suwayomi's own database, so the call returns `Ok` with stale (or empty)
+/// data and the caller cannot tell the difference. That is CORRECT for the reader — never
+/// hard-fail a user over a transient upstream blip — and WRONG for the scanner, whose
+/// entire job is detecting change: a cached list can't contain a chapter we haven't
+/// already seen, so "no new chapters" from it is not a finding, and recording it as a
+/// successful scan makes "this source is healthy" and "this source is completely broken"
+/// indistinguishable.
+///
+/// Measured: `en.suryascans` (now rebranded "Genz Toons") 404s on every chapter fetch, yet
+/// all 209 of its series reported `consecutive_failures = 0` with 0 chapters each, and
+/// **zero** failures were recorded across all 14,098 series in the library. That number
+/// was not a clean bill of health; it was this fallback.
+///
+/// So the fallback stays, and the *provenance* travels with the value. The reader ignores
+/// it; the scanner treats [`Self::CachedFallback`] as an upstream failure
+/// (`scanner::scan_due`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// The `fetch*` mutation succeeded: Suwayomi went out to the source site and this is
+    /// what the site said (including "nothing", which is a real answer).
+    Upstream,
+    /// The mutation failed and this value was read from Suwayomi's LOCAL database. It may
+    /// be stale, or empty because we never managed to fetch the series at all.
+    CachedFallback,
+}
+
+impl Provenance {
+    /// The weaker of two provenances — `Upstream` only if BOTH halves were fresh. Used
+    /// where one call composes several fetches.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Upstream, Self::Upstream) => Self::Upstream,
+            _ => Self::CachedFallback,
+        }
+    }
+
+    /// True when the value came out of Suwayomi's cache rather than the source.
+    pub fn is_cached_fallback(self) -> bool {
+        matches!(self, Self::CachedFallback)
+    }
+}
+
 /// Read a response body into memory, streamed, refusing anything past `cap` bytes.
 /// `Response::bytes()` is unbounded (only the request timeout bounds it), so a huge or
 /// hostile body could otherwise balloon the process. Mirrors `mangadex::read_capped`.
@@ -701,7 +747,15 @@ impl SuwayomiClient {
 
     /// Fetch full detail from the source (populates genres/status/description),
     /// falling back to the DB-cached manga if the source fetch fails.
+    ///
+    /// Returns only the value; callers that need to know whether the data is FRESH must
+    /// use [`Self::series_with_provenance`] — see [`Provenance`] for why (F11).
     pub async fn series(&self, id: i64) -> Result<SuwayomiManga> {
+        self.series_with_provenance(id).await.map(|(m, _)| m)
+    }
+
+    /// [`Self::series`], plus where the value came from. See [`Provenance`].
+    pub async fn series_with_provenance(&self, id: i64) -> Result<(SuwayomiManga, Provenance)> {
         let detail = format!(
             "{MANGA_FIELDS}\n\
              mutation D($id: Int!) {{ fetchMangaAndChapters(input: {{ id: $id, fetchManga: true, fetchChapters: false }}) {{ manga {{ ...MangaFields }} }} }}"
@@ -716,8 +770,8 @@ impl SuwayomiClient {
             f: DetailPayload,
         }
         match self.gql::<DetailData>(&detail, json!({ "id": id })).await {
-            Ok(d) => Ok(d.f.manga),
-            Err(_) => {
+            Ok(d) => Ok((d.f.manga, Provenance::Upstream)),
+            Err(e) => {
                 let doc = format!(
                     "{MANGA_FIELDS}\nquery M($id: Int!) {{ manga(id: $id) {{ ...MangaFields }} }}"
                 );
@@ -726,12 +780,28 @@ impl SuwayomiClient {
                     manga: SuwayomiManga,
                 }
                 let d: Data = self.gql(&doc, json!({ "id": id })).await?;
-                Ok(d.manga)
+                tracing::debug!(series_id = id, error = %e, "suwayomi: series detail fell back to the local cache");
+                Ok((d.manga, Provenance::CachedFallback))
             }
         }
     }
 
+    /// Fetch the source's chapter list, falling back to Suwayomi's local cache on an
+    /// upstream failure.
+    ///
+    /// Returns only the value; callers that need to know whether the list is FRESH must
+    /// use [`Self::chapters_with_provenance`] — see [`Provenance`] for why (F11).
     pub async fn chapters(&self, series_id: i64) -> Result<Vec<SuwayomiChapter>> {
+        self.chapters_with_provenance(series_id)
+            .await
+            .map(|(c, _)| c)
+    }
+
+    /// [`Self::chapters`], plus where the list came from. See [`Provenance`].
+    pub async fn chapters_with_provenance(
+        &self,
+        series_id: i64,
+    ) -> Result<(Vec<SuwayomiChapter>, Provenance)> {
         let fetch = format!(
             "{CHAPTER_FIELDS}\n\
              mutation FC($id: Int!) {{ fetchMangaAndChapters(input: {{ id: $id, fetchManga: false, fetchChapters: true }}) {{ chapters {{ ...ChapterFields }} }} }}"
@@ -749,13 +819,18 @@ impl SuwayomiClient {
             .gql::<FetchData>(&fetch, json!({ "id": series_id }))
             .await
         {
-            Ok(d) => Ok(parse_records::<SuwayomiChapter>(
-                d.f.chapters.unwrap_or_default(),
-                "chapters",
+            Ok(d) => Ok((
+                parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
+                Provenance::Upstream,
             )),
             Err(e) => {
+                // "No chapters" is an upstream ANSWER, not an upstream failure: the
+                // mutation reached the source and it has nothing. Reported as
+                // `Upstream` so a genuinely empty series is not mistaken for a broken
+                // source — the per-source health view counts zero-chapter series
+                // separately (see `catalog::source_scan_health`).
                 if e.to_string().contains("No chapters") {
-                    return Ok(vec![]);
+                    return Ok((vec![], Provenance::Upstream));
                 }
                 let doc = format!(
                     "{CHAPTER_FIELDS}\n\
@@ -770,9 +845,10 @@ impl SuwayomiClient {
                     chapters: Nodes,
                 }
                 let d: Data = self.gql(&doc, json!({ "id": series_id })).await?;
-                Ok(parse_records::<SuwayomiChapter>(
-                    d.chapters.nodes,
-                    "chapters",
+                tracing::debug!(series_id, error = %e, "suwayomi: chapter list fell back to the local cache");
+                Ok((
+                    parse_records::<SuwayomiChapter>(d.chapters.nodes, "chapters"),
+                    Provenance::CachedFallback,
                 ))
             }
         }
@@ -783,10 +859,29 @@ impl SuwayomiClient {
     /// due series costs a single engine call for current status (pause re-check) + the
     /// chapter list, instead of two. Falls back to the separate `series` + `chapters`
     /// calls if the combined mutation fails (older engine / partial support).
+    ///
+    /// Returns only the values; the scanner MUST use
+    /// [`Self::series_and_chapters_with_provenance`] instead — see [`Provenance`] (F11).
     pub async fn series_and_chapters(
         &self,
         id: i64,
     ) -> Result<(SuwayomiManga, Vec<SuwayomiChapter>)> {
+        self.series_and_chapters_with_provenance(id)
+            .await
+            .map(|(m, c, _)| (m, c))
+    }
+
+    /// [`Self::series_and_chapters`], plus where the data came from. See [`Provenance`].
+    ///
+    /// The provenance is the WEAKER of the two halves: this call is only `Upstream` when
+    /// the combined mutation itself succeeded. Once it fails, both the manga and the
+    /// chapter list come from the per-call fallbacks below, and the chapter list is the
+    /// half that matters — a cached list cannot contain a chapter we have not already
+    /// seen, so "no new chapters" from it is not a finding.
+    pub async fn series_and_chapters_with_provenance(
+        &self,
+        id: i64,
+    ) -> Result<(SuwayomiManga, Vec<SuwayomiChapter>, Provenance)> {
         let doc = format!(
             "{MANGA_FIELDS}\n{CHAPTER_FIELDS}\n\
              mutation MC($id: Int!) {{ fetchMangaAndChapters(input: {{ id: $id, fetchManga: true, fetchChapters: true }}) {{ manga {{ ...MangaFields }} chapters {{ ...ChapterFields }} }} }}"
@@ -805,12 +900,13 @@ impl SuwayomiClient {
             Ok(d) => Ok((
                 d.f.manga,
                 parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
+                Provenance::Upstream,
             )),
             Err(_) => {
                 // Fallback: two calls (each carries its own older-engine fallback).
-                let m = self.series(id).await?;
-                let chapters = self.chapters(id).await?;
-                Ok((m, chapters))
+                let (m, m_prov) = self.series_with_provenance(id).await?;
+                let (chapters, ch_prov) = self.chapters_with_provenance(id).await?;
+                Ok((m, chapters, m_prov.and(ch_prov)))
             }
         }
     }

@@ -26,7 +26,23 @@
  * unchanged rather than emit invalid GraphQL) but it silently disables the fallback,
  * so the query just fails against an older server.
  */
-export const OPTIONAL_SERIES_FIELDS = ['detectedAt', 'workId'] as const;
+export const OPTIONAL_SERIES_FIELDS = [
+	'detectedAt',
+	'workId',
+	'latestChapter',
+	// F12's per-chapter date on `AggregatedChapter`. Optional for the usual reason: the
+	// reader and the API deploy separately, and a reader that shipped first would
+	// otherwise fail the WHOLE series page rather than lose one date line. Its caller-side
+	// fallback is the pre-F12 behaviour — a row with no date renders without one.
+	//
+	// NOT named `releasedAt`, deliberately: this stripper matches by NAME across every
+	// document, and `UpdateFeedRow.releasedAt` (which every deployed server already has)
+	// is selected in the updates query. Sharing the name would mean one older server
+	// rejecting the aggregated field also silently strips the feed's date for the rest of
+	// the session. The name is also the more honest one — it is the FIRST release across
+	// the chapter's sources, not the selected source's.
+	'firstReleasedAt',
+] as const;
 
 /**
  * Query ARGUMENTS the client passes OPPORTUNISTICALLY — same deploy-ordering hazard
@@ -87,6 +103,14 @@ const SERIES_FIELDS = /* GraphQL */ `
 		# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
 		latestChapterAt
 		detectedAt
+		# The newest chapter's NUMBER ("151"), which is NOT \`chapterCount\` ("12 ch") —
+		# printing the count under a "Ch." label is the F4 bug the chapter-number contract
+		# exists to prevent, so a null here means print the count ALONE. Own line, no alias
+		# and no arguments, because the unknown-field fallback strips it by line
+		# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without
+		# that entry a reader shipped first would fail EVERY series query rather than lose
+		# one label.
+		latestChapter
 	}
 `;
 
@@ -95,6 +119,8 @@ const CHAPTER_FIELDS = /* GraphQL */ `
 		id
 		seriesId
 		number
+		label
+		externalUrl
 		title
 		pageCount
 		uploadedAt
@@ -214,6 +240,7 @@ export const AGGREGATED_CHAPTERS = /* GraphQL */ `
 		aggregatedChapters(workId: $workId) {
 			number
 			title
+			firstReleasedAt
 			sources {
 				sourceType
 				sourceId
@@ -716,6 +743,63 @@ export const RETRY_COVER = /* GraphQL */ `
 	}
 `;
 
+/** Every field of a report, shared by the submit mutation and the admin queue so the
+ *  two can never drift apart. */
+const REPORT_FIELDS = /* GraphQL */ `
+	fragment ReportFields on Report {
+		id
+		kind
+		status
+		reporter
+		subjectId
+		subjectIdSecondary
+		subjectTitle
+		commentId
+		reportedUsername
+		commentExcerpt
+		sourceUrl
+		detail
+		adminNote
+		createdAt
+		resolvedAt
+	}
+`;
+
+/** Reader-facing: file a report. Works signed out (see `submitReport` on the server). */
+export const SUBMIT_REPORT = /* GraphQL */ `
+	${REPORT_FIELDS}
+	mutation SubmitReport($input: ReportInput!) {
+		submitReport(input: $input) {
+			...ReportFields
+		}
+	}
+`;
+
+/** Admin queue. Null `status`/`kind` mean "every value". */
+export const REPORTS = /* GraphQL */ `
+	${REPORT_FIELDS}
+	query Reports($status: ReportStatus, $kind: ReportKind, $page: Int) {
+		reports(status: $status, kind: $kind, page: $page) {
+			items {
+				...ReportFields
+			}
+			page
+			hasNextPage
+			total
+			openCount
+		}
+	}
+`;
+
+export const RESOLVE_REPORT = /* GraphQL */ `
+	${REPORT_FIELDS}
+	mutation ResolveReport($reportId: ID!, $status: ReportStatus!, $note: String) {
+		resolveReport(reportId: $reportId, status: $status, note: $note) {
+			...ReportFields
+		}
+	}
+`;
+
 export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
 		resolveMergeCandidate(id: $id, accept: $accept)
@@ -727,6 +811,43 @@ export const MERGE_WORKS = /* GraphQL */ `
 		mergeWorks(sourceWorkId: $sourceWorkId, targetWorkId: $targetWorkId) {
 			targetWorkId
 			movedSourceSeries
+		}
+	}
+`;
+
+// Catalogue search for the admin MERGE PICKER, which needs a different shape from the
+// reader's `SEARCH` and so gets its own lean document rather than a flag on that one.
+//
+// `workId` IS THE POINT. `mergeWorks` addresses works, but `Series.id` is the reader id —
+// `w_…` only when the work is MangaDex-anchored, and the numeric Suwayomi id otherwise —
+// so passing `id` as `targetWorkId` would send a numeric id to a mutation that only
+// understands `w_…`. It stays off `SeriesFields` because it is a resolver field (one query
+// per row, an N+1 on any grid); paying it on ≤30 admin-only rows is the trade this
+// document exists to make. Kept on its OWN LINE for the unknown-field stripper
+// (OPTIONAL_SERIES_FIELDS).
+//
+// The rest is deliberately minimal — enough to RECOGNISE a duplicate (cover, author,
+// chapter count) and no more; every extra field here is another per-row cost.
+//
+// `includeNsfw: true` because a duplicate is just as likely to be NSFW-flagged, and ~2,500
+// mainstream works are wrongly flagged today — an admin merging duplicates must be able to
+// see them. The server honours the argument for admins only, so this grants nothing to
+// anyone else, and the stripper handles a server that predates it (OPTIONAL_ARGUMENTS).
+export const SEARCH_FOR_MERGE = /* GraphQL */ `
+	query SearchForMerge($query: String!, $page: Int, $includeNsfw: Boolean) {
+		search(query: $query, page: $page, includeNsfw: $includeNsfw) {
+			items {
+				id
+				title
+				author
+				coverUrl
+				chapterCount
+				isNsfw
+				workId
+			}
+			page
+			hasNextPage
+			total
 		}
 	}
 `;
@@ -1110,6 +1231,37 @@ const SOURCE_INGEST_JOB_FIELDS = /* GraphQL */ `
 		error
 		startedAt
 		finishedAt
+	}
+`;
+
+/**
+ * Per-source scan health (Phase E4.3). Every field is a count the console renders, so there
+ * is no fragment to share — this query has one caller.
+ */
+export const SOURCE_SCAN_HEALTH = /* GraphQL */ `
+	query SourceScanHealth {
+		sourceScanHealth {
+			id
+			name
+			pkgName
+			installed
+			subscribed
+			subscriptionDisabledAt
+			series
+			failing
+			confirmedFailing
+			cachedFallback
+			fetchError
+			zeroChapterSeries
+			exclusiveWorks
+			worstStreak
+			lastFailureAt
+			lastScannedAt
+			outageDetectedAt
+			outageLastAlertAt
+			outageKind
+			outageParkedUntil
+		}
 	}
 `;
 

@@ -8,10 +8,11 @@
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
+	import MergeDialog from '$lib/components/MergeDialog.svelte';
 	import { FLAG, type Shelf } from '$lib/data/types';
 	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
-	import { images } from '$lib/context';
+	import { backend, images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
 	import { socialLive, loadSeriesSocial, saveSeriesRating } from '$lib/data/social-repo';
 
@@ -338,6 +339,35 @@
 	const workId = $derived(view?.workId ?? null);
 	let switching = $state(false);
 
+	// --- admin: fold duplicate works into this one ---
+	//
+	// GATED THREE WAYS, and all three are needed. `auth.ready` because the token is read
+	// from localStorage on the client, so `auth.user` is null both when signed out AND
+	// during SSR//first paint — without it the button flashes for nobody and is absent for
+	// admins. `isAdmin` is the actual permission (the server re-checks it in
+	// `require_admin`; this only decides whether to render the affordance). `mergeWorks` /
+	// `searchForMerge` are OPTIONAL backend methods — the Suwayomi adapter and the native
+	// offline backend don't implement them, and calling `!` on an absent method would throw
+	// on click rather than simply not offering it.
+	//
+	// `workId` (not `seriesId`) is what the mutation takes: `seriesId` is the reader id,
+	// which is numeric for a Suwayomi-anchored work. It resolves a beat after the page
+	// does, which is why the button disables rather than hides while it's null — hiding
+	// would make it look like the permission check failed.
+	const canMerge = $derived(
+		auth.ready && !!auth.user?.isAdmin && !!backend.mergeWorks && !!backend.searchForMerge,
+	);
+	let mergeOpen = $state(false);
+
+	// A merge changes this work's sources, aliases and chapter list, so re-read the page
+	// rather than patching state by hand. By `workId` for the same reason
+	// `selectTranslator` uses it.
+	async function afterMerge(): Promise<void> {
+		if (!workId) return;
+		const r = await getSeries(workId);
+		if (r.view) override = r;
+	}
+
 	// The picker is a POPOVER rather than the flat button list it used to be. With a
 	// handful of sources the flat list pushed the chapter list a screen down the page, and
 	// it read as a set of tabs rather than "the source this list is coming from" — which
@@ -641,6 +671,14 @@
 						title={shareCopied ? 'Link copied' : 'Share'}
 						onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={18} /></button
 					>
+					{#if canMerge}
+						<button
+							class="merge"
+							disabled={!workId}
+							title={workId ? 'Merge duplicate series into this one' : 'Resolving work…'}
+							onclick={() => (mergeOpen = true)}>Merge</button
+						>
+					{/if}
 				</div>
 				{#if writeError}
 					<div class="write-error" role="alert">
@@ -872,6 +910,16 @@
 						<div class="ch-line">
 							<span class="ch-name">{c.title}</span>
 							{#if c.isNew}<span class="new">NEW</span>{/if}
+							<!-- Off-site chapters (~35,000 of them: MangaPlus, Comikey, NamiComi,
+							     BiliBili) have no pages for us to serve — tapping one opens a
+							     "read it on <host>" hand-off. Badged HERE, in the list people
+							     actually browse, because learning it only after you have opened
+							     the chapter is the dead end the badge exists to remove. The
+							     reader's own dropdown badges too, but that is already past the
+							     point of surprise. -->
+							{#if c.external}<span class="ext" title="Hosted on another site"
+									><Icon name="globe" size={11} />OFF-SITE</span
+								>{/if}
 						</div>
 						<!-- Multi-source works can carry a chapter no source we can date
 						     provides (S2 aggregation) — render nothing rather than an empty
@@ -927,6 +975,17 @@
 			<a class="nf-ghost" href="/">Go home</a>
 		</div>
 	</div>
+{/if}
+
+<!-- admin merge picker. Mounted only for an admin with a resolved work, so a normal
+     reader never ships its markup or its search handler. -->
+{#if canMerge && workId}
+	<MergeDialog
+		bind:open={mergeOpen}
+		targetWorkId={workId}
+		targetTitle={title}
+		onmerged={afterMerge}
+	/>
 {/if}
 
 <!-- cover lightbox (F2) -->
@@ -1301,6 +1360,29 @@
 		background: rgba(95, 191, 126, 0.12);
 		border-color: rgba(95, 191, 126, 0.5);
 		color: #7fd39a;
+	}
+	/* Admin-only, so it is deliberately the quietest thing in the CTA row — an outline
+	   button sized to the others. It sits last, after Share, because it is a maintenance
+	   action and must never compete with Continue / Add to Library. */
+	.merge {
+		height: 50px;
+		padding: 0 16px;
+		flex: 0 0 auto;
+		border-radius: 8px;
+		background: transparent;
+		border: 1px dashed var(--k-border-4);
+		color: var(--k-text-3);
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.merge:hover:not(:disabled) {
+		border-color: rgba(255, 255, 255, 0.34);
+		color: var(--k-text-1);
+	}
+	.merge:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 	.share {
 		width: 50px;
@@ -1906,6 +1988,23 @@
 		color: var(--k-on-primary);
 		background: var(--k-star);
 		padding: 2px 7px;
+		border-radius: 5px;
+	}
+	/* Outlined, not filled — unlike `.new`. An off-site chapter is a CAVEAT, not a
+	   highlight, and giving it the same visual weight as NEW would read as a promotion.
+	   Matches the reader dropdown's own `.ext-tag` so the same fact looks the same on both
+	   surfaces. */
+	.ext {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		padding: 2px 6px;
 		border-radius: 5px;
 	}
 	.ch-date {

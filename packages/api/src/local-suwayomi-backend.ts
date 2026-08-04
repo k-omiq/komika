@@ -1,6 +1,7 @@
 import type { Chapter, Id, Page, Series, SeriesStatus, ComicType } from '@komika/types';
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import { isTauri } from './platform.js';
+import { suwayomiChapterLabel } from './chapter-label';
 
 /**
  * The engine extension package that provides MangaDex. The "all" package exposes a
@@ -624,6 +625,14 @@ function mapChapter(c: SuwayomiChapter): Chapter {
 		id: String(c.id),
 		seriesId: String(c.mangaId),
 		number: c.chapterNumber,
+		// No Komika server on this path, so the label is derived here by the same
+		// precedence the server applies. Suwayomi's `-1` oneshot sentinel and the
+		// `99999999` TEST uploads both fail the sanity check and fall back to the
+		// chapter's own name — see `chapter-label.ts`.
+		label: suwayomiChapterLabel(c.chapterNumber, c.name),
+		// Suwayomi serves pages for everything it lists; an off-site chapter is a
+		// MangaDex concept and cannot occur on this path.
+		externalUrl: null,
 		title: c.name,
 		pageCount: c.pageCount,
 		uploadedAt: toIso(c.uploadDate),

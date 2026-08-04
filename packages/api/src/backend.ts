@@ -17,10 +17,16 @@ import type {
 	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
+	MergeCandidateRow,
 	MergeWorksResult,
 	Notification,
 	Page,
 	Paginated,
+	Report,
+	ReportInput,
+	ReportKind,
+	ReportPage,
+	ReportStatus,
 	Review,
 	ScanStatus,
 	Series,
@@ -31,6 +37,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	SourceScanHealth,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
@@ -311,6 +318,36 @@ export interface Backend {
 	 * survives as canonical. Irreversible. Optional: only the unified Komika API
 	 * implements it. */
 	mergeWorks?(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult>;
+	/**
+	 * Catalogue search for the admin merge picker: the same FTS ranking `search` uses,
+	 * projected to the fields needed to spot a duplicate, plus each row's canonical
+	 * `workId` (which `search` deliberately omits — it is a per-row resolver field).
+	 *
+	 * Pages at the same BROWSE_PAGE_SIZE (30) as `search`, and forces `includeNsfw` —
+	 * honoured by the server for admins only, so a non-admin caller gains nothing.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	searchForMerge?(query: string, page?: number): Promise<Paginated<MergeCandidateRow>>;
+
+	// --- reader reports (Support → Report an issue) ---
+	/**
+	 * File a report. Works SIGNED OUT — most catalogue-accuracy reports come from
+	 * readers without accounts — so the server rate-limits it per IP and enforces the
+	 * per-kind required fields, rejecting with a reader-facing message.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	submitReport?(input: ReportInput): Promise<Report>;
+	/** The report queue, newest first; null filters mean "every value". `openCount` is
+	 * the global open backlog, not this page's. Requires an admin session.
+	 * Optional: only the unified Komika API implements it. */
+	reports?(
+		status?: ReportStatus | null,
+		kind?: ReportKind | null,
+		page?: number,
+	): Promise<ReportPage>;
+	/** Triage one report (resolve/reject, or reopen), optionally with a note. Requires
+	 * an admin session. Optional: only the unified Komika API implements it. */
+	resolveReport?(reportId: Id, status: ReportStatus, note?: string | null): Promise<Report>;
 
 	// --- admin cover issues / "Bugs" panel (requires an admin session) ---
 	/** Paginated works whose cover the crawl couldn't process, most recent first.
@@ -364,6 +401,11 @@ export interface Backend {
 	 * `updateSeriesAdmin` is whole-state). Unpausing triggers an immediate
 	 * server-side re-scan; returns the recomputed series. Optional. */
 	setSeriesPaused?(seriesId: Id, paused: boolean): Promise<Series>;
+
+	/** Per-source scan health (Phase E4.3): series tracked, how many are failing, and how
+	 * many of those failed by being served Suwayomi's CACHE rather than the source — the
+	 * failure mode that used to record as a success. Worst source first. Optional. */
+	sourceScanHealth?(): Promise<SourceScanHealth[]>;
 
 	// --- admin background source-ingest jobs (requires an admin session; S1) ---
 	/** The "add all from this source" ingest jobs, newest first. Pass

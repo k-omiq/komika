@@ -103,7 +103,8 @@ const RATED_PER_WORK_CTE: &str = "WITH rated_per_work AS ( \
 /// `content_rating` is deliberately NOT selected: it is a FILTER key (and index payload),
 /// never a rendered field, so reading it back would cost a wider row for nothing.
 const BROWSE_COLS: &str = "f.work_id, f.reader_id, f.title, f.cover_url, f.suwayomi_thumbnail, \
-     f.comic_type, f.status, f.en_chapter_count, f.released_at, f.is_nsfw, f.created_at";
+     f.comic_type, f.status, f.en_chapter_count, f.latest_chapter, f.released_at, f.is_nsfw, \
+     f.created_at";
 
 /// One `browse_catalogue` row as Browse reads it.
 #[derive(sqlx::FromRow, Clone, Debug)]
@@ -118,6 +119,18 @@ pub struct BrowseRow {
     pub comic_type: Option<String>,
     pub status: Option<String>,
     pub en_chapter_count: i64,
+    /// The newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095). A different
+    /// quantity from [`Self::en_chapter_count`], which is how many chapters we know of: the
+    /// card renders both ("12 ch · Ch. 151") precisely because printing one under the
+    /// other's label is F4, the bug this overhaul exists to kill.
+    ///
+    /// `None` for the ~67,000 works with no feed row to copy it from, and for any feed row
+    /// the ledger projection has not labelled. The card must then print the count alone —
+    /// never "Ch. undefined", and never the count wearing a "Ch." prefix.
+    ///
+    /// TEXT, and never parsed back to a float: it is `release_event.label`, whose
+    /// vocabulary is defined once in `chapter_label::ChapterLabel`.
+    pub latest_chapter: Option<String>,
     /// Newest upstream chapter release (epoch millis), or **`None` for a work with no dated
     /// chapter** — 67,000 of the 115,567 rows. NULLABLE is the whole point of migration
     /// 0069; `feed_series_updates.released_at` is NOT NULL by contract.
@@ -224,19 +237,26 @@ pub fn canonical_genres(genres: &[String]) -> Vec<String> {
 }
 
 // ---- the COUNT memo -------------------------------------------------------------------
+//
+// SHARED WITH `graphql::updates`, which memoizes its own `total` through the same static
+// and the same `clear_count_cache` (see `graphql::updates_total`). One memo rather than two
+// because there is exactly one invalidation event for both — `catalog::refresh_browse_catalogue`,
+// which ends the chain that rewrites everything either total counts — and two caches would
+// mean two chances to forget to clear one. The key spaces are kept disjoint by prefix
+// (`v3|` here, `updates:v1|` there).
 
 /// How long a memoized Browse total stays usable. Short enough that a sync cycle's
 /// additions show up within a refresh or two, long enough that a reader paging through
 /// Browse pays the count once rather than once per page.
 #[cfg(not(test))]
-const COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Zero under test: the memo is a process-wide static but every test builds its own
 /// in-memory DB, so two tests whose filters hash to the same key would otherwise read each
 /// other's totals depending on scheduling. A zero TTL makes [`browse_catalogue`] compute
 /// exactly, always. The memo logic itself is covered directly, via [`cached_count_with`].
 #[cfg(test)]
-const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
+pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
 
 /// Ceiling on distinct memoized filter signatures.
 ///
@@ -329,7 +349,7 @@ fn cached_count(key: &str) -> Option<i64> {
     cached_count_with(key, COUNT_TTL)
 }
 
-fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
+pub(crate) fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
     let cache = COUNT_CACHE.lock().ok()?;
     let (total, at) = cache.get(key)?;
     (at.elapsed() < ttl).then_some(*total)
@@ -348,7 +368,7 @@ fn store_count(key: String, total: i64) {
 /// Dropping expired entries first means a flood slower than [`COUNT_TTL`] never touches a
 /// live entry, and a faster one degrades to "no memo" (each miss still computes exactly)
 /// rather than to something worse. Bounded either way.
-fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
+pub(crate) fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
     let Ok(mut cache) = COUNT_CACHE.lock() else {
         return; // poisoned → just stop memoizing; every count is still computed exactly
     };
@@ -538,6 +558,42 @@ async fn fetch_page(
     );
     let q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
+}
+
+/// Fetch `browse_catalogue` rows for an explicit, already-ordered list of work ids,
+/// **preserving the caller's order**. Used by text search, which ranks in `work_fts` and
+/// then needs the same card payload Browse renders — above all `reader_id`, without which a
+/// Suwayomi-only hit would be handed to the client as a bare `w_…` that `canonicalSeries`
+/// rejects (see `graphql::map_browse_rows`).
+///
+/// One indexed `IN` over the PRIMARY KEY, then a reorder in Rust. SQLite has no
+/// `ORDER BY FIELD(...)`, and the alternatives — a `CASE` ladder of `ids.len()` branches, or
+/// a values-CTE join — are both more SQL for a reorder of at most `BROWSE_PAGE_SIZE` rows.
+///
+/// A work in `work_fts` with NO `browse_catalogue` row is DROPPED rather than rendered from
+/// a fallback. Both tables are rebuilt from the same predicate in the same chain
+/// (`refresh_feed_updates`), so a miss means the work lost its last source or its title
+/// between the two rebuilds — exactly the shell Browse also refuses to show. Silent by
+/// design: the caller logs the count difference.
+pub async fn rows_by_work_ids(pool: &SqlitePool, ids: &[String]) -> Result<Vec<BrowseRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {BROWSE_COLS} FROM browse_catalogue f WHERE f.work_id IN ({})",
+        placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, BrowseRow>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let mut by_id: std::collections::HashMap<String, BrowseRow> = q
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| (r.work_id.clone(), r))
+        .collect();
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set

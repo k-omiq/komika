@@ -943,6 +943,12 @@ fn assemble_series(
         // for a single series, `map_series_batch` for a page), so in practice this is
         // populated wherever we hold a dated chapter at all.
         latest_chapter_at: to_iso(m.latest_chapter_at.as_deref()).unwrap_or_default(),
+        // `None`, and it must stay `None`. A `SuwayomiManga` carries `chapters.total_count`
+        // — a COUNT — and no label for the newest chapter. Deriving one from the count is
+        // F4 exactly; deriving one from `suwayomi_chapter` would be a per-series query on a
+        // live-fetch path and a second implementation of the ledger's labelling rule. The
+        // client prints the count alone when this is absent.
+        latest_chapter: None,
         chapter_count: m
             .chapters
             .as_ref()
@@ -1429,17 +1435,40 @@ fn apply_search_filters(
 /// by `round(number*100)` so "10.5" ≠ "10" but float noise can't split a number.
 fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<AggregatedChapter> {
     use std::collections::BTreeMap;
-    let mut by_num: BTreeMap<i64, AggregatedChapter> = BTreeMap::new();
+    // Ordered by (number, key) rather than by the numeric key alone, so UNNUMBERED
+    // chapters (`x:<id>`, no number) sort together after the numbered ones instead of
+    // interleaving arbitrarily — and, crucially, keep one row each rather than all
+    // collapsing onto 0 the way a numeric-only key forced them to (F2).
+    let mut by_key: BTreeMap<(OrderedNumber, String), AggregatedChapter> = BTreeMap::new();
     for r in rows {
-        let key = (r.number * 100.0).round() as i64;
-        let entry = by_num.entry(key).or_insert_with(|| AggregatedChapter {
-            number: r.number,
+        let key = (OrderedNumber(r.number), r.key.clone());
+        let entry = by_key.entry(key).or_insert_with(|| AggregatedChapter {
+            // 0.0 for an unnumbered chapter is a DISPLAY fallback for older clients only —
+            // `label` is authoritative and says "Oneshot". Deliberately not a negative
+            // sentinel: a client that renders it still shows something harmless.
+            number: r.number.unwrap_or(0.0),
+            label: r.label.clone(),
+            key: r.key.clone(),
             title: r.title.clone(),
+            first_released_at: None,
             sources: Vec::new(),
         });
         // Keep the first non-empty title we see for the number.
         if entry.title.as_deref().unwrap_or("").is_empty() {
             entry.title = r.title.clone();
+        }
+        // THE EARLIEST release across the sources, not the first one encountered and not the
+        // selected source's (F12). Same rule as the release ledger's first-source-wins, so
+        // the date this row prints is the instant `/updates` announced the chapter.
+        //
+        // A string MIN is a real comparison here because the column is ISO-8601 UTC
+        // throughout — `the_spine_stores_one_clock_and_it_is_iso_8601` is what keeps that
+        // true, and it is why the Suwayomi drain converts epoch-millis on the way in rather
+        // than storing both encodings in one column.
+        if let Some(t) = r.released_at.as_deref() {
+            if entry.first_released_at.as_deref().is_none_or(|cur| t < cur) {
+                entry.first_released_at = Some(t.to_string());
+            }
         }
         entry.sources.push(ChapterSource {
             source_type: r.source_type,
@@ -1449,7 +1478,38 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
             scanlator: r.scanlator,
         });
     }
-    by_num.into_values().collect()
+    by_key.into_values().collect()
+}
+
+/// `Option<f64>` that can be a `BTreeMap` key: numbered chapters ascend, and unnumbered
+/// ones (`None`) sort LAST rather than first, so a work's oneshots sit at the end of its
+/// list instead of ahead of chapter 1.
+///
+/// Total order over floats is safe here because the values are chapter numbers that
+/// `chapter_display` has already sanity-checked — no NaN survives it — and the `partial_cmp`
+/// fallback keeps the ordering total even if one ever did.
+#[derive(PartialEq)]
+struct OrderedNumber(Option<f64>);
+
+// Not derivable: `f64` is not `Eq`. Sound here because `chapter_display` has already
+// rejected every non-finite number, so no NaN can reach this key.
+impl Eq for OrderedNumber {}
+
+impl Ord for OrderedNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.0, other.0) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for OrderedNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// S1: resolve one Suwayomi series DB-first — return the cached row when it's still
@@ -1457,10 +1517,80 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
 /// (so N concurrent readers of the same id trigger ONE fetch), and fall back to the
 /// stale cached row if the refetch fails (the reader never hard-fails on upstream
 /// trouble).
+/// The memo key for `updates`' `total`.
+///
+/// THE VIEWER DIMENSION IS THE WHOLE POINT. That COUNT takes exactly one bind —
+/// `show_nsfw` — and everything else in its predicate is a compile-time constant, so one
+/// bit is the complete key. But it is a bit that MUST be in it: the anonymous total (13,726
+/// on the snapshot) and the opted-in total (14,169) are different numbers over different
+/// audiences, and a single global entry would hand one to the other. That is not a stale
+/// number, it is the wrong answer — and a total that over-counts for an anonymous viewer is
+/// a pager promising pages of rows the NSFW gate will never return.
+///
+/// `updates:v1|` prefix, because the memo is one process-wide static SHARED with Browse
+/// (see `browse`'s COUNT-memo section). Browse's own keys start `v3|`, so the two key spaces
+/// cannot overlap; the version digit is here for the same reason Browse has one — if this
+/// count is ever repointed at a different table its SCALE changes, and a surviving entry
+/// under a colliding key would serve one scale's total for another.
+fn updates_count_key(show_nsfw: bool) -> String {
+    format!("updates:v1|{}", if show_nsfw { '1' } else { '0' })
+}
+
+/// `updates`' `total`, memoized behind Browse's count cache.
+///
+/// `count_sql` is passed in rather than duplicated so the resolver stays the ONE owner of
+/// the membership predicate — the alternative is a second copy of `DETECTED`/`NSFW_FILTER`
+/// that can drift from the one the page query uses, which would make `total` describe a
+/// different row set than the pages (the exact bug the "counts EXACTLY the row set" comment
+/// at the call site was written about). `ttl` is a parameter for the same reason
+/// `browse::cached_count_with` takes one: `COUNT_TTL` is ZERO under `cfg(test)`, so a test
+/// that did not control it could never observe the memo at all.
+///
+/// A STALE TOTAL IS ACCEPTABLE HERE, a wrong one is not. The number only moves when a series
+/// enters or leaves the library or is re-flagged NSFW, and it is bounded by `COUNT_TTL`
+/// (60 s) plus `browse::clear_count_cache`, which `catalog::refresh_browse_catalogue` calls
+/// at the end of every rebuild — i.e. the same event that changes it. The cost of being one
+/// minute behind is a pager that briefly under- or over-promises by a row or two; the cost
+/// of not memoizing is 53 ms of CPU on every home-page load.
+///
+/// Deliberately NOT the other fix: rewriting `NSFW_FILTER` as a `NOT IN` anti-join measured
+/// 37.3 ms (versus 53.4) and would break that constant's documented token-for-token equality
+/// with `series_cache::NSFW_GATE_SQL`. Two copies of an NSFW predicate drifting apart is how
+/// adult content reaches an anonymous viewer, which is categorically worse than a slow COUNT.
+async fn updates_total(
+    pool: &SqlitePool,
+    count_sql: &str,
+    show_nsfw: bool,
+    ttl: std::time::Duration,
+) -> Result<i64, sqlx::Error> {
+    let key = updates_count_key(show_nsfw);
+    if let Some(total) = crate::browse::cached_count_with(&key, ttl) {
+        return Ok(total);
+    }
+    let total: i64 = sqlx::query_scalar(count_sql)
+        .bind(show_nsfw as i64)
+        .fetch_one(pool)
+        .await?;
+    crate::browse::store_count_with(key, total, ttl);
+    Ok(total)
+}
+
 /// The aggregate bucket key for a chapter number (matches `group_aggregated_chapters`
 /// and the `chapter_override.chapter_key` column).
+///
+/// DELEGATES to [`crate::chapter_label::ChapterLabel::key`] rather than re-deriving
+/// `round(number * 100)`. It used to hold its own copy of that arithmetic, and the two
+/// agreeing was a coincidence nothing pinned: this is the copy admin chapter-hiding
+/// actually uses (`:3486`, `:3572`), while the ledger and the chapter spine key off the
+/// other one, so a divergence would silently stop hiding hidden chapters AND silently
+/// re-key the release ledger — a corruption with no error and no log.
+///
+/// The `identity` argument is unreachable here: this function is only ever called with a
+/// number, so the label is always `Numbered` and the `x:<external_id>` namespace (which
+/// exists so a work's three oneshots stay three rows) is never taken. It is spelled out
+/// rather than hidden behind a wrapper so the one-namespace-per-shape rule stays visible.
 fn chapter_key(number: f64) -> String {
-    ((number * 100.0).round() as i64).to_string()
+    crate::chapter_label::ChapterLabel::Numbered(number).key("")
 }
 
 /// Admin chapter overrides for a work, keyed by aggregate bucket key → (hidden,
@@ -1872,6 +2002,12 @@ async fn map_canonical_series(
         // should prefer `latest_chapter_at`; both hold the same value here.
         updated_at: latest_chapter_at.clone(),
         latest_chapter_at,
+        // `None` on the canonical path. The series DETAIL page renders its own chapter
+        // list, so the newest chapter's label is already on screen from real chapter rows;
+        // buying it here would mean an eighth serial query on a path that is already the
+        // slow one (see `map_browse_rows`' doc comment). Browse is the surface that asked
+        // for it, and Browse reads the materialized column instead.
+        latest_chapter: None,
     }
 }
 
@@ -2071,6 +2207,17 @@ async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> 
                     released.clone()
                 },
                 latest_chapter_at: released,
+                // Migration 0095 — the second half of Browse's "12 ch · Ch. 151".
+                //
+                // Passed through UNPARSED and UNCOALESCED. A `None` here reaches the card
+                // as a `null` and the card prints "12 ch"; substituting `chapter_count`
+                // would put a count under a "Ch." label, which is F4 and is the reason the
+                // column exists at all. `filter(|s| !s.is_empty())` because the copy chain
+                // (feed row → `browse_catalogue`) can carry an empty string from a
+                // pre-ledger row, and `""` is a "we do not know" dressed as an answer —
+                // the reader's `chapterChip('')` returns `''`, but normalizing it here
+                // means every client gets the same signal.
+                latest_chapter: r.latest_chapter.filter(|s| !s.trim().is_empty()),
             }
         })
         .collect()
@@ -2086,19 +2233,21 @@ fn map_canonical_chapter(
     c: catalog::CanonicalChapter,
     progress: Option<(i32, bool)>,
 ) -> Chapter {
-    let number = c
-        .number
-        .as_deref()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(0.0);
+    // `.unwrap_or(0.0)` used to live here, which turned every oneshot into "Chapter 0" —
+    // indistinguishable from a real `Chapter 0`, which is common in webtoons. The label
+    // carries the truth now and `number` keeps 0 only as an old-client fallback.
+    let label =
+        crate::chapter_label::chapter_display(None, c.number.as_deref(), c.title.as_deref());
     let (last_page_read, read) = progress.unwrap_or((0, false));
     Chapter {
         id: ID(c.external_id),
         series_id: ID(work_id.to_string()),
-        number,
+        number: label.number().unwrap_or(0.0),
+        label: label.text(),
         title: c.title,
         page_count: 0, // unknown until the at-home page list is fetched
         uploaded_at: c.published_at,
+        external_url: c.external_url,
         scanlator: None,
         read,
         last_page_read,
@@ -2605,6 +2754,221 @@ struct CoverIssueRow {
     cover_file_name: Option<String>,
 }
 
+// ---- Reader reports (Support → Report an issue) -----------------------------
+
+/// What a reader is reporting. See `migrations/0080_reader_reports.sql` for why these
+/// four cases cannot be detected server-side.
+///
+/// The enum and the `report.kind` TEXT column must not drift, so the mapping lives in
+/// exactly one place: {@link ReportKind::as_str} / {@link ReportKind::from_str}.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ReportKind {
+    /// Two different series were folded into one canonical work.
+    WrongMerge,
+    /// One series exists twice under two different ids.
+    NeedsMerge,
+    /// A series that is missing from the catalogue entirely.
+    MissingWork,
+    /// A person in the comments, not a record.
+    CommentAbuse,
+    Other,
+}
+
+impl ReportKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReportKind::WrongMerge => "wrong_merge",
+            ReportKind::NeedsMerge => "needs_merge",
+            ReportKind::MissingWork => "missing_work",
+            ReportKind::CommentAbuse => "comment_abuse",
+            ReportKind::Other => "other",
+        }
+    }
+
+    /// Unknown strings fall back to `Other` rather than failing the whole page: a row
+    /// written by a newer deploy must not make the admin queue unreadable on an older
+    /// one.
+    ///
+    /// This is a DISPLAY fallback only. The `kind:` filter in `reports` is an exact
+    /// `kind = 'other'` match on the stored text, so a row that renders as `OTHER`
+    /// because its kind was unrecognized is still not in the `OTHER` filter — it is
+    /// reachable from the unfiltered queue. Pinned by
+    /// `reports_render_values_from_a_newer_deploy_without_breaking`.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "wrong_merge" => ReportKind::WrongMerge,
+            "needs_merge" => ReportKind::NeedsMerge,
+            "missing_work" => ReportKind::MissingWork,
+            "comment_abuse" => ReportKind::CommentAbuse,
+            _ => ReportKind::Other,
+        }
+    }
+}
+
+/// Triage state. `Rejected` ("we looked, this is not a bug") is deliberately distinct
+/// from `Resolved` — see the migration header.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ReportStatus {
+    Open,
+    Resolved,
+    Rejected,
+}
+
+impl ReportStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReportStatus::Open => "open",
+            ReportStatus::Resolved => "resolved",
+            ReportStatus::Rejected => "rejected",
+        }
+    }
+
+    /// Unknown strings read as `Open`, so a row is never rendered as something it isn't.
+    ///
+    /// Same caveat as {@link ReportKind::from_str}, and it bites harder here: `status:` and
+    /// `openCount` are exact matches on the stored text, so a row with an unrecognized
+    /// status displays as `OPEN` but is absent from the `OPEN` filter (the console's
+    /// default view) and from the open backlog count. Only `resolve_report` ever writes
+    /// this column and it writes one of the three known values, so this is reachable only
+    /// via a newer deploy or hand-written SQL — but it is not the "can never become
+    /// invisible" the queue would want if that changed.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "resolved" => ReportStatus::Resolved,
+            "rejected" => ReportStatus::Rejected,
+            _ => ReportStatus::Open,
+        }
+    }
+}
+
+/// One reader-filed report, as the admin queue sees it.
+#[derive(SimpleObject)]
+pub struct Report {
+    pub id: ID,
+    pub kind: ReportKind,
+    pub status: ReportStatus,
+    /// The reporter's username, or null when the report was filed anonymously (which
+    /// is allowed on purpose — see the migration header).
+    pub reporter: Option<String>,
+    /// The series/work id the reader was looking at, verbatim (numeric Suwayomi id or
+    /// `w_` canonical id).
+    pub subject_id: Option<String>,
+    /// The OTHER id, on a merge/unmerge report.
+    pub subject_id_secondary: Option<String>,
+    /// Free-text title, for a series that has no id yet (`MISSING_WORK`).
+    pub subject_title: Option<String>,
+    pub comment_id: Option<String>,
+    /// Snapshotted at submit time so the report outlives the comment it reports.
+    pub reported_username: Option<String>,
+    pub comment_excerpt: Option<String>,
+    pub source_url: Option<String>,
+    pub detail: String,
+    pub admin_note: Option<String>,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+/// A page of reports (mirrors the other admin `*Page` envelopes), plus the open count
+/// so the console can badge the nav without a second query.
+#[derive(SimpleObject)]
+pub struct ReportPage {
+    pub items: Vec<Report>,
+    pub page: i32,
+    pub has_next_page: bool,
+    pub total: Option<i32>,
+    /// Reports still in `OPEN`, across every kind — not just this page/filter.
+    pub open_count: i32,
+}
+
+/// Raw `report` row + the joined reporter username.
+#[derive(sqlx::FromRow)]
+struct ReportRow {
+    id: String,
+    kind: String,
+    status: String,
+    reporter: Option<String>,
+    subject_id: Option<String>,
+    subject_id_secondary: Option<String>,
+    subject_title: Option<String>,
+    comment_id: Option<String>,
+    reported_username: Option<String>,
+    comment_excerpt: Option<String>,
+    source_url: Option<String>,
+    detail: String,
+    admin_note: Option<String>,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+impl From<ReportRow> for Report {
+    fn from(r: ReportRow) -> Self {
+        Report {
+            id: ID(r.id),
+            kind: ReportKind::from_str(&r.kind),
+            status: ReportStatus::from_str(&r.status),
+            reporter: r.reporter,
+            subject_id: r.subject_id,
+            subject_id_secondary: r.subject_id_secondary,
+            subject_title: r.subject_title,
+            comment_id: r.comment_id,
+            reported_username: r.reported_username,
+            comment_excerpt: r.comment_excerpt,
+            source_url: r.source_url,
+            detail: r.detail,
+            admin_note: r.admin_note,
+            created_at: r.created_at,
+            resolved_at: r.resolved_at,
+        }
+    }
+}
+
+/// What the reader submits. Which optional fields are required depends on `kind` — the
+/// resolver enforces that pairing (see `submit_report`), because a report with no
+/// subject is not actionable and silently accepting one is worse than refusing it.
+#[derive(async_graphql::InputObject)]
+pub struct ReportInput {
+    pub kind: ReportKind,
+    /// The reader's description. Required, and length-bounded.
+    pub detail: String,
+    pub subject_id: Option<String>,
+    pub subject_id_secondary: Option<String>,
+    pub subject_title: Option<String>,
+    pub comment_id: Option<String>,
+    pub reported_username: Option<String>,
+    pub source_url: Option<String>,
+}
+
+/// Sliding-window budget for the unauthenticated `submitReport` write, keyed
+/// `report:{client_ip}`. Same shape and the same caveat as {@link VIEW_LIMITER}: it is
+/// only as good as `ClientIp`, and it is a process-global so this feature does not have
+/// to change `AppState`'s construction in `main.rs`.
+///
+/// 6 per hour per IP. A reader with a genuine list of catalogue mistakes files them over
+/// days, not minutes; a script filling the admin queue does it in seconds.
+static REPORT_LIMITER: std::sync::LazyLock<RateLimiter> =
+    std::sync::LazyLock::new(|| RateLimiter::new(6, 3600));
+
+/// Bounds on the fields a reader controls. Everything here is stored verbatim and later
+/// rendered in the admin console, so it is capped at submit time rather than on read.
+const REPORT_DETAIL_MIN: usize = 10;
+const REPORT_DETAIL_MAX: usize = 4000;
+const REPORT_FIELD_MAX: usize = 300;
+const REPORT_URL_MAX: usize = 600;
+/// How much of a reported comment's body is snapshotted with the report.
+const REPORT_EXCERPT_MAX: usize = 500;
+
+/// Trim, drop-if-empty, and cap a reader-supplied optional field.
+///
+/// Truncation is by CHARACTER, not byte: `String::truncate` panics on a non-char
+/// boundary, and these fields routinely carry CJK titles.
+fn report_field(v: Option<String>, max: usize) -> Option<String> {
+    let v = v?.trim().to_string();
+    if v.is_empty() {
+        return None;
+    }
+    Some(v.chars().take(max).collect())
+}
+
 // ---- Query -----------------------------------------------------------------
 
 pub struct QueryRoot;
@@ -2773,22 +3137,47 @@ impl QueryRoot {
              SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
                AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))";
-        // Membership: our scanner has recorded a new-chapter detection for this series.
-        // This used to be the DRIVING table and the ORDER BY key; it is now only a
-        // predicate, because ordering by it was the bug (see below).
+        // Membership: the series is ENROLLED with our scanner. It used to be the DRIVING
+        // table and the ORDER BY key; it is now only a predicate, because ordering by it was
+        // the bug (see below).
         //
-        // `INDEXED BY` is required, not decorative: the only other candidate is the
-        // `series_id` PRIMARY KEY autoindex, which answers the equality but not the
-        // IS NOT NULL, so every probe fell through to a random table fetch — 846 ms
-        // cold / 12.6 ms warm for this test alone at the last page. The planner picks
-        // that autoindex even with ANALYZE run and even when handed a two-column or
-        // non-partial alternative (measured), so the choice has to be forced. The
-        // partial index (migration 0063) carries only the ~1,316 detected rows, 0.02 MiB,
-        // and takes the same probe to 20 ms cold / 3.8 ms warm.
+        // THE F3 GATE IS GONE HERE TOO (owner-approved 2026-07-31). This carried
+        // `AND sss.last_new_chapter_at IS NOT NULL`, i.e. "our scanner has observed a NEW
+        // chapter since we started watching" — but a first observation is a baseline and
+        // deliberately never stamps that column (`scanner::record_scan`), so a series we
+        // mirrored completely and never saw CHANGE was locked out forever. Both feed WRITERS
+        // dropped the same predicate; this resolver kept its own copy, and it is not dead
+        // code — the reader's HOME "Latest Updates" row calls `updates`, while `/updates`
+        // pages `updatesFeed` off `feed_series_updates`. Leaving it here would have meant one
+        // page of the reader admitting 10,966 works and another admitting 1,820 (§8h).
+        //
+        // Measured on the 2026-07-31 snapshot: the gate admitted 2,060 in-library series
+        // (1,984 for an anonymous, NSFW-filtered viewer); without it, 14,169 / 13,726. Page 1
+        // does not flood — the ordering key is the upstream release clock, so 9 of the top 20
+        // and 23 of the top 100 are newly admitted and every one of them is genuinely a
+        // TODAY release. The tail sinks: at offset 900 the visible age moves from 10 days to
+        // 7. That is the owner's stated intent — "when a series is added its latest chapters
+        // are legitimately the latest added chapters of a series".
+        //
+        // THE `INDEXED BY` HINT WENT WITH IT, and that is not cosmetic. It named
+        // `idx_scan_state_detected_series`, a PARTIAL index (migration 0063) whose WHERE is
+        // `last_new_chapter_at IS NOT NULL` — it carries ONLY the ~1,316 detected rows. A
+        // partial index may only serve a query whose predicate implies its own; keeping the
+        // hint after widening the predicate would either be rejected by SQLite or, worse,
+        // silently answer the widened membership test from an index that cannot see 12,000 of
+        // the qualifying rows. The hint existed because the old predicate needed the
+        // IS NOT NULL and the PRIMARY KEY autoindex could not answer it (846 ms cold / 12.6 ms
+        // warm at the last page, versus 20 ms / 3.8 ms with the partial index). The widened
+        // predicate is a pure equality, which is exactly what that autoindex is for:
+        // `EXPLAIN QUERY PLAN` on the snapshot now reads
+        // `SEARCH sss USING COVERING INDEX sqlite_autoindex_series_scan_state_1 (series_id=?)`
+        // — covering, so it never fetches the table at all. The driving scan and the ORDER BY
+        // are unchanged (`SEARCH suwayomi_series USING COVERING INDEX
+        // idx_suwayomi_series_latest_chapter`, no TEMP B-TREE). Measured page 1: 1.6 ms
+        // before, 0.5 ms after.
         const DETECTED: &str = "EXISTS ( \
-             SELECT 1 FROM series_scan_state sss INDEXED BY idx_scan_state_detected_series \
-             WHERE sss.series_id = CAST(suwayomi_series.id AS TEXT) \
-               AND sss.last_new_chapter_at IS NOT NULL)";
+             SELECT 1 FROM series_scan_state sss \
+             WHERE sss.series_id = CAST(suwayomi_series.id AS TEXT))";
         // Ordered by the REAL UPSTREAM RELEASE TIME of the newest chapter
         // (`suwayomi_series.latest_chapter_at`), newest first — which is precisely the
         // timestamp the reader prints on each card. It used to order by our DETECTION
@@ -2836,12 +3225,23 @@ impl QueryRoot {
         // `in_library = 1` included. It previously counted every dated `series_scan_state`
         // row, so a scan-state row for a series no longer in the library inflated `total`
         // and `has_next` above what the pages could ever return.
-        let total: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM suwayomi_series \
-             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}"
-        ))
-        .bind(show_nsfw as i64)
-        .fetch_one(&st.pool)
+        //
+        // MEMOIZED, and that is a consequence of the F3-gate removal above. The membership
+        // predicate went from 2,060 in-library series to 14,169, and the NSFW subquery is
+        // evaluated per surviving row — so it stopped short-circuiting on the ~86% the gate
+        // used to reject and this COUNT went from 13.8 ms to 53.4 ms warm on the 2026-07-31
+        // snapshot, on an anonymous, user-facing path. Page 1 itself got FASTER (1.6 → 0.5 ms,
+        // the `INDEXED BY` removal), which is exactly why this had to be measured separately
+        // rather than assumed.
+        let total = updates_total(
+            &st.pool,
+            &format!(
+                "SELECT COUNT(*) FROM suwayomi_series \
+                 WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}"
+            ),
+            show_nsfw,
+            crate::browse::COUNT_TTL,
+        )
         .await
         .map_err(gql_err)?;
         let has_next = ids.len() as i64 > PAGE_SIZE;
@@ -3532,12 +3932,18 @@ impl QueryRoot {
             });
         }
         // AD-5: text query → full-text search over the canonical `work` catalogue
-        // (migration 0052), returning `w_` works ranked by bm25. This replaces the old
+        // (migration 0052, corpus widened in 0071) ranked by bm25. This replaces the old
         // live fan-out to a Suwayomi source, which was slow, nondeterministic (results
         // depended on which of ~24 sources answered within 8s), ranked only by exact
         // title, and WROTE new rows into the catalogue as a read side effect. Because
         // results are canonical works, opening one shows the translator/source picker —
         // consistent with the home/updates canonical rows.
+        //
+        // Results carry `browse_catalogue.reader_id`, NOT `work_id` — a `w_…` for a
+        // MangaDex-anchored work and its numeric Suwayomi id otherwise, same as a Browse
+        // card. Until 0071 this branch searched only MangaDex-anchored works and so could
+        // assume the two were the same thing; they are not, and assuming it is what made
+        // every Suwayomi-only series unfindable.
         //
         // Genre/rating filters are intentionally NOT applied on this path: canonical
         // genre coverage is sparse until MangaDex tags are ingested (AD-1/B7), so a
@@ -3570,44 +3976,49 @@ impl QueryRoot {
         )
         .await
         .map_err(gql_err)?;
-        // Mapping one result costs ~7 serial queries (`load_canonical_work` alone is 3),
-        // so a 20-result page used to issue ~140 STRICTLY SERIAL round-trips — measured
-        // at 0.83–8.5s cold on the anonymous path. A true batch would need grouped
-        // loaders in `catalog`; pipelining them with bounded concurrency gets most of the
-        // win here without changing the catalogue layer. `buffered` (not
-        // `buffer_unordered`) preserves the bm25 ranking exactly, and the concurrency is
-        // held below the pool's 8 connections so a search can't starve everything else.
-        const SEARCH_MAP_CONCURRENCY: usize = 4;
-        let items: Vec<Series> = {
-            use futures::StreamExt as _;
-            futures::stream::iter(ids.into_iter().map(|id| async move {
-                // A per-result load failure drops that ROW rather than the whole page
-                // (the serial version failed the request); it is logged, never silent.
-                let work = catalog::load_canonical_work(&st.pool, &id)
-                    .await
-                    .inspect_err(|e| tracing::warn!(work_id = %id, error = %e, "search: work load failed"))
-                    .ok()??;
-                // Anchored by construction (the index only holds mangadex-linked works);
-                // guard anyway so a concurrent unlink can't surface a chapterless shell.
-                work.mangadex_id.as_ref()?;
-                let chapters = catalog::load_canonical_chapters(&st.pool, &id)
-                    .await
-                    .inspect_err(|e| tracing::warn!(work_id = %id, error = %e, "search: chapter load failed"))
-                    .ok()?;
-                let count = catalog::main_chapter_count_str(&chapters) as i32;
-                Some(map_canonical_series(&st.pool, None, work, count).await)
-            }))
-            .buffered(SEARCH_MAP_CONCURRENCY)
-            .filter_map(|s| async move { s })
-            .collect()
+        // Hydrate through `browse_catalogue`, exactly as the browse branch above does.
+        //
+        // WHY, #1 — CORRECTNESS, and this is the reason it changed. `map_canonical_series`
+        // hardcodes `id: ID(work.work_id)`, and `canonicalSeries` hard-rejects a work with
+        // no MangaDex anchor (`if work.mangadex_id.is_none()`), so a bare `w_…` for a
+        // Suwayomi-only work is a result that 404s on click. The old code papered over that
+        // with `work.mangadex_id.as_ref()?` — dropping those rows instead of linking them
+        // — which was self-consistent only while the index was MangaDex-only. Migration
+        // 0071 widened the corpus to every sourced work (1,824 Suwayomi-only works that
+        // were browsable but unsearchable), so the drop had to become a correct link
+        // instead. `browse_catalogue.reader_id` IS that link, and it is the rule 0064/0069
+        // already settled: `w_…` when anchored, numeric Suwayomi id otherwise.
+        //
+        // WHY, #2 — the search path was the last caller of the per-row pattern the browse
+        // rebuild exists to kill. `load_canonical_work` alone is 3 serial queries and the
+        // full map is ~7, so a 30-result page issued ~210 STRICTLY SERIAL round-trips,
+        // measured at 0.83–8.5 s cold on the anonymous path (the `map_browse_rows` doc
+        // comment cites this branch by name as the thing it does not do). It is now the
+        // same 5 grouped queries per page as Browse.
+        //
+        // Ranking is preserved: `rows_by_work_ids` returns rows in the order given, which
+        // is `search_works_fts`' tier/chapters/bm25 order.
+        let rows = crate::browse::rows_by_work_ids(&st.pool, &ids)
             .await
-        };
+            .map_err(gql_err)?;
+        if rows.len() != ids.len() {
+            // A ranked id with no catalogue row — the work lost its last source or its
+            // title between the two rebuilds. Dropped, never silent (the old per-row
+            // failure path logged for the same reason).
+            tracing::warn!(
+                ranked = ids.len(),
+                hydrated = rows.len(),
+                "search: dropped ranked works with no browse_catalogue row"
+            );
+        }
         // Rust-side backstop mirroring `discovery`. VERIFIED LEAK: anonymous
         // `search(query:"", page:17)` returned works with `isNsfw: true` while
-        // `canonicalSeries` on the same work correctly refused. `Series.is_nsfw` here is
-        // `COALESCE(is_nsfw_override, is_nsfw)` (see `map_canonical_series`), so this
-        // catches admin-marked works the FTS SQL gate misses.
-        let items = filter_nsfw(show_nsfw, items);
+        // `canonicalSeries` on the same work correctly refused. Still a REAL check on this
+        // branch, not a restatement of the SQL gate: the gate reads `work` directly
+        // (`COALESCE(is_nsfw_override, is_nsfw)`) while `map_browse_rows` re-reads the live
+        // flag via `nsfw_work_ids`, so an override written since the last rebuild is caught
+        // by one or the other.
+        let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
         let has_next = (page.max(1) as i64) * BROWSE_PAGE_SIZE < total;
         Ok(SeriesPage {
             items,
@@ -4380,6 +4791,98 @@ impl QueryRoot {
         })
     }
 
+    /// The reader-report queue (Support → Report an issue), newest first. Admin only.
+    ///
+    /// `status`/`kind` are both "null = every value", so the unfiltered call is the whole
+    /// history; the console defaults to `OPEN`. `total` counts the FILTERED set (what the
+    /// pager needs) while `open_count` is always the global open backlog (what the nav
+    /// badge needs) — they are deliberately different numbers.
+    async fn reports(
+        &self,
+        ctx: &Context<'_>,
+        status: Option<ReportStatus>,
+        kind: Option<ReportKind>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<ReportPage> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let page = page.max(1);
+        const PER: i64 = 50;
+        let offset = (page as i64 - 1) * PER;
+
+        // Two optional equality filters, emitted as only the clauses actually present.
+        // The tempting constant-text form `(? IS NULL OR r.status = ?)` does NOT work
+        // here: SQLite cannot see an index through that disjunction, and EXPLAIN QUERY
+        // PLAN degrades both statements to `SCAN report` plus a temp b-tree for the whole
+        // ORDER BY — exactly what `idx_report_status_created` / `idx_report_kind_created`
+        // exist to prevent. Two optional equalities are four possible statement texts, so
+        // the prepared-statement cache still covers the entire query surface.
+        let status_s = status.map(|s| s.as_str());
+        let kind_s = kind.map(|k| k.as_str());
+        let mut clauses: Vec<&str> = Vec::new();
+        if status_s.is_some() {
+            clauses.push("r.status = ?");
+        }
+        if kind_s.is_some() {
+            clauses.push("r.kind = ?");
+        }
+        let filter = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        // Bound in the same order the clauses were pushed, so status/kind can never be
+        // applied to each other's column.
+        let binds: Vec<&str> = [status_s, kind_s].into_iter().flatten().collect();
+
+        let count_sql = format!("SELECT COUNT(*) FROM report r {filter}");
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds {
+            count_q = count_q.bind(*b);
+        }
+        let total: i64 = count_q.fetch_one(&st.pool).await.map_err(gql_err)?;
+
+        let open_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM report WHERE status = 'open'")
+                .fetch_one(&st.pool)
+                .await
+                .map_err(gql_err)?;
+
+        let page_sql = format!(
+            "SELECT r.id, r.kind, r.status, u.username AS reporter, r.subject_id, \
+                    r.subject_id_secondary, r.subject_title, r.comment_id, \
+                    r.reported_username, r.comment_excerpt, r.source_url, r.detail, \
+                    r.admin_note, r.created_at, r.resolved_at \
+             FROM report r LEFT JOIN users u ON u.id = r.user_id \
+             {filter} \
+             ORDER BY r.created_at DESC, r.id DESC \
+             LIMIT ? OFFSET ?"
+        );
+        let mut page_q = sqlx::query_as::<_, ReportRow>(&page_sql);
+        for b in &binds {
+            page_q = page_q.bind(*b);
+        }
+        let rows = page_q
+            .bind(PER + 1) // one extra to compute has_next_page
+            .bind(offset)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(gql_err)?;
+
+        let has_next_page = rows.len() as i64 > PER;
+        Ok(ReportPage {
+            items: rows
+                .into_iter()
+                .take(PER as usize)
+                .map(Report::from)
+                .collect(),
+            page,
+            has_next_page,
+            total: Some(total as i32),
+            open_count: open_count as i32,
+        })
+    }
+
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
         let Some(tok) = token(ctx) else {
             return Ok(None);
@@ -4563,6 +5066,98 @@ impl QueryRoot {
                     is_nsfw: s.is_nsfw,
                     icon_url: (!icon.is_empty()).then_some(icon),
                     pkg_name: s.pkg_name,
+                }
+            })
+            .collect())
+    }
+
+    /// Admin: per-source scan health (Phase E4.3) — worst first.
+    ///
+    /// The question this answers had no honest answer before E4. Every fetch path in
+    /// `suwayomi.rs` falls back to a read of Suwayomi's LOCAL database when the upstream
+    /// fetch fails, so a completely broken source returned `Ok` with stale-or-empty data and
+    /// its scans were recorded as successes: `en.suryascans` 404'd on every chapter fetch
+    /// while all 209 of its series reported `consecutive_failures = 0` and 0 chapters, and
+    /// the whole 14,098-series library showed zero failures. `cachedFallback` is that case
+    /// made visible.
+    ///
+    /// Three joins deep but all indexed, and no per-row lookups: the health aggregate, the
+    /// exclusive-work counts, and the open outages are one query each, then zipped with the
+    /// engine's installed-source list for names.
+    async fn source_scan_health(&self, ctx: &Context<'_>) -> Result<Vec<SourceScanHealth>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let health = catalog::source_scan_health(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let exclusive = catalog::source_exclusive_work_counts(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let outages: std::collections::HashMap<String, catalog::SourceOutage> =
+            catalog::source_outages(&st.pool)
+                .await
+                .map_err(gql_err)?
+                .into_iter()
+                .map(|o| (o.source_id.clone(), o))
+                .collect();
+        let subscribed = catalog::subscribed_extension_set(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        // Subscription rows that exist but are breaker-disabled: `subscribed_extension_set`
+        // deliberately excludes them (it is the sync work-list), and "disabled" is exactly
+        // what this panel needs to show.
+        let disabled: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+            "SELECT pkg_name, disabled_at FROM extension_subscription WHERE disabled_at IS NOT NULL",
+        )
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?
+        .into_iter()
+        .collect();
+        // Best-effort: names are a nicety, and a Suwayomi hiccup must not blank the health
+        // report — which would be the same class of dishonesty this whole phase removes.
+        let names: std::collections::HashMap<String, String> = match st
+            .suwayomi
+            .list_sources()
+            .await
+        {
+            Ok(list) => list.into_iter().map(|s| (s.id, s.name)).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "sourceScanHealth: could not list sources for names");
+                Default::default()
+            }
+        };
+        Ok(health
+            .into_iter()
+            .map(|h| {
+                let outage = outages.get(&h.source_id);
+                SourceScanHealth {
+                    id: ID(h.source_id.clone()),
+                    name: names.get(&h.source_id).cloned(),
+                    installed: names.contains_key(&h.source_id),
+                    subscribed: h
+                        .pkg_name
+                        .as_deref()
+                        .is_some_and(|p| subscribed.contains(p)),
+                    subscription_disabled_at: h
+                        .pkg_name
+                        .as_deref()
+                        .and_then(|p| disabled.get(p).cloned()),
+                    series: h.series as i32,
+                    failing: h.failing as i32,
+                    confirmed_failing: h.confirmed_failing as i32,
+                    cached_fallback: h.cached_fallback as i32,
+                    fetch_error: h.fetch_error as i32,
+                    zero_chapter_series: h.zero_chapter_series as i32,
+                    exclusive_works: exclusive.get(&h.source_id).copied().unwrap_or(0) as i32,
+                    worst_streak: h.worst_streak as i32,
+                    last_failure_at: h.last_failure_at,
+                    last_scanned_at: h.last_scanned_at,
+                    outage_detected_at: outage.map(|o| o.detected_at.clone()),
+                    outage_last_alert_at: outage.map(|o| o.last_alert_at.clone()),
+                    outage_kind: outage.and_then(|o| o.kind.clone()),
+                    outage_parked_until: outage.and_then(|o| o.parked_until.clone()),
+                    pkg_name: h.pkg_name,
                 }
             })
             .collect())
@@ -5595,6 +6190,222 @@ impl MutationRoot {
             tracing::warn!(series_id = %sid, error = %e, "recordView failed");
         }
         Ok(true)
+    }
+
+    /// File a reader report (Support → Report an issue). Returns the stored report so the
+    /// form can show its id as a reference.
+    ///
+    /// UNAUTHENTICATED ON PURPOSE. The four things this collects — a wrong merge, a
+    /// missing merge, a missing series, an abusive commenter — are overwhelmingly noticed
+    /// by readers who never sign in, and requiring an account would drop most of the
+    /// signal. It is a public write, so it is hardened the same way `recordView` is:
+    ///
+    ///  • a per-IP hourly budget (`REPORT_LIMITER`), so the queue can't be flooded;
+    ///  • every field trimmed and length-capped before it touches a query;
+    ///  • per-kind required fields enforced, so nothing unactionable is accepted;
+    ///  • `subjectId` must resolve to a series we actually know, so the queue can't be
+    ///    seeded with junk ids;
+    ///  • the reported comment's author and body are SNAPSHOTTED here, because acting on
+    ///    the report hard-deletes the comment (see the migration header).
+    ///
+    /// A signed-in reporter is recorded; an anonymous one stores no user and no IP.
+    async fn submit_report(&self, ctx: &Context<'_>, input: ReportInput) -> Result<Report> {
+        let st = state(ctx);
+
+        // Budget first: nothing below should run for a client that is already over it.
+        if let Err(retry) = REPORT_LIMITER.check(&format!("report:{}", client_ip(ctx))) {
+            let mins = retry.div_ceil(60);
+            return Err(Error::new(format!(
+                "You've filed several reports recently — please try again in {mins} minute(s)."
+            )));
+        }
+
+        let detail = input.detail.trim();
+        // Count CHARS, not bytes: a 10-byte minimum is ~3 CJK characters, which would let
+        // a useless report through in one language and reject a fine one in another.
+        let detail_len = detail.chars().count();
+        if detail_len < REPORT_DETAIL_MIN {
+            return Err(Error::new(
+                "Please describe the problem in a little more detail.",
+            ));
+        }
+        if detail_len > REPORT_DETAIL_MAX {
+            return Err(Error::new(format!(
+                "That description is too long (max {REPORT_DETAIL_MAX} characters)."
+            )));
+        }
+        let detail = detail.to_string();
+
+        let subject_id = report_field(input.subject_id, REPORT_FIELD_MAX);
+        let subject_id_secondary = report_field(input.subject_id_secondary, REPORT_FIELD_MAX);
+        let subject_title = report_field(input.subject_title, REPORT_FIELD_MAX);
+        let comment_id = report_field(input.comment_id, REPORT_FIELD_MAX);
+        let mut reported_username = report_field(input.reported_username, REPORT_FIELD_MAX);
+        let source_url = report_field(input.source_url, REPORT_URL_MAX);
+
+        // Per-kind minimum: what makes THIS kind of report actionable.
+        match input.kind {
+            ReportKind::WrongMerge | ReportKind::NeedsMerge => {
+                if subject_id.is_none() {
+                    return Err(Error::new(
+                        "Tell us which series this is about (open it and use the report link there).",
+                    ));
+                }
+            }
+            ReportKind::MissingWork => {
+                if subject_title.is_none() {
+                    return Err(Error::new("Please give the title of the missing series."));
+                }
+            }
+            ReportKind::CommentAbuse => {
+                if comment_id.is_none() && reported_username.is_none() {
+                    return Err(Error::new(
+                        "Please tell us which comment or which user you're reporting.",
+                    ));
+                }
+            }
+            ReportKind::Other => {}
+        }
+
+        // `sourceUrl` is the one reader-supplied field the admin console renders as a
+        // real `<a href>` (Svelte does not sanitize href schemes), so an UNAUTHENTICATED
+        // write must not be able to hand an admin a `javascript:`/`data:` link to click —
+        // that would run script in the console's origin with the admin's session. An
+        // allowlist, not a denylist: anything that is not http(s) after trimming is
+        // refused, so scheme-obfuscation tricks have nothing to slip past.
+        if let Some(u) = source_url.as_deref() {
+            let lower = u.to_ascii_lowercase();
+            if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+                return Err(Error::new("A link must start with http:// or https://."));
+            }
+        }
+
+        // Both ids, when given, must name a series we know. Note this validates the id
+        // EXISTS, not that the reader's claim about it is right — that is the admin's job.
+        for id in [subject_id.as_deref(), subject_id_secondary.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !known_series_id(&st.pool, id).await {
+                return Err(Error::new(format!("We don't have a series with id {id}.")));
+            }
+        }
+
+        // Snapshot the reported comment. A missing id is an error rather than a silent
+        // null: it means the reader's link is stale and the report would be untriageable.
+        let mut comment_excerpt = None;
+        if let Some(cid) = comment_id.as_deref() {
+            let found: Option<(String, String)> = sqlx::query_as(
+                "SELECT c.body, u.username FROM comments c \
+                 JOIN users u ON u.id = c.user_id WHERE c.id = ?",
+            )
+            .bind(cid)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?;
+            let Some((body, author)) = found else {
+                return Err(Error::new("That comment no longer exists."));
+            };
+            comment_excerpt = Some(body.chars().take(REPORT_EXCERPT_MAX).collect::<String>());
+            // The author we looked up beats whatever the client sent.
+            reported_username = Some(author);
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let user = current_user(ctx).await;
+
+        sqlx::query(
+            "INSERT INTO report (id, kind, status, user_id, subject_id, subject_id_secondary, \
+                                 subject_title, comment_id, reported_username, comment_excerpt, \
+                                 source_url, detail, created_at) \
+             VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(input.kind.as_str())
+        .bind(user.as_ref().map(|u| u.id.as_str()))
+        .bind(&subject_id)
+        .bind(&subject_id_secondary)
+        .bind(&subject_title)
+        .bind(&comment_id)
+        .bind(&reported_username)
+        .bind(&comment_excerpt)
+        .bind(&source_url)
+        .bind(&detail)
+        .bind(&now)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?;
+
+        tracing::info!(report_id = %id, kind = %input.kind.as_str(), "reader report filed");
+
+        Ok(Report {
+            id: ID(id),
+            kind: input.kind,
+            status: ReportStatus::Open,
+            reporter: user.map(|u| u.username),
+            subject_id,
+            subject_id_secondary,
+            subject_title,
+            comment_id,
+            reported_username,
+            comment_excerpt,
+            source_url,
+            detail,
+            admin_note: None,
+            created_at: now,
+            resolved_at: None,
+        })
+    }
+
+    /// Triage a report: mark it resolved/rejected (or back to open), optionally with a
+    /// note. Admin only. Returns the updated report.
+    async fn resolve_report(
+        &self,
+        ctx: &Context<'_>,
+        report_id: ID,
+        status: ReportStatus,
+        note: Option<String>,
+    ) -> Result<Report> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let note = report_field(note, REPORT_DETAIL_MAX);
+        // Re-opening clears the resolution stamp, so a reopened report is indistinguishable
+        // from a fresh one in the queue rather than showing a stale "resolved 3 days ago".
+        let (resolved_at, resolved_by) = match status {
+            ReportStatus::Open => (None, None),
+            _ => (Some(Utc::now().to_rfc3339()), Some(admin.id.clone())),
+        };
+
+        let affected = sqlx::query(
+            "UPDATE report SET status = ?, admin_note = COALESCE(?, admin_note), \
+                    resolved_at = ?, resolved_by = ? WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(&note)
+        .bind(&resolved_at)
+        .bind(&resolved_by)
+        .bind(&report_id.0)
+        .execute(&st.pool)
+        .await
+        .map_err(gql_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(Error::new("No such report"));
+        }
+
+        let row = sqlx::query_as::<_, ReportRow>(
+            "SELECT r.id, r.kind, r.status, u.username AS reporter, r.subject_id, \
+                    r.subject_id_secondary, r.subject_title, r.comment_id, \
+                    r.reported_username, r.comment_excerpt, r.source_url, r.detail, \
+                    r.admin_note, r.created_at, r.resolved_at \
+             FROM report r LEFT JOIN users u ON u.id = r.user_id WHERE r.id = ?",
+        )
+        .bind(&report_id.0)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.into())
     }
 
     async fn set_progress(
@@ -7799,6 +8610,10 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?;
             crate::sync::spawn_extension_sync(st_arc, pkg_name.0.clone());
+            // E3.3: a newly-subscribed extension is a new source. Kick the per-source
+            // supervisor so its scan loop spawns as soon as the sync above enrols series,
+            // instead of waiting up to a full reconcile interval.
+            crate::scanner::kick_supervisor();
         }
         Ok(subscribed)
     }
@@ -10411,6 +11226,243 @@ mod tests {
         .unwrap();
     }
 
+    /// THE `updates` TOTAL MEMO — correct per AUDIENCE, and invalidated by the rebuild.
+    ///
+    /// The F3-gate removal took this COUNT from 13.8 ms to 53.4 ms warm (2,060 → 14,169
+    /// candidate rows, and the NSFW subquery stopped short-circuiting behind the gate), so it
+    /// is memoized. A memo on a viewer-dependent number has one failure mode that matters far
+    /// more than staleness: serving one audience's answer to the other. Anonymous and
+    /// opted-in totals genuinely differ (13,726 vs 14,169 on the snapshot), and handing the
+    /// larger to an anonymous viewer is a pager promising pages the NSFW gate will never
+    /// return.
+    ///
+    /// This drives `updates_total` with a REAL ttl — `COUNT_TTL` is `ZERO` under `cfg(test)`,
+    /// so the resolver-level tests never touch the memo and could not catch any of this.
+    #[tokio::test]
+    async fn the_updates_total_memo_is_keyed_by_audience_and_cleared_by_the_rebuild() {
+        let (_s, pool) = setup_full(100).await;
+        // One SFW series and one NSFW one, both enrolled, in library and dated.
+        seed_feed_member(
+            &pool,
+            1,
+            "Safe",
+            Some("1752969600000"),
+            "2026-07-26T11:00:00+00:00",
+            1,
+        )
+        .await;
+        seed_feed_member(
+            &pool,
+            2,
+            "Adult",
+            Some("1752105600000"),
+            "2026-07-26T11:00:00+00:00",
+            1,
+        )
+        .await;
+        let nsfw_work = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Adult".into()),
+                is_nsfw: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &nsfw_work, "suwayomi", "src", "2", None, false,
+        )
+        .await
+        .unwrap();
+
+        // The SQL the resolver builds, byte for byte.
+        const DETECTED: &str = "EXISTS ( \
+             SELECT 1 FROM series_scan_state sss \
+             WHERE sss.series_id = CAST(suwayomi_series.id AS TEXT))";
+        const NSFW_FILTER: &str = "(? = 1 OR NOT EXISTS ( \
+             SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
+             WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
+               AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))";
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM suwayomi_series \
+             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}"
+        );
+        let ttl = std::time::Duration::from_secs(60);
+        let uncached = |show_nsfw: bool| {
+            let sql = count_sql.clone();
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(&sql)
+                    .bind(show_nsfw as i64)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        crate::browse::clear_count_cache();
+        // Cold: both audiences must equal the uncached query.
+        assert_eq!(uncached(false).await, 1, "the fixture must actually differ");
+        assert_eq!(uncached(true).await, 2, "…across the two audiences");
+        assert_eq!(
+            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            2
+        );
+        // WARM, and the load-bearing assertion: the anonymous viewer must not be served the
+        // opted-in total now that both are cached. A single un-keyed entry fails here.
+        assert_eq!(
+            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            1,
+            "an anonymous viewer must never be served the opted-in total"
+        );
+        assert_eq!(
+            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            2,
+            "…nor the reverse"
+        );
+        assert_ne!(
+            updates_count_key(false),
+            updates_count_key(true),
+            "the two audiences must not share a key"
+        );
+
+        // The memo really is serving: change the data underneath it and watch it NOT move.
+        // (Staleness is the accepted trade — see `updates_total`.)
+        sqlx::query("UPDATE suwayomi_series SET in_library = 0 WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(uncached(false).await, 0, "the data really did change");
+        assert_eq!(
+            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            1,
+            "a memoized total is allowed to be stale — that is what buys the 53 ms"
+        );
+
+        // …and `clear_count_cache` — which `catalog::refresh_browse_catalogue` calls at the
+        // end of every rebuild, i.e. the event that changes this number — closes it.
+        crate::browse::clear_count_cache();
+        assert_eq!(
+            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            0,
+            "the rebuild's cache clear must invalidate the updates total too"
+        );
+        assert_eq!(
+            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            1,
+            "…for both audiences"
+        );
+        // Leave nothing behind: the memo is a process-wide static and every other test in
+        // this binary shares it.
+        crate::browse::clear_count_cache();
+    }
+
+    /// THE F3 GATE'S REMOVAL, on the `updates` RESOLVER (owner-approved 2026-07-31).
+    ///
+    /// `updates` kept its own copy of `AND sss.last_new_chapter_at IS NOT NULL` after both
+    /// feed WRITERS dropped it, and it is not dead code: the reader's home "Latest Updates"
+    /// row calls this resolver while `/updates` pages `updatesFeed`. So the two surfaces
+    /// disagreed about who is in the feed — 10,966 works against 1,820 (§8h).
+    ///
+    /// The three membership rules that REMAIN are each asserted here, because the widening
+    /// is only safe if it widens exactly one of them:
+    ///
+    /// * ENROLLED — a `series_scan_state` row must exist. Almost every in-library series has
+    ///   one (snapshot: 14,169 of 14,182); the 13 that do not are series the scanner has
+    ///   never touched, and `detectedAt`/`latestChapterAt` come from that side of the house.
+    /// * IN LIBRARY — the feed is the reader's library, unchanged.
+    /// * The DETECTION STAMP is no longer consulted. A first observation is a baseline and
+    ///   deliberately never stamps `last_new_chapter_at` (`scanner::record_scan`), so a
+    ///   series we mirrored completely and never caught mid-update was locked out forever.
+    ///
+    /// If a later change re-adds the stamp test, "Never Detected" disappears and this fails.
+    #[tokio::test]
+    async fn updates_admits_a_series_our_scanner_never_saw_change() {
+        let (s, pool) = setup_full(100).await;
+        // Detected, in library — admitted before and after. The NEWEST release, so it leads.
+        seed_feed_member(
+            &pool,
+            1,
+            "Detected",
+            Some("1752969600000"),
+            "2026-07-26T11:00:00+00:00",
+            1,
+        )
+        .await;
+        // Enrolled, in library, dated — but never seen to CHANGE. This is the ~9,851-series
+        // cohort the gate excluded.
+        sqlx::query(
+            "INSERT INTO suwayomi_series \
+               (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
+             VALUES (2, 'Never Detected', 'ONGOING', 'src', 5, 1, '1752105600000', \
+                     '2026-07-15T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO series_scan_state \
+               (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
+             VALUES ('2', 0, 5, NULL, '2026-07-15T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Detected and freshly released, but NOT in the library — still excluded.
+        seed_feed_member(
+            &pool,
+            3,
+            "Out Of Library",
+            Some("1753969600000"),
+            "2026-07-26T11:00:00+00:00",
+            0,
+        )
+        .await;
+        // In library and freshly released, but never enrolled with the scanner at all — no
+        // `series_scan_state` row, so still excluded. This is the half of the predicate the
+        // change KEEPS, and the reason the `INDEXED BY` hint could be dropped rather than
+        // re-pointed: what is left is a pure equality on the table's primary key.
+        sqlx::query(
+            "INSERT INTO suwayomi_series \
+               (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
+             VALUES (4, 'Never Enrolled', 'ONGOING', 'src', 5, 1, '1753969600000', \
+                     '2026-07-15T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ updates { items { title detectedAt } total } }"#,
+            None,
+            "1.2.3.4",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "updates failed: {:?}", r.errors);
+        let data = r.data.into_json().unwrap();
+        let items = data["updates"]["items"].as_array().unwrap();
+        let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+        assert_eq!(
+            titles,
+            vec!["Detected", "Never Detected"],
+            "the undetected series joins the feed, ordered by its own release clock"
+        );
+        assert_eq!(data["updates"]["total"], serde_json::json!(2));
+        // And it reports an HONEST `detectedAt`: we have never detected a change on it, so
+        // the field is null rather than borrowing the release time.
+        assert!(
+            items[1]["detectedAt"].is_null(),
+            "detectedAt must stay null for a series we never saw change: {:?}",
+            items[1]
+        );
+    }
+
     /// REGRESSION GUARD for the Updates feed's sort key.
     ///
     /// The feed ordered by `series_scan_state.last_new_chapter_at` — the moment OUR
@@ -11844,6 +12896,22 @@ mod tests {
     /// 404 on click. And a series with no datable chapter is not an "update" at all: it is
     /// excluded, so every counted row is also a placeable row and the pager's arithmetic
     /// stays honest.
+    ///
+    /// THIS TEST ALSO PINS THE F3 GATE'S REMOVAL (owner-approved 2026-07-31). "Never
+    /// Detected" — dated, in library, but with no `series_scan_state.last_new_chapter_at`
+    /// — used to be excluded and is now admitted. The two exclusions are NOT the same
+    /// rule and only one of them survived:
+    ///
+    /// * UNDATED is still excluded, and must stay excluded. `released_at` is the feed's
+    ///   sort key; a row with no release time cannot be placed, so counting it makes the
+    ///   pager lie.
+    /// * UNDETECTED is admitted. "Our scanner has seen this series CHANGE" was never the
+    ///   same question as "does this series have a release time" — a first observation is
+    ///   a baseline and never stamps the column, so a fully-mirrored series we simply
+    ///   never caught mid-update was locked out permanently.
+    ///
+    /// If a later change re-adds the gate, this test fails on "Never Detected" alone and
+    /// the undated assertion still holds — which is the split it exists to keep visible.
     #[tokio::test]
     async fn updates_feed_reader_id_and_undated_exclusion() {
         let (s, pool) = setup_full(100).await;
@@ -11884,7 +12952,8 @@ mod tests {
             Some("2026-07-26T09:00:00+00:00"),
         )
         .await;
-        // Dated and in library, but our scanner has never detected a new chapter.
+        // Dated and in library, but our scanner has never detected a new chapter. Before
+        // the F3 gate was dropped this was excluded; it is now an update like any other.
         let undetected = crate::catalog::create_work(
             &pool,
             &crate::catalog::WorkInput {
@@ -11915,24 +12984,42 @@ mod tests {
         assert!(r.errors.is_empty(), "updatesFeed failed: {:?}", r.errors);
         let d = r.data.into_json().unwrap();
         let items = d["updatesFeed"]["items"].as_array().unwrap();
-        let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+        // Sorted, because both admitted rows share one `latest_chapter_at` and the feed's
+        // only tiebreak is `work_id DESC` — a random uuid. Asserting the emitted order
+        // here would be asserting the uuids, not the feed.
+        let mut titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
+        titles.sort_unstable();
         assert_eq!(
             titles,
-            vec!["Suwayomi Only"],
-            "only the dated + detected series is an update: {items:?}"
+            vec!["Never Detected", "Suwayomi Only"],
+            "dated series are updates whether or not WE caught the change; \
+             only the UNDATED one is excluded: {items:?}"
         );
-        assert_eq!(d["updatesFeed"]["total"], serde_json::json!(1));
+        assert_eq!(d["updatesFeed"]["total"], serde_json::json!(2));
+        let by_title = |t: &str| {
+            items
+                .iter()
+                .find(|i| i["title"] == serde_json::json!(t))
+                .unwrap_or_else(|| panic!("{t} missing from {items:?}"))
+        };
+        let only = by_title("Suwayomi Only");
         assert_eq!(
-            items[0]["id"],
+            only["id"],
             serde_json::json!("11"),
             "a work with no MangaDex anchor must open on the Suwayomi path"
         );
-        assert_eq!(items[0]["workId"], serde_json::json!(dated));
+        assert_eq!(only["workId"], serde_json::json!(dated));
         assert_eq!(
-            items[0]["chapterCount"],
+            only["chapterCount"],
             serde_json::json!(42),
             "the scanner half labels with the chapter COUNT, as it did before the merge"
         );
+        // The newly-admitted row is a COMPLETE card, not a half-populated one: the
+        // LEFT JOIN only NULLs `detected_at`, which is not rendered as a chapter figure.
+        let never = by_title("Never Detected");
+        assert_eq!(never["id"], serde_json::json!("13"));
+        assert_eq!(never["workId"], serde_json::json!(undetected));
+        assert_eq!(never["chapterCount"], serde_json::json!(42));
     }
 
     /// Page boundaries: disjoint id sets, non-increasing release times ACROSS the
@@ -12785,6 +13872,116 @@ mod tests {
             count("SELECT COUNT(*) FROM feed_series_updates").await < browsable,
             "the updates feed must stay the subset it is defined as"
         );
+    }
+
+    /// Browse's "12 ch · Ch. 151": the COUNT and the newest chapter's NUMBER are two
+    /// different quantities, and the card gets BOTH — or the count alone, never the count
+    /// wearing a "Ch." label.
+    ///
+    /// This pins the whole migration-0095 chain in one test, because every link in it is a
+    /// place the two quantities could silently collapse back into one:
+    /// `feed_series_updates.latest_chapter` → `browse_catalogue.latest_chapter` (the
+    /// rebuild's verbatim copy) → `browse::BROWSE_COLS` → `map_browse_rows` →
+    /// `Series.latestChapter`.
+    ///
+    /// The seeded work is deliberately the shape that makes F4 visible: TWO mirrored
+    /// chapters, numbered 1 and 151. A card that prints "Ch. 2" has substituted the count
+    /// for the number, which is the exact bug — and a partial mirror like this is ordinary,
+    /// not pathological.
+    ///
+    /// The second work is the "count but no known latest number" case the reader has to
+    /// degrade for: `latestChapter` must be `null`, NOT `0`, NOT `""`, and NOT the count.
+    #[tokio::test]
+    async fn browse_cards_carry_the_latest_chapter_number_beside_the_count() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-partial",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Partially Mirrored".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid =
+            crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-partial")
+                .await
+                .unwrap()
+                .unwrap();
+        for (n, day) in [("1", "01"), ("151", "20")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: format!("md-partial-{n}"),
+                    number: Some(n.to_string()),
+                    lang: Some("en".into()),
+                    published_at: Some(format!("2026-07-{day}T00:00:00Z")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // No dated chapter at all — the ~67,000-work cohort migration 0069 exists for.
+        seed_browse_work(
+            &pool,
+            "md-bare",
+            "Nothing Dated",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            0,
+            &[],
+        )
+        .await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ search(query: "", sort: NEWEST) { items { title chapterCount latestChapter } } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        let items = d["search"]["items"].as_array().unwrap();
+        let card = |t: &str| {
+            items
+                .iter()
+                .find(|i| i["title"] == serde_json::json!(t))
+                .unwrap_or_else(|| panic!("{t} missing from {items:?}"))
+                .clone()
+        };
+
+        let partial = card("Partially Mirrored");
+        assert_eq!(
+            partial["latestChapter"],
+            serde_json::json!("151"),
+            "the newest chapter's NUMBER, from the feed row — not the count, not a float"
+        );
+        assert_eq!(
+            partial["chapterCount"],
+            serde_json::json!(2),
+            "the honest catalogue-size count survives; the owner asked for BOTH figures"
+        );
+        assert_ne!(
+            partial["latestChapter"],
+            serde_json::json!(partial["chapterCount"].as_i64().unwrap().to_string()),
+            "if these two ever agree by construction the card has collapsed back to F4"
+        );
+
+        let bare = card("Nothing Dated");
+        assert_eq!(
+            bare["latestChapter"],
+            serde_json::Value::Null,
+            "no feed row → we do not know the number, and `null` is the only honest answer: \
+             `0` and `\"\"` both render as a chapter that exists"
+        );
+        assert_eq!(bare["chapterCount"], serde_json::json!(0));
     }
 
     /// A chapterless work must be BROWSABLE and its card must OPEN.
@@ -15236,8 +16433,19 @@ mod tests {
         );
     }
 
+    /// `total` must count EXACTLY the rows the pages return — the property this test was
+    /// written for, and the one it still asserts.
+    ///
+    /// WHAT CHANGED (2026-07-31, F3-gate removal): it used to also pin the gate, asserting
+    /// that the row with a NULL `last_new_chapter_at` was excluded. That predicate is gone
+    /// from this resolver — see `updates_admits_a_series_our_scanner_never_saw_change` for
+    /// why and for the membership rules that remain — so all three enrolled, in-library rows
+    /// are now counted and all three are returned. The count/page equality below is
+    /// unchanged and is what this test is really for: `total` once counted every dated
+    /// `series_scan_state` row regardless of `in_library`, which inflated the pager past what
+    /// the pages could return.
     #[tokio::test]
-    async fn updates_counts_dated_scan_state_rows() {
+    async fn updates_total_counts_exactly_the_rows_the_page_returns() {
         // Build state directly so we can seed series_scan_state, then query updates.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -15302,10 +16510,12 @@ mod tests {
         .await;
         assert!(r.errors.is_empty(), "updates errored: {:?}", r.errors);
         let data = r.data.into_json().unwrap();
-        // Two rows carry a last_new_chapter_at; the null one is excluded.
-        assert_eq!(data["updates"]["total"], serde_json::json!(2));
+        // All three are enrolled and in library. The one with a NULL `last_new_chapter_at`
+        // is admitted now: it is a series we have watched but never caught mid-update, not a
+        // series with nothing to show.
+        assert_eq!(data["updates"]["total"], serde_json::json!(3));
         assert_eq!(data["updates"]["hasNextPage"], serde_json::json!(false));
-        // Suwayomi is unreachable here, but hydration is DB-first, so the two
+        // Suwayomi is unreachable here, but hydration is DB-first, so the three
         // `suwayomi_series` rows resolve from cache. They share one `latest_chapter_at`,
         // so the `id DESC` tiebreaker decides the order.
         let ids: Vec<&str> = data["updates"]["items"]
@@ -15316,7 +16526,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["11", "10"],
+            vec!["12", "11", "10"],
             "items must be exactly the counted rows, tie broken by id DESC"
         );
         assert_eq!(
@@ -16123,6 +17333,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             latest_chapter_at: String::new(),
+            latest_chapter: None,
         };
         let items = vec![
             mk("Action8", &["Action", "Comedy"], 8.0, 3),
@@ -16153,20 +17364,37 @@ mod tests {
         );
     }
 
+    /// A `WorkChapterRow` for the aggregation tests. `released` is the SOURCE's own release
+    /// time for that chapter, which is what F12's date threading aggregates.
+    fn agg_row(
+        num: f64,
+        st: &str,
+        sid: &str,
+        mid: Option<&str>,
+        cid: &str,
+        released: Option<&str>,
+    ) -> crate::catalog::WorkChapterRow {
+        let label = crate::chapter_label::ChapterLabel::Numbered(num);
+        crate::catalog::WorkChapterRow {
+            number: Some(num),
+            key: label.key(cid),
+            label: label.text(),
+            title: Some(format!("Ch {num}")),
+            source_type: st.into(),
+            source_id: sid.into(),
+            suwayomi_manga_id: mid.map(Into::into),
+            chapter_id: cid.into(),
+            scanlator: None,
+            released_at: released.map(Into::into),
+        }
+    }
+
     #[test]
     fn group_aggregated_chapters_dedupes_by_number_keeps_sources() {
         // S2: one entry per number, ascending, each keeping every source (translator)
         // that provides it.
         let row = |num: f64, st: &str, sid: &str, mid: Option<&str>, cid: &str| {
-            crate::catalog::WorkChapterRow {
-                number: num,
-                title: Some(format!("Ch {num}")),
-                source_type: st.into(),
-                source_id: sid.into(),
-                suwayomi_manga_id: mid.map(Into::into),
-                chapter_id: cid.into(),
-                scanlator: None,
-            }
+            agg_row(num, st, sid, mid, cid, None)
         };
         // Number 1 from two sources; 2 from one; 10.5 distinct from 10; out of order.
         let rows = vec![
@@ -16187,6 +17415,76 @@ mod tests {
             .sources
             .iter()
             .any(|s| s.suwayomi_manga_id.as_ref().map(|i| i.0.as_str()) == Some("333")));
+        // No source dated anything here, so there is nothing to claim — null, never "now".
+        assert!(first.first_released_at.is_none());
+    }
+
+    /// F12 / §4.13: an aggregated chapter carries the FIRST release across its sources.
+    ///
+    /// §4.13's instruction was "ship F12 with or after B, not before, or the fix trades a
+    /// wrong default for a date-less chapter list". The date-less half is this: the reader
+    /// renders a chapter the selected translator lacks with no date at all, because the
+    /// aggregation had no timestamp to give it. This is the timestamp.
+    ///
+    /// EARLIEST, not the selected source's and not the last one seen — the same
+    /// first-source-wins rule `release_event` stores, so the series page and `/updates` date
+    /// a chapter identically no matter which translator the reader is on. Row order must not
+    /// matter, so the fixture deliberately offers the later source first.
+    #[test]
+    fn an_aggregated_chapter_carries_the_earliest_release_across_its_sources() {
+        let out = group_aggregated_chapters(vec![
+            // The LATE mirror comes first in the row order.
+            agg_row(
+                1.0,
+                "mangadex",
+                "mangadex",
+                None,
+                "md-1",
+                Some("2026-06-08T00:00:00+00:00"),
+            ),
+            agg_row(
+                1.0,
+                "suwayomi",
+                "asura",
+                Some("333"),
+                "s-1",
+                Some("2026-06-01T00:00:00+00:00"),
+            ),
+            // A chapter only one source has, and only that source dated.
+            agg_row(
+                2.0,
+                "suwayomi",
+                "asura",
+                Some("333"),
+                "s-2",
+                Some("2026-06-15T00:00:00+00:00"),
+            ),
+            // A chapter NO source dated: null, not a fabricated time.
+            agg_row(3.0, "suwayomi", "asura", Some("333"), "s-3", None),
+            // …and one where only the SECOND source carries a date, so the `None` must not
+            // win the minimum just by arriving first.
+            agg_row(4.0, "suwayomi", "asura", Some("333"), "s-4", None),
+            agg_row(
+                4.0,
+                "mangadex",
+                "mangadex",
+                None,
+                "md-4",
+                Some("2026-06-20T00:00:00+00:00"),
+            ),
+        ]);
+        let dates: Vec<Option<&str>> = out.iter().map(|c| c.first_released_at.as_deref()).collect();
+        assert_eq!(
+            dates,
+            vec![
+                Some("2026-06-01T00:00:00+00:00"),
+                Some("2026-06-15T00:00:00+00:00"),
+                None,
+                Some("2026-06-20T00:00:00+00:00"),
+            ],
+            "the earliest source release wins, an absent date never does, and no chapter \
+             invents one"
+        );
     }
 
     #[test]
@@ -16413,5 +17711,695 @@ mod tests {
             first_error(&r),
             "At most 100 ids per bulkAddSourceSeries call"
         );
+    }
+
+    // ---- Reader reports (Support → Report an issue) ----------------------
+    //
+    // NOTE ON IPs: `REPORT_LIMITER` is a process-global with a 6/hour budget per IP, and
+    // `cargo test` runs these in one process in parallel — so every test below uses its
+    // OWN client IP. Sharing one would make the suite order-dependent and flaky.
+
+    #[tokio::test]
+    async fn submit_report_accepts_anonymous_and_queues_for_admin() {
+        // The whole point of the feature: a reader with NO account can file a report, and
+        // it lands in the admin queue attributed to nobody.
+        let (s, _pool) = setup_full(100).await;
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: {
+                 kind: MISSING_WORK,
+                 subjectTitle: "Vinland Saga",
+                 detail: "This one isn't in the catalogue at all."
+               }) { id kind status reporter subjectTitle } }"#,
+            None, // anonymous
+            "10.0.0.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "submitReport failed: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["submitReport"]["kind"], serde_json::json!("MISSING_WORK"));
+        assert_eq!(d["submitReport"]["status"], serde_json::json!("OPEN"));
+        assert_eq!(
+            d["submitReport"]["reporter"],
+            serde_json::Value::Null,
+            "an anonymous report stores no user"
+        );
+
+        // Visible to an admin...
+        let r = exec(
+            &s,
+            r#"{ reports(status: OPEN) { total openCount items { subjectTitle detail } } }"#,
+            Some("admintok"),
+            "10.0.0.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "reports failed: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["total"], serde_json::json!(1));
+        assert_eq!(d["reports"]["openCount"], serde_json::json!(1));
+        assert_eq!(
+            d["reports"]["items"][0]["subjectTitle"],
+            serde_json::json!("Vinland Saga")
+        );
+
+        // ...and to nobody else.
+        let r = exec(&s, r#"{ reports { total } }"#, Some("bobtok"), "10.0.0.1").await;
+        assert_eq!(first_error(&r), "Admin access required");
+        let r = exec(&s, r#"{ reports { total } }"#, None, "10.0.0.1").await;
+        assert_eq!(first_error(&r), "Not authenticated");
+    }
+
+    #[tokio::test]
+    async fn submit_report_enforces_per_kind_required_fields() {
+        // A report with no subject is not actionable, so each kind refuses the shape it
+        // cannot triage — with a message written for the reader, not for a log.
+        let (s, _pool) = setup_full(100).await;
+
+        // MISSING_WORK with no title.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: MISSING_WORK, detail: "something is missing here" }) { id } }"#,
+            None,
+            "10.0.0.2",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "Please give the title of the missing series."
+        );
+
+        // A merge report with no series.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: WRONG_MERGE, detail: "these are two different stories" }) { id } }"#,
+            None,
+            "10.0.0.2",
+        )
+        .await;
+        assert!(
+            first_error(&r).starts_with("Tell us which series"),
+            "unexpected: {}",
+            first_error(&r)
+        );
+
+        // A detail too short to act on.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, detail: "broken" }) { id } }"#,
+            None,
+            "10.0.0.2",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "Please describe the problem in a little more detail."
+        );
+
+        // An id we don't have. This is the anti-junk gate: the queue must not be seedable
+        // with arbitrary subject ids.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: NEEDS_MERGE, subjectId: "nope-not-a-series", detail: "these two are the same series" }) { id } }"#,
+            None,
+            "10.0.0.2",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "We don't have a series with id nope-not-a-series."
+        );
+
+        // The same shape with a REAL id is accepted (id 42 is seeded by `setup_full`).
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: NEEDS_MERGE, subjectId: "42", detail: "these two are the same series" }) { subjectId } }"#,
+            None,
+            "10.0.0.2",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "valid report refused: {:?}", r.errors);
+    }
+
+    #[tokio::test]
+    async fn comment_report_snapshots_author_and_survives_deletion() {
+        // Acting on an abuse report DELETES the comment (hard delete, no tombstone). The
+        // report has to still be readable afterwards, or the audit trail evaporates
+        // exactly when it starts to matter.
+        let (s, _pool) = setup_full(100).await;
+        let r = exec(
+            &s,
+            r#"mutation { postComment(input: { targetType: "series", targetId: "s1", body: "you are all idiots", hasSpoiler: false }) { id } }"#,
+            Some("bobtok"),
+            "10.0.0.3",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "postComment failed: {:?}", r.errors);
+        let comment_id = r.data.into_json().unwrap()["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ submitReport(input: {{
+                     kind: COMMENT_ABUSE,
+                     commentId: "{comment_id}",
+                     reportedUsername: "someone-else-entirely",
+                     detail: "This is abusive and aimed at everyone."
+                   }}) {{ id reportedUsername commentExcerpt }} }}"#
+            ),
+            None,
+            "10.0.0.3",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "submitReport failed: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(
+            d["submitReport"]["reportedUsername"],
+            serde_json::json!("bob"),
+            "the looked-up author wins over whatever the client claimed"
+        );
+        assert_eq!(
+            d["submitReport"]["commentExcerpt"],
+            serde_json::json!("you are all idiots")
+        );
+
+        // Admin acts on it: the comment goes, the report stays whole.
+        let r = exec(
+            &s,
+            &format!(r#"mutation {{ deleteComment(commentId: "{comment_id}") }}"#),
+            Some("admintok"),
+            "10.0.0.3",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "deleteComment failed: {:?}", r.errors);
+
+        let r = exec(
+            &s,
+            r#"{ reports(kind: COMMENT_ABUSE) { items { commentExcerpt reportedUsername } } }"#,
+            Some("admintok"),
+            "10.0.0.3",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(
+            d["reports"]["items"][0]["commentExcerpt"],
+            serde_json::json!("you are all idiots"),
+            "the snapshot must outlive the comment it reports"
+        );
+
+        // A stale comment link is refused rather than silently filed against nothing.
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ submitReport(input: {{ kind: COMMENT_ABUSE, commentId: "{comment_id}", detail: "still abusive, still gone" }}) {{ id }} }}"#
+            ),
+            None,
+            "10.0.0.3",
+        )
+        .await;
+        assert_eq!(first_error(&r), "That comment no longer exists.");
+    }
+
+    #[tokio::test]
+    async fn resolve_report_moves_status_and_reopen_clears_the_stamp() {
+        let (s, _pool) = setup_full(100).await;
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, detail: "the cover is for a different series" }) { id } }"#,
+            Some("bobtok"),
+            "10.0.0.4",
+        )
+        .await;
+        let id = r.data.into_json().unwrap()["submitReport"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // A non-admin cannot triage.
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ resolveReport(reportId: "{id}", status: RESOLVED) {{ status }} }}"#
+            ),
+            Some("bobtok"),
+            "10.0.0.4",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Admin access required");
+
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ resolveReport(reportId: "{id}", status: REJECTED, note: "working as intended") {{ status adminNote resolvedAt }} }}"#
+            ),
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "resolveReport failed: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["resolveReport"]["status"], serde_json::json!("REJECTED"));
+        assert_eq!(
+            d["resolveReport"]["adminNote"],
+            serde_json::json!("working as intended")
+        );
+        assert!(!d["resolveReport"]["resolvedAt"].is_null());
+
+        // It leaves the OPEN queue, and `openCount` follows.
+        let r = exec(
+            &s,
+            r#"{ reports(status: OPEN) { total openCount } }"#,
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["total"], serde_json::json!(0));
+        assert_eq!(d["reports"]["openCount"], serde_json::json!(0));
+
+        // Reopening clears the resolution stamp but KEEPS the note (`note: null` merges,
+        // it does not erase) — so a reopened report reads as fresh without losing why it
+        // was closed the first time.
+        let r = exec(
+            &s,
+            &format!(r#"mutation {{ resolveReport(reportId: "{id}", status: OPEN) {{ status resolvedAt adminNote }} }}"#),
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["resolveReport"]["status"], serde_json::json!("OPEN"));
+        assert!(d["resolveReport"]["resolvedAt"].is_null());
+        assert_eq!(
+            d["resolveReport"]["adminNote"],
+            serde_json::json!("working as intended")
+        );
+
+        // A NEW note replaces the old one — `COALESCE(?, admin_note)` merges nulls, it does
+        // not append.
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ resolveReport(reportId: "{id}", status: RESOLVED, note: "actually a real duplicate") {{ adminNote }} }}"#
+            ),
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        assert_eq!(
+            r.data.into_json().unwrap()["resolveReport"]["adminNote"],
+            serde_json::json!("actually a real duplicate")
+        );
+
+        // But there is NO way to clear a note: null merges, and an empty/whitespace string
+        // trims to null (`report_field`) and therefore merges too. That is the documented
+        // choice — the note is why a report was closed, i.e. audit trail, not scratchpad —
+        // and it is asserted here so it reads as a decision rather than an oversight. An
+        // admin who needs it gone overwrites it with new text.
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ resolveReport(reportId: "{id}", status: RESOLVED, note: "   ") {{ adminNote }} }}"#
+            ),
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        assert_eq!(
+            r.data.into_json().unwrap()["resolveReport"]["adminNote"],
+            serde_json::json!("actually a real duplicate"),
+            "an empty note must merge like null, not blank the audit trail"
+        );
+
+        // An id that doesn't exist is an error, not a silent no-op.
+        let r = exec(
+            &s,
+            r#"mutation { resolveReport(reportId: "nope", status: RESOLVED) { status } }"#,
+            Some("admintok"),
+            "10.0.0.4",
+        )
+        .await;
+        assert_eq!(first_error(&r), "No such report");
+    }
+
+    #[tokio::test]
+    async fn submit_report_is_rate_limited_per_ip() {
+        // A public write needs a budget or the queue is a spam target. 6/hour per IP.
+        let (s, _pool) = setup_full(100).await;
+        for i in 0..6 {
+            let r = exec(
+                &s,
+                r#"mutation { submitReport(input: { kind: OTHER, detail: "something is wrong here" }) { id } }"#,
+                None,
+                "10.0.0.5",
+            )
+            .await;
+            assert!(r.errors.is_empty(), "report {i} refused: {:?}", r.errors);
+        }
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, detail: "something is wrong here" }) { id } }"#,
+            None,
+            "10.0.0.5",
+        )
+        .await;
+        assert!(
+            first_error(&r).starts_with("You've filed several reports recently"),
+            "7th report should be throttled, got: {}",
+            first_error(&r)
+        );
+        // A different reader is unaffected.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, detail: "something is wrong here" }) { id } }"#,
+            None,
+            "10.0.0.6",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "other IP throttled: {:?}", r.errors);
+    }
+
+    #[tokio::test]
+    async fn reports_filters_combine_and_open_count_stays_global() {
+        // The queue's two filters are built into the WHERE clause and bound positionally,
+        // so a swapped pair (`status = 'other' AND kind = 'open'`) would silently return
+        // an empty queue rather than fail. Only a query that filters on BOTH at once, with
+        // values that are wrong for the other column, can catch that.
+        //
+        // It also pins the one thing the two counters are FOR: `total` follows the filter,
+        // `openCount` never does. Asserting them only when they happen to be equal (as the
+        // other tests do) would not distinguish the two.
+        let (s, _pool) = setup_full(100).await;
+        let mut ids = Vec::new();
+        for (kind, extra) in [
+            ("OTHER", ""),
+            ("OTHER", ""),
+            ("MISSING_WORK", r#", subjectTitle: "Vinland Saga""#),
+        ] {
+            let r = exec(
+                &s,
+                &format!(
+                    r#"mutation {{ submitReport(input: {{ kind: {kind}{extra}, detail: "something is off with this one" }}) {{ id }} }}"#
+                ),
+                None,
+                "10.0.0.7",
+            )
+            .await;
+            assert!(r.errors.is_empty(), "submitReport failed: {:?}", r.errors);
+            ids.push(
+                r.data.into_json().unwrap()["submitReport"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        // Close one OTHER, so status and kind partition the table differently.
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ resolveReport(reportId: "{}", status: RESOLVED) {{ status }} }}"#,
+                ids[0]
+            ),
+            Some("admintok"),
+            "10.0.0.7",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "resolveReport failed: {:?}", r.errors);
+
+        // 3 filed, 2 still open, 2 of kind OTHER, and exactly 1 that is both OPEN and
+        // OTHER — every combination below is a different number, so no pair of binds can
+        // be swapped without one of them breaking.
+        for (args, want_total) in [
+            ("", 3),
+            ("(status: OPEN)", 2),
+            ("(status: RESOLVED)", 1),
+            ("(kind: OTHER)", 2),
+            ("(kind: MISSING_WORK)", 1),
+            ("(status: OPEN, kind: OTHER)", 1),
+            ("(status: RESOLVED, kind: MISSING_WORK)", 0),
+        ] {
+            let r = exec(
+                &s,
+                &format!("{{ reports{args} {{ total openCount items {{ id }} }} }}"),
+                Some("admintok"),
+                "10.0.0.7",
+            )
+            .await;
+            assert!(r.errors.is_empty(), "reports{args} failed: {:?}", r.errors);
+            let d = r.data.into_json().unwrap();
+            assert_eq!(
+                d["reports"]["total"],
+                serde_json::json!(want_total),
+                "reports{args} total"
+            );
+            assert_eq!(
+                d["reports"]["items"].as_array().unwrap().len(),
+                want_total as usize,
+                "reports{args} items"
+            );
+            // Unmoved by any filter: it is the nav badge, not the pager.
+            assert_eq!(
+                d["reports"]["openCount"],
+                serde_json::json!(2),
+                "reports{args} openCount must ignore the filter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_report_refuses_a_non_http_source_url() {
+        // `sourceUrl` is rendered by the admin console as a clickable <a href>, and this
+        // is an unauthenticated write — so a `javascript:` link here is a way for a
+        // stranger to run script in the console's origin with an admin's session.
+        let (s, _pool) = setup_full(100).await;
+        for bad in [
+            "javascript:fetch('/graphql')",
+            "JaVaScRiPt:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "/series/42",
+        ] {
+            let r = exec(
+                &s,
+                &format!(
+                    r#"mutation {{ submitReport(input: {{ kind: OTHER, sourceUrl: "{bad}", detail: "the cover here is wrong" }}) {{ id }} }}"#
+                ),
+                None,
+                "10.0.0.8",
+            )
+            .await;
+            assert_eq!(
+                first_error(&r),
+                "A link must start with http:// or https://.",
+                "accepted a non-http sourceUrl: {bad}"
+            );
+        }
+        // A real link still goes through.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, sourceUrl: "https://komiq.cc/series/42", detail: "the cover here is wrong" }) { sourceUrl } }"#,
+            None,
+            "10.0.0.9",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "https link refused: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["submitReport"]["sourceUrl"],
+            serde_json::json!("https://komiq.cc/series/42")
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_paginate_at_fifty_without_lying_about_a_next_page() {
+        // The pager fetches PER+1 and trims, so the 50/51 boundary is the only place it
+        // can be wrong. No test reached it: `submitReport` is capped at 6/hour per IP, so
+        // the rows go in directly — the pager is what is under test here, not the write.
+        let (s, pool) = setup_full(100).await;
+        for i in 0..51 {
+            sqlx::query(
+                "INSERT INTO report (id, kind, status, detail, created_at) \
+                 VALUES (?, 'other', 'open', 'seeded', ?)",
+            )
+            .bind(format!("r{i:03}"))
+            .bind(format!("2026-07-30T00:00:{i:02}Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Page 1: exactly PER items (the 51st is only read to answer `hasNextPage`),
+        // newest first.
+        let r = exec(
+            &s,
+            r#"{ reports(page: 1) { page total hasNextPage items { id } } }"#,
+            Some("admintok"),
+            "10.0.1.0",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "reports failed: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["total"], serde_json::json!(51));
+        assert_eq!(d["reports"]["hasNextPage"], serde_json::json!(true));
+        assert_eq!(d["reports"]["items"].as_array().unwrap().len(), 50);
+        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r050"));
+
+        // Page 2: the remainder, and no third page claimed.
+        let r = exec(
+            &s,
+            r#"{ reports(page: 2) { hasNextPage items { id } } }"#,
+            Some("admintok"),
+            "10.0.1.0",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["hasNextPage"], serde_json::json!(false));
+        assert_eq!(d["reports"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r000"));
+
+        // Past the end is empty, not an error, and `total` still describes the whole set.
+        let r = exec(
+            &s,
+            r#"{ reports(page: 3) { total hasNextPage items { id } } }"#,
+            Some("admintok"),
+            "10.0.1.0",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["total"], serde_json::json!(51));
+        assert_eq!(d["reports"]["hasNextPage"], serde_json::json!(false));
+        assert!(d["reports"]["items"].as_array().unwrap().is_empty());
+
+        // A non-positive page clamps to 1 rather than computing a negative OFFSET.
+        let r = exec(
+            &s,
+            r#"{ reports(page: 0) { page items { id } } }"#,
+            Some("admintok"),
+            "10.0.1.0",
+        )
+        .await;
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["page"], serde_json::json!(1));
+        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r050"));
+    }
+
+    #[tokio::test]
+    async fn submit_report_bounds_reader_text_by_characters_not_bytes() {
+        // Every bound on this unauthenticated write is a CHARACTER count. A byte count
+        // would be wrong in both directions for CJK, and byte truncation would panic
+        // mid-codepoint. Nothing tested that, and the fields routinely carry CJK titles.
+        let (s, _pool) = setup_full(100).await;
+
+        // 5 CJK characters = 15 BYTES: over a 10-byte floor, under the 10-CHARACTER one.
+        // A byte-counted minimum would let this useless report through.
+        let r = exec(
+            &s,
+            r#"mutation { submitReport(input: { kind: OTHER, detail: "这个封面错" }) { id } }"#,
+            None,
+            "10.0.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "Please describe the problem in a little more detail.",
+            "5 CJK chars is 15 bytes — the floor must count characters"
+        );
+
+        // One character over the ceiling (and ~3x over it in bytes).
+        let too_long = "字".repeat(REPORT_DETAIL_MAX + 1);
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ submitReport(input: {{ kind: OTHER, detail: "{too_long}" }}) {{ id }} }}"#
+            ),
+            None,
+            "10.0.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            format!("That description is too long (max {REPORT_DETAIL_MAX} characters).")
+        );
+
+        // An over-length title is truncated to exactly REPORT_FIELD_MAX *characters*.
+        // `String::truncate(300)` on this input would split a 3-byte codepoint and panic.
+        let long_title = "書".repeat(REPORT_FIELD_MAX + 100);
+        let r = exec(
+            &s,
+            &format!(
+                r#"mutation {{ submitReport(input: {{ kind: MISSING_WORK, subjectTitle: "{long_title}", detail: "这个作品不在目录里面" }}) {{ subjectTitle }} }}"#
+            ),
+            None,
+            "10.0.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "submitReport failed: {:?}", r.errors);
+        let stored = r.data.into_json().unwrap()["submitReport"]["subjectTitle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            stored.chars().count(),
+            REPORT_FIELD_MAX,
+            "capped by characters, not bytes"
+        );
+        assert!(stored.chars().all(|c| c == '書'), "truncated mid-codepoint");
+    }
+
+    #[tokio::test]
+    async fn reports_render_values_from_a_newer_deploy_without_breaking() {
+        // `from_str` falls back to OTHER/OPEN so a row written by a newer deploy cannot
+        // make the whole admin queue unreadable on an older one. That claim was untested —
+        // and it holds only for DISPLAY, which is the part worth pinning: the `kind:` /
+        // `status:` filters and `openCount` are exact matches on the stored text, so the
+        // fallback does NOT make such a row reachable through them.
+        let (s, pool) = setup_full(100).await;
+        sqlx::query(
+            "INSERT INTO report (id, kind, status, detail, created_at) \
+             VALUES ('from-the-future', 'licence_dispute', 'escalated', 'newer deploy', \
+                     '2026-07-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ reports { total openCount items { id kind status } } }"#,
+            Some("admintok"),
+            "10.0.1.2",
+        )
+        .await;
+        assert!(
+            r.errors.is_empty(),
+            "an unrecognized kind/status broke the whole queue: {:?}",
+            r.errors
+        );
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["reports"]["items"][0]["kind"], serde_json::json!("OTHER"));
+        assert_eq!(
+            d["reports"]["items"][0]["status"],
+            serde_json::json!("OPEN")
+        );
+        // Renders as OPEN, but is not IN the open backlog: `openCount` is `status = 'open'`.
+        assert_eq!(d["reports"]["openCount"], serde_json::json!(0));
+
+        // ...and likewise absent from both filters it appears to belong to. Documented on
+        // `ReportKind::from_str` / `ReportStatus::from_str`; only the unfiltered queue
+        // reaches this row.
+        for args in ["(kind: OTHER)", "(status: OPEN)"] {
+            let r = exec(
+                &s,
+                &format!("{{ reports{args} {{ total }} }}"),
+                Some("admintok"),
+                "10.0.1.2",
+            )
+            .await;
+            assert_eq!(
+                r.data.into_json().unwrap()["reports"]["total"],
+                serde_json::json!(0),
+                "reports{args} matches stored text, not the display fallback"
+            );
+        }
     }
 }

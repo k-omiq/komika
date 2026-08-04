@@ -243,6 +243,24 @@ pub struct Series {
     /// Empty when the series has no dated chapter cached yet. This is the field feeds
     /// and the reader's "· 4h" label should use.
     pub latest_chapter_at: String,
+    /// The newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095).
+    ///
+    /// **This is NOT [`Self::chapter_count`] and the two must never substitute for each
+    /// other.** `chapter_count` is how many chapters we know of; this is what the newest
+    /// one is CALLED. A series with 12 mirrored chapters whose newest is Ch. 151 is
+    /// ordinary — the mirror is partial — and printing "Ch. 12" for it is F4, the specific
+    /// bug the chapter-number contract exists to prevent. Browse renders both:
+    /// `12 ch · Ch. 151`.
+    ///
+    /// `None` means WE DO NOT KNOW, and the client must then print the count alone. It is
+    /// never a licence to fall back to `chapter_count`.
+    ///
+    /// Populated on the BROWSE path (`browse_catalogue.latest_chapter`, itself a verbatim
+    /// copy of `feed_series_updates.latest_chapter`, itself the ledger projection's
+    /// `release_event.label`). The Suwayomi-live path (`map_series`) leaves it `None`: that
+    /// object is assembled from a `SuwayomiManga`, which carries a chapter COUNT and no
+    /// label at all, and inventing one there is exactly the substitution above.
+    pub latest_chapter: Option<String>,
 }
 
 /// Per-series read progress for the whole library, returned by `libraryProgress`
@@ -264,10 +282,22 @@ pub struct SeriesProgress {
 pub struct Chapter {
     pub id: ID,
     pub series_id: ID,
+    /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — a
+    /// oneshot used to arrive here as a hard-coded `0.0` with no way to tell it from a
+    /// real `Chapter 0`, which is why the reader printed "Chapter 0" for 21,422 works.
     pub number: f64,
+    /// What to print: "45", "10.5", "Oneshot" (Phase A2).
+    pub label: String,
     pub title: Option<String>,
     pub page_count: i32,
+    /// When the chapter became READABLE — `readableAt` where MangaDex provides it, not the
+    /// `publishAt` that is a 2037 sentinel on external chapters (migration 0073).
     pub uploaded_at: Option<String>,
+    /// Set when the chapter is hosted off-site and has no pages for us to serve
+    /// (MangaPlus, Comikey, NamiComi, BiliBili — ~35,000 chapters, 4% of the mirror). The
+    /// reader must send the user here instead of asking for pages it will never get.
+    /// `externalUrl IS NOT NULL` is the only valid test — a `pages` count of 0 is not.
+    pub external_url: Option<String>,
     pub scanlator: Option<String>,
     pub read: bool,
     pub last_page_read: i32,
@@ -690,6 +720,54 @@ impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
     }
 }
 
+/// One source's scan health (Phase E4.3) — the admin answer to "is this source actually
+/// working?", which before E4 had no honest signal at all: a broken source's scans recorded
+/// as successes because the client silently fell back to Suwayomi's cache (F11).
+///
+/// Per SOURCE rather than per series, because that is the unit a breakage has: an extension
+/// whose site moved or rebranded breaks everything it carries at once.
+#[derive(SimpleObject, Clone)]
+pub struct SourceScanHealth {
+    /// Suwayomi source id.
+    pub id: ID,
+    /// Display name, when the source is still installed in the engine.
+    pub name: Option<String>,
+    /// Owning extension package. `None` once the extension is uninstalled — its series and
+    /// their scan state outlive it, which is a state worth seeing rather than hiding.
+    pub pkg_name: Option<String>,
+    /// Whether the extension is still installed in the Suwayomi engine.
+    pub installed: bool,
+    /// Whether we subscribe to its discovery walk, and whether that subscription's breaker
+    /// has been tripped.
+    pub subscribed: bool,
+    pub subscription_disabled_at: Option<String>,
+    /// Series of this source that the scanner tracks.
+    pub series: i32,
+    /// …with any current failure streak.
+    pub failing: i32,
+    /// …whose streak is long enough, for a source-side reason, to count toward an outage.
+    pub confirmed_failing: i32,
+    /// Of the failures, how many last failed by being served Suwayomi's CACHE (broken while
+    /// looking healthy) versus failing out loud.
+    pub cached_fallback: i32,
+    pub fetch_error: i32,
+    /// Series the scanner has never got a chapter for. Across a whole source, the signature
+    /// of one that has never once worked.
+    pub zero_chapter_series: i32,
+    /// Works that would become unreadable if this source stays broken — i.e. reachable
+    /// through no other source.
+    pub exclusive_works: i32,
+    pub worst_streak: i32,
+    pub last_failure_at: Option<String>,
+    pub last_scanned_at: Option<String>,
+    /// Set while a whole-source outage is open: when it was detected, when it last alerted,
+    /// the dominant failure kind, and how far out the source's series are parked.
+    pub outage_detected_at: Option<String>,
+    pub outage_last_alert_at: Option<String>,
+    pub outage_kind: Option<String>,
+    pub outage_parked_until: Option<String>,
+}
+
 /// One installed Suwayomi source — the admin picker feeding `sourceBrowse(sourceId)`.
 #[derive(SimpleObject, Clone)]
 pub struct SourceInfo {
@@ -855,8 +933,37 @@ pub struct ChapterSource {
 /// so the reader can pick a translator.
 #[derive(SimpleObject, Clone)]
 pub struct AggregatedChapter {
+    /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — this
+    /// stays non-null only so a client built before Phase A keeps working; a oneshot
+    /// reports 0 here and "Oneshot" there.
     pub number: f64,
+    /// What to print: "45", "10.5", "Oneshot". The one label rule, resolved server-side so
+    /// every surface agrees (Phase A2).
+    pub label: String,
+    /// Cross-source grouping key: `round(number * 100)` for numbered chapters — the same
+    /// key `chapter_override` matches on — or `x:<chapter id>` for unnumbered ones.
+    pub key: String,
     pub title: Option<String>,
+    /// When this chapter was FIRST released, across every source that carries it —
+    /// ISO-8601, or null when no source dated it (F12).
+    ///
+    /// `first_released_at`, not `released_at`, and the name is load-bearing on the client:
+    /// the reader strips unknown fields BY NAME across every document, and `UpdateFeedRow`
+    /// already has a `releasedAt` that every deployed server answers. Sharing the name would
+    /// let one older server rejecting this field silently disable the updates feed's date
+    /// too. It is also the more accurate name.
+    ///
+    /// The EARLIEST of the sources' own release times, which is the same rule the release
+    /// ledger stores (`release_event.first_seen_at`, first-source-wins) and therefore the
+    /// same instant `/updates` sorted the work by. Taking the SELECTED source's time instead
+    /// would make the row's date jump around as the reader switches translator, for a
+    /// chapter that was released once.
+    ///
+    /// Why this field exists at all: without it the reader has no honest date for a chapter
+    /// the selected translator does not carry, and `source.ts` rendered those rows with no
+    /// date line — §4.13's "a wrong default traded for a date-less chapter list", which is
+    /// exactly what F12's source picker was told to ship WITH, not before.
+    pub first_released_at: Option<String>,
     pub sources: Vec<ChapterSource>,
 }
 
@@ -1034,10 +1141,17 @@ pub fn to_iso(v: Option<&str>) -> Option<String> {
 /// canonical `map_canonical_chapter` path).
 pub fn map_chapter(c: SuwayomiChapter, progress: Option<(i32, bool)>) -> Chapter {
     let (last_page_read, read) = progress.unwrap_or((0, false));
+    // Same label rule as every other surface (Phase A2): the structured number when it is
+    // sane, the name's first number as the ~0.15% fallback, "Oneshot" when there is none —
+    // and never `Ch.99999999` from a TEST upload.
+    let label = crate::chapter_label::chapter_display(Some(c.chapter_number), None, Some(&c.name));
     Chapter {
         id: ID(c.id.to_string()),
         series_id: ID(c.manga_id.to_string()),
-        number: c.chapter_number,
+        number: label.number().unwrap_or(c.chapter_number),
+        label: label.text(),
+        // Suwayomi chapters are always served through the engine, never a redirect.
+        external_url: None,
         title: Some(c.name),
         page_count: c.page_count as i32,
         uploaded_at: to_iso(c.upload_date.as_deref()),

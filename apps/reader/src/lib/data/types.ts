@@ -32,6 +32,21 @@ export interface CatalogEntry {
 	author: string;
 	genre: string;
 	ch: number;
+	/**
+	 * The newest chapter's LABEL — `'151'`, `'10.5'`, `'Oneshot'` — already formatted by
+	 * `chapterChip()`, or `''` when we do not know it.
+	 *
+	 * A SECOND, INDEPENDENT quantity from {@link ch}, which is how many chapters we know
+	 * of. Browse shows both ("12 ch · Ch. 151") because a partial mirror makes them
+	 * legitimately different, and because rendering `ch` under a "Ch." label is the F4
+	 * bug the chapter-number contract exists to prevent.
+	 *
+	 * `''` (never `undefined`, so callers cannot accidentally print it) means the server
+	 * has no label for this work — the ~67k catalogue rows with no dated chapter, plus
+	 * any response from a server that predates the field. The card then shows the count
+	 * alone. It must never fall back to `ch`.
+	 */
+	latestCh: string;
 	rating: number;
 	status: Status;
 	/**

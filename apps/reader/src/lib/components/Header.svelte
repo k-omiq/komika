@@ -10,9 +10,8 @@
 	import SearchOverlay from './SearchOverlay.svelte';
 	import NotificationBell from './NotificationBell.svelte';
 
-	let {
-		searchPlaceholder = 'Search series, authors, genres…',
-	}: { searchPlaceholder?: string } = $props();
+	let { searchPlaceholder = 'Search series, authors, genres…' }: { searchPlaceholder?: string } =
+		$props();
 
 	let searchOpen = $state(false);
 	let menuOpen = $state(false);
@@ -99,14 +98,14 @@
 		<button class="icon-btn" aria-label="Search" onclick={() => (searchOpen = true)}>
 			<Icon name="search" size={21} />
 		</button>
-		{#if config.sponsorUrl}
+		{#if config.donateUrl}
 			<a
 				class="icon-btn sponsor"
-				href={config.sponsorUrl}
+				href={config.donateUrl}
 				target="_blank"
 				rel="noopener noreferrer"
-				aria-label="Sponsor"
-				title="Sponsor komiq"
+				aria-label="Donate"
+				title="Donate to komiq"
 			>
 				<Icon name="heart" size={19} />
 			</a>
@@ -133,7 +132,12 @@
 					aria-expanded={menuOpen}
 					onclick={() => (menuOpen = !menuOpen)}
 				>
-					<Avatar url={auth.user.avatarUrl} name={auth.user.username} colorKey={auth.user.id} size={34} />
+					<Avatar
+						url={auth.user.avatarUrl}
+						name={auth.user.username}
+						colorKey={auth.user.id}
+						size={34}
+					/>
 				</button>
 				{#if menuOpen}
 					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
@@ -148,6 +152,12 @@
 						>
 						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
 							>Library</a
+						>
+						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
+							>Support</a
+						>
+						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
+							>About</a
 						>
 						<button class="menu-item danger" role="menuitem" onclick={signOut}>Sign out</button>
 					</div>
@@ -275,6 +285,8 @@
 	.signin {
 		display: flex;
 		align-items: center;
+		flex: 0 0 auto;
+		white-space: nowrap;
 		height: 36px;
 		padding: 0 18px;
 		border-radius: var(--k-radius-pill);
@@ -360,6 +372,22 @@
 	.menu-item.danger:hover {
 		color: var(--k-accent);
 	}
+	/* 641–900px is the one band where EVERYTHING renders at once — brand, the four nav
+	   links, four icon buttons and Sign in — and stops fitting. `justify-content:
+	   space-between` has no slack to give and nothing shrinks, so at 768px `Library` slid
+	   underneath the theme button and `Sign in` wrapped onto two lines. Tightening the two
+	   generous desktop gaps is enough; no control has to be dropped. */
+	@media (min-width: 641px) and (max-width: 900px) {
+		.left {
+			gap: 24px;
+		}
+		nav {
+			gap: 20px;
+		}
+		.right {
+			gap: 10px;
+		}
+	}
 	@media (max-width: 640px) {
 		/* Primary nav moves to the bottom tab bar; keep only the brand on the left. */
 		nav {
@@ -371,11 +399,11 @@
 		.right {
 			gap: 8px;
 		}
-		/* Trim secondary icons on mobile: support lives in the footer/menu. Theme,
-		   search and the account control stay reachable. */
-		.support-btn {
-			display: none;
-		}
+		/* The support icon deliberately STAYS on mobile. It used to be hidden here with a
+		   comment claiming support "lives in the footer/menu" — there is no footer in this
+		   app, and the account menu only exists once you are signed in. Since most people
+		   who need /support (and the /about takedown route) are signed out, hiding it made
+		   both pages reachable only by typing the URL. */
 		.icon-btn {
 			width: 38px;
 			height: 38px;

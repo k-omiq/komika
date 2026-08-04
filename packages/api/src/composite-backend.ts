@@ -20,6 +20,8 @@ import type {
 	MergeWorksResult,
 	Page,
 	Paginated,
+	Report,
+	ReportInput,
 	Review,
 	ScanStatus,
 	Series,
@@ -29,6 +31,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	SourceScanHealth,
 	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
@@ -474,6 +477,26 @@ export class CompositeBackend implements Backend {
 		return this.opts.hosted.markNotificationsRead?.(ids) ?? Promise.resolve(0);
 	}
 
+	/**
+	 * Reader reports (Support → Report an issue) — always the hosted backend, never the
+	 * native engine: the report queue is a property of the hosted catalogue, and an
+	 * on-device engine has nobody to deliver a report to.
+	 *
+	 * NOT null-safe like the social reads above, deliberately. Those degrade to an empty
+	 * list because a missing feed is survivable; a report that silently evaporates is the
+	 * one outcome a reporting feature must never have, so an absent hosted implementation
+	 * throws and the form shows the failure. Without this delegation at all, the desktop
+	 * build's report form failed on every submit — `CompositeBackend` implements `Backend`
+	 * explicitly, and `submitReport` being optional on the interface meant its absence
+	 * compiled cleanly.
+	 */
+	submitReport(input: ReportInput): Promise<Report> {
+		if (!this.opts.hosted.submitReport) {
+			return Promise.reject(new Error('Reporting needs the live Komiq backend.'));
+		}
+		return this.opts.hosted.submitReport(input);
+	}
+
 	// --- admin "manga DB" ---
 	updateSeriesAdmin(input: SeriesAdminInput): Promise<Series> {
 		return this.opts.hosted.updateSeriesAdmin!(input);
@@ -570,6 +593,10 @@ export class CompositeBackend implements Backend {
 	}
 	setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
 		return this.opts.hosted.setSeriesPaused!(seriesId, paused);
+	}
+
+	sourceScanHealth(): Promise<SourceScanHealth[]> {
+		return this.opts.hosted.sourceScanHealth!();
 	}
 
 	// --- admin background source-ingest jobs (S1) ---

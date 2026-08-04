@@ -207,7 +207,24 @@ services:
       # GraphiQL IDE + schema introspection. Off by default so the public API
       # exposes neither; set GRAPHIQL_ENABLED=on in deploy/.env only for dev.
       GRAPHIQL_ENABLED: ${GRAPHIQL_ENABLED:-off}
+      # DEAD UNDER E3 — kept only so an existing deploy/.env does not error. The
+      # global scan tick was replaced by a supervisor + per-source loops, which use
+      # SOURCE_TICK_SECONDS (60s, compiled). `scanner::spawn` takes this value as
+      # `_tick_seconds` and ignores it. Do not tune it expecting an effect.
       SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
+      # Aggregate outbound scan concurrency across ALL per-source loops (E3). Per-source
+      # concurrency stays 3 — that is what protects an individual scanlator site from
+      # being hammered, and it is unchanged from the pre-E3 behaviour. This global cap
+      # bounds the SUM across sources, which the old single-loop design capped at 3 only
+      # as a side effect of being single-loop. Exposed as an env knob rather than a
+      # compile-time constant because the release build is ~13 minutes: if outbound load
+      # ever needs to come down NOW, this is the lever, and it takes a restart, not a
+      # rebuild. Lower it to 3 to reproduce exactly the pre-E3 aggregate behaviour.
+      SCAN_GLOBAL_CONCURRENCY: ${SCAN_GLOBAL_CONCURRENCY:-12}
+      # E5 LATEST-diff discovery: how often each subscribed source's page-1 LATEST is
+      # polled and diffed. This is the mechanism that replaces polling every series, so
+      # it is also the detection-latency knob (900s => <=15 min detection).
+      DISCOVERY_INTERVAL_SECS: ${DISCOVERY_INTERVAL_SECS:-900}
       # Canonical catalogue sync (direct MangaDex; CATALOGUE.md). Off by default —
       # nothing hits MangaDex unless CATALOGUE_SYNC=on. It is opt-in and, because
       # the rate limiter is in-process, only ONE replica may enable it (see
@@ -217,6 +234,14 @@ services:
       CATALOGUE_SYNC: ${CATALOGUE_SYNC:-off}
       MANGADEX_USER_AGENT: ${MANGADEX_USER_AGENT:-Komika/0.1 (+https://github.com/komika)}
       CATALOGUE_SYNC_INTERVAL_SECS: ${CATALOGUE_SYNC_INTERVAL_SECS:-21600}
+      # Phase D split `run_recurring` into THREE cadences; these two were previously
+      # left to their code defaults and so were invisible here. The 15-min chapter
+      # firehose is the feed-freshness knob (F5) and is only safe because Phase C
+      # demoted the ~20-25s wholesale rebuild off this tick — do not shorten it without
+      # re-reading §7 Phase D. The reconciler is a daily DRIFT REPORT, not the feed
+      # mechanism; `drifted == 0` is the evidence the incremental writers are correct.
+      CHAPTER_SYNC_INTERVAL_SECS: ${CHAPTER_SYNC_INTERVAL_SECS:-900}
+      FEED_RECONCILE_INTERVAL_SECS: ${FEED_RECONCILE_INTERVAL_SECS:-86400}
       COVER_PHASH: ${COVER_PHASH:-off}
       RUST_LOG: komika_server=info,tower_http=warn
       # Continuous backup (Litestream → S3-compatible; Cloudflare R2 reference).
@@ -304,6 +329,9 @@ services:
         # to your deployed Worker's base URL; images stay broken until it is set.
         PUBLIC_KOMIKA_IMG_MODE: proxy
         PUBLIC_KOMIKA_IMG_WORKER: ${KOMIKA_IMG_WORKER_URL:-}
+        # Empty unless you set KOMIKA_DONATE_URL in deploy/.env — a self-hosted
+        # instance must not ship komiq's donation link. Empty hides every donate link.
+        PUBLIC_KOMIKA_DONATE_URL: ${KOMIKA_DONATE_URL:-}
     restart: unless-stopped
     logging:
       driver: json-file

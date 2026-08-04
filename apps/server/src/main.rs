@@ -2,10 +2,12 @@ mod auth;
 mod avatar;
 mod browse;
 mod catalog;
+mod chapter_label;
 mod config;
 mod cover;
 mod db;
 mod dedup;
+mod discovery;
 mod ext_icon;
 mod gc;
 mod graphql;
@@ -13,6 +15,7 @@ mod ingest;
 mod mangadex;
 mod media;
 mod notify;
+mod phase_f;
 mod phash;
 mod scanner;
 mod series_cache;
@@ -1186,6 +1189,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = Config::from_env();
+
+    // `komika-server phase-f <stage> [--apply] …` — the Phase F (`all.mangadex`
+    // retirement) tool, handled BEFORE any server state is built so it can never
+    // start a listener, a scanner or a sync loop alongside itself. Every stage is a
+    // dry run unless `--apply` is passed, and the destructive one additionally needs
+    // `--confirm <token>`; see `phase_f`. It exits when the stage is done.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("phase-f") {
+        let pool = db::init(&cfg.database_url).await?;
+        let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
+        let result =
+            phase_f::run_cli(&pool, Some(&cover_pool), &cfg.suwayomi_url, &argv[1..]).await;
+        // Close both pools explicitly: a `merge` stage holds a WAL that a still-open
+        // pool would keep pinned, and this process runs alongside the live server.
+        pool.close().await;
+        cover_pool.close().await;
+        return result;
+    }
+
     tracing::info!(?cfg, "starting komika-server");
 
     let pool = db::init(&cfg.database_url).await?;
@@ -1285,13 +1307,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok(n) => tracing::info!(works = n, "feed_updates: initial build complete"),
                 Err(e) => tracing::warn!(error = %e, "feed_updates: initial build failed"),
             }
-            // AD-5: build the full-text search index (migration 0052) alongside the
-            // updates feed — same background slot, same "fresh within a sync interval"
-            // contract. Without this, text search is empty until the first sync.
-            match crate::catalog::refresh_work_fts(&pool).await {
-                Ok(n) => tracing::info!(works = n, "work_fts: initial build complete"),
-                Err(e) => tracing::warn!(error = %e, "work_fts: initial build failed"),
-            }
+            // AD-5's `refresh_work_fts` used to be a second call here. It is now the last
+            // link of the `refresh_feed_updates` chain (with `feed_series_updates` and
+            // `browse_catalogue`), so this slot still builds the search index — search and
+            // Browse just can no longer be wired to different cadences by accident.
         });
     }
 
@@ -1311,6 +1330,18 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
     );
 
+    // Phase E5: LATEST-diff discovery. A tight (~15 min) poll of page 1 of each subscribed
+    // source's LATEST, diffed against a per-source snapshot; series that moved up / entered
+    // are enqueued for a targeted scan via the same `trigger_due_now` sink E2 uses. This is
+    // the fast push signal that makes ~98.8%-wasted timer polling unnecessary (§8e). The
+    // per-series baseline poll still runs underneath it until Phase E slows it to a safety
+    // net.
+    discovery::spawn(
+        state.clone(),
+        cfg.discovery_interval_secs,
+        shutdown_tx.subscribe(),
+    );
+
     // Hourly garbage collection: orphaned staged comment-media uploads (rows the
     // uploader never attached to a comment) plus cover blobs in the separate covers DB
     // whose owning work/series no longer exists — nothing in the main DB can cascade
@@ -1322,6 +1353,14 @@ async fn main() -> anyhow::Result<()> {
     // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
     // an exact per-table ANALYZE rather than `PRAGMA optimize`.
     db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
+
+    // Chapter-spine drains (Phase B3). Migration 0090 adds `chapter.chapter_key` and
+    // `chapter.scanlator` and moves nothing; this is what backfills the 877,824 existing
+    // rows' keys and materialises the 563,095 Suwayomi chapters that have never had a
+    // canonical `chapter` row at all. Unconditional — the spine is the substrate the
+    // release ledger and the incremental feed are built on, not an opt-in feature — but
+    // paced, staggered behind boot, and self-terminating once drained.
+    catalog::spine::spawn(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
@@ -1337,6 +1376,8 @@ async fn main() -> anyhow::Result<()> {
             mangadex.clone(),
             cfg.catalogue_cover_phash,
             cfg.catalogue_sync_interval_secs,
+            cfg.chapter_sync_interval_secs,
+            cfg.feed_reconcile_interval_secs,
             shutdown_tx.subscribe(),
         );
         // One-time top-up: fill catalogue series the original seed missed (the
@@ -1356,6 +1397,19 @@ async fn main() -> anyhow::Result<()> {
             cfg.catalogue_cover_phash,
             shutdown_tx.subscribe(),
         );
+        // A1b — the backfill migration 0073 promised and nobody had written. Fills
+        // `chapter.readable_at` / `chapter.external_url` on the 877,868 mirrored MangaDex
+        // rows that have neither, by re-asking `/chapter?ids[]=` 100 at a time. That is what
+        // returns the 46 works whose every chapter carries MangaDex's 2037 `publishAt`
+        // sentinel to /updates, and what makes the ~35,000 off-site chapters identifiable
+        // (`external_url IS NOT NULL`) instead of silently unopenable.
+        //
+        // Inside the CATALOGUE_SYNC gate deliberately: it hits MangaDex under the same
+        // in-process rate limiter, so the one-replica rule above applies to it verbatim.
+        // Resumable with no cursor and no completion marker — its work-list is
+        // `readable_at IS NULL`, so an interrupted drain resumes itself and a finished one
+        // costs an hourly scan of an empty partial index.
+        mangadex::spawn_readable_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }

@@ -57,6 +57,7 @@ type Query {
 	mergeQueue(page: Int = 1, limit: Int = 50): MergeQueuePage! # [komika] dedup review queue — pending mid-confidence matches, highest score first, PAGINATED (`limit` clamped to 1..=200). Was an unbounded `[MergeCandidate!]!`: the backlog is ~10.4k rows now that refused consolidation pairs land here, so clients must page (requires isAdmin)
 	workReviewDetail(workId: ID!): WorkReviewDetail! # [komika] expand one side of a dedup candidate — metadata, cover, alt titles and source mappings for a single work; reads the canonical work directly so it also resolves the Suwayomi-only / NSFW works `canonicalSeries` refuses (requires isAdmin)
 	coverIssues(page: Int = 1): CoverIssuePage! # [komika] admin "Bugs" panel — works whose cover the crawl could not process, most recent first; each carries the failure reason + a best-effort current cover URL (requires isAdmin)
+	reports(status: ReportStatus, kind: ReportKind, page: Int = 1): ReportPage! # [komika] reader-report queue (Support → Report an issue), newest first; null status/kind mean "every value". `total` counts the FILTERED set, `openCount` is always the global open backlog (requires isAdmin)
 	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
@@ -114,6 +115,8 @@ type Mutation {
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
 	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
+	submitReport(input: ReportInput!): Report! # [komika] file a reader report (Support → Report an issue). NO AUTH REQUIRED by design — most catalogue-accuracy reports come from signed-out readers — so it is rate-limited per IP, length-caps every field, enforces the per-kind required fields, requires `subjectId` to name a series we know, and snapshots the reported comment's author/body (the comment may later be hard-deleted)
+	resolveReport(reportId: ID!, status: ReportStatus!, note: String): Report! # [komika] triage a reader report — resolve/reject, or reopen (which clears the resolution stamp); `note` is merged, not cleared, when null (requires isAdmin)
 }
 
 enum ComicType {
@@ -193,6 +196,7 @@ type Series {
 	updatedAt: String! # [komika] last metadata touch — NOT chapter recency; moves on every poll. Use latestChapterAt for "recently updated".
 	latestChapterAt: String! # [komika] real newest-chapter time (ISO); empty when no dated chapter cached. The field feeds/cards should sort and label by.
 	detectedAt: String # [komika] when WE detected that newest chapter (discovery time) — the third clock, distinct from updatedAt (poll touch) and latestChapterAt (upstream publish). Decides Updates-feed MEMBERSHIP but does NOT order it. Always carries a UTC offset, so Date.parse can't read it as local time. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts, the client drops it against a server that predates it.
+	latestChapter: String # [komika] the newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095). NOT chapterCount: that is how MANY chapters we know of, this is what the newest one is CALLED, and a series with 12 mirrored chapters whose newest is Ch. 151 is ordinary. Rendering the count under a "Ch." label is F4, the bug the chapter-number contract exists to prevent — so null means PRINT THE COUNT ALONE, never fall back to chapterCount. Populated on the browse/catalogue path only (browse_catalogue.latest_chapter); null on the Suwayomi-live and canonical-detail paths, which hold no label. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts.
 	views: SeriesViews! # [komika] per-series view (chapter-read) counts — the popularity signal; resolver field, selected only by the series-detail queries
 	workId: ID # [komika] the canonical work this series belongs to (null when uncatalogued). Lets the reader get from a numeric Suwayomi id to the work whose SIBLING source mappings the source picker must offer. Resolver field — one query per series, so like `views` it is selected only by the single-series detail query, never by the shared SeriesFields fragment (per-card N+1)
 	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
@@ -256,7 +260,18 @@ type ScanPolicy {
 type Chapter {
 	id: ID!
 	seriesId: ID!
+	# The chapter's number, or 0 when it has none. PREFER `label`: a oneshot arrives here
+	# as a hard-coded 0 with no way to tell it from a real Chapter 0, which is why the
+	# reader printed "Chapter 0" for 21,422 works (F2).
 	number: Float!
+	# What to print: "45", "10.5", "Oneshot". The one labelling rule, server-side.
+	label: String!
+	# Set when the chapter is hosted off-site (MangaPlus, Comikey, NamiComi, BiliBili —
+	# ~35,000 chapters, 4% of the mirror) and has no pages for us to serve. The reader must
+	# send the user here instead of asking for pages it will never get.
+	# `externalUrl != null` is the ONLY valid test — `pageCount == 0` is NOT: this server
+	# returns pageCount 0 for ordinary chapters too (verified live 2026-07-30).
+	externalUrl: String
 	title: String
 	pageCount: Int!
 	uploadedAt: String
@@ -793,6 +808,65 @@ type CoverIssuePage {
 	total: Int
 }
 
+# [komika] What a reader is reporting. These are the catalogue failures only a reader can
+# see — `mergeQueue`/`coverIssues` already cover what the pipeline knows it got wrong.
+enum ReportKind {
+	WRONG_MERGE # two different series folded into one entry
+	NEEDS_MERGE # the same series listed twice
+	MISSING_WORK # a series absent from the catalogue (no id to point at, so `subjectTitle` carries it)
+	COMMENT_ABUSE # a person in the comments, not a record
+	OTHER
+}
+
+# [komika] Triage state. REJECTED ("looked at it, not a bug") is deliberately distinct
+# from RESOLVED ("fixed it") — it is the more common outcome and stops re-triage.
+enum ReportStatus {
+	OPEN
+	RESOLVED
+	REJECTED
+}
+
+# [komika] One reader-filed report, as the admin queue sees it.
+type Report {
+	id: ID!
+	kind: ReportKind!
+	status: ReportStatus!
+	reporter: String # username, or null when filed anonymously (allowed by design)
+	subjectId: String # the series id the reader was looking at, verbatim (numeric Suwayomi id or `w_` canonical id)
+	subjectIdSecondary: String # the OTHER id, on a merge/unmerge report
+	subjectTitle: String # free-text title, for a series with no id yet (MISSING_WORK)
+	commentId: String
+	reportedUsername: String # snapshotted at submit time, so the report outlives the comment
+	commentExcerpt: String # ditto — the comment is hard-deleted when moderated
+	sourceUrl: String
+	detail: String!
+	adminNote: String
+	createdAt: String!
+	resolvedAt: String
+}
+
+# [komika] The report form's payload. Which optional fields are REQUIRED depends on
+# `kind` (merge kinds need subjectId; MISSING_WORK needs subjectTitle; COMMENT_ABUSE needs
+# commentId or reportedUsername) — the server enforces it and returns a reader-facing message.
+input ReportInput {
+	kind: ReportKind!
+	detail: String!
+	subjectId: String
+	subjectIdSecondary: String
+	subjectTitle: String
+	commentId: String
+	reportedUsername: String
+	sourceUrl: String
+}
+
+type ReportPage {
+	items: [Report!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int # the FILTERED count (what the pager needs)
+	openCount: Int! # the GLOBAL open backlog (what the nav badge needs)
+}
+
 type MergeWorksResult {
 	targetWorkId: ID! # the surviving (target) work
 	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
@@ -804,6 +878,7 @@ type MergeWorksResult {
 type AggregatedChapter {
 	number: Float!
 	title: String
+	firstReleasedAt: String # F12: when this chapter was FIRST released across ALL its sources (ISO-8601), or null when no source dated it. The EARLIEST source time, matching `release_event.first_seen_at`'s first-source-wins rule, so a chapter's date does not change as the reader switches translator. Deliberately NOT named `releasedAt` — the client strips unknown fields by NAME across every document, and `UpdateFeedRow.releasedAt` already exists
 	sources: [ChapterSource!]! # every source (translator) that provides this chapter number
 }
 

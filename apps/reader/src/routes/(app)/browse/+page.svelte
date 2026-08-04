@@ -814,9 +814,29 @@
 	 * than as the true statement "we have no chapters for this yet, try another source".
 	 * Neither half is guaranteed present, so the separator is only emitted between two real
 	 * parts.
+	 *
+	 * THE COUNT AND THE NUMBER ARE BOTH SHOWN, and they are two different facts:
+	 * `m.ch` is how many chapters we hold ("12 ch"), `m.latestCh` is what the newest one is
+	 * CALLED ("Ch. 151"). A partial mirror makes them legitimately far apart, so the card
+	 * says both rather than picking one and being wrong about the other.
+	 *
+	 * `m.latestCh` is ALREADY FORMATTED by `chapterChip` upstream (`toCatalogEntry`) and is
+	 * `''` when unknown — which is the ~67k chapterless works, plus every response from a
+	 * server that predates the field. `filter(Boolean)` drops it AND its separator, so that
+	 * case degrades to the exact string this line rendered before: "12 ch". What it must
+	 * never do is print "Ch. undefined", or reach for `m.ch` as a stand-in — a count under a
+	 * "Ch." label is F4, the bug the whole chapter-number contract exists to prevent.
+	 *
+	 * The two are independently absent, which is why this builds a list rather than nesting
+	 * ternaries. `m.ch === 0` with a real `m.latestCh` is not a corner case: ~11,000 works
+	 * in the feed count zero here because their chapters carry a NULL number (oneshots,
+	 * migration 0069's own note), and telling someone "No chapters yet" about a work whose
+	 * newest chapter is a Oneshot is a lie the old single-ternary version told. Only when
+	 * BOTH are absent does the card fall back to that string.
 	 */
 	function cardSub(m: FederatedResultView): string {
-		const chapters = m.ch > 0 ? `${m.ch} ch` : 'No chapters yet';
+		const parts = [m.ch > 0 ? `${m.ch} ch` : '', m.latestCh].filter(Boolean);
+		const chapters = parts.length ? parts.join(' · ') : 'No chapters yet';
 		return m.genre ? `${m.genre} · ${chapters}` : chapters;
 	}
 

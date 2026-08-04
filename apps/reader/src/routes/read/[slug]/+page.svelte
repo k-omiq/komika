@@ -3,6 +3,7 @@
 	import { untrack, onDestroy } from 'svelte';
 	import { getRating, setRating } from '$lib/data/social';
 	import { saveProgress, recordView } from '$lib/data/source';
+	import { externalChapterHost } from '$lib/data/chapter-label';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -18,6 +19,15 @@
 	const chNum = $derived(data.chNum);
 	const chTitle = $derived(data.chTitle);
 	const nextChapter = $derived(data.chapters.find((c) => c.id === data.nextChapterId));
+
+	// Off-site chapter: the publisher hosts it (MangaPlus, Comikey, NamiComi, BiliBili —
+	// ~35,000 chapters, 4% of the mirror), so we have no pages and never will. This is the
+	// ONE state that must be checked before `!hasPages`: both render zero pages, but only
+	// this one has somewhere to send the reader, and the no-pages copy ("often a licensing
+	// gap at the source") is actively wrong about it. Already validated to http(s) by
+	// `externalChapterHref` in source.ts — never raw upstream text in an href.
+	const externalUrl = $derived(data.externalUrl ?? null);
+	const externalHost = $derived(externalChapterHost(data.externalUrl));
 
 	// Translators (sources) for this work — switchable from reader settings. Picking
 	// a different source persists the preference and reopens the work under it
@@ -266,6 +276,11 @@
 			n: c.n,
 			title: c.title,
 			current: c.id === data.chapterId,
+			// Badged in the list, not discovered on arrival: ~35,000 chapters (4% of the
+			// mirror) are hosted by MangaPlus/Comikey/NamiComi/BiliBili, and clicking one
+			// leaves the app. Knowing that beforehand is the difference between a link and
+			// a dead end.
+			external: !!c.externalUrl,
 		})),
 	);
 
@@ -350,6 +365,9 @@
 							<div class="ch-item-info">
 								<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
 							</div>
+							{#if c.external}<span class="ext-tag" title="Hosted on another site"
+									><Icon name="globe" size={11} />OFF-SITE</span
+								>{/if}
 							{#if c.current}<span class="reading-tag">READING</span>{/if}
 						</button>
 					{/each}
@@ -463,7 +481,27 @@
 		</div>
 	{/if}
 
-	{#if !hasPages}
+	{#if externalUrl}
+		<!-- An off-site chapter (~35,000 of them: MangaPlus, Comikey, NamiComi, BiliBili).
+		     It has no pages BY DESIGN, so it must not fall through to the no-pages state
+		     below — that message blames "a licensing gap" for a chapter that is licensed
+		     and readable, one hop away. Send the reader there, the way MangaDex does.
+		     `rel="noopener noreferrer"` because the destination is a third party. -->
+		<div class="no-pages">
+			<div class="no-pages-icon"><Icon name="globe" size={26} /></div>
+			<h2>This chapter is read on {externalHost}</h2>
+			<p>
+				The publisher hosts it themselves, so there are no pages for us to show. Open it on
+				{externalHost} to keep reading.
+			</p>
+			<div class="no-pages-btns">
+				<a class="next-ch ext-go" href={externalUrl} target="_blank" rel="noopener noreferrer">
+					Read on {externalHost}<Icon name="arrow-right" size={16} strokeWidth={2.4} />
+				</a>
+				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+			</div>
+		</div>
+	{:else if !hasPages}
 		<div class="no-pages">
 			<div class="no-pages-icon"><Icon name="alert" size={26} /></div>
 			<h2>No pages available for this chapter</h2>
@@ -786,6 +824,26 @@
 		background: var(--k-primary);
 		padding: 2px 7px;
 		border-radius: 5px;
+	}
+	/* Off-site marker in the chapter list. Deliberately NOT the primary colour of
+	   `.reading-tag`: it flags a departure from the app, not a state to seek out. */
+	.ext-tag {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		padding: 2px 6px;
+		border-radius: 5px;
+	}
+	/* `.next-ch` is a <button> rule; the off-site CTA is a real <a> (it leaves the app,
+	   so it must be openable in a new tab and readable as a link by assistive tech). */
+	.ext-go {
+		text-decoration: none;
 	}
 	.settings-btn {
 		width: 38px;
