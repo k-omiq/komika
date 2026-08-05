@@ -1018,6 +1018,11 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series
     // of them at the single point they all funnel through, at no extra cost (one query
     // per page, and the ids are already deduped above).
     let real_latest = suwayomi_latest_chapter_at_batch(&st.pool, &ids).await;
+    // The newest chapter's LABEL for the same page, same one-query-per-page shape. See
+    // `suwayomi_latest_chapter_label_batch`: without it `discovery` (home) returned
+    // `latestChapter: null` for every item while `search` (Browse) returned it for all,
+    // so the same work read "115 ch" on home and "115 ch · Ch. 90" on Browse.
+    let latest_labels = suwayomi_latest_chapter_label_batch(&st.pool, &ids).await;
 
     let mut out = Vec::with_capacity(list.len());
     for m in list {
@@ -1053,6 +1058,14 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series
         if s.latest_chapter_at.is_empty() {
             if let Some(ts) = real_latest.get(&id) {
                 s.latest_chapter_at.clone_from(ts);
+            }
+        }
+        // Same rule as above: only FILL, never overwrite. `assemble_series` always sets
+        // this to `None` (a wire manga has no label), but a future cache-read path could
+        // carry one, and that value came from this same column.
+        if s.latest_chapter.is_none() {
+            if let Some(label) = latest_labels.get(&id) {
+                s.latest_chapter = Some(label.clone());
             }
         }
         out.push(s);
@@ -1192,6 +1205,56 @@ async fn suwayomi_latest_chapter_at_batch(
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(id, ts)| to_iso(Some(&ts)).map(|iso| (id, iso)))
+        .collect()
+}
+
+/// Batched read of the newest chapter's LABEL (`browse_catalogue.latest_chapter`) for a
+/// page of numeric Suwayomi series ids.
+///
+/// WHY THIS EXISTS. `assemble_series` sets `latest_chapter: None` and must keep doing so —
+/// a `SuwayomiManga` carries `chapters.total_count`, a COUNT, and no label, so deriving one
+/// there would be F4 exactly. But every list path funnels through `map_series_batch`, and
+/// there the label IS available: `browse_catalogue.latest_chapter` is a verbatim copy of
+/// `feed_series_updates.latest_chapter`, which is the ledger projection's own value — the
+/// same string Browse prints. Reading it here is a lookup, not a second implementation of
+/// the labelling rule, and it is one query per page rather than per series.
+///
+/// Without this, `discovery` (the home page's POPULAR / TRENDING / RECENTLY_ADDED rows)
+/// returned `latestChapter: null` for **every** item while `search` returned it for all of
+/// them — the same work rendering "115 ch" on home and "115 ch · Ch. 90" on Browse.
+///
+/// Ids with no row are absent, and the caller keeps `None`: the reader prints the count
+/// alone in that case, which is the pre-existing behaviour and never a count wearing a
+/// "Ch." label. Non-numeric (`w_…`) ids never match and cost nothing.
+async fn suwayomi_latest_chapter_label_batch(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> HashMap<String, String> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    // Join through `source_series` because `browse_catalogue` is keyed by `work_id` while
+    // this page is keyed by Suwayomi series id. `source_key` holds that id as TEXT, and
+    // the comparison is TEXT-to-TEXT against a bound TEXT parameter — no CAST on a column,
+    // so `idx_source_series_suwayomi_key` (0072) still serves it as a seek (§8b).
+    let sql = format!(
+        "SELECT ss.source_key, bc.latest_chapter \
+           FROM source_series ss \
+           JOIN browse_catalogue bc ON bc.work_id = ss.work_id \
+          WHERE ss.source_type = 'suwayomi' \
+            AND bc.latest_chapter IS NOT NULL AND bc.latest_chapter <> '' \
+            AND ss.source_key IN ({})",
+        in_placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "suwayomi_latest_chapter_label_batch failed"))
+        .unwrap_or_default()
+        .into_iter()
         .collect()
 }
 
@@ -11381,6 +11444,69 @@ mod tests {
     ///   series we mirrored completely and never caught mid-update was locked out forever.
     ///
     /// If a later change re-adds the stamp test, "Never Detected" disappears and this fails.
+    /// Home's `discovery` rows must carry the newest chapter's LABEL, not just a count.
+    ///
+    /// This regressed silently once already: `assemble_series` hardcodes
+    /// `latest_chapter: None` (correctly — a wire manga has only a count, and inventing a
+    /// label there is F4), and nothing refilled it on the batch path. The result was
+    /// `discovery` returning `latestChapter: null` for **every** item while `search`
+    /// returned it for all of them, so one work read "115 ch" on home and
+    /// "115 ch · Ch. 90" on Browse.
+    ///
+    /// The fixture deliberately makes count and label DISAGREE (7 chapters, newest
+    /// numbered 90). A regression that reached for the count would return "7" and fail
+    /// here rather than quietly printing a count under a "Ch." label.
+    #[tokio::test]
+    async fn discovery_rows_carry_the_latest_chapter_label_not_the_count() {
+        let (_s, pool) = setup_full(100).await;
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
+             VALUES ('w_home', 'Partial Mirror', 0, '2020-01-01T00:00:00Z', \
+                     '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series \
+               (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('ss_home', 'w_home', 'suwayomi', 'src', '77', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // count 7 vs newest label "90" — a partial mirror, the case the card exists for.
+        sqlx::query(
+            "INSERT INTO browse_catalogue \
+               (work_id, reader_id, title, content_rating, is_nsfw, en_chapter_count, \
+                latest_chapter, created_at) \
+             VALUES ('w_home', '77', 'Partial Mirror', 'safe', 0, 7, '90', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let got = suwayomi_latest_chapter_label_batch(&pool, &["77".to_string()]).await;
+        assert_eq!(
+            got.get("77").map(String::as_str),
+            Some("90"),
+            "home's batch path must supply the ledger's chapter LABEL for a mapped series"
+        );
+        assert_ne!(
+            got.get("77").map(String::as_str),
+            Some("7"),
+            "a count must never be served as the chapter number — that is F4"
+        );
+
+        // A series with no browse_catalogue row stays absent, so the caller keeps `None`
+        // and the card prints the count alone rather than "Ch. undefined".
+        let missing = suwayomi_latest_chapter_label_batch(&pool, &["404".to_string()]).await;
+        assert!(
+            missing.is_empty(),
+            "unmapped ids must be absent, not empty-string"
+        );
+    }
+
     #[tokio::test]
     async fn updates_admits_a_series_our_scanner_never_saw_change() {
         let (s, pool) = setup_full(100).await;
