@@ -2311,6 +2311,40 @@ change to 74% of the scan-state table, made for a saving of ~96 HTTP requests/da
 therefore a **post-delete follow-up**, and the safest general form is "skip a source with zero
 enrolled series", which is correct in either order and needs no coupling to Phase F at all.
 
+### 8n. The Browse chapter label never reached HOME (appended 2026-08-01, post-deploy)
+
+**Symptom.** After the deploy, Browse printed `"115 ch · Ch. 90"` correctly while home printed
+`"17 chapters"` with no chapter number at all.
+
+**Measured.** `discovery` (home's POPULAR / TRENDING / RECENTLY_ADDED) returned
+`latestChapter: null` for **0 of 50** items; `search` (Browse) returned it for **30 of 30**, and it
+differed from the count on 18 of them. The same work — *A Painter Who Draws Dungeons* — came back
+`"17"` via search and `null` via discovery. **Same GraphQL fragment, same type, different resolver.**
+
+**Root cause.** `graphql::assemble_series` hardcodes `latest_chapter: None`, and that is CORRECT and
+must stay: a `SuwayomiManga` carries `chapters.total_count`, a COUNT, and no label, so deriving one
+there is F4 exactly. Browse sidestepped it by reading `browse_catalogue` directly in `browse.rs`.
+Every other list path funnels through `graphql::map_series_batch`, which hydrated the sibling field
+`latest_chapter_at` from a batch query but never refilled `latest_chapter`.
+
+**Fix.** `suwayomi_latest_chapter_label_batch` — one query per page reading
+`browse_catalogue.latest_chapter` (a verbatim copy of `feed_series_updates.latest_chapter`, itself
+the ledger projection's own value), joined via `source_series.source_key`. TEXT-to-TEXT against a
+bound TEXT parameter, no CAST on a column, so 0072's partial index still serves it as a seek (§8b).
+Fill-only, never overwrite. Guarded by
+`discovery_rows_carry_the_latest_chapter_label_not_the_count`, whose fixture makes count and label
+DISAGREE on purpose (7 chapters, newest numbered 90) so a regression that reaches for the count
+returns "7" and fails loudly rather than silently printing a count under a "Ch." label.
+
+**Verified live:** discovery 0/50 → **50/50** carrying a label, **19 genuinely differing** from the
+count (*Dusk Divide*: 28 chapters, newest **Ch. 24**). Home now renders `Ch. 17 · 17 chapters`.
+
+**Scope correction to §7z.** The plan specifies this label for **Browse only** (§7z lines 1544-1571,
+§8 line 1646 — all say "Browse should show both"). Home was never a stated requirement, yet
+`(app)/+page.svelte` already built `[latestCh, count].join(' · ')` and was simply never fed. Note the
+two pages order it differently — home renders `Ch. 90 · 7 chapters`, Browse renders `7 ch · Ch. 90`.
+Both are deliberate in their own comments; they are now visibly inconsistent and want unifying.
+
 ---
 
 ## 9. Risks and open questions
