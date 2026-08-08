@@ -191,6 +191,73 @@ export interface MergeCandidateRow {
 }
 
 /**
+ * One detachable source mapping on a work — the unit the admin UNMERGE picker
+ * operates on (`workSourceRows`).
+ *
+ * DISTINCT FROM {@link WorkSource}, which describes how a NATIVE client fetches a
+ * source (extension package, repo, apk). This is the admin view of the same
+ * `source_series` row: what it calls the series, how much of it we hold, and — the
+ * part `WorkSource` has no field for — the row's own primary key.
+ *
+ * `id` IS THE `source_series` PRIMARY KEY, and it is what `splitSourceSeries` takes.
+ * Not `(sourceType, sourceKey)`: that pair is only unique across the catalogue in
+ * combination with `sourceId` (the table's UNIQUE is `(source_type, source_id,
+ * source_key)`), so addressing a row by the pair alone is ambiguous the moment one
+ * work carries the same manga id under two different Suwayomi sources.
+ *
+ * `title` is the source's OWN title for the series, not the work's. That is the
+ * whole point of the picker: a work whose sources disagree about the title is
+ * exactly the mis-merge an admin is here to undo, and it is also what names the
+ * detached work (see {@link SplitSourcesResult}).
+ */
+export interface WorkSourceRow {
+	/** `source_series.id` — the detach key passed to `splitSourceSeries`. */
+	id: Id;
+	/** `"mangadex"` or `"suwayomi"`. */
+	sourceType: string;
+	/** Display name for the source, e.g. "MangaDex", "MANGA Plus". */
+	sourceName: string;
+	/** Language code (e.g. `en`), or null when N/A or Suwayomi's catch-all "all". */
+	lang: string | null;
+	/** Extension logo served from our origin; null → the UI renders an initial. */
+	iconUrl: string | null;
+	/** How THIS source titles the series. */
+	title: string;
+	/** How many chapters we hold from this source. */
+	chapterCount: number;
+	/** Canonical URL for the series at the source; null when not available. */
+	sourceUrl: string | null;
+}
+
+/**
+ * The result of detaching source mappings off a work into a new one
+ * (admin `splitSourceSeries`).
+ *
+ * NOT AN UNDO OF {@link MergeWorksResult}, and it cannot be one: `mergeWorks`
+ * deletes the source work row and keeps no record of what it folded, so the
+ * pre-merge state is unrecoverable. This mints a NEW work carrying the detached
+ * sources (and, for free, every chapter they own — `chapter` is keyed by
+ * `source_series_id`, not by work). Reviews, library entries, reading progress and
+ * view counts stay with the ORIGINAL work, because nothing records which side of
+ * the split they came from.
+ */
+export interface SplitSourcesResult {
+	/** The freshly minted canonical work id (`w_…`). */
+	newWorkId: Id;
+	/**
+	 * Where to NAVIGATE for the new work — its reader id, which is the numeric
+	 * Suwayomi id unless the detached set includes a MangaDex source.
+	 * `canonicalSeries` rejects a work with no MangaDex anchor outright, so a
+	 * Suwayomi-only split must never be linked as `/series/w_…`.
+	 */
+	newReaderId: Id;
+	/** The new work's `primary_title` — taken from the detached source's own title. */
+	title: string;
+	/** How many `source_series` rows moved. */
+	movedSources: number;
+}
+
+/**
  * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
  * work with its most recent stored chapter, served from the `chapter` mirror.
  * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through
@@ -668,13 +735,18 @@ export interface GenreFacet {
 }
 
 /** Per-series read progress for the whole library (see `Backend.libraryProgress`).
- *  `read`/`total` are counted from the cached chapter state — the same source
- *  `chapters(seriesId)` reads — so they match. Series with no cached chapters are
- *  omitted from the list; callers treat those as unread. */
+ *  Series the viewer has never opened are omitted; callers treat those as unread. */
 export interface SeriesProgress {
 	id: Id;
+	/** Chapters marked read, summed from the viewer's own per-chapter progress rows. */
 	read: number;
+	/** Always 0 from the server — read it as `p.total || series.chapterCount`. */
 	total: number;
+	/** When the viewer last made progress (RFC 3339), or null if never.
+	 *  Moves on ANY progress, not just finishing a chapter, so a series someone is three
+	 *  pages into sorts ahead of one they finished last month. Orders the Profile's
+	 *  Continue-reading shelf and the Library's "Recently read". */
+	lastReadAt: string | null;
 }
 
 /** One source that provides a given chapter number of a work (S2 aggregation).

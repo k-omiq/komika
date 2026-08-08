@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
@@ -9,7 +9,8 @@
 	import CommentThread from '$lib/components/CommentThread.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
 	import MergeDialog from '$lib/components/MergeDialog.svelte';
-	import { FLAG, type Shelf } from '$lib/data/types';
+	import UnmergeDialog from '$lib/components/UnmergeDialog.svelte';
+	import { deriveShelf, FLAG, type Shelf } from '$lib/data/types';
 	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { backend, images } from '$lib/context';
@@ -84,6 +85,11 @@
 	const rating = $derived(detail?.rating ?? '');
 	const totalCh = $derived(detail?.totalCh ?? 0);
 	const statusLabel = $derived(detail?.statusLabel ?? '');
+	// Publication ended (completed/cancelled) — NOT the viewer's shelf. Gates both the
+	// derived `completed` shelf and whether the picker offers it at all. Defaults to
+	// false while `detail` is still loading, so the option can only ever appear once
+	// we actually know the series has ended.
+	const ended = $derived(detail?.ended ?? false);
 	const continueCh = $derived(detail?.continueCh ?? 1);
 	// All-time views, compactly formatted (1.2K / 3.4M). Only shown once a series has
 	// any recorded reads, so a brand-new/untracked series doesn't display "0 views".
@@ -184,14 +190,12 @@
 		});
 	});
 
-	// The shelf the picker shows: the explicit choice, else derived from progress
-	// (mirrors the library/profile derivation — completed when fully read, plan when
-	// untouched, otherwise reading).
+	// The shelf the picker shows: the explicit choice, else derived from progress via
+	// the SHARED `deriveShelf` — this page used to carry its own inline copy of the
+	// rule, which is how the same series could read "Completed" here and "Reading" on
+	// the library. Catching up on an ongoing series no longer derives to `completed`.
 	const readCount = $derived((view?.chapters ?? []).filter((c) => c.read).length);
-	const effectiveShelf = $derived<Shelf>(
-		libStatus ??
-			(totalCh > 0 && readCount >= totalCh ? 'completed' : readCount === 0 ? 'plan' : 'reading'),
-	);
+	const effectiveShelf = $derived<Shelf>(libStatus ?? deriveShelf(readCount, totalCh, ended));
 
 	// Library writes are optimistic, but a FAILED write now rolls back and says so.
 	// Previously the data layer returned the optimistic argument on error, so an
@@ -366,6 +370,34 @@
 		if (!workId) return;
 		const r = await getSeries(workId);
 		if (r.view) override = r;
+	}
+
+	// --- admin: detach sources that were folded in by mistake ---
+	//
+	// Gated the same three ways as Merge, and for the same reasons; only the optional
+	// backend methods differ. This is NOT an undo for the button above it — see the
+	// header of UnmergeDialog.svelte — so it is offered independently of `canMerge`: a
+	// wrongly-merged work is worth splitting whether or not this backend can merge.
+	const canSplit = $derived(
+		auth.ready && !!auth.user?.isAdmin && !!backend.workSourceRows && !!backend.splitSourceSeries,
+	);
+	let splitOpen = $state(false);
+
+	// Go to what was just created. Confirming the detached run landed where the admin
+	// meant it to is the whole point of the action, and the new work's page is the only
+	// place that shows it.
+	//
+	// `newReaderId`, never `newWorkId`: a work with no MangaDex anchor is addressed by
+	// the numeric Suwayomi source key (0069), and `w_…` 404s for it.
+	//
+	// invalidateAll because the target URL can be THIS one. Detaching the mapping that
+	// gave this work its numeric reader id hands that id to the new work, so
+	// `/series/{id}` now resolves to the other side of the split — and a plain goto to
+	// an unchanged URL would leave the pre-split page on screen. Dropping `override`
+	// first stops the stale local refetch from outliving the navigation.
+	async function afterSplit(r: { newReaderId: string }): Promise<void> {
+		override = undefined;
+		await goto(`/series/${r.newReaderId}`, { invalidateAll: true });
 	}
 
 	// The picker is a POPOVER rather than the flat button list it used to be. With a
@@ -651,6 +683,7 @@
 							onchange={chooseStatus}
 							disabled={marking || statusBusy}
 							variant="button"
+							canComplete={ended}
 						/>
 					{/if}
 					<button
@@ -677,6 +710,16 @@
 							disabled={!workId}
 							title={workId ? 'Merge duplicate series into this one' : 'Resolving work…'}
 							onclick={() => (mergeOpen = true)}>Merge</button
+						>
+					{/if}
+					{#if canSplit}
+						<button
+							class="merge"
+							disabled={!workId}
+							title={workId
+								? 'Detach sources that belong to a different series'
+								: 'Resolving work…'}
+							onclick={() => (splitOpen = true)}>Split</button
 						>
 					{/if}
 				</div>
@@ -986,6 +1029,12 @@
 		targetTitle={title}
 		onmerged={afterMerge}
 	/>
+{/if}
+
+<!-- admin source splitter. Same mount conditions as the merge picker: an admin with a
+     resolved work, so its row query never leaves a reader's page. -->
+{#if canSplit && workId}
+	<UnmergeDialog bind:open={splitOpen} {workId} workTitle={title} onsplit={afterSplit} />
 {/if}
 
 <!-- cover lightbox (F2) -->

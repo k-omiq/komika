@@ -615,15 +615,23 @@
 				<span class="eoc-rate-label">{rateLabel}</span>
 				<Stars bind:value={userRating} max={5} size={30} gap={4} />
 			</div>
+			<!-- On the LAST chapter there is no "Next Chapter" button at all. It used to
+			     render always and merely carry `disabled`, so the end of a series still
+			     said "Next Chapter" — a dead control promising a chapter that doesn't
+			     exist. "All chapters" becomes the primary action instead. -->
 			<div class="eoc-btns">
-				<button
-					class="next-ch"
-					onclick={() => openChapter(data.nextChapterId)}
-					disabled={!data.nextChapterId}
-					>Next Chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
+				{#if data.nextChapterId}
+					<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
+						>Next Chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
+					>
+				{/if}
+				<a class="all-ch" class:solo={!data.nextChapterId} href={seriesHref}
+					><Icon name="list" size={16} />All chapters</a
 				>
-				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />All chapters</a>
 			</div>
+			{#if !data.nextChapterId}
+				<p class="eoc-caught-up">You're all caught up — this is the latest chapter we have.</p>
+			{/if}
 			{#if nextChapter}
 				<div class="upnext">
 					<span class="upnext-label">Up next</span>
@@ -1362,6 +1370,22 @@
 	}
 	.all-ch:hover {
 		border-color: rgba(255, 255, 255, 0.34);
+	}
+	/* Last chapter: with no "Next Chapter" beside it, this is the only action left,
+	   so it takes the primary treatment rather than sitting alone as a lone outline. */
+	.all-ch.solo {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+		color: var(--k-on-primary);
+	}
+	.all-ch.solo:hover {
+		border-color: var(--k-primary);
+		filter: brightness(1.08);
+	}
+	.eoc-caught-up {
+		margin: 14px 0 0;
+		font-size: 13.5px;
+		color: var(--k-text-dimmer);
 	}
 	.upnext {
 		width: 100%;

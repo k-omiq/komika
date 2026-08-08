@@ -1,6 +1,6 @@
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -594,6 +594,102 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
 fn gql_err(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "internal error");
     Error::new("Internal error")
+}
+
+/// Parse a `chapter.number` for ordering. `None` when the label isn't a number.
+///
+/// `chapter.number` is free-form TEXT, so a bare `CAST(number AS REAL)` in SQL would read
+/// every non-numeric label as 0.0 — and 0 is a legitimate chapter (prologues), so the two
+/// cannot be told apart downstream. Parsing here keeps the SQL comparison honest, and a
+/// chapter with an unparseable number simply doesn't trigger a cascade.
+fn parse_chapter_number(raw: &str) -> Option<f64> {
+    let n = raw.trim().parse::<f64>().ok()?;
+    n.is_finite().then_some(n)
+}
+
+/// Mark every earlier chapter of a canonical work read, after the viewer finished one.
+///
+/// Readers arrive mid-series constantly — they have read 177 chapters somewhere else and
+/// their first chapter here is 178. Without this, komiq would show them "1 / 178" forever
+/// and their Continue-reading shelf would offer chapter 1.
+///
+/// Three guards make it safe to run on every completion:
+///  - `number GLOB '[0-9]*'` — only numerically-labelled chapters take part. `CAST` alone
+///    would fold every non-numeric label to 0.0 and sweep it in (see `parse_chapter_number`).
+///  - strict `<` — the chapter just read is already upserted by the caller with its real
+///    `last_page_read`, and must not be overwritten by this statement's 0.
+///  - `WHERE canonical_progress.read = 0` on the conflict — a chapter already marked read
+///    keeps its stored `updated_at`, so replaying a finish doesn't restamp a whole series
+///    and shove it to the top of the "Recently read" sort.
+/// `last_page_read` is only ever written on INSERT, so a chapter the viewer had genuinely
+/// stopped partway through keeps the position it stopped at.
+async fn catch_up_canonical(
+    pool: &SqlitePool,
+    user_id: &str,
+    work_id: &str,
+    number: f64,
+    now: &str,
+) -> Result<()> {
+    // work_id is '' for a chapter that isn't in the mirror; there is nothing to catch up.
+    if work_id.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO canonical_progress \
+           (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+         SELECT ?, c.external_id, ?, 0, 1, ? \
+           FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+            AND c.number GLOB '[0-9]*' AND CAST(c.number AS REAL) < ? \
+         ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+           read = 1, updated_at = excluded.updated_at \
+          WHERE canonical_progress.read = 0",
+    )
+    .bind(user_id)
+    .bind(work_id)
+    .bind(now)
+    .bind(work_id)
+    .bind(number)
+    .execute(pool)
+    .await
+    .map_err(gql_err)?;
+    Ok(())
+}
+
+/// The Suwayomi half of [`catch_up_canonical`] — same contract, same guards.
+///
+/// Simpler only because `suwayomi_chapter.chapter_number` is already REAL, so the
+/// numeric-label guard is a plain `IS NOT NULL`.
+async fn catch_up_suwayomi(
+    pool: &SqlitePool,
+    user_id: &str,
+    series_id: &str,
+    number: f64,
+    now: &str,
+) -> Result<()> {
+    if series_id.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO suwayomi_progress \
+           (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+         SELECT ?, CAST(sc.id AS TEXT), ?, 0, 1, ? \
+           FROM suwayomi_chapter sc \
+          WHERE sc.manga_id = ? AND sc.chapter_number IS NOT NULL \
+            AND sc.chapter_number < ? \
+         ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+           read = 1, updated_at = excluded.updated_at \
+          WHERE suwayomi_progress.read = 0",
+    )
+    .bind(user_id)
+    .bind(series_id)
+    .bind(now)
+    .bind(series_id.parse::<i64>().unwrap_or(-1))
+    .bind(number)
+    .execute(pool)
+    .await
+    .map_err(gql_err)?;
+    Ok(())
 }
 
 /// Aggregate the stored reviews for a series into a `RatingSummary`.
@@ -2000,15 +2096,27 @@ async fn map_canonical_series(
     // no schema change). Library membership (`isMarked`) is resolved per-viewer in
     // the `#[ComplexObject]` impl against `user_library`, not computed here.
     let rating = rating_summary(pool, &work.work_id).await;
-    // chapterCount is the English reader-list count (deduped to one row per number
-    // by `load_canonical_chapters`) — Komika serves only English chapters, so that is
-    // the number the details page must show. The cross-source aggregate
-    // (`aggregate_chapter_count`) is only a FALLBACK for works whose MangaDex spine has
-    // 0 English chapters but whose Suwayomi source carries some: without the English
-    // spine there is nothing else to count. When the English mirror is non-empty we
-    // never fall back, because the Suwayomi branch of the aggregate is not
-    // language-filtered (`suwayomi_chapter` has no `lang` column) and would inflate the
-    // count with non-English / half / re-numbered chapters (e.g. Tsukimichi: 120 → 151).
+    // chapterCount is the BEST-SOURCED count, not simply the English one.
+    //
+    // `chapter_count` as passed in is the English reader-list count (deduped to one row per
+    // number by `load_canonical_chapters`). That used to win outright whenever it was
+    // non-zero, with the cross-source aggregate as a zero-only fallback — and that is what
+    // made 495 works read "1 ch" while their Suwayomi source carried hundreds, because a
+    // MangaDex spine holding a single stub chapter still counts as non-zero.
+    //
+    // So the English count is now RAISED by `suwayomi_chapter_count` (per-source, already
+    // deduped, all `lang='en'`), the same number Browse shows — which also closes the
+    // long-standing divergence where the two pages printed different counts for one work.
+    // `aggregate_chapter_count` stays as the last resort and keeps its old role exactly:
+    // it is the only thing that can count a work with NO numbered chapters anywhere (a
+    // oneshot), and it is still never allowed to lower a count, because unioning raw
+    // `suwayomi_chapter` rows inflates on scanlator duplicates (Tsukimichi: 120 → 151).
+    let chapter_count = chapter_count.max(
+        catalog::suwayomi_chapter_count(pool, &work.work_id)
+            .await
+            .unwrap_or(0)
+            .max(0) as i32,
+    );
     let chapter_count = if chapter_count > 0 {
         chapter_count
     } else {
@@ -3816,6 +3924,86 @@ impl QueryRoot {
         load_work_sources(&st.pool, &new_id, show_nsfw).await
     }
 
+    /// Admin: a work's `source_series` mappings in DETACHABLE shape — what the split
+    /// picker lists. Each row carries its own primary key (the id `splitSourceSeries`
+    /// takes), the title THAT source gives the series, and how many chapters we hold from
+    /// it.
+    ///
+    /// A separate resolver from `workSources` rather than fields added to it, because the
+    /// two answer different questions for different callers: that one is public and tells
+    /// a native client how to FETCH a source, this one is admin-gated and exposes the row
+    /// identity a public surface has no business carrying.
+    ///
+    /// NO NSFW GATE, unlike `workSources`. `require_admin` is the access control here, and
+    /// hiding an NSFW mapping from the picker would silently make it un-detachable — the
+    /// admin would pick "every source" and the server would still refuse the split for
+    /// emptying the work, with nothing on screen to explain why.
+    async fn work_source_rows(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<WorkSourceRow>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let rows = catalog::work_source_series_rows(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_err)?;
+        // Display names come from the ENGINE's installed-source list, which is the only
+        // place they exist — nothing caches them (see `Translator::source_name`, nullable
+        // for exactly this reason). Best-effort: an engine that is down or slow must not
+        // fail the picker, because the split itself does not need the engine at all. On
+        // failure every row falls back to its extension package name, then its raw source
+        // id, which is still enough to tell two sources apart.
+        let listed = st.suwayomi.list_sources().await;
+        let by_id: HashMap<String, crate::suwayomi::SuwayomiSource> = match listed {
+            Ok(list) => list.into_iter().map(|s| (s.id.clone(), s)).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "workSourceRows: source list unavailable; falling back to package names");
+                HashMap::new()
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let mangadex = r.source_type == "mangadex";
+                let live = by_id.get(&r.source_id);
+                let source_name = if mangadex {
+                    "MangaDex".to_string()
+                } else {
+                    live.map(|s| s.name.clone())
+                        .or_else(|| r.pkg_name.clone())
+                        .unwrap_or_else(|| r.source_id.clone())
+                };
+                // Same preference as `workSourcesToTranslators`: the STORE-hosted icon
+                // first (browser-reachable even where the engine host is internal), the
+                // engine's own icon only as a fallback.
+                let icon_url = if mangadex {
+                    None
+                } else {
+                    r.repo_url
+                        .as_deref()
+                        .zip(r.pkg_name.as_deref())
+                        .and_then(|(repo, pkg)| store_icon_url(repo, pkg))
+                        .map(|u| st.suwayomi.abs(Some(&u)))
+                        .or_else(|| {
+                            live.and_then(|s| s.icon_url.as_deref())
+                                .map(|u| st.suwayomi.abs(Some(u)))
+                        })
+                        .filter(|u| !u.is_empty())
+                };
+                WorkSourceRow {
+                    id: ID(r.id),
+                    source_type: r.source_type,
+                    source_name,
+                    lang: live
+                        .map(|s| s.lang.clone())
+                        .or(r.lang)
+                        .filter(|l| !l.is_empty() && l != "all"),
+                    icon_url,
+                    title: r.title,
+                    chapter_count: r.chapter_count as i32,
+                    source_url: r.source_url,
+                }
+            })
+            .collect())
+    }
+
     /// Batched `workSources`: one `WorkSourceGroup` per requested id, in input order. A
     /// work with no (visible) sources yields an empty `sources` list. NSFW gating is
     /// identical to `workSources`.
@@ -4296,63 +4484,166 @@ impl QueryRoot {
         Ok(filter_nsfw(viewer_show_nsfw(ctx).await, out))
     }
 
-    /// Per-series read progress for the viewer's library, in a couple of grouped
-    /// queries. The Library and Profile screens use this to shelve series by progress
-    /// (reading / completed / plan) without fetching each series' chapter list — the
-    /// N-round-trip fan-out that hung both pages. Empty for anonymous viewers.
+    /// Per-series read progress for the viewer's library, in two grouped queries. The
+    /// Library and Profile screens use this to shelve series by progress (reading /
+    /// completed / plan) without fetching each series' chapter list — the N-round-trip
+    /// fan-out that hung both pages. Empty for anonymous viewers.
     ///
-    /// Numeric Suwayomi series read counts come from the viewer's per-user
-    /// `suwayomi_progress`; canonical `w_` works from the per-user `canonical_progress`.
-    /// A series with no progress rows is omitted; the client then treats it as unread
-    /// and uses `chapterCount` for the total.
+    /// BOTH `read` and `total` are counted over the SAME population: distinct
+    /// `chapter.chapter_key` values on the chapter spine, reached from the library row.
+    /// That is the whole design, and it fixes two bugs that a naive `SUM(read)` with a
+    /// `total` of 0 could not:
+    ///
+    /// 1. `read > total`. The old `read` was a raw `SUM` over progress rows, so a work
+    ///    carrying the same chapter from two scanlators (or from both MangaDex and a
+    ///    Suwayomi mirror) counted it twice, while the client's fallback `total` — the
+    ///    deduped `chapterCount` — counted it once. Reading a series to the end could
+    ///    therefore report 151/117. Counting DISTINCT chapter keys on both sides makes
+    ///    `read <= total` true *by construction*: every key `read` can produce is drawn
+    ///    from the same spine rows `total` counts.
+    /// 2. The cross-store dropout. Progress on a canonical `w_` work can land in EITHER
+    ///    store — `canonical_progress` when the viewer read the MangaDex spine, or
+    ///    `suwayomi_progress` (keyed by the numeric source series) when they read a
+    ///    Suwayomi translation of the same work. The old query joined
+    ///    `user_library.series_id = suwayomi_progress.series_id`, which a `w_` library
+    ///    row can never match, so those reads vanished and every such series reported
+    ///    read=0 and shelved itself as "Plan to Read" — with 208 chapters read. The
+    ///    third UNION branch below routes them back through
+    ///    `source_series.source_key -> work_id`.
+    ///
+    /// `MAX(updated_at)` rides along in the same GROUP BY — it orders the Profile's
+    /// Continue-reading shelf and the Library's "Recently read" sort, and computing it
+    /// here keeps both off a second round trip. It is taken over ALL progress rows, not
+    /// just the ones that resolve to a spine key, so a series whose spine has not been
+    /// drained yet still sorts correctly.
     async fn library_progress(&self, ctx: &Context<'_>) -> Result<Vec<SeriesProgress>> {
         let st = state(ctx);
         let Some(user) = current_user(ctx).await else {
             return Ok(Vec::new());
         };
-        // Numeric Suwayomi series in the viewer's library — read count from the viewer's
-        // own `suwayomi_progress` (no longer the shared `suwayomi_chapter.is_read`).
-        // `total` is left 0 so the client falls back to the series' `chapterCount`
-        // (only chapters the viewer has touched have progress rows).
-        let mut out: Vec<SeriesProgress> = sqlx::query_as::<_, (String, i64)>(
-            "SELECT sp.series_id, COALESCE(SUM(sp.read), 0) AS read \
-             FROM suwayomi_progress sp \
-             JOIN user_library ul ON ul.series_id = sp.series_id AND ul.user_id = sp.user_id \
-             WHERE sp.user_id = ? \
-             GROUP BY sp.series_id",
-        )
-        .bind(&user.id)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(gql_err)?
-        .into_iter()
-        .map(|(id, read)| SeriesProgress {
-            id: ID(id),
-            read: read as i32,
-            total: 0,
-        })
-        .collect();
-        // Canonical works in the viewer's library — read from per-user progress;
-        // `total` is left 0 so the client falls back to the work's `chapterCount`.
-        let canon = sqlx::query_as::<_, (String, i64)>(
-            "SELECT cp.work_id, COALESCE(SUM(cp.read), 0) AS read \
-             FROM canonical_progress cp \
-             JOIN user_library ul ON ul.series_id = cp.work_id AND ul.user_id = cp.user_id \
-             WHERE cp.user_id = ? \
-             GROUP BY cp.work_id",
+        // Read side. Each branch maps one progress row to the spine key it read, via a
+        // scalar sub-select so a row that doesn't resolve (spine not drained for that
+        // source yet) still contributes its timestamp — COUNT(DISTINCT) skips the NULL.
+        let read_rows = sqlx::query_as::<_, (String, i64, Option<String>)>(
+            "WITH prog(lib_id, ckey, ts) AS ( \
+               SELECT ul.series_id, \
+                      (SELECT c.chapter_key FROM chapter c \
+                         JOIN source_series ss ON ss.id = c.source_series_id \
+                              AND ss.work_id = cp.work_id \
+                        WHERE c.external_id = cp.chapter_id LIMIT 1), \
+                      cp.updated_at \
+                 FROM canonical_progress cp \
+                 JOIN user_library ul ON ul.user_id = cp.user_id AND ul.series_id = cp.work_id \
+                WHERE cp.user_id = ?1 AND cp.read = 1 \
+               UNION ALL \
+               SELECT ul.series_id, \
+                      (SELECT c.chapter_key FROM chapter c \
+                         JOIN source_series ss ON ss.id = c.source_series_id \
+                              AND ss.source_type = 'suwayomi' AND ss.source_key = sp.series_id \
+                        WHERE c.external_id = sp.chapter_id LIMIT 1), \
+                      sp.updated_at \
+                 FROM suwayomi_progress sp \
+                 JOIN user_library ul ON ul.user_id = sp.user_id AND ul.series_id = sp.series_id \
+                WHERE sp.user_id = ?1 AND sp.read = 1 \
+               UNION ALL \
+               SELECT ul.series_id, \
+                      (SELECT c.chapter_key FROM chapter c \
+                        WHERE c.source_series_id = ss.id AND c.external_id = sp.chapter_id \
+                        LIMIT 1), \
+                      sp.updated_at \
+                 FROM suwayomi_progress sp \
+                 JOIN source_series ss ON ss.source_type = 'suwayomi' \
+                      AND ss.source_key = sp.series_id \
+                 JOIN user_library ul ON ul.user_id = sp.user_id AND ul.series_id = ss.work_id \
+                WHERE sp.user_id = ?1 AND sp.read = 1 \
+             ) \
+             SELECT lib_id, COUNT(DISTINCT ckey), MAX(ts) FROM prog GROUP BY lib_id",
         )
         .bind(&user.id)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        for (work_id, read) in canon {
-            out.push(SeriesProgress {
-                id: ID(work_id),
-                read: read as i32,
+        // Total side — the same spine, reached from the library row rather than from a
+        // progress row. The first branch matches `w_` works (all their sources), the
+        // second numeric Suwayomi rows (that one source); the two id shapes are disjoint,
+        // and the outer GROUP BY would fold them anyway.
+        let total_rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
+               SELECT ul.series_id AS lib_id, c.chapter_key AS ckey \
+                 FROM user_library ul \
+                 JOIN source_series ss ON ss.work_id = ul.series_id \
+                 JOIN chapter c ON c.source_series_id = ss.id \
+                WHERE ul.user_id = ?1 \
+               UNION ALL \
+               SELECT ul.series_id, c.chapter_key \
+                 FROM user_library ul \
+                 JOIN source_series ss ON ss.source_type = 'suwayomi' \
+                      AND ss.source_key = ul.series_id \
+                 JOIN chapter c ON c.source_series_id = ss.id \
+                WHERE ul.user_id = ?1 \
+             ) GROUP BY lib_id",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        // Pre-spine fallback for NUMERIC library rows, counted off `suwayomi_chapter`
+        // directly. A series added moments ago has its chapter list cached but has not
+        // been drained into the spine yet, and in that window both queries above return
+        // nothing for it — which would read as "you have read none of this", losing
+        // progress the viewer can plainly see. Counting both sides off the same
+        // `suwayomi_chapter` rows keeps `read <= total` here too. This is only consulted
+        // when the spine has nothing for the row (below); on production data the two
+        // agree exactly on every numeric library series.
+        let fallback = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT lib_id, \
+                    COUNT(DISTINCT CASE WHEN rd = 1 THEN k END), \
+                    COUNT(DISTINCT k) \
+               FROM ( \
+                 SELECT ul.series_id AS lib_id, \
+                        CAST(CAST(ROUND(sc.chapter_number * 100) AS INTEGER) AS TEXT) AS k, \
+                        COALESCE(sp.read, 0) AS rd \
+                   FROM user_library ul \
+                   JOIN suwayomi_chapter sc ON sc.manga_id = CAST(ul.series_id AS INTEGER) \
+                   LEFT JOIN suwayomi_progress sp ON sp.user_id = ul.user_id \
+                        AND sp.chapter_id = CAST(sc.id AS TEXT) \
+                  WHERE ul.user_id = ?1 AND ul.series_id GLOB '[0-9]*' \
+               ) GROUP BY lib_id",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        // Merge on the library id. A row is emitted when ANY source has something to say:
+        // a series with a known total but no progress reports 0/N (the client used to
+        // have to infer that from a missing row plus `chapterCount`), and a series with
+        // no chapters cached anywhere still reports its read count with `total` 0, which
+        // the client backfills from `chapterCount` exactly as before.
+        fn entry(map: &mut BTreeMap<String, SeriesProgress>, id: String) -> &mut SeriesProgress {
+            map.entry(id.clone()).or_insert_with(|| SeriesProgress {
+                id: ID(id),
+                read: 0,
                 total: 0,
-            });
+                last_read_at: None,
+            })
         }
-        Ok(out)
+        let mut by_id: BTreeMap<String, SeriesProgress> = BTreeMap::new();
+        for (id, read, last_read_at) in read_rows {
+            let e = entry(&mut by_id, id);
+            e.read = read as i32;
+            e.last_read_at = last_read_at;
+        }
+        for (id, total) in total_rows {
+            entry(&mut by_id, id).total = total as i32;
+        }
+        for (id, read, total) in fallback {
+            let e = entry(&mut by_id, id);
+            if e.total == 0 {
+                e.read = read as i32;
+                e.total = total as i32;
+            }
+        }
+        Ok(by_id.into_values().collect())
     }
 
     async fn reviews(
@@ -5545,8 +5836,13 @@ fn summarize_bulk(entries: Vec<BulkAddEntry>) -> BulkAddResult {
 /// One `source_series` row LEFT-JOINed to its `source_extension` coordinates. The
 /// extension columns are all `Option` because a MangaDex-native mapping (source_id
 /// `'mangadex'`) has no extension row, and a Suwayomi source may not be catalogued yet.
+///
+/// NOT the `WorkSourceRow` in `types.rs`: that one is the ADMIN view of a
+/// `source_series` row (its primary key, its own title, its chapter count) that the
+/// split picker lists, while this is the read behind `workSources`, whose job is to tell
+/// a native client how to FETCH a source.
 #[derive(sqlx::FromRow)]
-struct WorkSourceRow {
+struct WorkSourceJoinRow {
     work_id: String,
     source_type: String,
     source_id: String,
@@ -5562,7 +5858,7 @@ struct WorkSourceRow {
 
 /// Map a joined row to a `WorkSource`, honoring the opted-out NSFW filter (returns
 /// `None` for an NSFW mapping a non-opted-in viewer must not see).
-fn work_source_from_row(r: WorkSourceRow, show_nsfw: bool) -> Option<WorkSource> {
+fn work_source_from_row(r: WorkSourceJoinRow, show_nsfw: bool) -> Option<WorkSource> {
     if !show_nsfw && r.is_nsfw != 0 {
         return None;
     }
@@ -5632,7 +5928,7 @@ async fn load_work_sources(
     work_id: &str,
     show_nsfw: bool,
 ) -> Result<Vec<WorkSource>> {
-    let rows = sqlx::query_as::<_, WorkSourceRow>(&format!(
+    let rows = sqlx::query_as::<_, WorkSourceJoinRow>(&format!(
         "{WORK_SOURCE_SELECT} WHERE ss.work_id = ? \
          ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
     ))
@@ -5666,7 +5962,7 @@ async fn load_work_sources_batch(
         "{WORK_SOURCE_SELECT} WHERE ss.work_id IN ({placeholders}) \
          ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
     );
-    let mut q = sqlx::query_as::<_, WorkSourceRow>(&sql);
+    let mut q = sqlx::query_as::<_, WorkSourceJoinRow>(&sql);
     for wid in work_ids {
         q = q.bind(wid);
     }
@@ -6490,15 +6786,16 @@ impl MutationRoot {
             let user = require_user(ctx).await?;
             // The owning work, for per-series aggregation. If the chapter isn't in the
             // mirror, store with work_id = '' rather than erroring — it's per-user private.
-            let work_id: String = sqlx::query_scalar(
-                "SELECT ss.work_id FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+            // The chapter's own number comes back with it, for the catch-up cascade below.
+            let owner: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
                  WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
             )
             .bind(&chapter_id.0)
             .fetch_optional(&st.pool)
             .await
-            .map_err(gql_err)?
-            .unwrap_or_default();
+            .map_err(gql_err)?;
+            let (work_id, number) = owner.unwrap_or_default();
             let now = Utc::now().to_rfc3339();
             sqlx::query(
                 "INSERT INTO canonical_progress \
@@ -6517,6 +6814,11 @@ impl MutationRoot {
             .execute(&st.pool)
             .await
             .map_err(gql_err)?;
+            if read {
+                if let Some(n) = number.as_deref().and_then(parse_chapter_number) {
+                    catch_up_canonical(&st.pool, &user.id, &work_id, n, &now).await?;
+                }
+            }
             return Ok(true);
         }
         // Numeric Suwayomi chapter: per-user progress in `suwayomi_progress` (CR6).
@@ -6526,13 +6828,18 @@ impl MutationRoot {
         // The owning series id, for per-series aggregation in `libraryProgress`. If the
         // chapter isn't cached yet, store with series_id = '' rather than erroring —
         // the row is per-user private and the read state still round-trips.
-        let series_id: Option<i64> =
-            sqlx::query_scalar("SELECT manga_id FROM suwayomi_chapter WHERE id = ? LIMIT 1")
-                .bind(n)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        let series_id = series_id.map(|s| s.to_string()).unwrap_or_default();
+        // Its number rides along for the catch-up cascade below.
+        let owner: Option<(i64, Option<f64>)> = sqlx::query_as(
+            "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = ? LIMIT 1",
+        )
+        .bind(n)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let (series_id, number) = match owner {
+            Some((sid, num)) => (sid.to_string(), num),
+            None => (String::new(), None),
+        };
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO suwayomi_progress \
@@ -6551,6 +6858,11 @@ impl MutationRoot {
         .execute(&st.pool)
         .await
         .map_err(gql_err)?;
+        if read {
+            if let Some(num) = number {
+                catch_up_suwayomi(&st.pool, &user.id, &series_id, num, &now).await?;
+            }
+        }
         Ok(true)
     }
 
@@ -7507,6 +7819,21 @@ impl MutationRoot {
                     .await
                     .map_err(gql_err)?;
                 for other in involved.iter().filter(|w| *w != &survivor) {
+                    // Never re-fold a pair an admin SPLIT apart (migration 0098). This
+                    // path is the easiest way to undo a split by accident: the two halves
+                    // share a normalized title by construction, so typing that title as an
+                    // alt title on either one drags the other back in — without the admin
+                    // having asked for a merge at all.
+                    if catalog::is_split_pair(&st.pool, other, &survivor)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        tracing::info!(
+                            a = %other, b = %survivor, alias = %norm,
+                            "addSeriesAltTitle: skipped auto-merge — this pair was split apart"
+                        );
+                        continue;
+                    }
                     // `_ex` + the covers pool: the loser's cached cover BLOB lives in a
                     // separate database with no FK to `work`, so the plain entry point
                     // orphans it forever (8,868 orphans / 1.53 GB measured in prod).
@@ -8113,6 +8440,49 @@ impl MutationRoot {
         Ok(MergeWorksResult {
             target_work_id,
             moved_source_series: outcome.moved_source_series as i32,
+        })
+    }
+
+    /// Admin: SPLIT source mappings off a work onto a new one — the fix for two different
+    /// series that were folded together because they share a title.
+    ///
+    /// THE COUNTERPART TO `mergeWorks`, NOT ITS INVERSE. Nothing can invert that mutation:
+    /// it deletes the losing `work` row and records only `(old_id, new_id)`, having already
+    /// dropped the colliding reviews/library rows and summed the view counters, so the
+    /// pre-merge state is not on disk to restore. This is the forward-looking repair
+    /// instead, and it is cheap and lossless where it counts: `chapter` is keyed by
+    /// `source_series_id`, so re-pointing a mapping carries its whole chapter run and
+    /// writes no chapter rows. Nothing is deleted.
+    ///
+    /// Reviews, library entries, reading progress and view counts STAY with the original
+    /// work — they are keyed to the work with no per-source attribution, so there is no
+    /// honest way to route them. The client states this before confirming.
+    ///
+    /// Refuses to move EVERY source off a work: one with none is excluded from
+    /// `browse_catalogue` and `work_fts`, i.e. it vanishes from Browse and search while
+    /// still existing in the database. The client disables the last checkbox for the same
+    /// reason; this is the enforcement.
+    async fn split_source_series(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+        source_series_ids: Vec<ID>,
+    ) -> Result<SplitSourcesResult> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let ids: Vec<String> = source_series_ids.into_iter().map(|i| i.0).collect();
+        let outcome = catalog::split_source_series(&st.pool, &work_id.0, &ids, Some(&admin.id))
+            .await
+            .map_err(gql_err)?;
+        tracing::info!(
+            from = %work_id.0, to = %outcome.new_work_id, moved = outcome.moved_sources,
+            title = %outcome.title, "splitSourceSeries: detached sources onto a new work"
+        );
+        Ok(SplitSourcesResult {
+            new_work_id: ID(outcome.new_work_id),
+            new_reader_id: ID(outcome.new_reader_id),
+            title: outcome.title,
+            moved_sources: outcome.moved_sources as i32,
         })
     }
 
@@ -9438,6 +9808,23 @@ async fn consolidate_exact_duplicates_from(
         // cluster (never "merge the first two"), and queue each member for review.
         let oversized = works.len() > CONSOLIDATE_MAX_CLUSTER;
         for other in &works[1..] {
+            // An admin already ruled on this pair by SPLITTING it apart (migration 0098).
+            // Skip it outright — not queued for review either, because the review queue is
+            // a question and this pair has an answer. Checked BEFORE the gate for the
+            // reason the table exists: the two halves of a split share a normalized title
+            // by construction (that shared title is what caused the bad merge), and they
+            // routinely share an author too, so the gate would pass and `merge_works`
+            // would destroy one of them for good.
+            if catalog::is_split_pair(pool, &other.id, &survivor.id)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::debug!(
+                    a = %other.id, b = %survivor.id, alias = %norm,
+                    "consolidate: skipped — an admin split this pair apart"
+                );
+                continue;
+            }
             let verdict = if oversized {
                 Err("cluster_too_large")
             } else {
@@ -15720,8 +16107,9 @@ mod tests {
         assert_eq!(anon["read"], serde_json::json!(false));
         assert_eq!(anon["lastPageRead"], serde_json::json!(0));
 
-        // libraryProgress reflects each viewer's own read count; total is 0 (client
-        // falls back to chapterCount).
+        // libraryProgress reflects each viewer's own read count, against a REAL total.
+        // This series is cached in `suwayomi_chapter` but has no spine rows, so it
+        // exercises the pre-spine fallback: 1 of 2 chapters read.
         let lib_q = r#"{ libraryProgress { id read total } }"#;
         let bob_lib = exec(&s, lib_q, Some("bobtok"), "1.1.1.1").await;
         let lp = bob_lib.data.into_json().unwrap()["libraryProgress"]
@@ -15732,13 +16120,20 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(lp["read"], serde_json::json!(1));
-        assert_eq!(lp["total"], serde_json::json!(0));
-        // Admin has no progress rows → series omitted entirely.
+        assert_eq!(lp["total"], serde_json::json!(2));
+        // Admin has no progress rows → 0 read, but still a real total.
         let admin_lib = exec(&s, lib_q, Some("admintok"), "1.1.1.1").await;
-        assert!(admin_lib.data.into_json().unwrap()["libraryProgress"]
+        let admin_lp = admin_lib.data.into_json().unwrap()["libraryProgress"]
             .as_array()
             .unwrap()
-            .is_empty());
+            .iter()
+            .find(|p| p["id"] == "500")
+            .cloned();
+        assert_eq!(
+            admin_lp.map(|p| (p["read"].clone(), p["total"].clone())),
+            Some((serde_json::json!(0), serde_json::json!(2))),
+            "admin sees the series unread, not missing"
+        );
 
         // A second write updates in place — no duplicate row.
         let r = exec(
@@ -15757,6 +16152,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((cnt, lpr, rd), (1, 5, 0), "upsert in place");
+    }
+
+    /// REGRESSION: `libraryProgress` reported `read > total`, and lost Suwayomi reads on
+    /// canonical works entirely.
+    ///
+    /// The old resolver summed raw progress ROWS for `read` while leaving `total` 0 for
+    /// the client to backfill from the deduped `chapterCount` — two different populations,
+    /// so a work carried by two sources counted every shared chapter twice and could
+    /// report 151/117. Worse, it looked up Suwayomi progress by
+    /// `user_library.series_id = suwayomi_progress.series_id`, which a `w_` library row
+    /// can never equal, so a viewer who read a work through its Suwayomi translation
+    /// showed 0 read — and the Library shelved a series they were 208 chapters into as
+    /// "Plan to Read".
+    ///
+    /// This work has 3 chapters mirrored from BOTH a MangaDex and a Suwayomi source, and
+    /// the viewer read chapter 1 twice (once per source) plus chapter 2. The answer is
+    /// 2 of 3.
+    #[tokio::test]
+    async fn library_progress_dedupes_across_sources_and_both_progress_stores() {
+        let (s, pool) = setup_full(100).await;
+        let work_id = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Two Mirrors".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // The same three chapters under two sources. External ids differ per source (a
+        // MangaDex uuid vs a Suwayomi chapter id); the spine key does not.
+        for (source_type, source_key, ext) in [
+            ("mangadex", "md-mirror", ["md-c1", "md-c2", "md-c3"]),
+            ("suwayomi", "700", ["7001", "7002", "7003"]),
+        ] {
+            let ssid = crate::catalog::upsert_source_series(
+                &pool,
+                &work_id,
+                source_type,
+                source_type,
+                source_key,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            for (i, external_id) in ext.iter().enumerate() {
+                crate::catalog::upsert_chapter(
+                    &pool,
+                    &ssid,
+                    &crate::catalog::ChapterInput {
+                        external_id: (*external_id).into(),
+                        number: Some((i + 1).to_string()),
+                        lang: Some("en".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', ?, '2020-01-01T00:00:00Z')")
+            .bind(&work_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Chapter 1 read on the MangaDex spine…
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', ?, 'md-c1', 0, 1, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // …then chapters 1 and 2 read through the Suwayomi translation of the same work.
+        for cid in ["7001", "7002"] {
+            sqlx::query(
+                "INSERT INTO suwayomi_progress (user_id, series_id, chapter_id, last_page_read, read, updated_at) \
+                 VALUES ('bob-id', '700', ?, 0, 1, '2026-01-02T00:00:00Z')",
+            )
+            .bind(cid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let r = exec(
+            &s,
+            r#"{ libraryProgress { id read total lastReadAt } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let p = r.data.into_json().unwrap()["libraryProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == work_id.as_str())
+            .expect("canonical work missing from libraryProgress")
+            .clone();
+        assert_eq!(p["read"], serde_json::json!(2), "chapter 1 counted once");
+        assert_eq!(p["total"], serde_json::json!(3), "3 chapters, not 6");
+        // The Suwayomi read is the most recent, so it has to win `lastReadAt` too —
+        // that is what orders the Continue-reading shelf.
+        assert_eq!(p["lastReadAt"], serde_json::json!("2026-01-02T00:00:00Z"));
     }
 
     #[tokio::test]
@@ -16673,6 +17175,252 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&r), "lastPageRead must be non-negative");
+    }
+
+    /// A MangaDex spine holding a STUB must not decide the count when a Suwayomi source
+    /// carries the real run. This is the shape that made 495 works read "1 ch" in
+    /// production (Starting Over as a Tree: MangaDex 1, Suwayomi 526).
+    #[tokio::test]
+    async fn chapter_count_takes_the_best_sourced_number_not_the_mangadex_one() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-stub",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Stubbed Spine".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-stub")
+            .await
+            .unwrap()
+            .unwrap();
+        // The whole English spine: one chapter.
+        crate::catalog::upsert_chapter(
+            &pool,
+            &ssid,
+            &crate::catalog::ChapterInput {
+                external_id: "md-stub-ch-1".into(),
+                number: Some("1".into()),
+                lang: Some("en".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-stub'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // A Suwayomi source for the same work, carrying 526.
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) \
+             VALUES (4242, 'Stubbed Spine', 'en', 'UNKNOWN', 'src', 0, 526, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series \
+               (id, work_id, source_type, source_id, source_key, created_at, last_seen) \
+             VALUES ('ss_stub_sw', ?, 'suwayomi', 'src', '4242', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let q = format!(r#"{{ canonicalSeries(workId: "{work_id}") {{ chapterCount }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let json = data_json(&r);
+        assert!(
+            json.contains("\"chapterCount\":526"),
+            "the Suwayomi run must RAISE the one-chapter MangaDex spine, got {json}"
+        );
+    }
+
+    /// The other direction: a healthy English spine must not be LOWERED by a thinner
+    /// Suwayomi source. `MAX` only ever raises.
+    #[tokio::test]
+    async fn chapter_count_is_never_lowered_by_a_thinner_suwayomi_source() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-full",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Full Spine".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-full")
+            .await
+            .unwrap()
+            .unwrap();
+        for n in 1..=5 {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: format!("md-full-ch-{n}"),
+                    number: Some(n.to_string()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-full'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) \
+             VALUES (4343, 'Full Spine', 'en', 'UNKNOWN', 'src', 0, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series \
+               (id, work_id, source_type, source_id, source_key, created_at, last_seen) \
+             VALUES ('ss_full_sw', ?, 'suwayomi', 'src', '4343', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let q = format!(r#"{{ canonicalSeries(workId: "{work_id}") {{ chapterCount }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        let json = data_json(&r);
+        assert!(
+            json.contains("\"chapterCount\":5"),
+            "the 5-chapter English spine must survive a 2-chapter Suwayomi source, got {json}"
+        );
+    }
+
+    /// Seed Suwayomi chapters 1..=n for series `manga_id`, ids `manga_id * 1000 + number`.
+    async fn seed_suwayomi_chapters(pool: &SqlitePool, manga_id: i64, n: i64) {
+        for i in 1..=n {
+            sqlx::query(
+                "INSERT INTO suwayomi_chapter \
+                   (id, manga_id, name, chapter_number, page_count, updated_at) \
+                 VALUES (?, ?, ?, ?, 10, '2026-01-01T00:00:00Z')",
+            )
+            .bind(manga_id * 1000 + i)
+            .bind(manga_id)
+            .bind(format!("Ch {i}"))
+            .bind(i as f64)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// `(chapter number, read, last page read)` for bob, ordered by number.
+    /// `chapter_number` is REAL in the schema, so it decodes as f64 and is rounded here —
+    /// the fixtures are whole chapters and comparing floats in assertions is noise.
+    async fn read_rows(pool: &SqlitePool, manga_id: i64) -> Vec<(i64, i64, i64)> {
+        sqlx::query_as::<_, (f64, i64, i64)>(
+            "SELECT sc.chapter_number, p.read, p.last_page_read \
+               FROM suwayomi_progress p JOIN suwayomi_chapter sc \
+                 ON CAST(sc.id AS TEXT) = p.chapter_id \
+              WHERE p.user_id = 'bob-id' AND sc.manga_id = ? \
+              ORDER BY sc.chapter_number",
+        )
+        .bind(manga_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(n, read, page)| (n as i64, read, page))
+        .collect()
+    }
+
+    /// Readers arrive mid-series: their first chapter here is 178 and the 177 they read
+    /// elsewhere must not be counted unread forever.
+    #[tokio::test]
+    async fn finishing_a_chapter_marks_every_earlier_one_read() {
+        let (s, pool) = setup_full(100).await;
+        seed_suwayomi_chapters(&pool, 700, 10).await;
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId:"700005", lastPageRead:9, read:true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+
+        let rows = read_rows(&pool, 700).await;
+        let read: Vec<i64> = rows.iter().filter(|r| r.1 == 1).map(|r| r.0).collect();
+        assert_eq!(
+            read,
+            vec![1, 2, 3, 4, 5],
+            "chapters 1-4 must be caught up alongside the 5 just finished"
+        );
+        assert!(
+            rows.iter().all(|r| r.0 <= 5),
+            "nothing ABOVE the finished chapter may be touched, got {rows:?}"
+        );
+    }
+
+    /// The cascade must not overwrite a position someone genuinely stopped at, and must
+    /// never unmark. It also must not fire on a mid-chapter save.
+    #[tokio::test]
+    async fn catch_up_preserves_partial_positions_and_ignores_unfinished_reads() {
+        let (s, pool) = setup_full(100).await;
+        seed_suwayomi_chapters(&pool, 800, 6).await;
+
+        // Bob is 4 pages into chapter 2 and has not finished it.
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId:"800002", lastPageRead:4, read:false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            read_rows(&pool, 800).await,
+            vec![(2, 0, 4)],
+            "an unfinished chapter must not cascade to chapter 1"
+        );
+
+        // Now he finishes chapter 5.
+        exec(
+            &s,
+            r#"mutation { setProgress(chapterId:"800005", lastPageRead:9, read:true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        let rows = read_rows(&pool, 800).await;
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.1 == 1)
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "finishing 5 catches up 1-4, including the half-read 2"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.0 == 2).map(|r| r.2),
+            Some(4),
+            "chapter 2 keeps the page bob actually stopped on, not the cascade's 0"
+        );
     }
 
     #[tokio::test]

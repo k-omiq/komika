@@ -38,10 +38,12 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
+	WorkSourceRow,
 } from '@komika/types';
 
 /**
@@ -328,6 +330,30 @@ export interface Backend {
 	 * Optional: only the unified Komika API implements it.
 	 */
 	searchForMerge?(query: string, page?: number): Promise<Paginated<MergeCandidateRow>>;
+	/**
+	 * The work's own `source_series` mappings, in admin shape — what the UNMERGE
+	 * picker lists. Each row carries its `source_series.id`, the title THAT source
+	 * gives the series, and how many chapters we hold from it.
+	 *
+	 * A separate call from `workSources`, which answers a different question (how a
+	 * native client should FETCH a source) and has no field for the row's own id.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	workSourceRows?(workId: Id): Promise<WorkSourceRow[]>;
+	/**
+	 * Detach source mappings off a work into a NEW canonical work, titled from the
+	 * detached source's own title.
+	 *
+	 * NOT the inverse of {@link mergeWorks} — see {@link SplitSourcesResult}. It is a
+	 * forward-looking split: the moved rows keep every chapter they own (`chapter` is
+	 * keyed by `source_series_id`), and nothing is deleted.
+	 *
+	 * The server refuses to move EVERY source off a work: a work with no
+	 * `source_series` row is excluded from `browse_catalogue` and `work_fts`, i.e. it
+	 * would vanish from the product while still existing in the database.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	splitSourceSeries?(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult>;
 
 	// --- reader reports (Support → Report an issue) ---
 	/**

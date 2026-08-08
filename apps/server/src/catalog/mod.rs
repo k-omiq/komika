@@ -1312,6 +1312,18 @@ pub async fn publish_mirror_feed_row(pool: &SqlitePool, work_id: &str) -> Result
 /// open on either path (2 works in production), and a work with no title would render a card
 /// with no label and no href (0 works; the guard is also what makes `title NOT NULL` safe).
 fn browse_catalogue_select() -> String {
+    browse_catalogue_select_for("")
+}
+
+/// [`browse_catalogue_select`] with an extra predicate appended to its WHERE — the ONE
+/// point of variation between the wholesale rebuild (`""`) and the per-work re-projection
+/// [`reproject_work_caches`] uses (`" AND w.id = ?"`).
+///
+/// A parameter rather than a second copy of the SELECT, because a copy is precisely the
+/// failure this table has already had once: `scanner::mirror_feed_row_into_browse_catalogue`
+/// hand-copied the mutable-column list and drifted from it, freezing every incrementally
+/// mirrored card's chapter number (§8h). One expression, two scopes.
+fn browse_catalogue_select_for(scope: &str) -> String {
     format!(
         "SELECT w.id, \
             -- The ANCHOR decides first: a MangaDex-anchored work navigates to its canonical
@@ -1335,7 +1347,17 @@ fn browse_catalogue_select() -> String {
                  ELSE COALESCE(w.content_rating, 'safe') END, \
             CASE WHEN f.work_id IS NOT NULL THEN f.is_nsfw \
                  ELSE COALESCE(w.is_nsfw_override, w.is_nsfw) END, \
-            COALESCE(NULLIF(en.n, 0), NULLIF(swc.n, 0), 0), \
+            -- The BEST-SOURCED count wins, not the MangaDex one. This was
+            -- `COALESCE(NULLIF(en.n,0), NULLIF(swc.n,0), 0)` — English spine first,
+            -- Suwayomi only as a zero-fallback — which showed 1 ch for 495 works whose
+            -- MangaDex mirror holds a stub while their Suwayomi source carries the real
+            -- run (Starting Over as a Tree: en=1, suwayomi=526; median 3.7x undercount).
+            -- MAX is safe here where the aggregate in `aggregate_chapter_count` is not:
+            -- this reads `suwayomi_series.chapter_count`, one already-deduped number per
+            -- source, and every `suwayomi_series` row is `lang='en'` (14,182/14,182), so
+            -- there is no non-English inflation to guard against. The 3,737 works where
+            -- the English spine is larger are unaffected — MAX picks it, as before.
+            MAX(COALESCE(en.n, 0), COALESCE(swc.n, 0)), \
             f.latest_chapter, \
             f.released_at, \
             w.created_at \
@@ -1360,7 +1382,7 @@ fn browse_catalogue_select() -> String {
                    WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
                    GROUP BY ss.work_id) en ON en.work_id = w.id \
       WHERE (md.work_id IS NOT NULL OR sw.work_id IS NOT NULL) \
-        AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''"
+        AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''{scope}"
     )
 }
 
@@ -1714,11 +1736,17 @@ async fn fill_comic_types(
 /// `en_chapter_count` (migration 0068) — Browse's CHAPTERS sort key and the number its cards
 /// print — for every row, or for one work when `work_id` is `Some`.
 ///
-/// TWO statements, in this order, because the fallback must only ever RAISE a zero: the
-/// English mirror count is authoritative where it exists, and the Suwayomi count is the only
-/// thing available for a work whose MangaDex spine has no English chapter (the same
-/// precedence `map_canonical_series` applies between its English count and
-/// `aggregate_chapter_count`).
+/// TWO statements, in this order, because the second must only ever RAISE the first: the
+/// count a reader should see is the best-sourced one, so the English mirror count is written
+/// and then the Suwayomi count overwrites it WHERE IT IS LARGER (`sw.n > en_chapter_count`),
+/// which covers both a work whose MangaDex spine has no English chapter at all and the 495
+/// whose spine holds a stub against a fully-populated Suwayomi source. It only raises, never
+/// lowers, so a work the English mirror knows better keeps its number.
+///
+/// The raise is safe because `suwayomi_series.chapter_count` is one already-deduped count per
+/// source and every such row is `lang='en'` — unlike `aggregate_chapter_count`, which unions
+/// raw `suwayomi_chapter` rows and can inflate. Keep this expression in step with
+/// `browse_catalogue_select`, which computes the same `MAX` inline for the rebuild.
 ///
 /// ONE function for both scopes so [`publish_mirror_feed_row`] cannot drift from the
 /// rebuild's pass (4) — that drift is what makes a card announce a new chapter while still
@@ -1758,8 +1786,7 @@ async fn fill_en_chapter_count(
                     WHERE ss.source_type = 'suwayomi' \
                     GROUP BY ss.work_id) AS sw \
             WHERE sw.work_id = feed_series_updates.work_id \
-              AND feed_series_updates.en_chapter_count = 0 \
-              AND sw.n > 0 {scope}"
+              AND sw.n > feed_series_updates.en_chapter_count {scope}"
     );
     let mut q = sqlx::query(&sql2);
     if let Some(w) = work_id {
@@ -3281,6 +3308,505 @@ pub async fn reclaim_cover_blob(covers: &SqlitePool, work_id: &str) -> Result<()
     Ok(())
 }
 
+/// One of a work's `source_series` mappings, in the shape the admin SPLIT picker lists
+/// it: what THIS source calls the series, how much of it we hold, and the row's own id.
+///
+/// Distinct from `graphql::WorkSource`, which answers "how does a native client FETCH
+/// this source" and carries no primary key — and a key is the whole point here, because
+/// `(source_type, source_key)` is only unique in combination with `source_id` (the
+/// table's `UNIQUE (source_type, source_id, source_key)`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SourceSeriesRow {
+    /// `source_series.id` — the detach key [`split_source_series`] takes.
+    pub id: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub source_key: String,
+    pub source_url: Option<String>,
+    pub is_nsfw: i64,
+    pub lang: Option<String>,
+    /// How this source titles the series: the cached Suwayomi title where there is one,
+    /// else the work's own title. A MangaDex mapping has no per-source title on disk —
+    /// the mirror's title IS the work's — so it necessarily falls back.
+    pub title: String,
+    /// Chapters we hold FROM THIS SOURCE (`chapter` is keyed by `source_series_id`, which
+    /// is exactly why detaching the row carries its whole run with it).
+    pub chapter_count: i64,
+    /// Extension coordinates, for the picker's source logo. Both `None` for a MangaDex
+    /// mapping and for a source whose extension isn't catalogued.
+    pub pkg_name: Option<String>,
+    pub repo_url: Option<String>,
+}
+
+/// Every `source_series` mapping on a work, newest-relevant first — the admin SPLIT
+/// picker's list.
+///
+/// ORDER IS PART OF THE CONTRACT, not a display nicety: [`split_source_series`] names the
+/// new work after the FIRST detached row in this order, and the picker shows the admin
+/// that same name before they confirm. Same ordering expression as
+/// `graphql::load_work_sources` (MangaDex anchor first, then by recency) so one work's
+/// sources don't appear in two different orders on two admin surfaces.
+pub async fn work_source_series_rows(
+    pool: &SqlitePool,
+    work_id: &str,
+) -> Result<Vec<SourceSeriesRow>> {
+    let rows = sqlx::query_as::<_, SourceSeriesRow>(
+        "SELECT ss.id, ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+                COALESCE(NULLIF(sy.lang, ''), NULLIF(se.lang, '')) AS lang, \
+                COALESCE(NULLIF(sy.title, ''), w.title_override, w.primary_title, '') AS title, \
+                (SELECT COUNT(*) FROM chapter c WHERE c.source_series_id = ss.id) AS chapter_count, \
+                se.pkg_name, se.repo_url \
+           FROM source_series ss \
+           JOIN work w ON w.id = ss.work_id \
+           LEFT JOIN suwayomi_series sy \
+                  ON ss.source_type = 'suwayomi' AND sy.id = CAST(ss.source_key AS INTEGER) \
+           LEFT JOIN source_extension se ON se.source_id = ss.source_id \
+          WHERE ss.work_id = ? \
+          ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC",
+    )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// `(description, author, artist, status, lang)` as `suwayomi_series` caches them — the
+/// only metadata a split's new work inherits from anywhere other than its own title.
+type SuwayomiMeta = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Outcome of detaching sources off a work onto a new one (admin split).
+#[derive(Debug, Clone)]
+pub struct SplitOutcome {
+    /// The freshly minted canonical work.
+    pub new_work_id: String,
+    /// Where the reader NAVIGATES for it — see [`split_source_series`].
+    pub new_reader_id: String,
+    /// Its `primary_title`, taken from the first detached source's own title.
+    pub title: String,
+    /// How many `source_series` rows moved.
+    pub moved_sources: u64,
+}
+
+/// Detach `source_series_ids` off `work_id` onto a NEW canonical work — the admin fix for
+/// two different series that were merged together because they share a title.
+///
+/// NOT AN UNDO OF [`merge_works`], and nothing can be: that merge DELETEs the losing work
+/// row and records only `(old_id, new_id)` in `work_redirect`, having already dropped the
+/// colliding reviews/library rows and SUMMED the view counters. The pre-merge state is not
+/// on disk. What this does instead is the thing that actually repairs the catalogue, and
+/// it is cheap and lossless in the direction that matters: `chapter` is keyed by
+/// `source_series_id`, not by work, so re-pointing the mapping carries its ENTIRE chapter
+/// run with it and writes no chapter rows at all. Nothing is deleted here.
+///
+/// WHAT DOES NOT MOVE: reviews, library entries, reading progress and view counts. They
+/// hang off the work and carry no per-source attribution, so there is no honest way to
+/// decide which side of the split they belong to; they stay on the original. The admin UI
+/// says so before confirming rather than letting it be discovered afterwards.
+///
+/// THE LAST SOURCE CANNOT BE DETACHED. A work with no `source_series` row is excluded from
+/// both `browse_catalogue` and `work_fts` (see [`refresh_browse_catalogue`] and
+/// [`refresh_work_fts`]) — it would vanish from Browse and from search while still
+/// existing in the database, taking its reviews and library entries with it into a page
+/// nothing links to.
+///
+/// The new work is titled from the FIRST detached row in [`work_source_series_rows`]'
+/// order, which is the name the picker showed the admin. It is deliberately given only
+/// metadata the DETACHED SOURCE itself carries (its title, description, author, artist,
+/// status) and NONE of the original work's identity columns beyond the NSFW gating. That
+/// is not squeamishness about copying: `consolidate_gate` merges two works that share a
+/// normalized primary title as soon as year / author / cover pHash corroborates, so
+/// copying the original's `year` and `cover_phash` onto a work that by construction shares
+/// its title would hand the automated sweep everything it needs to undo this split. The
+/// `work_split` row below is the belt to that braces.
+///
+/// NSFW is the one thing inherited, and inherited CONSERVATIVELY: the new work takes the
+/// original's effective flag and content rating, OR'd with the detached rows' own
+/// `is_nsfw`. Under-gating a split-off work would expose it to anonymous viewers on the
+/// strength of an admin action that was about identity, not about rating.
+pub async fn split_source_series(
+    pool: &SqlitePool,
+    work_id: &str,
+    source_series_ids: &[String],
+    actor_user_id: Option<&str>,
+) -> Result<SplitOutcome> {
+    if source_series_ids.is_empty() {
+        anyhow::bail!("pick at least one source to detach");
+    }
+    let all = work_source_series_rows(pool, work_id).await?;
+    if all.is_empty() {
+        anyhow::bail!("no such work, or it has no sources: {work_id}");
+    }
+    let wanted: std::collections::HashSet<&str> =
+        source_series_ids.iter().map(|s| s.as_str()).collect();
+    let (detached, kept): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|r| wanted.contains(r.id.as_str()));
+    if detached.len() != wanted.len() {
+        // Named rather than counted: the usual cause is a stale picker (another admin
+        // merged or split this work since it loaded), and the id says which row moved.
+        let found: std::collections::HashSet<&str> =
+            detached.iter().map(|r| r.id.as_str()).collect();
+        let missing: Vec<&str> = source_series_ids
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !found.contains(s))
+            .collect();
+        anyhow::bail!(
+            "not a source of this work (reload and try again): {}",
+            missing.join(", ")
+        );
+    }
+    if kept.is_empty() {
+        anyhow::bail!(
+            "at least one source has to stay — a work with none disappears from Browse and search"
+        );
+    }
+
+    let title = detached[0].title.trim().to_string();
+    if title.is_empty() {
+        anyhow::bail!("the detached source has no title to name the new series with");
+    }
+    // The reader id, by the SAME rule `browse_catalogue` applies (migration 0069): a work
+    // with a MangaDex anchor navigates to its `w_…` page, and anything else navigates to
+    // the numeric Suwayomi id of its lowest-id mapping — which is the row 0069's `sw`
+    // sub-select picks with `MIN(ss.id)`. Getting this wrong produces a link that 404s:
+    // `canonical_series` rejects a work with no MangaDex anchor outright.
+    let new_work_id = new_id("w_");
+    let new_reader_id = if detached.iter().any(|r| r.source_type == "mangadex") {
+        new_work_id.clone()
+    } else {
+        detached
+            .iter()
+            .filter(|r| r.source_type == "suwayomi")
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .map(|r| r.source_key.clone())
+            .unwrap_or_else(|| new_work_id.clone())
+    };
+
+    let now = Utc::now().to_rfc3339();
+    // IMMEDIATE for the reason every writer in this file takes it: the transaction reads
+    // (the parent work's gating columns, the source's cached metadata) before it writes,
+    // and a DEFERRED read-then-write upgrade fails with SQLITE_BUSY_SNAPSHOT, which
+    // `busy_timeout` structurally cannot retry (`db::is_locked_error`).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    // Re-read the parent under the write lock: the gating columns are what the new work
+    // inherits, and `updateSeriesMetadata` is not single-flighted against this.
+    let (parent_rating, parent_nsfw): (Option<String>, i64) = sqlx::query_as(
+        "SELECT content_rating, COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = ?",
+    )
+    .bind(work_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("no such work: {work_id}"))?;
+    let nsfw = if parent_nsfw != 0 || detached.iter().any(|r| r.is_nsfw != 0) {
+        1_i64
+    } else {
+        0_i64
+    };
+
+    // The detached source's OWN metadata, where it has any on disk. A MangaDex mapping
+    // has none (its metadata IS the work's), so those columns stay NULL rather than being
+    // copied off the work — see the doc comment on why copying is unsafe here.
+    let source_meta: Option<SuwayomiMeta> =
+        match detached.iter().find(|r| r.source_type == "suwayomi") {
+            Some(r) => {
+                sqlx::query_as(
+                    "SELECT description, author, artist, status, lang FROM suwayomi_series \
+                      WHERE id = CAST(? AS INTEGER)",
+                )
+                .bind(&r.source_key)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            None => None,
+        };
+    // All-None when the detached set is MangaDex-only, or when the cached Suwayomi row is
+    // gone: the new work then carries title + gating and nothing else, which is the safe
+    // direction (see the doc comment).
+    let (description, author, artist, status, lang) = source_meta.unwrap_or_default();
+
+    sqlx::query(
+        "INSERT INTO work \
+           (id, primary_title, primary_lang, description, status, content_rating, is_nsfw, \
+            author, artist, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&new_work_id)
+    .bind(&title)
+    .bind(&lang)
+    .bind(&description)
+    .bind(&status)
+    .bind(&parent_rating)
+    .bind(nsfw)
+    .bind(&author)
+    .bind(&artist)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    // The move itself — one UPDATE, no chapter writes, nothing deleted.
+    let mut moved = 0_u64;
+    for r in &detached {
+        moved += sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ? AND work_id = ?")
+            .bind(&new_work_id)
+            .bind(&r.id)
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    }
+    if moved as usize != detached.len() {
+        // A concurrent merge/split moved a row out from under the read above. Roll back
+        // rather than mint a half-populated work.
+        anyhow::bail!("sources changed while splitting — reload and try again");
+    }
+
+    // A detached MangaDex mapping takes its UUID's identity row with it. `work_external_id`
+    // is `PRIMARY KEY (provider, external_id)` — globally unique, not per-work — so leaving
+    // it behind would claim the new work's own anchor for the work it was detached from,
+    // and `load_canonical_work` would read a MangaDex id that no longer maps to a mapping.
+    for r in detached.iter().filter(|r| r.source_type == "mangadex") {
+        sqlx::query(
+            "UPDATE work_external_id SET work_id = ? \
+              WHERE provider = 'mangadex' AND external_id = ? AND work_id = ?",
+        )
+        .bind(&new_work_id)
+        .bind(&r.source_key)
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Release events follow the row, but ONLY for chapter keys the detached rows were the
+    // sole source of on the old work — the same rule `phase_f::split_mismatched` applies,
+    // and for the same reason: the ledger's law is earliest-anywhere, so a key the old
+    // work still has from a remaining source keeps its (possibly earlier) event there.
+    //
+    // The `source_series` UPDATE above has already committed within this transaction, so
+    // `s.work_id = <old>` no longer matches the detached rows — the NOT EXISTS below asks
+    // exactly "does a REMAINING source still carry this chapter key".
+    for r in &detached {
+        sqlx::query(
+            "INSERT OR IGNORE INTO release_event \
+                 (work_id, chapter_key, first_seen_at, first_source_series_id, label) \
+             SELECT ?, e.chapter_key, e.first_seen_at, e.first_source_series_id, e.label \
+               FROM release_event e \
+              WHERE e.work_id = ? AND e.first_source_series_id = ? \
+                AND NOT EXISTS (SELECT 1 FROM chapter c \
+                                  JOIN source_series s ON s.id = c.source_series_id \
+                                 WHERE s.work_id = ? AND c.chapter_key = e.chapter_key)",
+        )
+        .bind(&new_work_id)
+        .bind(work_id)
+        .bind(&r.id)
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM release_event \
+              WHERE work_id = ? AND first_source_series_id = ? \
+                AND NOT EXISTS (SELECT 1 FROM chapter c \
+                                  JOIN source_series s ON s.id = c.source_series_id \
+                                 WHERE s.work_id = ? AND c.chapter_key = release_event.chapter_key)",
+        )
+        .bind(work_id)
+        .bind(&r.id)
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Index the new work's title so it is searchable under its own name (H9 keeps the
+    // token index in lockstep). The original KEEPS its copy of that alias: the merge that
+    // caused this may have folded a genuine alt-title, and dropping it would be a second
+    // guess about identity on top of the one the admin already made.
+    insert_aliases(
+        &mut tx,
+        &new_work_id,
+        &[Alias {
+            raw: title.clone(),
+            lang: lang.clone(),
+        }],
+    )
+    .await?;
+
+    // "These two are NOT duplicates" — the memory that stops `consolidateExactDuplicates`
+    // silently re-merging what was just separated (migration 0098). Written as the ordered
+    // pair because the sweep chooses its own survivor.
+    let (a, b) = if work_id < new_work_id.as_str() {
+        (work_id, new_work_id.as_str())
+    } else {
+        (new_work_id.as_str(), work_id)
+    };
+    sqlx::query(
+        "INSERT OR IGNORE INTO work_split (work_a, work_b, split_at, split_by) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(&now)
+    .bind(actor_user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    // Both works' derived caches are now wrong in ways a reader can see, so they are
+    // re-projected HERE rather than left to the periodic rebuild — the opposite of the
+    // choice `mergeWorks` and `phase_f::split_mismatched` make, and the difference is
+    // scope: those re-project nothing because they run over hundreds of works at a time
+    // (measured: 486 merges take ~5 s without the per-work projection and made no
+    // measurable progress in 90 s with it). This is ONE admin action on exactly two works,
+    // and both of them are wrong until it runs: the new work has no `browse_catalogue` or
+    // `work_fts` row at all, and the original may be pointing at a `reader_id` that just
+    // moved. Best-effort — the split is already durable, so a projection failure is logged,
+    // not returned.
+    for id in [work_id, new_work_id.as_str()] {
+        if let Err(e) = reproject_work_caches(pool, id).await {
+            tracing::warn!(work_id = %id, error = %e, "split: cache re-projection failed (the next refresh will fix it)");
+        }
+    }
+
+    Ok(SplitOutcome {
+        new_work_id,
+        new_reader_id,
+        title,
+        moved_sources: moved,
+    })
+}
+
+/// Is this pair of works one an admin explicitly SPLIT apart (migration 0098)? Order
+/// doesn't matter — `work_split` stores the pair sorted and this sorts to match.
+///
+/// Consulted by EVERY path that can merge two works without an admin naming both of them:
+/// `dedup::resolve_ex` (the post-ingest reconcile sweep — the one that gets there first,
+/// because a split-off work is Suwayomi-only and an exact title hit there auto-merges with
+/// no corroboration at all), `consolidate_exact_duplicates_from` (the alias-cluster sweep)
+/// and the auto-merge inside `addSeriesAltTitle`. The two halves of a split share a title
+/// BY CONSTRUCTION — that shared title is what caused the bad merge in the first place — so
+/// without this they are re-merged on the next pass, destructively: `merge_works` deletes
+/// the loser.
+pub async fn is_split_pair(pool: &SqlitePool, one: &str, other: &str) -> Result<bool> {
+    let (a, b) = if one < other {
+        (one, other)
+    } else {
+        (other, one)
+    };
+    let hit: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM work_split WHERE work_a = ? AND work_b = ?")
+            .bind(a)
+            .bind(b)
+            .fetch_optional(pool)
+            .await?;
+    Ok(hit.is_some())
+}
+
+/// Re-project ONE work's derived caches — `feed_series_updates.reader_id`,
+/// `browse_catalogue` and `work_fts` — without waiting for the periodic rebuild.
+///
+/// Every statement here is the corresponding wholesale refresh narrowed to one work, so
+/// the two converge by construction rather than by a field mapping that has to be kept in
+/// agreement: the `browse_catalogue` upsert runs [`browse_catalogue_select`] itself, and
+/// the `work_fts` write is [`refresh_work_fts`]'s INSERT with a `w.id = ?` added.
+///
+/// `reader_id` needs the explicit UPDATE because `browse_catalogue` COPIES it from
+/// `feed_series_updates` for a work with no MangaDex anchor, so a stale value there
+/// propagates rather than being recomputed. It goes stale in exactly one situation, which
+/// is the one this function exists for: [`split_source_series`] moved the Suwayomi mapping
+/// the id was derived from onto another work, leaving the original's Browse card linking
+/// to the series it just detached.
+///
+/// NOT called from the hot path. Two `work_fts` statements scan the FTS table (its
+/// `work_id` column is `UNINDEXED`), which is fine for a one-shot admin action and would
+/// not be for a per-scan write.
+pub async fn reproject_work_caches(pool: &SqlitePool, work_id: &str) -> Result<()> {
+    // (1) `reader_id`, by the rule both feed writers apply — the MangaDex anchor wins, else
+    //     the numeric Suwayomi id. `MIN(ss.id)` (via ORDER BY ... LIMIT 1) matches the
+    //     `sw` sub-select in `browse_catalogue_select`, so the two surfaces agree on WHICH
+    //     Suwayomi mapping names the work. COALESCE keeps the old value rather than writing
+    //     NULL into a NOT NULL column if the work somehow has neither.
+    sqlx::query(
+        "UPDATE feed_series_updates SET reader_id = COALESCE( \
+             CASE WHEN EXISTS (SELECT 1 FROM source_series md \
+                                WHERE md.work_id = feed_series_updates.work_id \
+                                  AND md.source_type = 'mangadex') \
+                  THEN feed_series_updates.work_id \
+                  ELSE (SELECT ss.source_key FROM source_series ss \
+                         WHERE ss.work_id = feed_series_updates.work_id \
+                           AND ss.source_type = 'suwayomi' \
+                         ORDER BY ss.id LIMIT 1) END, \
+             feed_series_updates.reader_id) \
+          WHERE work_id = ?",
+    )
+    .bind(work_id)
+    .execute(pool)
+    .await?;
+
+    // (2) `browse_catalogue`, the rebuild's own upsert narrowed to this work — same
+    //     columns, same conflict clause, same `IS NOT` change guard.
+    let set = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let select = browse_catalogue_select_for(" AND w.id = ?");
+    sqlx::query(&format!(
+        "INSERT INTO browse_catalogue ({BROWSE_CATALOGUE_COLUMNS}) {select} \
+         ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
+    ))
+    .bind(work_id)
+    .execute(pool)
+    .await?;
+
+    // `comic_type` is not in the SELECT (see `fill_comic_types`), and a NULL type is
+    // invisible to Browse's format tabs — so a row this call just INSERTED would sit out
+    // of every tab until the next wholesale rebuild.
+    let mut conn = pool.acquire().await?;
+    fill_comic_types(&mut conn, "browse_catalogue", Some(work_id)).await?;
+    drop(conn);
+
+    // (3) `work_fts`. A virtual FTS5 table has no unique key to upsert against, so this is
+    //     delete-then-insert; the INSERT is `refresh_work_fts`'s, scoped, and it carries
+    //     that function's exclusion rule (a title to label, a source to open) verbatim, so
+    //     a work that no longer qualifies is simply left deleted.
+    sqlx::query("DELETE FROM work_fts WHERE work_id = ?")
+        .bind(work_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO work_fts (work_id, chapters, title, aliases) \
+         SELECT w.id, COALESCE(cc.n, 0), \
+                COALESCE(w.title_override, w.primary_title, ''), \
+                COALESCE((SELECT group_concat(a.raw_title, ' ') \
+                          FROM work_alias a WHERE a.work_id = w.id), '') \
+         FROM work w \
+         LEFT JOIN (SELECT ss.work_id, COUNT(*) AS n FROM chapter ch \
+                    JOIN source_series ss ON ss.id = ch.source_series_id \
+                    WHERE ss.work_id = ? GROUP BY ss.work_id) cc ON cc.work_id = w.id \
+         WHERE w.id = ? \
+           AND COALESCE(w.title_override, w.primary_title, '') <> '' \
+           AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)",
+    )
+    .bind(work_id)
+    .bind(work_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// One raw chapter row from any of a work's sources (S2 aggregation input).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkChapterRow {
@@ -3658,6 +4184,33 @@ pub async fn aggregate_chapter_count(pool: &SqlitePool, work_id: &str) -> Result
     let (numbered, unnumbered): (Vec<_>, Vec<_>) = rows.iter().partition(|r| r.number.is_some());
     let grouped = main_chapter_count(numbered.iter().filter_map(|r| r.number));
     Ok(grouped + unnumbered.len() as i64)
+}
+
+/// The largest chapter count any of a work's Suwayomi sources reports.
+///
+/// This is the DETAIL-page counterpart to the `swc` sub-select in
+/// [`browse_catalogue_select`], and it exists so the two surfaces answer the same question
+/// the same way. It reads `suwayomi_series.chapter_count` — one already-deduped number per
+/// source, written by `series_cache::persist_chapters` via `main_chapter_count` — rather
+/// than unioning raw `suwayomi_chapter` rows the way [`aggregate_chapter_count`] does.
+///
+/// That distinction is the whole point: the aggregate counts every cached chapter row across
+/// sources, so scanlator duplicates and re-numbered releases inflate it (Tsukimichi 120 →
+/// 151), which is why it could only ever be used as a zero-fallback. A MAX over per-source
+/// counts has no such failure mode and can therefore be trusted to RAISE a non-zero English
+/// count — which is what fixes the works whose MangaDex spine is a stub.
+pub async fn suwayomi_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<i64> {
+    let n = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(sy.chapter_count) FROM source_series ss \
+           JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+          WHERE ss.work_id = ? AND ss.source_type = 'suwayomi'",
+    )
+    .bind(work_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .unwrap_or(0);
+    Ok(n.max(0))
 }
 
 /// Resolve the id of an existing source_series by its natural key.
@@ -7585,5 +8138,286 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    // ---- admin split (detach sources onto a new work) ----
+
+    /// A work with one Suwayomi mapping per `keys`, each carrying one chapter.
+    ///
+    /// `last_seen` is stamped explicitly and ascending: `work_source_series_rows` orders by
+    /// it DESC, and that order decides which detached row NAMES the new work — a test that
+    /// let two rows tie on the same timestamp would assert on an arbitrary winner.
+    async fn work_with_suwayomi_sources(
+        pool: &SqlitePool,
+        title: &str,
+        keys: &[i64],
+    ) -> (String, Vec<String>) {
+        let work = create_work(
+            pool,
+            &WorkInput {
+                primary_title: Some(title.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            insert_suwayomi_series(pool, *key, Some("en")).await;
+            let ss = upsert_source_series(
+                pool,
+                &work,
+                "suwayomi",
+                "src",
+                &key.to_string(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE source_series SET last_seen = ? WHERE id = ?")
+                .bind(format!("2026-01-0{}T00:00:00Z", i + 1))
+                .bind(&ss)
+                .execute(pool)
+                .await
+                .unwrap();
+            ids.push(ss);
+        }
+        (work, ids)
+    }
+
+    async fn add_chapter(pool: &SqlitePool, ss_id: &str, chapter_key: &str) -> String {
+        let id = format!("ch_{ss_id}_{chapter_key}");
+        sqlx::query(
+            "INSERT INTO chapter (id, source_series_id, external_id, number, lang, chapter_key, created_at) \
+             VALUES (?, ?, ?, ?, 'en', ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&id)
+        .bind(ss_id)
+        .bind(&id)
+        .bind(chapter_key)
+        .bind(chapter_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn work_of(pool: &SqlitePool, ss_id: &str) -> String {
+        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            .bind(ss_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn split_moves_the_mapping_and_carries_its_chapters_without_writing_any() {
+        let pool = pool().await;
+        let (work, ss) = work_with_suwayomi_sources(&pool, "Ouroboros", &[500, 501]).await;
+        let keep_ch = add_chapter(&pool, &ss[0], "1").await;
+        let move_ch = add_chapter(&pool, &ss[1], "7").await;
+
+        // ss[1] has the later `last_seen`, so it heads the picker's list and names the new
+        // work after its OWN Suwayomi title — not the shared title that caused the merge.
+        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
+            .await
+            .unwrap();
+        assert_eq!(out.title, "Series 501");
+        assert_eq!(out.moved_sources, 1);
+        // No MangaDex anchor anywhere in the detached set, so the reader navigates by the
+        // numeric Suwayomi key (0069) — `w_…` would 404 in `canonical_series`.
+        assert_eq!(out.new_reader_id, "501");
+
+        assert_eq!(work_of(&pool, &ss[0]).await, work);
+        assert_eq!(work_of(&pool, &ss[1]).await, out.new_work_id);
+
+        // The point of the whole design: the chapter rows are untouched — same ids, same
+        // `source_series_id`, nothing deleted — and they follow the mapping purely because
+        // that is what they are keyed by.
+        let owner = |ch: &str| {
+            let pool = pool.clone();
+            let ch = ch.to_string();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT s.work_id FROM chapter c JOIN source_series s ON s.id = c.source_series_id \
+                      WHERE c.id = ?",
+                )
+                .bind(&ch)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(owner(&keep_ch).await, work);
+        assert_eq!(owner(&move_ch).await, out.new_work_id);
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "a split must not delete or duplicate chapter rows"
+        );
+
+        // The new work is on Browse and in search under its own name straight away, rather
+        // than only after the next periodic rebuild.
+        let browsed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE work_id = ?")
+                .bind(&out.new_work_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            browsed, 1,
+            "the new work must be projected into browse_catalogue"
+        );
+        let (_, found) = search_works_fts(&pool, "Series 501", false, 1, 10)
+            .await
+            .unwrap();
+        assert!(
+            found.contains(&out.new_work_id),
+            "the new work must be searchable under its own title; got {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_records_the_pair_so_the_consolidator_cannot_re_merge_it() {
+        let pool = pool().await;
+        let (work, ss) = work_with_suwayomi_sources(&pool, "Ouroboros", &[510, 511]).await;
+        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
+            .await
+            .unwrap();
+
+        // Unordered: the sweep picks its own survivor, so the guard has to answer the same
+        // either way round.
+        assert!(is_split_pair(&pool, &work, &out.new_work_id).await.unwrap());
+        assert!(is_split_pair(&pool, &out.new_work_id, &work).await.unwrap());
+        assert!(!is_split_pair(&pool, &work, "w_unrelated").await.unwrap());
+
+        // The corroboration `consolidate_gate` needs must NOT have been copied over: the two
+        // halves share a title by construction, so a copied year/author/pHash would let the
+        // automated sweep destroy the split on its next pass even with the guard in place.
+        let (year, author, phash): (Option<i64>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT year, author, cover_phash FROM work WHERE id = ?")
+                .bind(&out.new_work_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(year.is_none() && author.is_none() && phash.is_none());
+    }
+
+    #[tokio::test]
+    async fn split_refuses_an_empty_pick_a_foreign_row_and_the_last_source() {
+        let pool = pool().await;
+        let (work, ss) = work_with_suwayomi_sources(&pool, "Ouroboros", &[520, 521]).await;
+
+        assert!(split_source_series(&pool, &work, &[], None).await.is_err());
+
+        // A row of a DIFFERENT work is named in the error, because the usual cause is a
+        // picker that loaded before someone else merged or split this work.
+        let (_, other) = work_with_suwayomi_sources(&pool, "Elsewhere", &[522]).await;
+        let err = split_source_series(&pool, &work, &[other[0].clone()], None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&other[0]),
+            "error should name the missing row: {err}"
+        );
+
+        // Detaching everything would leave a work with no `source_series` row, which
+        // `browse_catalogue` and `work_fts` both exclude — it would vanish from Browse and
+        // search while keeping its reviews and library entries.
+        assert!(
+            split_source_series(&pool, &work, &[ss[0].clone(), ss[1].clone()], None)
+                .await
+                .is_err()
+        );
+        // Every rejection rolls back whole: nothing moved, no work was minted.
+        assert_eq!(work_of(&pool, &ss[0]).await, work);
+        assert_eq!(work_of(&pool, &ss[1]).await, work);
+    }
+
+    #[tokio::test]
+    async fn split_takes_the_mangadex_anchor_with_the_detached_mapping() {
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(&pool, "md-split", &slime_input())
+            .await
+            .unwrap();
+        insert_suwayomi_series(&pool, 530, Some("en")).await;
+        let sw = upsert_source_series(&pool, &work, "suwayomi", "src", "530", None, false)
+            .await
+            .unwrap();
+        let md: String = sqlx::query_scalar(
+            "SELECT id FROM source_series WHERE work_id = ? AND source_type = 'mangadex'",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let out = split_source_series(&pool, &work, std::slice::from_ref(&md), Some("u_admin"))
+            .await
+            .unwrap();
+        // A detached MangaDex mapping makes the new work anchored, so it addresses by `w_…`.
+        assert_eq!(out.new_reader_id, out.new_work_id);
+        assert_eq!(work_of(&pool, &md).await, out.new_work_id);
+        assert_eq!(work_of(&pool, &sw).await, work);
+        // `work_external_id` is PK (provider, external_id) — globally unique, not per-work —
+        // so the uuid has to move with the mapping or it claims an anchor the original no
+        // longer has a mapping for.
+        let anchor: String = sqlx::query_scalar(
+            "SELECT work_id FROM work_external_id WHERE provider = 'mangadex' AND external_id = 'md-split'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor, out.new_work_id);
+    }
+
+    #[tokio::test]
+    async fn split_moves_release_events_only_where_the_detached_row_was_the_sole_source() {
+        let pool = pool().await;
+        let (work, ss) = work_with_suwayomi_sources(&pool, "Ouroboros", &[540, 541]).await;
+        // Key "1" is carried by BOTH sources; key "9" only by the one being detached.
+        add_chapter(&pool, &ss[0], "1").await;
+        add_chapter(&pool, &ss[1], "1").await;
+        add_chapter(&pool, &ss[1], "9").await;
+        for key in ["1", "9"] {
+            sqlx::query(
+                "INSERT INTO release_event (work_id, chapter_key, first_seen_at, first_source_series_id, label) \
+                 VALUES (?, ?, 1000, ?, ?)",
+            )
+            .bind(&work)
+            .bind(key)
+            .bind(&ss[1])
+            .bind(format!("Ch. {key}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
+            .await
+            .unwrap();
+
+        let keys_of = |w: &str| {
+            let pool = pool.clone();
+            let w = w.to_string();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT chapter_key FROM release_event WHERE work_id = ? ORDER BY chapter_key",
+                )
+                .bind(&w)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // "1" stays: the ledger's law is earliest-ANYWHERE, and a remaining source still
+        // carries that chapter, so the original keeps its (possibly earlier) event.
+        assert_eq!(keys_of(&work).await, vec!["1".to_string()]);
+        assert_eq!(keys_of(&out.new_work_id).await, vec!["9".to_string()]);
     }
 }

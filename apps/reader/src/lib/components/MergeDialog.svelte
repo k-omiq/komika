@@ -436,7 +436,21 @@
 		background: var(--k-primary);
 		border-color: transparent;
 	}
+	/* `position: relative` is LOAD-BEARING, not decoration. `Cover` renders its <img> as
+	   `position: absolute; inset: 0`, so it sizes against the nearest POSITIONED ancestor.
+	   Without this line that was `.panel` (the only positioned box in the chain — `.pick`,
+	   `.row` and `.results` are all static, and `overflow` alone does not establish a
+	   containing block), so every candidate's cover rendered at the dialog's full 680×760
+	   instead of 38×54, stacked over the search field and the whole result list.
+
+	   It was not merely ugly: absolutely-positioned boxes paint above static in-flow
+	   siblings, so `elementFromPoint` at the dialog's centre returned the cover — which is
+	   a child of that row's `.pick` button — and every click anywhere in the dialog
+	   toggled the last candidate instead of hitting the control under the pointer. The
+	   38×54 thumbs were still laid out correctly; they were just empty grey boxes with
+	   their image escaped. */
 	.thumb {
+		position: relative;
 		display: block;
 		width: 38px;
 		height: 54px;

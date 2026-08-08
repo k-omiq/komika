@@ -266,16 +266,32 @@ pub struct Series {
 /// Per-series read progress for the whole library, returned by `libraryProgress`
 /// in ONE batched query. Lets the Library and Profile screens shelve every series
 /// by progress without fetching each series' chapter list (the old N+1 that hung
-/// those pages). `read`/`total` are counted from the cached chapter state — the
-/// same source `chapters(seriesId)` reads — so the numbers match exactly.
+/// those pages).
+///
+/// `read` and `total` are two counts over the SAME population — distinct chapter keys
+/// on the chapter spine — so `read <= total` always holds. See the resolver for why
+/// that matters.
 #[derive(SimpleObject, Clone)]
 pub struct SeriesProgress {
-    /// The Suwayomi series id (matches `Series.id` for library series).
+    /// The library series id — a canonical `w_` work id or a numeric Suwayomi id,
+    /// matching `Series.id` for library series.
     pub id: ID,
-    /// Chapters marked read.
+    /// Distinct chapters the viewer has marked read, deduped across sources: a chapter
+    /// carried by two scanlators (or by both MangaDex and a Suwayomi mirror) counts once,
+    /// the same way `total` counts it once.
     pub read: i32,
-    /// Total chapters known for the series (cached chapter count).
+    /// Distinct chapters that exist for this series across all its sources.
+    ///
+    /// 0 only when the series has no cached chapters at all; clients read it as
+    /// `p.total || s.chapterCount` and so fall back to the series' own count there.
     pub total: i32,
+    /// When the viewer last made progress on this series (RFC 3339), or null if never.
+    ///
+    /// `MAX(updated_at)` over their progress rows, so it moves on ANY progress — a
+    /// mid-chapter page position counts, not just finishing one. That is what "last read"
+    /// has to mean for ordering a Continue-reading shelf: a series you are three pages
+    /// into is more current than one you finished a month ago.
+    pub last_read_at: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -974,6 +990,65 @@ pub struct MergeWorksResult {
     pub target_work_id: ID,
     /// How many `source_series` mappings were re-pointed onto the target.
     pub moved_source_series: i32,
+}
+
+/// One detachable source mapping on a work — the unit the admin SPLIT picker
+/// (`workSourceRows`) operates on.
+///
+/// DISTINCT FROM `WorkSource`, which describes how a NATIVE client fetches a source
+/// (extension package, repo, apk). This is the admin view of the same `source_series`
+/// row: what it calls the series, how much of it we hold, and — the field `WorkSource`
+/// has none of — the row's own primary key.
+#[derive(SimpleObject, Clone)]
+pub struct WorkSourceRow {
+    /// `source_series.id`, and it is what `splitSourceSeries` takes. NOT
+    /// `(sourceType, sourceKey)`: that pair is unique only in combination with
+    /// `sourceId` (the table's `UNIQUE (source_type, source_id, source_key)`), so it is
+    /// ambiguous the moment one work carries the same manga id under two Suwayomi
+    /// sources.
+    pub id: ID,
+    /// `"mangadex"` or `"suwayomi"`.
+    pub source_type: String,
+    /// The source's display name, e.g. "MangaDex", "MANGA Plus". Never null — falls back
+    /// through the extension package name to the raw source id, because the picker leads
+    /// each row with it.
+    pub source_name: String,
+    /// Language code (`en`), or null when the source declares none.
+    pub lang: Option<String>,
+    /// Extension logo, preferring the store-hosted URL served from our own origin. Null
+    /// for a source with no derivable icon; the UI renders an initial instead.
+    pub icon_url: Option<String>,
+    /// How THIS source titles the series — the disagreement that identifies a mis-merge,
+    /// and the name the detached work takes. A MangaDex mapping has no per-source title
+    /// on disk (the mirror's title IS the work's), so it reports the work's.
+    pub title: String,
+    /// Chapters held from this source; they all move with it.
+    pub chapter_count: i32,
+    /// Canonical URL for the series at the source, when the mapping recorded one.
+    pub source_url: Option<String>,
+}
+
+/// Result of detaching source mappings off a work onto a new one (`splitSourceSeries`).
+///
+/// NOT an undo of `MergeWorksResult` and it cannot be one: `mergeWorks` deletes the
+/// losing work row and keeps no record of what it folded. This mints a NEW work carrying
+/// the detached sources and — for free, since `chapter` is keyed by `source_series_id`
+/// rather than by work — every chapter they own. Reviews, library entries, reading
+/// progress and view counts stay with the ORIGINAL work, which is where they already
+/// were: nothing records which side of the split they came from.
+#[derive(SimpleObject, Clone)]
+pub struct SplitSourcesResult {
+    /// The freshly minted canonical work id (`w_…`).
+    pub new_work_id: ID,
+    /// Where to NAVIGATE for it — the reader id, which is the numeric Suwayomi id unless
+    /// the detached set includes a MangaDex source. `canonicalSeries` rejects a work with
+    /// no MangaDex anchor outright, so a Suwayomi-only split must never be linked as
+    /// `/series/w_…`.
+    pub new_reader_id: ID,
+    /// The new work's `primary_title`, taken from the detached source's own title.
+    pub title: String,
+    /// How many `source_series` rows moved.
+    pub moved_sources: i32,
 }
 
 /// Serialize a `SeriesStatus` to its SDL name (for storage).

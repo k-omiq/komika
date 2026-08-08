@@ -39,6 +39,7 @@ type Query {
 	# mappings + extension coordinates a native client needs to fetch it directly.
 	workSources(workId: ID!): [WorkSource!]! # [komika] source mappings for one canonical work
 	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
+	workSourceRows(workId: ID!): [WorkSourceRow!]! # [komika] the same mappings in ADMIN/detachable shape — each row's own `source_series` primary key, the title THAT source gives the series, and its chapter count. Feeds the split picker; `splitSourceSeries` takes the ids. Ungated by NSFW (hiding a mapping would make it silently un-detachable) — `requires isAdmin` is the access control
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
@@ -90,6 +91,7 @@ type Mutation {
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
+	splitSourceSeries(workId: ID!, sourceSeriesIds: [ID!]!): SplitSourcesResult! # [komika] detach source mappings onto a NEW work — the fix for two different series merged together on a shared title. The counterpart to `mergeWorks`, NOT its inverse (that one deletes the losing work row and keeps no record of it). Lossless where it counts: `chapter` is keyed by `source_series_id`, so the mappings carry their whole chapter runs and nothing is deleted; reviews/library/progress/view-counts stay on the original, which has no per-source attribution to route them by. Refuses to detach the LAST source — a work with none vanishes from Browse and search (requires isAdmin)
 	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
 	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension; NSFW-gated by show_nsfw (requires isAdmin)
 	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
@@ -283,13 +285,15 @@ type Chapter {
 }
 
 # Per-series read progress for the whole library, returned by `libraryProgress`
-# in one batched query. read/total are counted from the cached chapter state
-# (the same source `chapters(seriesId)` reads), so they match. Series with no
-# cached chapters are omitted; the client treats those as unread (read = 0).
+# in one batched query. `read` and `total` count the same population (distinct
+# chapters across the series' sources), so `read <= total` always holds.
 type SeriesProgress {
-	id: ID! # [suwayomi] series id (matches Series.id)
-	read: Int!
-	total: Int!
+	id: ID! # [komika] library series id — a canonical `w_` work id or a numeric Suwayomi id (matches Series.id)
+	read: Int! # distinct chapters read, deduped across sources and across both progress stores
+	total: Int! # distinct chapters that exist; 0 only when none are cached — the client reads it as `total || series.chapterCount`
+	lastReadAt: String # RFC 3339, or null. MAX(updated_at) over the viewer's progress rows, so it
+	# moves on ANY progress, not just finishing a chapter. Orders the Profile's
+	# Continue-reading shelf and the Library's "Recently read" sort.
 }
 
 # Upstream image URL; never used directly as <img src> — the client's
@@ -870,6 +874,28 @@ type ReportPage {
 type MergeWorksResult {
 	targetWorkId: ID! # the surviving (target) work
 	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
+}
+
+# [komika] One detachable source mapping on a work — what the admin SPLIT picker lists.
+# Distinct from `WorkSource`, which says how a NATIVE client fetches a source; this is the
+# admin view of the same `source_series` row, and it is the only one carrying the row's key.
+type WorkSourceRow {
+	id: ID! # `source_series.id` — what `splitSourceSeries` takes. NOT (sourceType, sourceKey): that pair is unique only together with sourceId (UNIQUE (source_type, source_id, source_key)), so it is ambiguous when one work carries the same manga id under two Suwayomi sources
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceName: String! # display name; falls back to the extension package name, then the raw source id, so the picker always has a label
+	lang: String
+	iconUrl: String # store-hosted extension icon (served from our origin), else the engine's; null → the UI renders an initial
+	title: String! # how THIS source titles the series — the disagreement that identifies a mis-merge, and the name the detached work takes. A MangaDex mapping has no per-source title on disk, so it reports the work's
+	chapterCount: Int! # chapters held from this source; they all move with it
+	sourceUrl: String
+}
+
+# [komika] Result of `splitSourceSeries`. NOT an undo of MergeWorksResult — see the mutation.
+type SplitSourcesResult {
+	newWorkId: ID! # the freshly minted canonical work
+	newReaderId: ID! # where to NAVIGATE for it: the numeric Suwayomi id unless the detached set includes a MangaDex source. `canonicalSeries` rejects a work with no MangaDex anchor, so a Suwayomi-only split must never be linked as /series/w_…
+	title: String! # the new work's primary title, from the detached source's own title
+	movedSources: Int! # how many source_series rows moved
 }
 
 # [komika] S2 cross-source chapter aggregation. `Series.chapterCount` on a canonical

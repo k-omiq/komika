@@ -70,6 +70,19 @@ export interface Card {
 	title: string;
 	ch: string;
 	/**
+	 * How many chapters the series has, when the row's feed reports it.
+	 *
+	 * A SEPARATE field from {@link ch}, which is the newest chapter's own LABEL —
+	 * the two are different numbers and collapsing them is the F4 bug the
+	 * chapter-number contract exists to prevent ("Ch. 412" on a series whose newest
+	 * release is 10.5). Carried apart so a card can print both, exactly as Browse
+	 * does: "12 ch · Ch. 151".
+	 *
+	 * `undefined` (or 0) when the feed doesn't carry a count — {@link cardSub} drops
+	 * the half rather than printing "0 ch".
+	 */
+	chCount?: number;
+	/**
 	 * The card's headline recency label. On update/trending rows this is the real
 	 * upstream CHAPTER RELEASE time (`Series.latestChapterAt`), never our polling
 	 * clock; on the "Latest Added" row it's the catalogue-add time. See
@@ -135,7 +148,11 @@ export function cardTimeTooltip(card: Card): string {
  */
 export function cardSub(card: Card, prefix = ''): string {
 	const time = card.time ? `${prefix}${card.time}` : '';
-	return [card.ch, time].filter(Boolean).join(' · ');
+	// The COUNT and the newest chapter's LABEL are both printed, count first, the
+	// same shape Browse uses ("12 ch · Ch. 151"). They are never substituted for one
+	// another — see {@link Card.chCount}.
+	const count = card.chCount && card.chCount > 0 ? `${card.chCount} ch` : '';
+	return [count, card.ch, time].filter(Boolean).join(' · ');
 }
 
 /** URL-safe slug for title-based series links (fallback when no id is known). */
@@ -146,41 +163,6 @@ export function slug(title: string): string {
 		.replace(/[^a-z0-9]+/g, '-')
 		.replace(/^-+|-+$/g, '');
 }
-
-/**
- * "Browse by format" card chrome (name, blurb, glow colours). Counts are
- * derived from the live catalog sample in `source.ts`; the empty default
- * renders no count line.
- */
-export const FORMAT_CARDS = [
-	{
-		type: 'Manga' as ComicType,
-		flag: '🇯🇵',
-		name: 'Manga',
-		desc: 'Japanese comics · read right-to-left',
-		count: '',
-		glow: 'rgba(224,131,105,0.16)',
-		hover: 'rgba(224,131,105,0.4)',
-	},
-	{
-		type: 'Manhwa' as ComicType,
-		flag: '🇰🇷',
-		name: 'Manhwa',
-		desc: 'Korean webtoons · full-colour vertical scroll',
-		count: '',
-		glow: 'rgba(198,156,240,0.16)',
-		hover: 'rgba(198,156,240,0.4)',
-	},
-	{
-		type: 'Manhua' as ComicType,
-		flag: '🇨🇳',
-		name: 'Manhua',
-		desc: 'Chinese comics · sweeping colour art',
-		count: '',
-		glow: 'rgba(95,200,207,0.16)',
-		hover: 'rgba(95,200,207,0.4)',
-	},
-];
 
 // ---- Library shelves ---------------------------------------------------------
 
@@ -215,6 +197,39 @@ export const SHELF_META: Record<
 		border: 'rgba(255,255,255,0.18)',
 	},
 };
+
+/**
+ * Whether a series will get no further chapters — the gate on the `completed` shelf.
+ *
+ * `hiatus` is deliberately NOT ended: a hiatus resumes, and a reader who is current
+ * on one has not finished it. `unknown` folds to ongoing upstream (`STATUS_WORD`),
+ * so an unclassified series is never auto-finished either.
+ */
+export function isEndedStatus(status: Status): boolean {
+	return status === 'completed' || status === 'cancelled';
+}
+
+/**
+ * The shelf a series lands on from read progress alone — the derivation used when
+ * the viewer has NOT filed one by hand (an explicit `libraryStatus` always wins).
+ *
+ * `ended` is the SERIES' publication status, not the viewer's, and it gates
+ * `completed` on purpose: reading every chapter that currently EXISTS of an ongoing
+ * series does not finish it — more are coming, so the honest shelf is still
+ * `reading`. Without that gate the library flipped a caught-up ongoing series to
+ * DONE, which is the same word meaning two different things ({@link STATUS_META}'s
+ * "Completed" = the series ended; {@link SHELF_META}'s = the viewer finished it).
+ *
+ * This is the ONE derivation. The library, the profile and the series page each used
+ * to carry their own near-copy — the profile's had no `plan` branch and the series
+ * page counted reads off a differently-deduped list — so one series could show three
+ * different shelves on three screens.
+ */
+export function deriveShelf(read: number, total: number, ended: boolean): Shelf {
+	if (ended && total > 0 && read >= total) return 'completed';
+	if (read === 0) return 'plan';
+	return 'reading';
+}
 
 // ---- Social view shapes --------------------------------------------------------
 

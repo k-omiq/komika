@@ -39,7 +39,7 @@ import {
 } from './translator-select';
 import { getPreferredTranslator, setPreferredTranslator } from './translator-pref.svelte';
 import { config, apiAssetSrc } from '$lib/config';
-import { FLAG, FORMAT_CARDS } from './types';
+import { deriveShelf, FLAG, isEndedStatus } from './types';
 import type { Card, CatalogEntry, ComicType, Shelf, Status } from './types';
 
 const LIVE = config.backendEnabled;
@@ -247,14 +247,19 @@ function toCard(s: Series): Card {
 	const at = chapterRecency(s);
 	return {
 		title: s.title,
-		// EMPTY, and deliberately: this used to be `Ch. ${s.chapterCount}`, which prints
-		// the series' chapter COUNT under a chapter-NUMBER label — "Ch. 412" on a series
-		// whose newest release is 10.5. `Series` carries no latest-chapter number (the
-		// column exists only on the feed/updates path), so there is nothing honest to
-		// print here and `cardSub` drops the empty half with its separator. Do not
-		// "restore" the count: see {@link chapterChip}. Adding a real number to this
-		// mapper needs a server column first (plan §7z, "Browse's chapter label").
-		ch: '',
+		// The newest chapter's LABEL and the chapter COUNT, carried as two fields.
+		//
+		// `ch` was hardcoded '' here because `Series` genuinely had no latest-chapter
+		// column — printing the count under a "Ch." label is F4 ("Ch. 412" on a series
+		// whose newest release is 10.5), so blank was the only honest render. That
+		// premise no longer holds: `SERIES_FIELDS` selects `latestChapter` and the
+		// `discovery` resolver hydrates it per page (`suwayomi_latest_chapter_label_batch`),
+		// which is why Browse read "115 ch · Ch. 90" while home read nothing at all.
+		//
+		// The count still does NOT feed `ch` — it feeds `chCount`, and `cardSub` prints
+		// them as separate halves. See {@link chapterChip} (Rule 1) before touching this.
+		ch: chapterChip(s.latestChapter),
+		chCount: s.chapterCount,
 		// The RELEASE time, not our poll time — see {@link chapterRecency}.
 		time: relTime(at),
 		timeAt: epochMs(at),
@@ -319,6 +324,9 @@ function toFeedCard(u: UpdateFeedRow): Card {
 	return {
 		title: u.title,
 		ch: chapterChip(u.latestChapter),
+		// The count as its own half — never a fallback for `ch` above (that substitution
+		// is the F4 defect this mapper's docstring describes); `cardSub` prints both.
+		chCount: u.chapterCount ?? undefined,
 		// The RELEASE clock, same as every other card — see {@link chapterRecency}.
 		time: relTime(u.releasedAt),
 		timeAt: epochMs(u.releasedAt),
@@ -468,6 +476,15 @@ export interface FeaturedView {
 	author: string | null;
 	type: ComicType;
 	ch: number;
+	/**
+	 * The newest chapter's LABEL — `'Ch. 151'`, `'Oneshot'` — already formatted by
+	 * `chapterChip`, or `''` when we do not know it. See {@link CatalogEntry.latestCh}:
+	 * this is a SECOND, INDEPENDENT quantity from {@link ch}, which counts how many
+	 * chapters we hold. The hero prints both ("Ch. 151 · 12 chapters") for the same
+	 * reason Browse does — a partial mirror makes them legitimately far apart, and
+	 * printing the count under a "Ch." label is F4.
+	 */
+	latestCh: string;
 	cover: string;
 	id?: string;
 }
@@ -521,22 +538,10 @@ function toFeatured(s: Series): FeaturedView {
 		author: s.author ?? s.artist,
 		type: toViewType(s.type),
 		ch: s.chapterCount,
+		latestCh: chapterChip(s.latestChapter),
 		cover: s.coverUrl,
 		id: s.id,
 	};
-}
-
-/**
- * Per-format counts backed by the live catalog sample (the union of discovery
- * feeds), keeping the cards' presentation metadata. Not the true global total —
- * the federated catalog isn't fully enumerated client-side — but a real
- * reflection of what's currently surfaced.
- */
-function deriveFormatCards(pool: Series[]): typeof FORMAT_CARDS {
-	return FORMAT_CARDS.map((card) => {
-		const n = pool.filter((s) => toViewType(s.type) === card.type).length;
-		return { ...card, count: `${n} ${n === 1 ? 'title' : 'titles'}` };
-	});
 }
 
 /** The most common genres across the live catalog sample, most-frequent first. */
@@ -549,11 +554,10 @@ function deriveGenres(pool: Series[]): string[] {
 		.map(([g]) => g);
 }
 
-/** Classify a series onto a library shelf from its real read progress. */
-function shelfFor(read: number, total: number): 'reading' | 'completed' | 'plan' {
-	if (total > 0 && read >= total) return 'completed';
-	if (read === 0) return 'plan';
-	return 'reading';
+/** Whether a series' publication has ENDED, so catching up on it really is finishing
+ *  it. Gates the auto-`completed` shelf — see {@link deriveShelf}. */
+function isEnded(s: Series): boolean {
+	return isEndedStatus(toViewStatus(s.status));
 }
 
 // ---- translators (per-source "translator" selection, S3) -------------------
@@ -1071,7 +1075,6 @@ export function getHome() {
 		latestUpdates: [] as Card[],
 		trending: [] as Card[],
 		latestAdded: [] as Card[],
-		formatCards: FORMAT_CARDS,
 		homeGenres: [] as string[],
 	};
 	return live(async () => {
@@ -1117,7 +1120,6 @@ export function getHome() {
 			// which would collide on the home row's `{#each}` key and could show twice.
 			trending: dedupeCardsByTitle(byKind('TRENDING').map(toCard)).slice(0, 10),
 			latestAdded: dedupeCardsByTitle(byKind('RECENTLY_ADDED').map(toAddedCard)).slice(0, 10),
-			formatCards: pool.length ? deriveFormatCards(pool) : FORMAT_CARDS,
 			homeGenres: deriveGenres(pool),
 		};
 	}, fallback);
@@ -1344,9 +1346,27 @@ export interface LibraryRowView {
 	genre: string;
 	rating: string;
 	shelf: Shelf;
+	/**
+	 * Whether the SERIES has finished publishing (completed/cancelled) — not whether
+	 * the viewer finished it (that's {@link shelf}). Carried so the card's shelf
+	 * picker can withhold "Completed" on a series that is still running, and so the
+	 * derived shelf can be recomputed client-side after an optimistic edit.
+	 */
+	ended: boolean;
 	favorite: boolean;
 	read: number;
 	total: number;
+	/** Newest chapter's release time (RFC 3339), or '' — sorts "Latest chapter". */
+	latestChapterAt: string;
+	/**
+	 * When the viewer last made progress (RFC 3339), or '' if never — sorts "Recently read".
+	 *
+	 * There is deliberately no `addedAt` beside these two: `library()` already returns rows
+	 * in `user_library.created_at DESC`, so the "Added" sort is the array order it arrives
+	 * in and needs no field. Exposing a real timestamp would mean a new server field for a
+	 * number nothing displays.
+	 */
+	lastReadAt: string;
 }
 export interface ContinueRowView {
 	id?: string;
@@ -1383,20 +1403,25 @@ export function getLibrary() {
 			const p = byId.get(s.id);
 			const total = p?.total || s.chapterCount;
 			const read = p?.read ?? 0;
-			return { s, total, read };
+			return { s, p, total, read };
 		});
-		const libraryCatalog = rows.map(({ s, total, read }) => ({
+		const libraryCatalog = rows.map(({ s, p, total, read }) => ({
 			id: s.id,
 			title: s.title,
 			cover: s.coverUrl,
 			type: toViewType(s.type),
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
-			// An explicit shelf the viewer filed wins; otherwise derive from progress.
-			shelf: (s.libraryStatus as Shelf | null) ?? shelfFor(read, total),
+			// An explicit shelf the viewer filed wins; otherwise derive from progress —
+			// and only an ENDED series can derive to `completed`, so catching up on an
+			// ongoing one leaves the card on "Reading". See {@link deriveShelf}.
+			shelf: (s.libraryStatus as Shelf | null) ?? deriveShelf(read, total, isEnded(s)),
+			ended: isEnded(s),
 			favorite: s.isFavorite ?? false,
 			read,
 			total,
+			latestChapterAt: s.latestChapterAt ?? '',
+			lastReadAt: p?.lastReadAt ?? '',
 		}));
 		// Continue-reading: series with progress underway.
 		//
@@ -1479,6 +1504,13 @@ export interface SeriesDetailView {
 	 *  report it. Shown as a hover title next to `updated`, not as its own line. */
 	detected: string;
 	statusLabel: string;
+	/**
+	 * Whether publication has ENDED (completed/cancelled), the machine-readable
+	 * companion to {@link statusLabel}. Gates both the auto-`completed` shelf and
+	 * whether the shelf picker offers "Completed" at all — an ongoing series can't
+	 * be finished, only caught up on.
+	 */
+	ended: boolean;
 	author: string;
 	artist: string;
 	genres: string[];
@@ -1647,6 +1679,7 @@ function mapSeriesView(
 			updated: relTime(chapterRecency(s, chs)) || 'recently',
 			detected: relTime(s.detectedAt),
 			statusLabel: STATUS_WORD[s.status],
+			ended: isEnded(s),
 			author: s.author ?? '',
 			artist: s.artist ?? '',
 			genres: s.genres,
@@ -1815,7 +1848,32 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			) {
 				setPreferredTranslator(effectiveId, preferred);
 			}
-			const metaForView: Series = { ...resolved.meta, id: effectiveId };
+			// PER-VIEWER FLAGS FOLLOW THE ID, NOT THE METADATA.
+			//
+			// `resolved.meta` is the SELECTED TRANSLATOR's series — for anything but the
+			// MangaDex spine that's `backend.series(<numeric suwayomi id>)`, whose
+			// `isMarked`/`isFavorite`/`libraryStatus` the server resolved against
+			// `user_library.series_id = '<numeric>'`. Overwriting only `id` below left
+			// those three source-scoped while every write on this page addresses
+			// `effectiveId` (a `w_` work id), so the row was stored under one key and
+			// read back under another: "Add to Library" succeeded, the series appeared
+			// in /library, and a reload showed "Add to Library" again — with a second
+			// click then sending `marked: false` and deleting the real row.
+			//
+			// `canonSeries` is the same work fetched under `effectiveId` and already
+			// selects all three (CANONICAL_SERIES), so it costs no extra round trip. It
+			// only applies when the ids actually agree; a federation-only work has no
+			// canonical row and its numeric-scoped flags are already the right ones.
+			const canon = resolved.canonSeries;
+			const viewerScoped =
+				canon && canon.id === effectiveId
+					? {
+							isMarked: canon.isMarked,
+							isFavorite: canon.isFavorite ?? false,
+							libraryStatus: canon.libraryStatus ?? null,
+						}
+					: {};
+			const metaForView: Series = { ...resolved.meta, id: effectiveId, ...viewerScoped };
 			const view = mapSeriesView(
 				metaForView,
 				resolved.chapters,
@@ -2421,7 +2479,7 @@ export function getProfile(): Promise<ProfileView | null> {
 			const p = byId.get(s.id);
 			const total = p?.total || s.chapterCount;
 			const read = p?.read ?? 0;
-			return { s, total, read };
+			return { s, p, total, read };
 		});
 		const chaptersRead = rows.reduce((n, r) => n + r.read, 0);
 		const readingNow = rows.filter((r) => r.read > 0 && r.read < r.total);
@@ -2436,14 +2494,25 @@ export function getProfile(): Promise<ProfileView | null> {
 			.slice(0, 5)
 			.map(([name, c]) => ({ name, pct: totalG ? Math.round((c / totalG) * 100) : 0 }));
 
-		const reading = readingNow.slice(0, 6).map(({ s, read, total }) => ({
-			id: s.id,
-			title: s.title,
-			cover: s.coverUrl,
-			genre: s.genres[0] ?? '',
-			ch: read,
-			total,
-		}));
+		// Continue reading: the six series touched most recently, newest first.
+		//
+		// Ordered by `lastReadAt`, NOT by the array order. `library()` comes back in
+		// `user_library.created_at DESC` — when the series was ADDED — so slicing it
+		// directly showed the six most recently shelved, which is a different set from
+		// the six most recently read and, for anyone who adds in bulk, a mostly untouched
+		// one. Series with no timestamp (progress predating `lastReadAt`) sort last
+		// rather than jumping the queue on an empty string.
+		const reading = [...readingNow]
+			.sort((a, b) => (b.p?.lastReadAt ?? '').localeCompare(a.p?.lastReadAt ?? ''))
+			.slice(0, 6)
+			.map(({ s, read, total }) => ({
+				id: s.id,
+				title: s.title,
+				cover: s.coverUrl,
+				genre: s.genres[0] ?? '',
+				ch: read,
+				total,
+			}));
 
 		const shelves = rows.map(({ s, read, total }) => ({
 			id: s.id,
@@ -2451,10 +2520,11 @@ export function getProfile(): Promise<ProfileView | null> {
 			cover: s.coverUrl,
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
-			// Explicit shelf wins; else derive (completed when fully read, else reading).
-			shelf:
-				(s.libraryStatus as string | null) ??
-				(total > 0 && read >= total ? 'completed' : 'reading'),
+			// Explicit shelf wins; else derive. Shares {@link deriveShelf} with the library
+			// and the series page — this used to be its own near-copy with no `plan`
+			// branch and no ongoing-series gate, so an untouched series read "Reading"
+			// here and "Plan" there, and a caught-up ongoing one read "Completed" on both.
+			shelf: (s.libraryStatus as string | null) ?? deriveShelf(read, total, isEnded(s)),
 			favorite: s.isFavorite ?? false,
 			ch: read,
 			total,

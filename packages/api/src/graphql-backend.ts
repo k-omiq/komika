@@ -37,10 +37,12 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
+	WorkSourceRow,
 } from '@komika/types';
 import type {
 	Activity,
@@ -608,6 +610,21 @@ export class GraphQLBackend implements Backend {
 			targetWorkId,
 		});
 		return d.mergeWorks;
+	}
+
+	async workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
+		const d = await this.gql<{ workSourceRows: WorkSourceRow[] }>(ops.WORK_SOURCE_ROWS, {
+			workId,
+		});
+		return d.workSourceRows;
+	}
+
+	async splitSourceSeries(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult> {
+		const d = await this.gql<{ splitSourceSeries: SplitSourcesResult }>(ops.SPLIT_SOURCE_SERIES, {
+			workId,
+			sourceSeriesIds,
+		});
+		return d.splitSourceSeries;
 	}
 
 	// --- admin sources & extensions (EXT-1/EXT-2) ---

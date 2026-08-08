@@ -343,6 +343,7 @@ export const LIBRARY_PROGRESS = /* GraphQL */ `
 			id
 			read
 			total
+			lastReadAt
 		}
 	}
 `;
@@ -811,6 +812,41 @@ export const MERGE_WORKS = /* GraphQL */ `
 		mergeWorks(sourceWorkId: $sourceWorkId, targetWorkId: $targetWorkId) {
 			targetWorkId
 			movedSourceSeries
+		}
+	}
+`;
+
+// The admin SPLIT picker's list. A separate document from `WORK_SOURCES` rather than extra
+// fields on it, because that one is fired by every reader on every series page and this one
+// carries `source_series.id` — a row identity no public surface should be handing out.
+export const WORK_SOURCE_ROWS = /* GraphQL */ `
+	query WorkSourceRows($workId: ID!) {
+		workSourceRows(workId: $workId) {
+			id
+			sourceType
+			sourceName
+			lang
+			iconUrl
+			title
+			chapterCount
+			sourceUrl
+		}
+	}
+`;
+
+// Detach sources onto a new work. NOT an "unmerge" — see `Backend.splitSourceSeries`.
+//
+// `newReaderId` is the field the caller navigates with, and it is NOT `newWorkId`: a
+// Suwayomi-only split produces a work with no MangaDex anchor, which `canonicalSeries`
+// refuses to serve, so linking it as `/series/w_…` would 404 on the page we just told the
+// admin we created.
+export const SPLIT_SOURCE_SERIES = /* GraphQL */ `
+	mutation SplitSourceSeries($workId: ID!, $sourceSeriesIds: [ID!]!) {
+		splitSourceSeries(workId: $workId, sourceSeriesIds: $sourceSeriesIds) {
+			newWorkId
+			newReaderId
+			title
+			movedSources
 		}
 	}
 `;

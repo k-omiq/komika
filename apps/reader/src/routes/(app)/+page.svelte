@@ -120,6 +120,30 @@
 	 */
 	const slide = $derived(Math.min(heroIndex, Math.max(0, featured.length - 1)));
 	const current = $derived(featured[slide]);
+
+	/**
+	 * The slide's chapter line — "Ch. 151 · 12 chapters".
+	 *
+	 * TWO INDEPENDENT FACTS, both printed: `latestCh` is what the newest chapter is
+	 * CALLED, `ch` is how many we hold. A partially-mirrored series makes them far
+	 * apart, so the hero says both rather than picking one and being wrong about the
+	 * other — and neither may ever stand in for the other (a count under a "Ch."
+	 * label is F4, the bug the chapter-number contract exists to prevent).
+	 *
+	 * Both halves are independently absent, which is why this builds a list rather
+	 * than nesting ternaries. `latestCh` is `''` for the catalogue rows with no dated
+	 * chapter and for any response from a server predating the field; `ch === 0` is
+	 * real and common (MangaDex strips chapters on a licensing takedown, and ~11k
+	 * works count zero because their chapters carry a NULL number). With both gone
+	 * the line is empty and the foot renders the arrows alone — "0 chapters" under
+	 * the site's most prominent artwork is worse than no line at all.
+	 */
+	const chapterMeta = $derived.by(() => {
+		const f = current;
+		if (!f) return '';
+		const count = f.ch > 0 ? `${f.ch} ${f.ch === 1 ? 'chapter' : 'chapters'}` : '';
+		return [f.latestCh, count].filter(Boolean).join(' · ');
+	});
 </script>
 
 <!-- Resolved object on the server (SSR renders cards) vs pending Promise on the
@@ -136,16 +160,18 @@
 
 {#snippet loading()}
 	<!-- LOADING -->
-	<section class="hero hero-loading">
-		<div class="hero-body">
-			<span class="eyebrow">trending</span>
-			<div class="hero-grid">
-				<div class="hero-cover k-skeleton"></div>
-				<div class="hero-text">
-					<div class="k-skeleton title-sk"></div>
-					<div class="k-skeleton line-sk"></div>
-					<div class="k-skeleton line-sk short"></div>
-				</div>
+	<!-- Reuses `.hero-slide` / `.hero-cover` / `.hero-text` / `.hero-foot` verbatim, so its
+	     geometry is the real hero's by construction and the swap doesn't shift layout. -->
+	<section class="hero">
+		<div class="hero-slide">
+			<div class="hero-cover k-skeleton"></div>
+			<div class="hero-text">
+				<div class="k-skeleton title-sk"></div>
+				<div class="k-skeleton line-sk"></div>
+				<div class="k-skeleton line-sk short"></div>
+			</div>
+			<div class="hero-foot">
+				<div class="k-skeleton foot-sk"></div>
 			</div>
 		</div>
 	</section>
@@ -180,91 +206,70 @@
 			onfocusin={() => (heroHeld = true)}
 			onfocusout={() => (heroHeld = false)}
 		>
-			<!-- The slide's own cover, blown up and blurred, is the backdrop; the scrim over
-			     it is `--k-bg`, so the wash (and therefore the text on top of it) follows the
-			     active theme instead of forcing a dark plate into the light one. -->
-			{#if current.cover}
-				<div class="hero-bg" aria-hidden="true"><Cover src={current.cover} alt="" /></div>
-			{/if}
-			<div class="hero-scrim" aria-hidden="true"></div>
-			<div class="hero-body">
-				<span class="eyebrow">trending</span>
-				<!-- `aria-live` is off while the carousel is advancing on its own (announcing a
-				     slide every 5s would make the page unusable) and polite once it is paused —
-				     which includes the moment an arrow is clicked, so a screen-reader user hears
-				     the slide they just asked for. This is the APG carousel pattern. -->
-				<div
-					class="hero-grid"
-					role="group"
-					aria-roledescription="slide"
-					aria-label={`Slide ${slide + 1} of ${featured.length}`}
-					aria-live={heroPaused ? 'polite' : 'off'}
+			<!-- `aria-live` is off while the carousel is advancing on its own (announcing a
+			     slide every 5s would make the page unusable) and polite once it is paused —
+			     which includes the moment an arrow is clicked, so a screen-reader user hears
+			     the slide they just asked for. This is the APG carousel pattern. -->
+			<div
+				class="hero-slide"
+				role="group"
+				aria-roledescription="slide"
+				aria-label={`Slide ${slide + 1} of ${featured.length}`}
+				aria-live={heroPaused ? 'polite' : 'off'}
+			>
+				<a
+					class="hero-cover"
+					href={seriesHref(current)}
+					aria-label={`Open ${current.title}`}
+					tabindex="-1"
 				>
-					<a
-						class="hero-cover"
-						href={seriesHref(current)}
-						aria-label={`Open ${current.title}`}
-						tabindex="-1"
-					>
-						<Cover src={current.cover} alt={current.title} />
-						<span class="hero-flag" title={current.type}>{FLAG[current.type]}</span>
-					</a>
-					<div class="hero-text">
-						<h1><a href={seriesHref(current)}>{current.title}</a></h1>
-						{#if current.genres.length}
-							<div class="hero-tags">
-								{#each current.genres.slice(0, HERO_GENRES) as g (g)}
-									<a class="hero-tag" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
-								{/each}
-							</div>
-						{/if}
-						{#if current.description}
-							<p class="hero-desc">{current.description}</p>
-						{/if}
-						<div class="hero-foot">
-							<!-- The credit line, in the same slot as the design's author name. Not every
-							     source gives one, and italicising a chapter figure would read as an author,
-							     so the fallback drops the italic. A chapter count of 0 is real and common
-							     (MangaDex strips chapters on a licensing takedown), and "0 chapters" as a
-							     credit is worse than no credit, so that case shows nothing.
-
-							     "98 chapters", NOT "Ch. 98" — this was the last surviving F4 site.
-							     `current.ch` is `Series.chapterCount` (see `toFeatured`), a COUNT of how
-							     many chapters we hold; the old "Ch. 98" label announced it as the newest
-							     chapter's NUMBER, which it is not. On a partially-mirrored series the two
-							     are far apart. The fix is to LABEL it honestly rather than blank it: the
-							     count is a true and useful fact, it was only wearing the wrong word. -->
-							{#if current.author}
-								<span class="hero-author">{current.author}</span>
-							{:else if current.ch > 0}
-								<span class="hero-author plain"
-									>{current.ch} {current.ch === 1 ? 'chapter' : 'chapters'}</span
-								>
-							{/if}
-							<div class="hero-nav">
-								<span class="hero-no">NO. {slide + 1}</span>
-								<!-- Disabled off `featured`, the same list `stepHero` steps through and
-								     `slide` indexes. `home.featured` is the same array by every path that
-								     can render this snippet, but it is a SECOND source of truth for a
-								     control whose whole job is to move within the first one. -->
-								<button
-									class="hero-arrow"
-									onclick={() => stepHero(-1)}
-									disabled={featured.length < 2}
-									aria-label="Previous featured series"
-								>
-									<Icon name="chevron-left" size={26} />
-								</button>
-								<button
-									class="hero-arrow"
-									onclick={() => stepHero(1)}
-									disabled={featured.length < 2}
-									aria-label="Next featured series"
-								>
-									<Icon name="chevron-right" size={26} />
-								</button>
-							</div>
+					<Cover src={current.cover} alt={current.title} />
+					<span class="hero-flag" title={current.type}>{FLAG[current.type]}</span>
+				</a>
+				<div class="hero-text">
+					<h1><a href={seriesHref(current)}>{current.title}</a></h1>
+					{#if current.genres.length}
+						<div class="hero-tags">
+							{#each current.genres.slice(0, HERO_GENRES) as g (g)}
+								<a class="hero-tag" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
+							{/each}
 						</div>
+					{/if}
+					{#if current.description}
+						<p class="hero-desc">{current.description}</p>
+					{/if}
+				</div>
+				<!-- The foot is a GRID CHILD, not a child of `.hero-text`: on a phone it moves
+				     out from beside the cover and spans the full width, which is the only way
+				     the credit, the chapter line and both arrows fit on one row at 390px. -->
+				<div class="hero-foot">
+					{#if current.author}
+						<span class="hero-author">{current.author}</span>
+					{/if}
+					<div class="hero-nav">
+						{#if chapterMeta}
+							<span class="hero-chapters">{chapterMeta}</span>
+						{/if}
+						<!-- Disabled off `featured`, the same list `stepHero` steps through and
+						     `slide` indexes. `home.featured` is the same array by every path that
+						     can render this snippet, but it is a SECOND source of truth for a
+						     control whose whole job is to move within the first one. -->
+						<button
+							class="hero-arrow"
+							onclick={() => stepHero(-1)}
+							disabled={featured.length < 2}
+							aria-label="Previous featured series"
+						>
+							<Icon name="chevron-left" size={26} />
+						</button>
+						<button
+							class="hero-arrow"
+							onclick={() => stepHero(1)}
+							disabled={featured.length < 2}
+							aria-label="Next featured series"
+						>
+							<Icon name="chevron-right" size={26} />
+						</button>
 					</div>
 				</div>
 			</div>
@@ -272,22 +277,6 @@
 	{/if}
 
 	<div class="sections k-gutter">
-		<!-- BROWSE BY FORMAT -->
-		<section class="block">
-			<h2>Browse by format</h2>
-			<div class="format-grid">
-				{#each home.formatCards as f (f.type)}
-					<a class="format-card" href={`/browse?type=${f.type}`} style="--hover:{f.hover}">
-						<span class="glow" style="background:radial-gradient(circle, {f.glow}, transparent 65%)"
-						></span>
-						<span class="format-name"><span class="format-flag">{f.flag}</span>{f.name}</span>
-						<span class="format-desc">{f.desc}</span>
-						<span class="format-count">{f.count}</span>
-					</a>
-				{/each}
-			</div>
-		</section>
-
 		<!-- LATEST UPDATES -->
 		{#if home.latestUpdates.length}
 			<section class="block">
@@ -365,77 +354,73 @@
 {/snippet}
 
 <style>
+	/* SOLID, not the slide's cover blurred into a colour field. The wash was the only
+	   thing tinting the banner, but it was also what every piece of hero text had its
+	   contrast computed against — and the art behind it is arbitrary, so the dimmest
+	   line on the slide sat a hair over the 4.5:1 floor in the worst case and needed a
+	   0.88 scrim propping it up. On a flat theme background the text is back on the
+	   normal ramp, at the ramp's designed contrast, in both themes. The cover still
+	   supplies the banner's colour — it is just the real cover now, bled to the edge,
+	   rather than a 48px-blurred copy of it behind glass. */
 	.hero {
 		position: relative;
+		/* The cover bleeds to the left/top/bottom edges; clip it to the banner. */
 		overflow: hidden;
 		background: var(--k-bg);
-		/* Contain the backdrop's blur+scale inside the banner. */
-		isolation: isolate;
-	}
-	/* The slide's cover, overscanned and blurred to a colour field. The overscan has to
-	   exceed the blur's reach or the element's own transparent edge gets averaged in and
-	   the backdrop fades out around the banner's rim: CSS `blur(r)` is a Gaussian with
-	   standard deviation r, so it feathers ~3r = 144px inward. That is an ABSOLUTE
-	   distance, which is why the inset is px and not the -10% it started as — 10% of a
-	   300px-tall phone hero is 30px of overscan against 144px of feather, i.e. the top and
-	   bottom thirds of the art washed away, worst exactly where the banner is shortest. */
-	.hero-bg {
-		position: absolute;
-		inset: -150px;
-		filter: blur(48px) saturate(1.4);
-	}
-	.hero-scrim {
-		position: absolute;
-		inset: 0;
-		/* Theme token, not a fixed dark plate: in light mode this washes the cover art
-		   out to a pale tint and the hero's text can stay on the normal text ramp.
-		   0.88, not 0.84: the wash is what the hero's text contrast is computed against,
-		   and the art behind it is arbitrary. A dark cover under the LIGHT theme is the
-		   worst case — it drags the plate from #f4f2ee down toward #d3d1cd, and at 0.84
-		   that put the dimmest text on the slide (the "Ch. 98" credit) at 4.07:1, under
-		   the 4.5:1 floor. 12% art still reads as colour. */
-		background: var(--k-bg);
-		opacity: 0.88;
+		/* The page below is the same token, so the band needs an edge of its own. */
+		border-bottom: 1px solid var(--k-border-1);
 	}
 	.head-sk {
 		width: 180px;
 		height: 22px;
 		border-radius: 6px;
 	}
-	.hero-body {
-		position: relative;
-		display: flex;
-		flex-direction: column;
-		gap: 20px;
-		padding: 40px var(--k-gutter) 44px;
+	/*
+	 * cover │ text
+	 * cover │ foot     — and on a phone: cover │ text
+	 *                                    foot  ╵ foot
+	 *
+	 * A grid, not the nested flex rows this used to be, precisely so that second layout
+	 * is a `grid-template-areas` swap rather than a different DOM. The foot has to leave
+	 * the text column on a phone (a ~190px column cannot hold a credit, a chapter line
+	 * and two arrows), and it has to stay in it on a desktop (pinned to the bottom of
+	 * the cover, per the design).
+	 *
+	 * The first row is `1fr` and the second `auto`, so `min-height` slack lands on the
+	 * TEXT and the foot stays a fixed strip at the bottom of the banner. Without it the
+	 * banner is only ever as tall as its content, and a short synopsis collapses the
+	 * cover — the one element whose whole job here is to be tall.
+	 */
+	.hero-slide {
+		display: grid;
+		grid-template-columns: var(--hero-cover-w) minmax(0, 1fr);
+		grid-template-areas:
+			'cover text'
+			'cover foot';
+		grid-template-rows: 1fr auto;
+		min-height: var(--hero-h);
+		/* 2:3 against `--hero-h`, because the cover spans BOTH rows here — see the
+		   breakpoints, where the phone layout drops it to row 1 and re-derives this. */
+		--hero-cover-w: 320px;
+		--hero-h: 480px;
+		/* Gap between the cover and the text column — the text's own left padding,
+		   kept as a variable because the foot has to match it exactly. */
+		--hero-pad-l: 40px;
 	}
-	.eyebrow {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		color: var(--k-text-bright);
-	}
-	.hero-grid {
-		display: flex;
-		align-items: stretch;
-		gap: 34px;
-		min-height: 360px;
-	}
+	/* Full-bleed: flush to the banner's left/top/bottom edges, no radius, no shadow.
+	   `object-fit: cover` (Cover's default) crops the art to the column; the column is
+	   sized ~2:3 at every breakpoint so that crop stays small. */
 	.hero-cover {
+		grid-area: cover;
 		position: relative;
-		flex: 0 0 auto;
-		width: 240px;
-		aspect-ratio: 2 / 3;
-		border-radius: var(--k-radius-lg);
 		overflow: hidden;
 		background: var(--k-cover);
-		box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+		border-right: 1px solid var(--k-border-1);
 	}
 	.hero-flag {
 		position: absolute;
-		right: 8px;
-		bottom: 8px;
+		left: 14px;
+		bottom: 14px;
 		width: 26px;
 		height: 26px;
 		border-radius: var(--k-radius-sm);
@@ -447,11 +432,13 @@
 		line-height: 1;
 	}
 	.hero-text {
-		flex: 1 1 auto;
+		grid-area: text;
 		min-width: 0;
 		display: flex;
 		flex-direction: column;
+		justify-content: center;
 		gap: 16px;
+		padding: 40px var(--k-gutter) 0 var(--hero-pad-l);
 	}
 	.hero-text h1 {
 		font-size: 46px;
@@ -502,13 +489,12 @@
 		overflow: hidden;
 	}
 	.hero-foot {
+		grid-area: foot;
 		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
+		align-items: center;
 		gap: 20px;
-		/* Pin the credit + carousel controls to the bottom of the cover. */
-		margin-top: auto;
-		padding-top: 12px;
+		min-width: 0;
+		padding: 16px var(--k-gutter) 36px var(--hero-pad-l);
 	}
 	.hero-author {
 		font-size: 19px;
@@ -522,29 +508,29 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	.hero-author.plain {
-		font-style: normal;
-		font-size: 15px;
-		/* Not --k-text-dim: see the scrim. This is the lowest-contrast text on the slide
-		   and it sits over an arbitrary cover. */
-		color: var(--k-text-muted);
-	}
 	.hero-nav {
 		display: flex;
 		align-items: center;
 		gap: 10px;
 		flex: 0 0 auto;
-		/* Stay hard right even when the credit line is absent (no author and no chapter
-		   count) — `space-between` alone would slide the controls left in that case. */
+		/* Stay hard right even when the credit is absent (not every source gives one) —
+		   `justify-content: space-between` alone would slide the controls left there. */
 		margin-left: auto;
 	}
-	.hero-no {
+	.hero-chapters {
 		font-family: var(--k-font-display);
 		font-weight: 700;
-		font-size: 17px;
-		letter-spacing: 0.06em;
-		color: var(--k-text-bright);
+		font-size: 14px;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-muted);
 		margin-right: 6px;
+		white-space: nowrap;
+	}
+	.foot-sk {
+		width: 200px;
+		height: 18px;
+		border-radius: 6px;
 	}
 	.hero-arrow {
 		display: inline-flex;
@@ -567,8 +553,6 @@
 		color: var(--k-text-disabled);
 		cursor: default;
 	}
-	/* The loading hero reuses `.hero-body` / `.hero-grid` / `.hero-cover` verbatim, so its
-	   geometry is the real hero's by construction and the swap doesn't shift layout. */
 	.title-sk {
 		width: min(460px, 70%);
 		height: 44px;
@@ -612,59 +596,6 @@
 	.view-all:hover {
 		color: var(--k-text);
 	}
-	.format-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-		gap: 20px;
-	}
-	.format-card {
-		position: relative;
-		overflow: hidden;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		border: 1px solid var(--k-border-1);
-		border-radius: 14px;
-		padding: 24px 26px;
-		background: var(--k-surface);
-		text-decoration: none;
-		transition: all 0.18s;
-	}
-	.format-card:hover {
-		border-color: var(--hover);
-		transform: translateY(-3px);
-	}
-	.glow {
-		position: absolute;
-		top: -24px;
-		right: -24px;
-		width: 110px;
-		height: 110px;
-		border-radius: 50%;
-	}
-	.format-name {
-		display: inline-flex;
-		align-items: center;
-		gap: 10px;
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 20px;
-		color: var(--k-text-bright);
-	}
-	.format-flag {
-		font-size: 23px;
-		line-height: 1;
-	}
-	.format-desc {
-		font-size: 13px;
-		color: var(--k-text-dimmer);
-		line-height: 1.5;
-	}
-	.format-count {
-		font-size: 12.5px;
-		color: var(--k-text-fainter);
-		margin-top: 2px;
-	}
 	.row {
 		display: flex;
 		gap: 22px;
@@ -687,13 +618,29 @@
 		color: var(--k-text);
 		border-bottom-color: rgba(255, 255, 255, 0.3);
 	}
-	@media (max-width: 900px) {
-		.hero-grid {
-			gap: 22px;
-			min-height: 0;
+	/* The cover column and the banner height shrink TOGETHER at every breakpoint, so the
+	   column stays near 2:3 and `object-fit: cover` has almost nothing to crop. While the
+	   cover spans both grid rows its height IS `--hero-h`, so each pair below satisfies
+	   `--hero-cover-w ≈ --hero-h × 2/3`. (The phone block re-derives it — there the cover
+	   spans row 1 only, so the foot's height comes off first.) */
+	@media (max-width: 1100px) {
+		.hero-slide {
+			--hero-cover-w: 280px;
+			--hero-h: 420px;
+			--hero-pad-l: 32px;
 		}
-		.hero-cover {
-			width: 150px;
+	}
+	@media (max-width: 900px) {
+		.hero-slide {
+			--hero-cover-w: 240px;
+			--hero-h: 360px;
+			--hero-pad-l: 26px;
+		}
+		.hero-text {
+			padding-top: 30px;
+		}
+		.hero-foot {
+			padding-bottom: 28px;
 		}
 		.hero-text h1 {
 			font-size: 32px;
@@ -705,45 +652,67 @@
 		}
 	}
 	@media (max-width: 640px) {
-		.hero-body {
-			padding-top: 28px;
-			padding-bottom: 30px;
-			gap: 16px;
-		}
-		.eyebrow {
-			font-size: 24px;
-		}
-		.hero-grid {
-			gap: 16px;
-		}
-		.hero-cover {
-			width: 112px;
+		/* PHONE. The foot leaves the text column and spans the banner's full width —
+		   a ~190px column beside the cover cannot hold a credit, a chapter line and two
+		   34px arrows without the arrows falling off the screen. The cover keeps its
+		   full-bleed left edge and now ends where the foot begins.
+
+		   `--hero-cover-w` is viewport-relative because the banner's height is fixed
+		   while the screen's width is not: at a flat 150px the column would be 2:3 on
+		   a 390px phone and near-square on a 600px tablet. The clamp holds it between
+		   a 130px floor (below which the cover reads as a stripe) and 175px. */
+		.hero-slide {
+			grid-template-areas:
+				'cover text'
+				'foot foot';
+			--hero-cover-w: clamp(130px, 44vw, 175px);
+			--hero-h: 320px;
+			--hero-pad-l: 16px;
 		}
 		.hero-text {
 			gap: 10px;
+			padding-top: 22px;
 		}
+		.hero-foot {
+			/* Full width now, so it takes the page gutter on BOTH sides rather than the
+			   cover-column offset on the left. */
+			padding: 12px var(--k-gutter) 18px;
+			gap: 12px;
+		}
+		/* Clamped, unlike the desktop title: the column beside the cover is ~180px, so an
+		   unclamped 24px title of the length this catalogue actually carries ("I Became
+		   the Villainess of an Otome Game…") runs seven lines and pushes the synopsis out
+		   of the banner entirely. */
 		.hero-text h1 {
 			font-size: 24px;
+			display: -webkit-box;
+			-webkit-box-orient: vertical;
+			-webkit-line-clamp: 3;
+			line-clamp: 3;
+			overflow: hidden;
 		}
-		.hero-tag {
-			font-size: 10px;
-			padding: 4px 8px;
+		/* Dropped, not shrunk. Genre chips are ~90px each and wrap one per line in that
+		   column, so four of them cost three rows — the same space the synopsis needs and
+		   a worse use of it. They are one tap away on /browse. */
+		.hero-tags {
+			display: none;
 		}
-		/* On a phone the cover column leaves no room for a synopsis beside it, so the
-		   description moves below the whole grid and the credit row sits under it. */
 		.hero-desc {
 			font-size: 14px;
 			-webkit-line-clamp: 3;
 			line-clamp: 3;
 		}
-		.hero-foot {
-			padding-top: 4px;
+		.hero-flag {
+			left: 10px;
+			bottom: 10px;
 		}
 		.hero-author {
 			font-size: 15px;
 		}
-		.hero-no {
-			font-size: 14px;
+		.hero-chapters {
+			font-size: 11.5px;
+			letter-spacing: 0.02em;
+			margin-right: 2px;
 		}
 		.hero-arrow {
 			width: 30px;
@@ -753,13 +722,6 @@
 			gap: 40px;
 			padding-top: 40px;
 			padding-bottom: 56px;
-		}
-		.format-grid {
-			grid-template-columns: 1fr;
-			gap: 14px;
-		}
-		.format-card {
-			padding: 20px 22px;
 		}
 		.block h2 {
 			font-size: 19px;

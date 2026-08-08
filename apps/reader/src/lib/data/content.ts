@@ -10,32 +10,30 @@
  */
 
 import type { ReportKind } from '@komika/types';
-import type { IconName } from '$lib/components/Icon.svelte';
 
 /**
  * Where donations go. Deliberately coarse — the point is that the money covers
  * infrastructure, not that a reader can audit the invoices.
+ *
+ * One clause each: /support renders these as a plain list, not as cards, so a
+ * paragraph here reads as filler rather than as an answer.
  */
-export const EXPENSES: { icon: IconName; title: string; desc: string }[] = [
+export const EXPENSES: { title: string; desc: string }[] = [
 	{
-		icon: 'image',
 		title: 'Image workers',
-		desc: 'The workers that fetch a page from its source and hand it straight to your reader. The largest single cost, and it scales with how much everyone reads.',
+		desc: 'Fetching each page from its source and handing it to your reader. The biggest line, and it grows with how much everyone reads.',
 	},
 	{
-		icon: 'share',
 		title: 'Bandwidth',
-		desc: 'Every page and cover crosses the network on its way to you. Nothing is pre-uploaded, so this is billed as it happens.',
+		desc: 'Every page and cover crosses the network to reach you. Nothing is pre-uploaded, so it is billed as it happens.',
 	},
 	{
-		icon: 'globe',
 		title: 'Domains',
 		desc: 'The komiq.cc names and their certificates — the reader, the API and the image workers each need one.',
 	},
 	{
-		icon: 'wrench',
 		title: 'Maintenance',
-		desc: 'Keeping the catalogue accurate and the sources working: servers, monitoring, and the unglamorous time spent fixing what broke.',
+		desc: 'Servers, monitoring, and the unglamorous hours spent fixing whatever broke.',
 	},
 ];
 

@@ -32,9 +32,11 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
+	WorkSourceRow,
 } from '@komika/types';
 import type {
 	Activity,
@@ -553,6 +555,12 @@ export class CompositeBackend implements Backend {
 	}
 	mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
 		return this.opts.hosted.mergeWorks!(sourceWorkId, targetWorkId);
+	}
+	workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
+		return this.opts.hosted.workSourceRows!(workId);
+	}
+	splitSourceSeries(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult> {
+		return this.opts.hosted.splitSourceSeries!(workId, sourceSeriesIds);
 	}
 
 	// --- admin sources & extensions (EXT-1/EXT-2) ---
