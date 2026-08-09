@@ -355,6 +355,29 @@ services:
 networks:
   komika:
     driver: bridge
+    # IPv6 (NAT66) so source extensions can reach IPv6-only-reachable sites.
+    #
+    # Eris Scans is the case that forced this: erisscans.com answers 200 over IPv6 but
+    # 404 over IPv4 — a Cloudflare stealth-block on this box's v4 egress, same CF edge
+    # (LAX), same path, only the source IP differs. The bridge was IPv4-only, so every
+    # one of its 293 tracked series failed every scan while the site was demonstrably
+    # up from the host over v6.
+    #
+    # The host has a single /128 with no delegated prefix, so containers cannot hold a
+    # globally routable address — this is a ULA subnet masqueraded to the host's /128.
+    # Docker >= 27 enables the `ip6tables` NAT for that by default, so this needs NO
+    # daemon.json change and NO Docker daemon restart (which would have bounced every
+    # unrelated stack on this box). Verified on 29.5.2.
+    enable_ipv6: true
+    ipam:
+      config:
+        # PINNED, not auto-allocated. Declaring an IPv6 subnet makes Docker re-derive
+        # the IPv4 one from its default pool, and the gateway address is load-bearing:
+        # deploy/.env carries TRUSTED_PROXY_CIDRS=127.0.0.1/32,172.21.0.1/32, so a
+        # renumbered bridge would silently stop the auth rate-limiter from trusting
+        # Caddy's X-Forwarded-For. Keep this in sync with that variable.
+        - subnet: 172.21.0.0/16
+        - subnet: fd00:21::/64
 
 volumes:
   suwayomi-data:
