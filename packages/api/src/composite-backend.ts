@@ -73,7 +73,7 @@ interface RefMapper {
  * on-device content engine. Auth, library, reading-progress, the social layer,
  * admin, canonical mirror, and source routing ALWAYS go to the hosted backend;
  * only live series/chapters/pages content is eligible to be served locally (see
- * the §1 routing table + §10 in `docs/plans/native-embedded-suwayomi.md`).
+ * the embedded-Suwayomi routing and licensing requirements).
  *
  * In Wave B there is no local engine (its transport lands in Wave C), so
  * `local` is null and every call — including the three content methods —

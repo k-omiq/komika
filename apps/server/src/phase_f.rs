@@ -1,5 +1,4 @@
-//! Phase F — `all.mangadex` retirement (`CHAPTER_UPDATES_PLAN.md` §7 Phase F, F8/§4.9),
-//! **as corrected by §8g**.
+//! `all.mangadex` retirement.
 //!
 //! The `all.mangadex` Suwayomi extension mirrors MangaDex through Suwayomi. We also
 //! mirror MangaDex *directly* (`source_type = 'mangadex'`), which is the richer path:

@@ -87,7 +87,7 @@
 	let maxRating = $state(10);
 
 	// TEMPORARILY DISABLED — re-enable once MangaDex statistics are ingested into
-	// `work_stats` (see docs/plans/2026-07-23-architecture-decisions.md, AD-6).
+	// `work_stats` is the dedicated aggregate for browse-card statistics.
 	//
 	// The server filters rating on AVG(score) FROM reviews — LOCAL user reviews —
 	// and the entire database contains 3 of them. Measured against the live API:

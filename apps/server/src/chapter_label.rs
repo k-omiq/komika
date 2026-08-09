@@ -315,7 +315,7 @@ mod tests {
 
     /// DUPLICATE-IMPLEMENTATION PIN — `round(number * 100)` is written TWICE.
     ///
-    /// `CHAPTER_UPDATES_HANDOFF.md` hard constraint 5 says the chapter key is "implemented
+    /// The chapter identity contract says the chapter key is "implemented
     /// once in `chapter_label::ChapterLabel::key()`". It is not. There is a second, textually
     /// identical implementation:
     ///

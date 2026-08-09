@@ -6,7 +6,6 @@ performance work**: any "this made it faster" claim should be a before/after run
 harness, not an argument.
 
 Baseline results: [`results/2026-07-27-baseline.md`](results/2026-07-27-baseline.md).
-Analysis and the optimisation plan: [`../../../PERFORMANCE_ROADMAP.md`](../../../PERFORMANCE_ROADMAP.md).
 
 ## Why hand-rolled
 

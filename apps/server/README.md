@@ -65,9 +65,8 @@ generator that speaks the reader's real GraphQL operations; `bench/README.md` co
 usage and — importantly — what a clean run does *not* prove.
 
 Baseline 2026-07-27: **~78 origin rps ≈ ~390 concurrent users**. The bottleneck is the
-`discovery` resolver (~63 ms CPU/request, viewer-invariant, uncached). Analysis and the
-phased plan are in `PERFORMANCE_ROADMAP.md`; the investigation write-up is in
-`docs/plans/2026-07-27-performance-investigation.md`.
+`discovery` resolver (~63 ms CPU/request, viewer-invariant, uncached). Benchmark
+instructions and captured results are in `bench/`.
 
 Re-run the `discovery` scenario as the acceptance test for any caching work.
 

@@ -408,8 +408,7 @@ starts:
   growth is one-directional and `docker builder prune` reclaims ~3.3 GB today if
   you need slack in a hurry.
 
-The fix is an **LRU cap on the covers cache**, already decided as **AD-21** in
-`docs/plans/2026-07-23-architecture-review.md` and **not yet implemented**. It
+The fix is an **LRU cap on the covers cache**, which is **not yet implemented**. It
 needs application code, not deploy config. Until it lands, a disk-usage alert on
 `/` (warn at 75%, page at 85%) is the cheap stand-in.
 

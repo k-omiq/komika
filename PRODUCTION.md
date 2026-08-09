@@ -45,7 +45,7 @@ proxy; no object-storage tier).
 - [x] Reader is a static SPA (`adapter-static`), CDN-cacheable; immutable-asset caching in `deploy/nginx.conf`.
 - [x] Image delivery via a Cloudflare Worker edge-cached proxy (`apps/worker`) — no object-storage tier; images are proxied + cached at Cloudflare's edge.
 - [x] **Load-test harness + measured baseline** — `apps/server/bench/loadtest.mjs` (zero-dep; no k6/wrk on this host). Baseline 2026-07-27: **~78 origin rps ≈ ~390 concurrent users**; `discovery` saturates at **55 rps** pinning ~3.5 of 4 cores. See `apps/server/bench/results/2026-07-27-baseline.md`.
-- [ ] **Cache the viewer-invariant reads** — `discovery` costs ~63 ms of CPU per request, is identical for every anonymous visitor, and is cached nowhere (`graphql/mod.rs:2490`). Single biggest win (~10×). Plan: `PERFORMANCE_ROADMAP.md` P1.
+- [ ] **Cache the viewer-invariant reads** — `discovery` costs ~63 ms of CPU per request, is identical for every anonymous visitor, and is cached nowhere (`graphql/mod.rs:2490`). Single biggest win (~10×).
 - [ ] **`CompressionLayer`** — responses are uncompressed; home feed is 64 KB vs 22 KB gzipped.
 - [ ] **`Cache-Control` + `ETag` on `/graphql`** — currently none, so no CDN or browser revalidation is possible for any query.
 - [ ] **Core Web Vitals budget** — Lighthouse CI job is a stub (`workflow_dispatch`); add `lighthouserc.json` + `budget.json` (LCP/CLS/INP) and enforce.
